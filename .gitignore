@@ -1,0 +1,35 @@
+# Colcon / ROS 2 build output
+/build/
+/install/
+/log/
+**/build/
+**/install/
+**/log/
+
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Eval data / artifacts (regenerate from scripts)
+**/results/
+**/data/
+**/*.npz
+**/*.npz.*
+**/*.ply
+**/*.bag
+**/*.bag.*
+**/*.mcap
+
+# Per-cell stdout logs from eval batches (reproducible from scripts)
+**/*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Paper sources (kept locally, not tracked)
+scovox_paper/

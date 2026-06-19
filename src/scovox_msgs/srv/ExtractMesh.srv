@@ -1,0 +1,6 @@
+float32 min_weight
+string output_path
+---
+uint32 vertex_count
+uint32 triangle_count
+string ply_path

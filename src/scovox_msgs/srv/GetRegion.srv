@@ -1,0 +1,6 @@
+# Request: axis-aligned bounding box in map frame
+geometry_msgs/Point min_corner
+geometry_msgs/Point max_corner
+---
+# Response: structured map containing only voxels within the box
+scovox_msgs/ScovoxMap map

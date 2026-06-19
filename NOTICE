@@ -1,0 +1,10 @@
+SCovox
+Copyright 2026 SCovox authors
+
+This product includes software developed by third parties:
+
+* Bonxai (https://github.com/facontidavide/Bonxai) — a sparse voxel
+  data structure used by `scovox_core` as a header-only dependency.
+  Vendored under `src/scovox_core/include/third_party/bonxai/`.
+  Bonxai is distributed under the MIT License; see the
+  `LICENSE_BONXAI` and `bonxai/LICENSE` files in that directory.

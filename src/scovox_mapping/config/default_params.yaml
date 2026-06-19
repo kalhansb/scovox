@@ -1,0 +1,255 @@
+# =======================================================================
+# SCovox Parameter Reference
+# Task 0.7: Complete audit of all runtime parameters
+# =======================================================================
+#
+# Notation:
+#   [M] = Map algorithm param (in scovox::Params, shared by library)
+#   [N] = Node-level param (ROS wrapper only)
+#   [T] = Topic / frame / transport config
+#
+# Counts:
+#   SCovoxNode:   17 [M] + 14 [N] + 8 [T] = 39 total  (17 algorithmic)
+#   DSCovoxNode:  4  [M] + 11 [N] + 5 [T] = 20 total  (4  algorithmic)
+#
+# The plan target was <=20 algorithmic for SCovoxNode, <=14 for DSCovoxNode.
+# Current: 17 [M] and 4 [M] respectively. Both within target.
+# =======================================================================
+
+# -----------------------------------------------------------------------
+# SCovoxNode  (scovox_mapping_node)
+# -----------------------------------------------------------------------
+
+scovox_node:
+  ros__parameters:
+
+    # === Map algorithm params [M] ===
+
+    resolution:                    # double, default 0.10, meters
+      # Voxel edge length. Determines spatial resolution of the map.
+
+    w_occ:                         # float, default 2.0, pseudo-counts
+      # Evidence added to a_occ per hit observation.
+      # Sensor-physics derivation: w_occ = (2·prob_hit − 1) / (1 − prob_hit).
+      #   RGB-D conservative (OctoMap prob_hit=0.7):  w_occ = 1.33
+      #     → noisy depth, many edge-spurious hits; low evidence per ray.
+      #   RGB-D moderate (prob_hit≈0.75, current):    w_occ = 2.0
+      #     → typical RealSense / Azure Kinect indoor.
+      #   LiDAR (prob_hit≈0.9):                       w_occ = 8.0
+      #     → physical TOF returns; very low FP rate, high evidence per ray.
+
+    w_free:                        # float, default 1.0, pseudo-counts
+      # Evidence added to a_free per free-space ray traversal.
+      # Sensor-physics derivation: w_free = 1/prob_miss − 2.
+      #   RGB-D conservative (OctoMap prob_miss=0.4):  w_free = 0.5
+      #     → frequent missed returns (dark/specular surfaces).
+      #   RGB-D moderate (prob_miss≈0.33, current):    w_free = 1.0
+      #     → moderate confidence in clear free-space rays.
+      #   LiDAR (prob_miss≈0.15):                      w_free ≈ 4.67
+      #     → clear-air rays are highly trustworthy.
+      # Ratio w_occ/w_free matters more than absolute scale for steady-state.
+
+    kappa0:                        # float, default 2.0, pseudo-counts
+      # Base Dirichlet evidence weight per semantic observation.
+
+    semantic_top_k:                # int, default 2 (=K_TOP), classes
+      # Number of top semantic classes stored per voxel (sparse Dirichlet).
+
+    semantic_occ_gate:             # float, default 0.5, dimensionless [0,1]
+      # Publish/visualization threshold: voxels with p_occ > this are emitted
+      # in pointcloud / binary outputs and used for the binary-message
+      # semantic_threshold field. NOT used in the per-voxel semantic update —
+      # the Dirichlet update is now Bayesian-soft (weights by p_occ directly).
+
+    semantic_mode:                 # string, default "dirichlet"
+      # Semantic update rule: "dirichlet", "naive", or "majority_vote".
+
+    range_decay_length:            # float, default -1.0 (disabled), meters
+      # Exponential range weighting: w(r) = exp(-r / decay_length).
+      # Set <= 0 to disable range weighting entirely.
+
+    min_range:                     # float, default 0.3, meters
+      # Minimum valid depth. Points closer than this are discarded.
+
+    max_range:                     # float, default 10.0, meters
+      # Maximum valid depth. Points farther than this are discarded.
+
+    grazing_angle_threshold:       # float, default -1.0 (disabled), dimensionless [0,1]
+      # cos(angle) below which angle weight drops linearly.
+      # Set <= 0 to disable grazing angle weighting.
+
+    # === Node behaviour params [N] ===
+
+    max_semantic_classes:           # int, default 10, classes
+      # Total number of semantic classes in the label space.
+
+    transient_decay_rate:           # float, default 0.8, dimensionless [0,1]
+      # Per-frame multiplicative decay applied to transient grid evidence.
+
+    dynamic_classes:                # int[], default [6], class IDs
+      # Segmentation class IDs routed to the transient layer.
+
+    stride:                         # int, default 1, pixels
+      # Pixel stride for depth/segmentation image processing.
+
+    min_depth:                      # float, default 0.1, meters
+      # Minimum valid raw depth reading.
+
+    max_depth:                      # float, default 10.0, meters
+      # Maximum valid raw depth reading (also used for no-return rays).
+
+    trace_no_return_rays:           # bool, default false
+      # If true, trace free-space rays to max_depth for pixels with no return.
+
+    mode:                           # string, default "rolling"
+      # Operating mode: "rolling" (publishes ScovoxMapBinary snapshots for the
+      # dscovox merger; planning_map is a rolling crop around the robot) or
+      # "persistent" (single continuous local map, no binary publish, fixed
+      # planning_map envelope).
+
+    robot_id:                       # string, default ""
+      # Robot identifier (informational, used in log messages).
+
+    occupancy_vis_threshold:             # float, default 0.7, dimensionless [0,1]
+      # Minimum p_occ for a voxel to appear in point cloud / planning map.
+
+    scovox_publish_rate:            # float, default 1.0, Hz
+      # Rate of full ScovoxMap publication (uncertainty visualization).
+
+    publish_pointcloud:             # bool, default true
+      # Whether to publish the colored occupancy point cloud.
+
+    publish_planning_map:           # bool, default true
+      # Whether to publish the 2D OccupancyGrid for planners.
+
+    # === Planning map params [N] ===
+
+    planning_map_resolution:        # float, default 0.20, meters
+      # Cell size for the 2D planning OccupancyGrid.
+
+    planning_map_size_m:            # float, default 80.0, meters
+      # Side length of the square 2D grid.
+
+    planning_map_origin_x:          # float, default -40.0, meters
+      # X origin of the 2D grid in the integration frame.
+
+    planning_map_origin_y:          # float, default -40.0, meters
+      # Y origin of the 2D grid in the integration frame.
+
+    planning_map_min_z:             # float, default -1.0, meters
+      # Minimum z for voxels projected into the 2D grid.
+
+    planning_map_max_z:             # float, default 2.0, meters
+      # Maximum z for voxels projected into the 2D grid.
+
+    planning_map_inflation_m:       # float, default 0.0, meters
+      # Inflation radius applied to occupied cells in the planning map.
+
+    # === Topic / frame config [T] ===
+
+    base_frame:                     # string, default "base_link"
+    map_frame:                      # string, default "map"
+    integration_frame:              # string, default "odom"
+    depth_topic:                    # string, default "/atlas/rgbd_camera/depth_image"
+    depth_info_topic:               # string, default "/atlas/rgbd_camera/camera_info"
+    seg_topic:                      # string, default "/atlas/segmentation/colored"
+    pointcloud_topic:               # string, default "~/pointcloud"
+    scovox_topic:                   # string, default "~/scovox"
+
+    # === Semantic color map [T] ===
+
+    semantic_color_map_keys:        # int[], default [0x4382, 0x21C1, 0x8605, 0xCA88, 0xA8C7, 0x6544, 0]
+      # RGB keys (as packed uint32) for mapping segmentation colors to class IDs.
+
+    semantic_color_map_classes:     # int[], default [1, 2, 4, 6, 5, 3, 0]
+      # Corresponding class IDs for each color key.
+
+
+# -----------------------------------------------------------------------
+# DSCovoxNode  (dscovox_mapping_node)
+# -----------------------------------------------------------------------
+
+dscovox_node:
+  ros__parameters:
+
+    # === Map algorithm params [M] ===
+
+    consensus_kl_threshold:         # float, default 5.0, nats
+      # KL divergence threshold above which source cells are flagged as conflicting.
+
+    tau_occ_gate:                   # float, default 0.6, dimensionless [0,1]
+      # Minimum p_occ for semantic evidence to be merged during consensus.
+
+    semantic_occ_gate:              # float, default 0.5, dimensionless [0,1]
+      # (Forwarded from SCovoxNode) p_occ hard threshold for semantic merging.
+
+    semantic_top_k:                 # int, default 2 (=K_TOP), classes
+      # Active top-K classes per voxel for deserialization.
+
+    # === Node behaviour params [N] ===
+
+    occupancy_vis_threshold:             # float, default 0.7, dimensionless [0,1]
+      # Minimum p_occ for visualization / planning output.
+
+    pose_source:                    # string, default "tf"
+      # How submap poses are obtained: "tf" or "pose_graph".
+
+    correction_check_hz:            # float, default 1.0, Hz
+      # Rate at which TF corrections are checked for map rebuilds.
+
+    correction_pos_threshold:       # float, default 0.05, meters
+      # Translation change that triggers a fused map rebuild.
+
+    correction_rot_threshold:       # float, default 0.05, radians
+      # Rotation change that triggers a fused map rebuild.
+
+    publish_rate_hz:                # float, default 5.0, Hz
+      # Rate of point cloud and planning map publication.
+
+    publish_planning_map:           # bool, default false
+      # Whether to publish the 2D OccupancyGrid.
+
+    # === Planning map params [N] ===
+
+    planning_map_resolution:        # float, default 0.20, meters
+    planning_map_size_m:            # float, default 80.0, meters
+    planning_map_origin_x:          # float, default -40.0, meters
+    planning_map_origin_y:          # float, default -40.0, meters
+    planning_map_min_z:             # float, default -1.0, meters
+    planning_map_max_z:             # float, default 2.0, meters
+    planning_map_inflation_m:       # float, default 0.0, meters
+
+    # === Topic / frame config [T] ===
+
+    input_topics:                   # string[], default []
+      # List of ScovoxMapBinary input topics. If empty, falls back to input_topic_1/2.
+
+    input_topic_1:                  # string, default "/robot1/scovox_node/scovox_bin"
+    input_topic_2:                  # string, default "/robot2/scovox_node/scovox_bin"
+    map_frame:                      # string, default "map"
+    pointcloud_topic:               # string, default "~/pointcloud"
+    planning_map_topic:             # string, default "~/planning_map"
+
+
+# -----------------------------------------------------------------------
+# scovox::Params struct (scovox_core library)
+# -----------------------------------------------------------------------
+# These are the 17 framework-agnostic parameters in the Params struct.
+# They control the Beta-conjugate occupancy model, Dirichlet semantics,
+# occupancy gate, evidence saturation, range/angle weighting, and
+# consensus fusion. All have sensible defaults. No ROS dependency.
+#
+#  1. resolution              double  0.05   m
+#  2. w_free                  float   1.0    pseudo-counts
+#  3. w_occ                   float   2.0    pseudo-counts
+#  4. semantic_mode           enum    DIRICHLET
+#  5. kappa0                  float   2.0    pseudo-counts
+#  6. top_k                   int     2      classes
+#  7. semantic_occ_gate       float   0.5    dimensionless  (publish threshold)
+#  8. consensus_kl_threshold  float   5.0    nats
+#  9. consensus_tau_occ_gate  float   0.6    dimensionless
+# 10. range_decay_length      float  -1.0    m  (disabled)
+# 11. min_range               float   0.3    m
+# 12. max_range               float  10.0    m
+# 13. grazing_angle_threshold float  -1.0    dimensionless  (disabled)
+# -----------------------------------------------------------------------

@@ -1,0 +1,6 @@
+# Request: height range and optional 2D resolution
+float64 z_min
+float64 z_max
+float64 resolution_2d  # 0 = use voxel resolution
+---
+nav_msgs/OccupancyGrid grid
