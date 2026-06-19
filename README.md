@@ -13,10 +13,6 @@ src/
   scovox_msgs/      BinaryMap v3 wire format + service definitions
 
 docs/
-  STEP8_EXPERIMENT_RESULTS_2026_05_14.md   Full Step-8 results write-up
-  jetbot_experiment_2026_05_21.md          Jetson Nano edge-feasibility report
-  NEW_EXPERIMENT_PLAN.md                   Phase 0–7 protocol the results follow
-  METHODS.md                               Math + per-voxel storage layout
   design/unified_dirichlet_design_2026_05_13.md   v3 Dirichlet design doc
 ```
 
