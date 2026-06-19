@@ -102,6 +102,13 @@ public:
     // few hundred bytes of overhead.
     map_ = std::make_unique<scovox::Map>(P);
     declareNodeParams();   // sets use_split_ / share_tsdf_ before substrate creation
+    if (use_split_ && P.sdf_trunc == 0.f) {
+      RCLCPP_WARN(get_logger(),
+        "TSDF off (enable_tsdf=false or sdf_trunc_voxels=0) has no clean effect in split "
+        "mode (use_split=true): TsdfMap clamps sdf_trunc back up so it keeps integrating a "
+        "surface, yet ~/tsdf_pointcloud is suppressed (the publisher is gated on the legacy "
+        "map's sdf_trunc=0). Use the legacy fused path (use_split=false) for TSDF-free mapping.");
+    }
     if (use_split_) {
       // Step 8 (D7) — split-grid v2 substrate. ScovoxMapSplit::Params shares
       // (resolution, inner_bits, leaf_bits) across both grids; per-substrate
@@ -186,7 +193,7 @@ public:
     RCLCPP_INFO(get_logger(), "sizeof(Mask)=%zu sizeof(LeafGrid)=%zu sizeof(Voxel)=%zu trivial=%d",
       sizeof(Bonxai::Mask), sizeof(scovox::Map::Grid::LeafGrid), sizeof(scovox::Voxel),
       (int)std::is_trivial_v<scovox::Voxel>);
-    RCLCPP_INFO(get_logger(), "TSDF: sdf_trunc=%.3f m space_carving=%d band_only=%d (0 sdf_trunc disables TSDF)",
+    RCLCPP_INFO(get_logger(), "TSDF: sdf_trunc=%.3f m space_carving=%d band_only=%d (sdf_trunc=0 means off; set via enable_tsdf / sdf_trunc_voxels)",
       P.sdf_trunc, (int)P.tsdf_space_carving, (int)P.band_only_integration);
     if (use_split_) {
       RCLCPP_INFO(get_logger(), "split substrate: sizeof(TsdfVoxel)=%zu sizeof(SemDirVoxel)=%zu",
@@ -213,13 +220,16 @@ private:
       }
     }
     // TSDF: truncation distance is set in voxel units so it scales with
-    // resolution across launch files. 0 disables TSDF integration entirely.
-    // `carve_band` is independent — partial-ray mode (carve_band > 0) still
-    // walks the TSDF band normally; the only effect is a shorter free-carve
-    // segment in front of the surface.
+    // resolution across launch files. The whole legacy fused path treats
+    // sdf_trunc==0 as "TSDF off" — no band walk in fused_integrate_ray_static,
+    // no ~/tsdf_pointcloud publisher, no ~/extract_mesh service. `enable_tsdf`
+    // (default true) is the explicit off-switch that forces it there; split
+    // mode (use_split=true) can't honor it (TsdfMap re-clamps sdf_trunc<=0 in
+    // tsdf_map.cpp), so the constructor warns. `carve_band` is independent.
     {
+      const bool enable_tsdf = dp("enable_tsdf", true);
       const int sdf_trunc_voxels = (int)dp("sdf_trunc_voxels", 3);
-      P.sdf_trunc = sdf_trunc_voxels > 0
+      P.sdf_trunc = (enable_tsdf && sdf_trunc_voxels > 0)
         ? (float)(sdf_trunc_voxels * P.resolution) : 0.f;
     }
     P.tsdf_space_carving = dp("tsdf_space_carving", false);

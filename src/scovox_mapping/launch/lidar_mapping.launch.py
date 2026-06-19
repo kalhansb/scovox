@@ -1,17 +1,22 @@
 """SCovox LiDAR mapping — geometry / occupancy only (no semantics).
 
-Integrates a LiDAR PointCloud2 stream into a Beta-occupancy + TSDF voxel
-map. The input cloud carries no `semantic_label` field, so scovox_node runs
-purely geometrically — no Dirichlet / top-K semantic fusion.
+Integrates a LiDAR PointCloud2 stream into a Beta-occupancy voxel map (TSDF
+off by default; see below). The input cloud carries no `semantic_label`
+field, so scovox_node runs purely geometrically — no Dirichlet / top-K
+semantic fusion.
 
 Parameters are loaded from config/lidar_mapping.yaml; a couple of common
 ones are exposed as launch arguments.
 
+TSDF surface integration is off by default here — pure occupancy mapping.
+It is not a launch argument; edit `enable_tsdf: true` in config/lidar_mapping.yaml
+to also build the dense fused surface and publish ~/tsdf_pointcloud.
+
 Outputs (under /scovox_node):
   ~/pointcloud        coloured occupancy point cloud
-  ~/tsdf_pointcloud   TSDF surface point cloud
   ~/scovox            full ScovoxMap (occupancy + uncertainty)
-  ~/planning_map      2-D occupancy grid for navigation
+  ~/tsdf_pointcloud   TSDF surface point cloud (only when enable_tsdf: true)
+  ~/planning_map      2-D occupancy grid for navigation (off by default)
 
 Usage:
   ros2 launch scovox_mapping lidar_mapping.launch.py

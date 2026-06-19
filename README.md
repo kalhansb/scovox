@@ -51,6 +51,8 @@ ros2 launch scovox_mapping lidar_mapping.launch.py pointcloud_topic:=/your/lidar
 ```
 
 Tune frames/ranges in [`config/lidar_mapping.yaml`](src/scovox_mapping/config/lidar_mapping.yaml).
+TSDF surface integration is off by default (`enable_tsdf: false`) — occupancy
+only; set `enable_tsdf: true` to also build the dense fused surface.
 For semantics, give SCovox a class per voxel via a `semantic_label` field on the
 `PointCloud2`, or a colored segmentation image (`seg_topic`) — RGB-D path is wired
 in [`scovox_single_robot.launch.py`](src/scovox_mapping/launch/scovox_single_robot.launch.py).
@@ -69,7 +71,7 @@ Edit the `robots` list / `input_topics` in [`scovox_multi_robot.launch.py`](src/
 ### Interfaces
 
 * `scovox_mapping_node` — **in:** LiDAR `PointCloud2` *or* depth + camera_info + seg;
-  **out:** `~/pointcloud`, `~/tsdf_pointcloud`, `~/scovox`, `~/planning_map`, `~/scovox_bin` (rolling).
+  **out:** `~/pointcloud`, `~/scovox`, `~/scovox_bin` (rolling), `~/tsdf_pointcloud` (if `enable_tsdf`), `~/planning_map` (if `publish_planning_map`).
 * `dscovox_mapping_node` — **in:** each robot's `~/scovox_bin` (`input_topics`);
   **out:** fused `~/pointcloud`, `~/scovox`, `~/planning_map`, `~/frontier_centroids`.
 

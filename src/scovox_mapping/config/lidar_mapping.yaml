@@ -1,7 +1,8 @@
 # =======================================================================
 # SCovox — LiDAR geometry mapping (no semantics)
 # =======================================================================
-# Builds a Beta-occupancy + TSDF voxel map from a LiDAR PointCloud2 stream.
+# Builds a Beta-occupancy voxel map from a LiDAR PointCloud2 stream. TSDF
+# surface integration is off by default (enable_tsdf: false) — occupancy only.
 # Semantic fusion is inactive: the input cloud carries no `semantic_label`
 # field, so scovox_node integrates geometry / occupancy only. None of the
 # Dirichlet / top-K / colour-map semantic parameters are set here.
@@ -45,7 +46,10 @@
     carve_band: -1.0
 
     # --- TSDF surface integration ---------------------------------------
-    sdf_trunc_voxels: 3        # truncation distance in voxels (0 disables TSDF)
+    # Master switch. false = occupancy only (no TSDF stored, computed, or
+    # published). Set true (with sdf_trunc_voxels > 0) for the dense surface.
+    enable_tsdf: false
+    sdf_trunc_voxels: 3        # truncation in voxels; ignored while enable_tsdf=false
     tsdf_space_carving: false
     band_only_integration: false
 
@@ -58,25 +62,31 @@
     # --- Frames ----------------------------------------------------------
     base_frame:        "base_link"  # sensor / robot base frame
     integration_frame: "odom"       # fixed frame rays are integrated in
-    map_frame:         "map"
+    map_frame:         "map"         # unused on the LiDAR path (outputs are
+                                     # published in integration_frame); only
+                                     # consumed once the 2-D planning grid is on
 
     # --- TF startup gate -------------------------------------------------
     startup_tf_stable_sec:     0.0   # start integrating immediately
     startup_tf_jump_threshold: 10.0  # tolerate fast platform motion at startup
 
     # --- Mode ------------------------------------------------------------
+    # Pin the legacy fused substrate: a single Beta-occupancy grid (geometry
+    # only). use_split=true would allocate the split TSDF + Dirichlet-semantic
+    # substrate instead — not wanted here, and it would also ignore enable_tsdf.
+    use_split: false
+
     # "persistent": single continuous local map, no inter-robot binary
     # publishing. Use "rolling" only for multi-robot dscovox fusion.
     mode: "persistent"
     dataset_mode: false
 
     # --- Outputs ---------------------------------------------------------
+    # No publish_tsdf_pointcloud here: enable_tsdf is the single TSDF switch.
     publish_pointcloud:      true
-    publish_tsdf_pointcloud: true
     occupancy_vis_threshold: 0.6     # minimum p_occ for a voxel to be emitted
     scovox_publish_rate:     1.0     # full-map publish rate [Hz]
     pointcloud_topic:        "~/pointcloud"
-    tsdf_pointcloud_topic:   "~/tsdf_pointcloud"
     scovox_topic:            "~/scovox"
 
     # --- 2-D planning grid (occupancy projection) ------------------------
