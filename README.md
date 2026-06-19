@@ -1,6 +1,6 @@
 # SCovox
 
-Sparse-Covariance Voxel mapping with a unified per-voxel Dirichlet
+Semantic Conjugate Voxel mapping with a unified per-voxel Dirichlet
 over `{top-K classes, OTHER, FREE}` — semantic occupancy mapping with
 calibrated uncertainty, multi-robot fusion, and edge-device runtime.
 
@@ -29,7 +29,6 @@ src/
   scovox_core/      Voxel types, Dirichlet semantics, ray casting (C++17, zero ROS deps)
   scovox_mapping/   ROS 2 nodes: scovox_mapping_node, dscovox_mapping_node
   scovox_msgs/      BinaryMap v3 wire format + service definitions
-  scovox_eval/      Replay drivers, batch scripts, evaluation tooling, Jetson runner
 
 docs/
   STEP8_EXPERIMENT_RESULTS_2026_05_14.md   Full Step-8 results write-up
@@ -55,34 +54,50 @@ Release builds are mandatory — debug builds inflate timing numbers
 by ~3–4× and bias any wall-clock measurement.
 
 Runtime dependencies: Eigen 3.4+, lz4, standard ROS 2 stack.
-Evaluation scripts additionally require `numpy`, `scipy`, and
-`open3d` (for Chamfer / F-score computations).
 
-## Reproducing the paper
+## Running on a robot
 
-The reproduction workflow follows [docs/NEW_EXPERIMENT_PLAN.md](docs/NEW_EXPERIMENT_PLAN.md).
-Each phase has a driver shell script under `src/scovox_eval/scripts/`:
+Both nodes consume live sensor topics + TF — no datasets needed. Use
+`use_sim_time:=false` on hardware.
 
-| Phase | Question | Driver |
-|-------|----------|--------|
-| 0     | Substrate smoke test                     | `phase0_smoke_post_semdir.sh` |
-| 1     | K_TOP Pareto sweep (KITTI + SceneNet)    | `phase1_ktop_sweep.sh`, `phase1_kitti_soft_sweep.sh` |
-| 2     | Dirichlet vs no-prior / majority-vote    | `phase2_component_ablation.sh` |
-| 2.5   | Publish- and admission-gate sweeps       | `phase2_5_gate_threshold_sweep.sh`, `phase2_5_v2_admission_gate_sweep.sh` |
-| 3     | Two-robot Dirichlet fusion (SceneNet)    | `phase3_scenenet_fusion_batch.sh` |
-| 4     | Head-to-head vs SLIM-VDB                 | `eval_scovox_kitti_miou.py`, `eval_slimvdb_kitti_miou.py`, scenenet equivalents |
-| 5     | Per-voxel memory accounting              | inline in `eval_slimvdb_runtime_memory.py` |
+**TF required** (from your odometry/SLAM): `integration_frame → sensor_frame`
+(the cloud/depth `frame_id`) and `integration_frame → base_frame` (robot pose).
+Multi-robot fusion also needs `map_frame → <robot>/odom` per robot.
 
-The scripts assume KITTI seq 06–10, SceneNet-RGBD val split, and
-PolarSeg `.topk` soft-probability outputs are staged at the paths
-documented at the top of each script.
+### Single robot
 
-### Jetson Nano edge experiment
+LiDAR, geometry only:
 
-Two-machine setup with a Jetson Nano 4 GB running scovox + dscovox
-and the laptop replaying SceneNet trajectories.  See
-[`src/scovox_eval/jetbot/README.md`](src/scovox_eval/jetbot/README.md)
-for DDS configuration and the runner scripts on both sides.
+```bash
+ros2 launch scovox_mapping lidar_mapping.launch.py pointcloud_topic:=/your/lidar/points
+```
+
+Tune frames/ranges in [`config/lidar_mapping.yaml`](src/scovox_mapping/config/lidar_mapping.yaml).
+For semantics, give SCovox a class per voxel via a `semantic_label` field on the
+`PointCloud2`, or a colored segmentation image (`seg_topic`) — RGB-D path is wired
+in [`scovox_single_robot.launch.py`](src/scovox_mapping/launch/scovox_single_robot.launch.py).
+
+### Multi-robot (SCovox + DSCovox)
+
+One `scovox_mapping_node` per robot (`mode:=rolling`, namespaced) publishes
+`/<robot>/scovox_node/scovox_bin`; one `dscovox_mapping_node` fuses them:
+
+```bash
+ros2 launch scovox_mapping scovox_multi_robot.launch.py
+```
+
+Edit the `robots` list / `input_topics` in [`scovox_multi_robot.launch.py`](src/scovox_mapping/launch/scovox_multi_robot.launch.py).
+
+### Interfaces
+
+* `scovox_mapping_node` — **in:** LiDAR `PointCloud2` *or* depth + camera_info + seg;
+  **out:** `~/pointcloud`, `~/tsdf_pointcloud`, `~/scovox`, `~/planning_map`, `~/scovox_bin` (rolling).
+* `dscovox_mapping_node` — **in:** each robot's `~/scovox_bin` (`input_topics`);
+  **out:** fused `~/pointcloud`, `~/scovox`, `~/planning_map`, `~/frontier_centroids`.
+
+Full parameter reference: [`config/default_params.yaml`](src/scovox_mapping/config/default_params.yaml).
+
+> Paper-reproduction tooling (`scovox_eval/`) is not in this deployment tree; measured results are under [`docs/`](docs/).
 
 ## Determinism and run-to-run variance
 
