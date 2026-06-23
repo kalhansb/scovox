@@ -1020,9 +1020,9 @@ private:
       return false;
     }
     size_t total;
-    uint8_t C;
+    uint8_t C = 0;
     if (image_mode) {
-      uint16_t H, W;
+      uint16_t H = 0, W = 0;
       f.read(reinterpret_cast<char*>(&H), 2);
       f.read(reinterpret_cast<char*>(&W), 2);
       f.read(reinterpret_cast<char*>(&C), 1);
@@ -1030,12 +1030,27 @@ private:
       topk_cache_h_ = H; topk_cache_w_ = W; topk_cache_c_ = C;
       topk_cache_n_ = 0;
     } else {
-      uint32_t N;
+      uint32_t N = 0;
       f.read(reinterpret_cast<char*>(&N), 4);
       f.read(reinterpret_cast<char*>(&C), 1);
       total = (size_t)N * C;
       topk_cache_n_ = N; topk_cache_c_ = C;
       topk_cache_h_ = 0; topk_cache_w_ = 0;
+    }
+    // Guard the header reads before sizing the buffer. An empty or truncated
+    // .topk file leaves the dimension fields at their zero-init (failed reads
+    // no-op), and a garbage `total` from a partially-read header would throw
+    // bad_alloc out of resize() — uncaught in the integration callback, that
+    // calls std::terminate and kills the mapper. Require a clean header read
+    // and a payload within a sane absolute ceiling.
+    static constexpr size_t kMaxTopkBytes = size_t(1) << 30;  // 1 GiB
+    if (!f.good() || total == 0 || total > kMaxTopkBytes) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "topk: bad/empty header in %s (total=%zu) — falling back to one-hot",
+                           path, total);
+      topk_cache_valid_ = false;
+      ++topk_load_failure_;
+      return false;
     }
     topk_cache_probs_.resize(total);
     f.read(reinterpret_cast<char*>(topk_cache_probs_.data()), total);

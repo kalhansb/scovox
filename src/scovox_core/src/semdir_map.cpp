@@ -264,7 +264,23 @@ bool SemDirMap::applyCarveUpdate(const CoordT& c, float quality) {
   const float skip = params_.carve_skip_occ_threshold;
 
   SemDirVoxel* v = acc_.value(c, /*create_if_missing=*/false);
-  if (v && v->p_occ() > skip) return false;  // wall — caller stops carving
+  // Wall guard: stop carving through a voxel only when it is CONFIDENTLY
+  // occupied — i.e. it carries real occupied evidence beyond the prior AND its
+  // posterior p_occ exceeds the skip threshold. The unified/split occupancy
+  // prior is p_occ = C/(C+1) ≈ 0.933 (not 0.5), so an allocated-but-unobserved
+  // voxel (e.g. hit with quality≈0, or allocated then never carved) already
+  // sits above the default carve_skip_occ_threshold=0.7. Gating on p_occ alone
+  // would treat such prior-only voxels as walls and truncate the carve ray.
+  // The prior occupied mass is C·α₀ (= num_classes·alpha_0); require s_occ
+  // above it before the wall short-circuits.
+  if (v) {
+    const float prior_s_occ =
+        static_cast<float>(params_.num_classes) * params_.alpha_0;
+    const float occ_evidence = v->s_occ() - prior_s_occ;
+    constexpr float kWallEvidenceEps = 1e-4f;
+    if (occ_evidence > kWallEvidenceEps && v->p_occ() > skip)
+      return false;  // wall — caller stops carving
+  }
 
   if (!v) {
     SemDirVoxel nv = defaultSemDirVoxel(params_.num_classes, params_.alpha_0);

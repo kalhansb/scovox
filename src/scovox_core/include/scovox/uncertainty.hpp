@@ -67,8 +67,15 @@ inline int estimateDistinctClasses(const V& v) {
 inline float hutterEscapeMass(int m, float N) {
   if (m <= 0 || N <= 0.f) return 0.f;
   const float ratio = (N + 1.f) / static_cast<float>(m);
-  if (ratio <= 1.f) return static_cast<float>(m);  // degenerate: all singletons
-  return static_cast<float>(m) / (2.f * std::log(ratio));
+  // The escape mass is a pseudo-count for untracked classes and is bounded
+  // above by the total observation count N — you cannot allocate more unknown
+  // evidence than evidence actually seen. The Hutter formula assumes N ≫ m; as
+  // ratio → 1⁺ (N small relative to m) the raw m / (2 ln ratio) term diverges
+  // (e.g. m=1, N≈1e-4 → ratio≈1.0001 → ~5000), which is physically impossible.
+  // Clamp to N in both the degenerate (ratio ≤ 1, i.e. m ≥ N+1) and the
+  // near-singleton regimes.
+  if (ratio <= 1.f) return N;  // degenerate: m ≥ N+1, escape mass capped at N
+  return std::min(static_cast<float>(m) / (2.f * std::log(ratio)), N);
 }
 
 /// Effective a_unk with Hutter floor applied.

@@ -162,6 +162,18 @@ class ScovoxMapSplit {
       const Eigen::Vector3f v_point_voxel  = endpoint - vc;
       const float dist = v_point_voxel.norm();
       const float proj = v_voxel_origin.dot(v_point_voxel);
+
+      // (3) Hit (endpoint voxel) — semantic/occupancy update. Run this BEFORE
+      // the proj≈0 early-return: when the endpoint lands exactly on a voxel
+      // centre, v_point_voxel≈0 so proj≈0, and returning here would skip the
+      // hit update entirely — leaving the surface voxel at prior and diverging
+      // the fused walker from the non-fused SemDirMap::integrateHit, which
+      // applies the hit unconditionally. The TSDF band update below may still
+      // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
+      if (c == k_hit) {
+        semHit(c, sem_probs, quality);
+      }
+
       if (std::fabs(proj) < 1e-12f) return;
       const float sign = (proj > 0.f) ? 1.f : -1.f;
       const float sdf  = sign * dist;
@@ -171,11 +183,8 @@ class ScovoxMapSplit {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
-      // (2) semantic carve (interior of carve band, not the hit voxel)
-      // (3) Hit (endpoint voxel) — semantic update.
-      if (c == k_hit) {
-        semHit(c, sem_probs, quality);
-      } else if (!carve_blocked && sdf > 0.f && sdf <= carve_band) {
+      // (2) semantic carve (interior of carve band, not the hit voxel).
+      if (c != k_hit && !carve_blocked && sdf > 0.f && sdf <= carve_band) {
         if (!semCarve(c, quality)) {
           carve_blocked = true;
         }

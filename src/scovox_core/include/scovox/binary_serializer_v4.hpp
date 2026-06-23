@@ -46,6 +46,7 @@
 /// values. If K_TOP must change on the wire, bump FORMAT_VERSION to v5 and add
 /// a new serializer; all existing v4 frames become invalid.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -194,6 +195,22 @@ class BinarySerializerV4 {
     need(sizeof(float));
     std::memcpy(&f.alpha_0, data.data() + off, sizeof(float));
     off += sizeof(float);
+
+    // Validate the header-supplied prior parameters before any voxel is
+    // reconstructed from them. consensus_merge_v4 rebuilds the Beta/Dirichlet
+    // prior as num_classes·alpha_0 and (num_classes − K_TOP)·alpha_0, so a
+    // corrupt header — num_classes < K_TOP, or a non-finite/non-positive
+    // alpha_0 — would silently inject negative or NaN mass into the live map
+    // (and two re-sent snapshots from the same bad sender agree with each
+    // other, so the per-frame equality check cannot catch it).
+    if (f.num_classes < static_cast<uint16_t>(K_TOP)) {
+      throw std::runtime_error(
+          "BinarySerializerV4: num_classes (" + std::to_string(f.num_classes)
+          + ") < K_TOP (" + std::to_string(K_TOP) + ")");
+    }
+    if (!std::isfinite(f.alpha_0) || f.alpha_0 <= 0.f) {
+      throw std::runtime_error("BinarySerializerV4: alpha_0 must be finite and > 0");
+    }
 
     // TSDF stream.
     need(sizeof(uint32_t));

@@ -236,9 +236,18 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
 /// at query time, not in storage), whereas DirVoxel stores prior-inflated
 /// counts. So the projection subtracts the per-class α_0 from each tracked
 /// slot and the OTHER bucket's (C−K)·α_0 prior, yielding the same raw-evidence
-/// convention selectTopKSemantics / argmaxClassConfidence expect — byte-identical
-/// to what the v1 fused path produced. Empty Dir slots (cnt == α_0) collapse to
-/// sem_cnt == 0 and are skipped by every consumer's `sem_cnt > 0` test.
+/// convention selectTopKSemantics / argmaxClassConfidence expect — the SEMANTIC
+/// fields are byte-identical to what the v1 fused path produced. Empty Dir slots
+/// (cnt == α_0) collapse to sem_cnt == 0 and are skipped by every consumer's
+/// `sem_cnt > 0` test.
+///
+/// OCCUPANCY is NOT v1-equivalent: a_occ / a_free are copied verbatim from the
+/// BetaVoxel, which carries the calibrated split prior (a_occ = C·α_0,
+/// a_free = α_0 → prior p_occ = C/(C+1) ≈ 0.933), whereas the v1 fused Voxel
+/// uses Beta(1,1) (prior p_occ = 0.5). For the same physical observation history
+/// the two substrates report different p_occ / variance / EIG / SSMI; this is by
+/// design (the split prior is calibrated to the unified-Dirichlet occupancy
+/// marginal), not a parity bug — so do NOT claim occupancy parity with v1.
 inline scovox::Voxel projectBetaDirToVoxel(
     const scovox::BetaVoxel& b, const scovox::DirVoxel* d,
     uint16_t num_classes, float alpha_0) {
@@ -998,8 +1007,12 @@ private:
   // NOTE: the RPC query services (GetRegion / GetOccupancyGrid /
   // ScoreCandidates) ARE v4-aware — they dispatch on (use_split_ &&
   // wire_format_v4_) to a substrate-agnostic templated core that projects the
-  // split Beta(+Dir) grids into a transient scovox::Voxel, so the query math
-  // is byte-identical to the legacy v1 path. Occupancy-only services
+  // split Beta(+Dir) grids into a transient scovox::Voxel. The SEMANTIC query
+  // math is byte-identical to the legacy v1 path (raw-evidence convention); the
+  // OCCUPANCY math is NOT — the Beta grid carries the calibrated split prior
+  // (prior p_occ ≈ C/(C+1), not v1's 0.5), so p_occ / EIG / SSMI differ from v1
+  // for the same evidence by design (see projectBetaDirToVoxel). Occupancy-only
+  // services
   // (ScoreCandidates / GetOccupancyGrid) read just the Beta grid; GetRegion
   // joins the Dir grid for per-class evidence. The v2/v3 fused substrates are
   // still query-empty (no planner consumes them); add analogous branches if
@@ -1153,10 +1166,23 @@ private:
       }
       {
         auto fa = split_fused_dir_->createAccessor();
-        std::vector<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> source_accs;
-        source_accs.reserve(sources_.size());
+        // Fold the Dir sources in a deterministic (sorted-by-source-id) order.
+        // mergeDir truncates to top-K and a class dumped to OTHER cannot climb
+        // back, so the fused slots — and hence dominantClass / mesh labels —
+        // depend on fold order. Iterating sources_ (an unordered_map) directly
+        // would let them flip across runs and rehashes; sort the keys first so
+        // the refold is reproducible. (Beta merge is additive/commutative and
+        // needs no ordering.)
+        std::vector<const std::string*> keys;
+        keys.reserve(sources_.size());
         for (auto& [k, sg] : sources_)
-          if (sg.dir_grid) source_accs.emplace_back(sg.dir_grid->createAccessor());
+          if (sg.dir_grid) keys.push_back(&k);
+        std::sort(keys.begin(), keys.end(),
+                  [](const std::string* a, const std::string* b) { return *a < *b; });
+        std::vector<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> source_accs;
+        source_accs.reserve(keys.size());
+        for (const std::string* k : keys)
+          source_accs.emplace_back(sources_.at(*k).dir_grid->createAccessor());
         for (const auto& mc : touched_dir) refoldCellDir(mc, fa, source_accs);
       }
     }  // unique_lock released
@@ -1460,6 +1486,11 @@ private:
     const float ot = (float)min_occ_;
     size_t cnt = 0;
     g.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT&) {
+      // Skip prior-only cells: the calibrated Beta prior is p_occ = C/(C+1) ≈
+      // 0.933, which exceeds the default 0.7 threshold, so without this guard
+      // every allocated-but-unobserved voxel would be published as a phantom
+      // occupied point. Mirror the isPrior gate the RPC walkers use.
+      if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
       if (v.p_occ() >= ot) ++cnt;
     });
     if (!cnt) return;
@@ -1491,6 +1522,9 @@ private:
       iao(cl, "a_occ"), iaf(cl, "a_free");
     sensor_msgs::PointCloud2Iterator<uint8_t> ik(cl, "semantic_class");
     g.forEachCell([&](const scovox::BetaVoxel& vb, const Bonxai::CoordT& co) {
+      // Same prior gate as the counting pass above — keep the two passes in
+      // lock-step so the emitted point count matches md.resize(cnt).
+      if (isPriorBeta(vb, fused_num_classes_, fused_alpha_0_)) return;
       float pr = vb.p_occ();
       if (pr < ot) return;
       const scovox::DirVoxel* dv = dacc.value(co);
