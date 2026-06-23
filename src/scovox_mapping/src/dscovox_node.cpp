@@ -55,6 +55,8 @@
 #include <scovox/consensus_merge_v2.hpp>
 #include <scovox/binary_serializer_v3.hpp>
 #include <scovox/consensus_merge_v3.hpp>
+#include <scovox/binary_serializer_v4.hpp>
+#include <scovox/consensus_merge_v4.hpp>
 #include <scovox/semdir_voxel.hpp>
 #include <scovox/sembeta_voxel.hpp>
 #include <scovox_msgs/srv/get_region.hpp>
@@ -109,6 +111,12 @@ struct SourceGrid {
   // semdir_grid} is allocated per source; the receiver's wire_format_v3_
   // flag picks which.
   std::unique_ptr<Bonxai::VoxelGrid<scovox::SemDirVoxel>> semdir_grid;
+  // Split Beta/Dirichlet (wire_format=v4) receiver populates these two grids
+  // in place of semdir_grid: occupancy (BetaVoxel) ∥ semantics (DirVoxel).
+  // Exactly one of {grid, sem_grid, semdir_grid, (beta_grid+dir_grid)} is
+  // allocated per source, picked by the receiver's wire_format flag.
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> beta_grid;
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  dir_grid;
   // Cached static source->map transform. Looked up once on first sight and
   // never refreshed — this assumes TFs are static (c-slam disabled). Under
   // c-slam, loop closures change this TF and the cache becomes a correctness
@@ -174,6 +182,50 @@ inline scovox::SemBetaVoxel projectSemDirToSemBetaForViz(
   }
   return out;
 }
+
+/// BetaVoxel "is at prior" check for the split (v4) consensus refold. A voxel
+/// is at prior iff a_occ ≈ C·α_0 and a_free ≈ α_0 (the calibrated occupancy
+/// prior). `slop` matches isPriorSemDir's one-quantum tolerance.
+inline bool isPriorBeta(const scovox::BetaVoxel& v,
+                        uint16_t num_classes, float alpha_0) {
+  const float occ_prior = static_cast<float>(num_classes) * alpha_0;
+  const float slop = std::max(0.01f, 0.01f * alpha_0);
+  return v.a_occ <= occ_prior + slop && v.a_free <= alpha_0 + slop;
+}
+
+/// DirVoxel "is at prior" check: OTHER ≈ (C−K)·α_0 and no slot filled.
+inline bool isPriorDir(const scovox::DirVoxel& v,
+                       uint16_t num_classes, float alpha_0) {
+  const float other_prior =
+      static_cast<float>(static_cast<int>(num_classes) - scovox::K_TOP) * alpha_0;
+  const float slop = std::max(0.01f, 0.01f * alpha_0);
+  if (v.other > other_prior + slop) return false;
+  for (int i = 0; i < scovox::K_TOP; ++i)
+    if (v.cls[i] != 0xFFFF) return false;
+  return true;
+}
+
+/// Project split Beta(occupancy) + Dir(semantics) → SemBetaVoxel for the v4
+/// visualisation path (reuses the shared argmax/variance/EIG helpers). The
+/// Dir pointer may be null (occupancy-only voxel). Per-class evidence has the
+/// α_0 prior subtracted so empty slots read 0, matching the sender's viz.
+inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
+    const scovox::BetaVoxel& b, const scovox::DirVoxel* d, float alpha_0) {
+  scovox::SemBetaVoxel out{};
+  out.a_occ  = b.a_occ;
+  out.a_free = b.a_free;
+  if (d) {
+    out.a_unk = d->other;
+    for (int i = 0; i < scovox::K_TOP; ++i) {
+      out.sem_cnt[i] = std::max(0.f, d->cnt[i] - alpha_0);
+      out.sem_cls[i] = d->cls[i];
+    }
+  } else {
+    out.a_unk = 0.f;
+    for (int i = 0; i < scovox::K_TOP; ++i) { out.sem_cnt[i] = 0.f; out.sem_cls[i] = 0xFFFF; }
+  }
+  return out;
+}
 } // namespace
 
 class DSCovoxNode : public rclcpp::Node {
@@ -227,14 +279,37 @@ public:
     // dscovox does not bridge v2 senders into the SemDir fused grid.
     {
       const std::string fmt = declare_parameter<std::string>("wire_format", "v2");
-      if (fmt == "v3")      wire_format_v3_ = true;
+      if (fmt == "v4")      wire_format_v4_ = true;
+      else if (fmt == "v3") wire_format_v3_ = true;
       else if (fmt == "v2") wire_format_v3_ = false;
       else {
         RCLCPP_WARN(get_logger(),
-          "dscovox wire_format='%s' unrecognised (want v2|v3); defaulting v2.",
+          "dscovox wire_format='%s' unrecognised (want v2|v3|v4); defaulting v2.",
           fmt.c_str());
         wire_format_v3_ = false;
       }
+    }
+    // Coherence guard: the v3 (SemDir) and v4 (split Beta/Dir) receive paths
+    // are only reached when use_split_=true (onBinaryMap routes legacy v1
+    // otherwise, which drops v3/v4 envelopes as "Bad version"). Enforce the
+    // documented contract here so a `wire_format=v3|v4` launch with the default
+    // `use_split=false` fails loudly at startup instead of silently losing
+    // every frame at runtime. Mirrors scovox_node's param guards.
+    if ((wire_format_v3_ || wire_format_v4_) && !use_split_) {
+      RCLCPP_WARN(get_logger(),
+        "dscovox wire_format=%s requires use_split=true (the v3/v4 receive "
+        "paths are gated on it) — forcing use_split=true.",
+        wire_format_v4_ ? "v4" : "v3");
+      use_split_ = true;
+    }
+    if (wire_format_v4_) {
+      // K_TOP is compile-time-locked into the v4 Dir record size; a sender
+      // built with a different K_TOP will fail deserialization. Announce ours
+      // up front so build-skew is diagnosable before frames flow.
+      RCLCPP_INFO(get_logger(),
+        "dscovox wire_format=v4 (split Beta/Dir): receiver compiled with "
+        "K_TOP=%d — every connected sender must match.",
+        static_cast<int>(scovox::K_TOP));
     }
     {
       int tk = declare_parameter<int>("semantic_top_k", scovox::K_TOP);
@@ -398,6 +473,7 @@ private:
   // double-counting when the same source publishes the same voxel twice.
   void onBinaryMap(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
     if (use_split_) {
+      if (wire_format_v4_)      { onBinaryMapV4(msg); return; }
       if (wire_format_v3_) onBinaryMapV3(msg);
       else                 onBinaryMapV2(msg);
       return;
@@ -869,6 +945,222 @@ private:
     }
   }
 
+  // ==================================================================
+  // Step 8 — split-grid v4 receive path. Same skeleton as onBinaryMapV3
+  // but on the de-unified BetaVoxel (occupancy) ∥ DirVoxel (semantics)
+  // grids + consensus_merge_v4.hpp. The two grids ingest + refold
+  // INDEPENDENTLY: a touched coord may be in either or both. Priors are
+  // pinned from the first frame's header exactly as v3.
+  //
+  // NOTE: the RPC query services (GetRegion / GetOccupancyGrid /
+  // ScoreCandidates) are gated on the v1/v2/v3 fused grids and are not yet
+  // v4-aware — they return empty under wire_format=v4. The consensus +
+  // pointcloud-viz path is complete; service support is a follow-on.
+  // ==================================================================
+  void onBinaryMapV4(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
+    if (msg->version != 4) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "wire_format=v4 expects v4 envelope, got version %d (dropping)",
+        msg->version);
+      return;
+    }
+    const std::string sf = msg->header.frame_id;
+    std::string buf = scovox::ScovoxBinarySerializer::decompressLZ4(msg->data);
+    if (buf.empty()) {
+      RCLCPP_ERROR(get_logger(), "LZ4 fail '%s'", sf.c_str());
+      return;
+    }
+
+    scovox::BinarySerializerV4::Frame frame;
+    try {
+      frame = scovox::BinarySerializerV4::deserialize(buf);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "v4 deserialize failed for '%s': %s", sf.c_str(), e.what());
+      return;
+    }
+    if (frame.beta_deltas.empty() && frame.dir_deltas.empty()) return;
+
+    // TF cache (same pattern as v2/v3).
+    Eigen::Isometry3d Tmo;
+    {
+      std::shared_lock<std::shared_mutex> rlk(mu_);
+      auto it = sources_.find(sf);
+      if (it != sources_.end() && it->second.tf_cached) {
+        Tmo = it->second.T_map_source;
+      } else {
+        rlk.unlock();
+        if (!lookupTF(sf, Tmo)) {
+          RCLCPP_WARN(get_logger(), "No TF for '%s'", sf.c_str());
+          return;
+        }
+      }
+    }
+
+    float src_res = frame.resolution > 0.f ? frame.resolution : 0.f;
+
+    {
+      std::unique_lock<std::shared_mutex> lk(mu_);
+      // Pin the symmetric-Dirichlet prior on first valid frame, then assert
+      // match (cross-prior fusion mis-subtracts in mergeBeta/mergeDir).
+      if (fused_num_classes_ == 0) {
+        fused_num_classes_ = frame.num_classes;
+        fused_alpha_0_     = frame.alpha_0;
+        RCLCPP_INFO(get_logger(),
+          "v4 receive: pinned num_classes=%u alpha_0=%.4f (from first frame, src='%s')",
+          (unsigned)fused_num_classes_, fused_alpha_0_, sf.c_str());
+      } else {
+        if (frame.num_classes != fused_num_classes_ ||
+            std::abs(frame.alpha_0 - fused_alpha_0_) > 1e-6f) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "v4 prior mismatch from '%s' (got C=%u α=%.4f, pinned C=%u α=%.4f) — dropping frame",
+            sf.c_str(),
+            (unsigned)frame.num_classes, frame.alpha_0,
+            (unsigned)fused_num_classes_, fused_alpha_0_);
+          return;
+        }
+      }
+
+      if (res_ <= 0.f) res_ = src_res > 0.f ? src_res : 0.1f;
+      if (src_res <= 0.f) src_res = res_;
+
+      if (!split_fused_beta_) {
+        scovox::Params P; P.resolution = res_;
+        split_fused_beta_ = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+        split_fused_dir_  = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+      }
+
+      auto it = sources_.find(sf);
+      if (it == sources_.end()) {
+        SourceGrid sg;
+        sg.source_frame = sf;
+        sg.T_map_source = Tmo;
+        sg.tf_cached = true;
+        scovox::Params P; P.resolution = res_;
+        sg.beta_grid = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+        sg.dir_grid  = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+        it = sources_.emplace(sf, std::move(sg)).first;
+      } else if (!it->second.tf_cached) {
+        it->second.T_map_source = Tmo;
+        it->second.tf_cached = true;
+      }
+      auto& src = it->second;
+      if (!src.beta_grid) {
+        scovox::Params P; P.resolution = res_;
+        src.beta_grid = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+        src.dir_grid  = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+      }
+
+      // Step 1 — ingest both deltas into this source's MAP-FRAME grids.
+      // Centre-sample posToCoord (same anti-aliasing argument as v2/v3).
+      std::unordered_set<Bonxai::CoordT, CoordTHash, CoordTEqual> touched_beta, touched_dir;
+      touched_beta.reserve(frame.beta_deltas.size());
+      touched_dir.reserve(frame.dir_deltas.size());
+      const Eigen::Isometry3d Te = src.T_map_source;
+      const double half_src_res = 0.5 * double(src_res);
+      auto toMapCoord = [&](const Bonxai::CoordT& sc, auto& grid_ptr) {
+        Eigen::Vector3d sp(
+          double(sc.x) * double(src_res) + half_src_res,
+          double(sc.y) * double(src_res) + half_src_res,
+          double(sc.z) * double(src_res) + half_src_res);
+        Eigen::Vector3d mp = Te * sp;
+        return grid_ptr->posToCoord(mp.x(), mp.y(), mp.z());
+      };
+
+      {
+        auto ba = src.beta_grid->createAccessor();
+        for (auto& d : frame.beta_deltas) {
+          auto mc = toMapCoord(d.coord, src.beta_grid);
+          auto* v = ba.value(mc, true);
+          if (!v) continue;
+          *v = d.data;     // snapshot-replace
+          touched_beta.insert(mc);
+        }
+      }
+      {
+        auto da = src.dir_grid->createAccessor();
+        for (auto& d : frame.dir_deltas) {
+          auto mc = toMapCoord(d.coord, src.dir_grid);
+          auto* v = da.value(mc, true);
+          if (!v) continue;
+          *v = d.data;     // snapshot-replace
+          touched_dir.insert(mc);
+        }
+      }
+
+      // Step 2 — refold each touched cell from all sources, per grid.
+      {
+        auto fa = split_fused_beta_->createAccessor();
+        std::vector<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor> source_accs;
+        source_accs.reserve(sources_.size());
+        for (auto& [k, sg] : sources_)
+          if (sg.beta_grid) source_accs.emplace_back(sg.beta_grid->createAccessor());
+        for (const auto& mc : touched_beta) refoldCellBeta(mc, fa, source_accs);
+      }
+      {
+        auto fa = split_fused_dir_->createAccessor();
+        std::vector<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> source_accs;
+        source_accs.reserve(sources_.size());
+        for (auto& [k, sg] : sources_)
+          if (sg.dir_grid) source_accs.emplace_back(sg.dir_grid->createAccessor());
+        for (const auto& mc : touched_dir) refoldCellDir(mc, fa, source_accs);
+      }
+    }  // unique_lock released
+
+    // Step 3 — visualisation publish.
+    {
+      std::shared_lock<std::shared_mutex> rlk(mu_);
+      maybePublishPointCloud();
+    }
+  }
+
+  // BetaVoxel-typed refold. Reset fused[mc] to the calibrated occupancy prior,
+  // then fold every source's value via mergeBeta (conjugate Beta consensus).
+  void refoldCellBeta(
+      const Bonxai::CoordT& mc,
+      Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor& fa,
+      std::vector<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor>& source_accs)
+  {
+    auto* fv = fa.value(mc, true);
+    if (!fv) return;
+    *fv = scovox::defaultBetaVoxel(
+        static_cast<float>(fused_num_classes_) * fused_alpha_0_, fused_alpha_0_);
+    bool seeded = false;
+    for (auto& sa : source_accs) {
+      auto* sv = sa.value(mc, false);
+      if (!sv || isPriorBeta(*sv, fused_num_classes_, fused_alpha_0_)) continue;
+      if (!seeded) { *fv = *sv; seeded = true; }
+      else         { *fv = scovox::mergeBeta(*fv, *sv,
+                                             fused_num_classes_, fused_alpha_0_); }
+    }
+  }
+
+  // DirVoxel-typed refold. Reset fused[mc] to the symmetric Dirichlet prior,
+  // then fold every source's value via mergeDir (slot-reconciling consensus).
+  void refoldCellDir(
+      const Bonxai::CoordT& mc,
+      Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor& fa,
+      std::vector<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor>& source_accs)
+  {
+    auto* fv = fa.value(mc, true);
+    if (!fv) return;
+    *fv = scovox::defaultDirVoxel(fused_num_classes_, fused_alpha_0_);
+    bool seeded = false;
+    for (auto& sa : source_accs) {
+      auto* sv = sa.value(mc, false);
+      if (!sv || isPriorDir(*sv, fused_num_classes_, fused_alpha_0_)) continue;
+      if (!seeded) { *fv = *sv; seeded = true; }
+      else         { *fv = scovox::mergeDir(*fv, *sv,
+                                            fused_num_classes_, fused_alpha_0_); }
+    }
+  }
+
   // SemBeta-typed analogue of refoldCell. Reset fused[mc] to the
   // SemBeta default (Beta(1,1) prior, empty Dirichlet slots), then
   // fold every source's current value at mc via mergeSemBeta. The
@@ -904,8 +1196,9 @@ private:
     if ((now - last_pc_pub_time_).seconds() < pc_min_interval_s_) return;
     last_pc_pub_time_ = now;
     if (use_split_) {
-      if (wire_format_v3_) publishPointCloudV3();
-      else                 publishPointCloudV2();
+      if (wire_format_v4_)      publishPointCloudV4();
+      else if (wire_format_v3_) publishPointCloudV3();
+      else                      publishPointCloudV2();
     } else {
       publishPointCloud();
     }
@@ -1088,6 +1381,73 @@ private:
       float pr = v_sd.p_occ();
       if (pr < ot) return;
       const scovox::SemBetaVoxel v = projectSemDirToSemBetaForViz(v_sd);
+      auto p = g.coordToPos(co);
+      *ix = p.x; *iy = p.y; *iz = p.z; *ip = pr;
+      const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
+      const uint8_t bc = static_cast<uint8_t>(best_cls);
+      *ik = bc; *ic = cf;
+      float r = 1, gg = 1, b = 1;
+      if (v.a0() > 0 && cf >= sem_gate_ && bc < sem_col_.size()) {
+        r = sem_col_[bc][0]; gg = sem_col_[bc][1]; b = sem_col_[bc][2];
+      }
+      uint32_t rp = ((uint32_t)(r * 255) << 16) | ((uint32_t)(gg * 255) << 8) | (uint32_t)(b * 255);
+      *ir = *reinterpret_cast<float*>(&rp);
+      *iv = scovox::variance(v);
+      *ie = scovox::expectedInformationGain(v);
+      *iao = v.a_occ; *iaf = v.a_free;
+      ++ix; ++iy; ++iz; ++ir; ++ip; ++ik; ++ic; ++iv; ++ie; ++iao; ++iaf;
+    });
+    pc_pub_->publish(cl);
+  }
+
+  // Step 8 v4 — split-substrate visualisation publisher. Walks the fused Beta
+  // grid (occupancy) and joins the fused Dir grid (semantics) at each coord,
+  // projecting to a transient SemBetaVoxel so the 11-field schema + colours
+  // stay byte-identical to the v2/v3 paths.
+  void publishPointCloudV4() {
+    if (!pc_pub_ || !split_fused_beta_ ||
+        pc_pub_->get_subscription_count() == 0) return;
+    auto& g = *split_fused_beta_;
+    auto dacc = split_fused_dir_->createConstAccessor();
+    const float ot = (float)min_occ_;
+    size_t cnt = 0;
+    g.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT&) {
+      if (v.p_occ() >= ot) ++cnt;
+    });
+    if (!cnt) return;
+
+    sensor_msgs::msg::PointCloud2 cl;
+    cl.header.frame_id = map_frame_;
+    cl.header.stamp = get_clock()->now();
+    cl.height = 1;
+    cl.is_dense = true;
+    cl.is_bigendian = false;
+    sensor_msgs::PointCloud2Modifier md(cl);
+    md.setPointCloud2Fields(11,
+      "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "rgb", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "occupancy_prob", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "semantic_class", 1, sensor_msgs::msg::PointField::UINT8,
+      "semantic_confidence", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "posterior_variance", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "eig", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "a_occ", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "a_free", 1, sensor_msgs::msg::PointField::FLOAT32);
+    md.resize(cnt);
+    sensor_msgs::PointCloud2Iterator<float>
+      ix(cl, "x"), iy(cl, "y"), iz(cl, "z"), ir(cl, "rgb"),
+      ip(cl, "occupancy_prob"), ic(cl, "semantic_confidence"),
+      iv(cl, "posterior_variance"), ie(cl, "eig"),
+      iao(cl, "a_occ"), iaf(cl, "a_free");
+    sensor_msgs::PointCloud2Iterator<uint8_t> ik(cl, "semantic_class");
+    g.forEachCell([&](const scovox::BetaVoxel& vb, const Bonxai::CoordT& co) {
+      float pr = vb.p_occ();
+      if (pr < ot) return;
+      const scovox::DirVoxel* dv = dacc.value(co);
+      const scovox::SemBetaVoxel v =
+          projectBetaDirToSemBetaForViz(vb, dv, fused_alpha_0_);
       auto p = g.coordToPos(co);
       *ix = p.x; *iy = p.y; *iz = p.z; *ip = pr;
       const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
@@ -1562,11 +1922,17 @@ private:
   // fused_num_classes_ is 0 until pinned, which is the also the sentinel
   // "not yet seen" check in onBinaryMapV3.
   std::unique_ptr<Bonxai::VoxelGrid<scovox::SemDirVoxel>> split_fused_semdir_;
+  // Step 8 v4 — split Beta/Dirichlet fused grids. Allocated lazily on the
+  // first v4 frame; null otherwise. Occupancy ∥ semantics, merged independently
+  // (consensus_merge_v4.hpp). Share the pinned (fused_num_classes_, fused_alpha_0_).
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> split_fused_beta_;
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  split_fused_dir_;
   uint16_t fused_num_classes_{0};
   float    fused_alpha_0_{scovox::kDefaultDirichletPrior};
   bool use_split_{false};
   bool share_tsdf_{false};
   bool wire_format_v3_{false};
+  bool wire_format_v4_{false};
   mutable std::shared_mutex mu_;
   std::vector<rclcpp::Subscription<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr> subs_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
