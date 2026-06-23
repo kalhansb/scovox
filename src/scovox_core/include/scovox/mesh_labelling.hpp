@@ -24,6 +24,7 @@
 
 #include "scovox/sembeta_voxel.hpp"
 #include "scovox/semdir_voxel.hpp"
+#include "scovox/dir_voxel.hpp"
 #include "scovox/tsdf_voxel.hpp"
 #include "scovox/marching_cubes.hpp"  // TriangleMesh, mc_tables::corners
 
@@ -182,6 +183,64 @@ inline std::vector<uint16_t> labelPointCloud(
     const auto coord = semdir_grid.posToCoord(p.x(), p.y(), p.z());
     const SemDirVoxel* v = acc.value(coord);
     labels.push_back(v ? detail::dominantClass(*v, alpha_0) : uint16_t(0xFFFF));
+  }
+  return labels;
+}
+
+// ---------------------------------------------------------------------------
+// DirVoxel overloads (split Beta/Dirichlet substrate — SemSplitMap's Dir grid)
+// ---------------------------------------------------------------------------
+//
+// Same anchor-via-centroid strategy as the SemDir overloads; argmax uses the
+// occupied-class `dominantClass(const DirVoxel&, alpha_0)` from dir_voxel.hpp,
+// which (like the SemDir version) refuses to commit when `other` exceeds every
+// top-K slot's observed evidence. Occupancy is *not* consulted here — in the
+// split substrate the surface geometry comes from the TSDF grid and per-point
+// occupancy from the Beta grid; this function answers only "which class".
+
+/// Per-triangle labels against a DirVoxel grid.
+inline std::vector<uint16_t> labelMesh(
+    const TriangleMesh&                     geom,
+    const Bonxai::VoxelGrid<TsdfVoxel>&     tsdf_grid,
+    const Bonxai::VoxelGrid<DirVoxel>&      dir_grid,
+    float                                   alpha_0 = kDefaultDirichletPrior)
+{
+  std::vector<uint16_t> labels;
+  labels.reserve(geom.triangles.size());
+
+  auto dir_acc  = dir_grid.createConstAccessor();
+  auto tsdf_acc = tsdf_grid.createConstAccessor();
+  (void)tsdf_acc;  // reserved for future TSDF-sign disambiguation
+
+  for (const auto& tri : geom.triangles) {
+    if (tri[0] >= (int)geom.vertices.size() ||
+        tri[1] >= (int)geom.vertices.size() ||
+        tri[2] >= (int)geom.vertices.size()) {
+      labels.push_back(0xFFFF);
+      continue;
+    }
+    const Eigen::Vector3f centroid =
+        (geom.vertices[tri[0]] + geom.vertices[tri[1]] + geom.vertices[tri[2]]) / 3.0f;
+    const auto coord = dir_grid.posToCoord(centroid.x(), centroid.y(), centroid.z());
+    const DirVoxel* v = dir_acc.value(coord);
+    labels.push_back(v ? dominantClass(*v, alpha_0) : uint16_t(0xFFFF));
+  }
+  return labels;
+}
+
+/// Per-point labels against a DirVoxel grid.
+inline std::vector<uint16_t> labelPointCloud(
+    const std::vector<Eigen::Vector3f>&     positions,
+    const Bonxai::VoxelGrid<DirVoxel>&      dir_grid,
+    float                                   alpha_0 = kDefaultDirichletPrior)
+{
+  std::vector<uint16_t> labels;
+  labels.reserve(positions.size());
+  auto acc = dir_grid.createConstAccessor();
+  for (const auto& p : positions) {
+    const auto coord = dir_grid.posToCoord(p.x(), p.y(), p.z());
+    const DirVoxel* v = acc.value(coord);
+    labels.push_back(v ? dominantClass(*v, alpha_0) : uint16_t(0xFFFF));
   }
   return labels;
 }
