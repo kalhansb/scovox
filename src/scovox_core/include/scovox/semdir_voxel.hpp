@@ -103,11 +103,9 @@ static_assert(offsetof(SemDirVoxel, cls)
     == offsetof(SemDirVoxel, cnt) + K_TOP * sizeof(float),
     "Layout: cls[] must immediately follow cnt[K_TOP] with no padding.");
 
-/// Default symmetric Dirichlet prior. **Recommended ship value `0.01`** —
-/// matches "Beta starts near zero" behaviour of the legacy code and minimises
-/// behavioural drift in the refactor. The launch-file knob `dirichlet_prior`
-/// exposes this for the one-shot Jeffreys-prior ablation (`1 / (C + 1)`).
-constexpr float kDefaultDirichletPrior = 0.01f;
+// `kDefaultDirichletPrior` (the symmetric Dirichlet prior α₀) is defined in
+// voxel.hpp — shared across the SemBeta / SemDir / split substrates so they
+// agree on the ship default. Included transitively above.
 
 /// Build a freshly-primed voxel at the symmetric Dirichlet prior.
 /// **Required at every allocation** for the same reason as

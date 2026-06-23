@@ -10,6 +10,14 @@ namespace scovox {
 
 constexpr int K_TOP = 2;
 
+/// Default symmetric Dirichlet prior `α₀` applied per underlying class
+/// dimension. **Recommended ship value `0.01`** — matches the "Beta starts
+/// near zero" behaviour of the legacy code and minimises behavioural drift
+/// across the SemBeta / unified-SemDir / split-Beta+Dir substrates, all of
+/// which share this default. The launch-file knob `dirichlet_prior` exposes it
+/// for the one-shot Jeffreys-prior ablation (`1 / (C + 1)`).
+constexpr float kDefaultDirichletPrior = 0.01f;
+
 // Process-wide counters for the four sparse_add branches. All paths are
 // instrumented for E5.2 — match/empty are common (hot) and slow the path
 // negligibly (one relaxed atomic add per integration). Read at any time via

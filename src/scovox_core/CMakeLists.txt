@@ -16,7 +16,8 @@ add_library(scovox_core
     src/uncertainty.cpp
     src/tsdf_map.cpp
     src/sembeta_map.cpp
-    src/semdir_map.cpp)
+    src/semdir_map.cpp
+    src/sem_split_map.cpp)
 
 target_link_libraries(scovox_core
   PUBLIC Eigen3::Eigen
@@ -92,6 +93,12 @@ target_link_libraries(test_binary_serializer_v3 scovox_core Eigen3::Eigen)
 # Step-7.5 gate: v3 consensus merge (TSDF + unified-Dirichlet SemDir).
 ament_add_gtest(test_consensus_merge_v3 test/test_consensus_merge_v3.cpp)
 target_link_libraries(test_consensus_merge_v3 scovox_core Eigen3::Eigen)
+
+# Split Beta/Dirichlet substrate (SemSplitMap): de-unifies SemDir into a
+# BetaVoxel occupancy grid + DirVoxel semantics grid. Layout/prior, two-stream
+# update, STRICT per-grid mass conservation, gate + sparse-semantics memory win.
+ament_add_gtest(test_sem_split_map test/test_sem_split_map.cpp)
+target_link_libraries(test_sem_split_map scovox_core Eigen3::Eigen)
 
 # ==================================================================
 # Tools (CLI demos / diagnostics, lib-only no ROS)
