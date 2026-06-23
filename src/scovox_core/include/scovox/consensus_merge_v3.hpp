@@ -8,7 +8,7 @@
 /// the Beta-consensus formula `a_fused = a_A + a_B − 1` to all K_TOP + 2
 /// Dirichlet dimensions:
 ///   alpha_free  ← A.alpha_free  + B.alpha_free  − α_0
-///   alpha_other ← A.alpha_other + B.alpha_other − (C − K_TOP − 1) · α_0
+///   alpha_other ← A.alpha_other + B.alpha_other − (C − K_TOP) · α_0
 ///   top-K class slots: build union, sum coinciding counts (subtracting α_0
 ///     once per duplicated prior), sort by count, re-truncate to K_TOP;
 ///     remainder flows to OTHER.

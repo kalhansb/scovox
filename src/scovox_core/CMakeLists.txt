@@ -100,6 +100,16 @@ target_link_libraries(test_consensus_merge_v3 scovox_core Eigen3::Eigen)
 ament_add_gtest(test_sem_split_map test/test_sem_split_map.cpp)
 target_link_libraries(test_sem_split_map scovox_core Eigen3::Eigen)
 
+# v4 wire format (triple-stream: TSDF + BetaVoxel + DirVoxel) round-trip +
+# header/size/truncation validation.
+ament_add_gtest(test_binary_serializer_v4 test/test_binary_serializer_v4.cpp)
+target_link_libraries(test_binary_serializer_v4 scovox_core Eigen3::Eigen)
+
+# v4 consensus merge: independent BetaVoxel + DirVoxel conjugate merges,
+# per-grid mass conservation, frame-level prior assertions.
+ament_add_gtest(test_consensus_merge_v4 test/test_consensus_merge_v4.cpp)
+target_link_libraries(test_consensus_merge_v4 scovox_core Eigen3::Eigen)
+
 # ==================================================================
 # Tools (CLI demos / diagnostics, lib-only no ROS)
 # ==================================================================
