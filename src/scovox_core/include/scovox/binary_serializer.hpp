@@ -225,7 +225,18 @@ public:
             is.read(reinterpret_cast<char*>(&encoding_type), sizeof(encoding_type));
         }
         if (!is) return result;
-        result.voxels.reserve(update_count);
+        // SECURITY: update_count is an untrusted u32 read straight off the wire
+        // (dscovox_node feeds attacker-controllable decompressed bytes here). A
+        // forged count like 0xFFFFFFFF must NOT drive a multi-gigabyte reserve.
+        // The cheapest possible encoding of one voxel is 8-bit coords (3 bytes)
+        // plus the minimum wire voxel (a_occ+a_free+a_unk = 12 bytes + k byte,
+        // k=0 ⇒ no semantic pairs) = 16 bytes. Cap the reserve to what the
+        // remaining payload could actually contain; the per-voxel loop below
+        // already bails on the first short read, so under-reserving only costs
+        // a few reallocations on a genuinely large (well-formed) frame.
+        constexpr size_t kMinBytesPerVoxel = 16;
+        const size_t max_plausible = data.size() / kMinBytesPerVoxel;
+        result.voxels.reserve(std::min(static_cast<size_t>(update_count), max_plausible));
         const size_t top_k_limit = static_cast<size_t>(std::max(1, top_k));
 
         for (uint32_t i = 0; i < update_count; ++i) {
@@ -371,12 +382,26 @@ private:
     template<typename T>
     static T readLittleEndian(std::istream& in) {
         static_assert(std::is_integral<T>::value, "Type must be integral");
-        T value = 0;
+        // Detect end-of-stream PER BYTE. Previously this cast in.get() (an int
+        // that returns EOF == -1 on a truncated frame) straight to unsigned
+        // char, silently materializing a 0xFF high byte instead of failing.
+        // That let a value truncated mid-integer decode to a garbage-but-
+        // plausible number; we relied entirely on the caller's post-read `!in`
+        // check to reject it. By testing each get() against EOF and setting the
+        // stream failbit immediately, the partially-read value is never trusted
+        // and the failure surfaces at the exact byte it occurred.
+        // Promote to the integer type so the shift is well-defined for small T.
+        using UT = typename std::make_unsigned<T>::type;
+        UT value = 0;
         for (size_t i = 0; i < sizeof(T); ++i) {
-            T byte = static_cast<unsigned char>(in.get());
-            value |= (byte << (i * 8));
+            const int ch = in.get();
+            if (ch == std::char_traits<char>::eof()) {
+                in.setstate(std::ios::failbit);
+                return static_cast<T>(value);
+            }
+            value |= static_cast<UT>(static_cast<unsigned char>(ch)) << (i * 8);
         }
-        return value;
+        return static_cast<T>(value);
     }
 
     static float readFloat32LittleEndian(std::istream& in) {

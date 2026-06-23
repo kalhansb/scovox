@@ -125,8 +125,14 @@ class ScovoxMapSplit {
     const Eigen::Vector3f d = endpoint - origin;
     const float depth = d.norm();
     if (depth < 1e-4f) {
+      // Degenerate ray (origin≈endpoint): no TSDF or semantic work happens.
+      // Attribute the (near-zero) bracket to tsdf_ns_ — same accumulator the
+      // main return below uses — so the fused walker reports ALL of its time in
+      // one bucket. (Routing this to semdir_ns_ would be doubly wrong: it does
+      // no semantic work, and it splits the fused path's time across two
+      // accumulators whose per-substrate split is meaningless on this path.)
       const auto t1 = clk::now();
-      semdir_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+      tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
       return;
     }
     const Eigen::Vector3f u = d / depth;
@@ -178,8 +184,19 @@ class ScovoxMapSplit {
       const float sign = (proj > 0.f) ? 1.f : -1.f;
       const float sdf  = sign * dist;
 
-      // (1) TSDF band update — gate + clamp + Curless–Levoy.
-      if (sdf <= trunc + h) {
+      // (1) TSDF band update — gate + clamp + Curless–Levoy. The fused walker
+      // always walks back to the origin (walk_back = max(depth, trunc)), so the
+      // upper gate here must MATCH the non-fused TsdfMap::integrateRay band,
+      // which depends on space_carving:
+      //   - space_carving=false (Replica/KITTI default): the non-fused path
+      //     walks only [hit−trunc, hit+trunc], so we keep the `sdf <= trunc + h`
+      //     band gate; dropping it would write the whole front ray that the
+      //     non-fused path never touches (and break the band invariant).
+      //   - space_carving=true: the non-fused path walks [origin, hit+trunc] and
+      //     applyBandUpdate clamps every in-front voxel (incl. sdf > trunc) to
+      //     +trunc, so we drop the upper gate to integrate the full carve front.
+      // applyBandUpdate owns the lower gate (`sdf <= -trunc` → drop) for both.
+      if (tparams.space_carving || sdf <= trunc + h) {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
@@ -205,6 +222,15 @@ class ScovoxMapSplit {
     }
 
     const auto t1 = clk::now();
+    // Fused walker: TSDF band updates and semantic hit/carve are interleaved in
+    // ONE per-voxel loop, so wall-clock cannot be cleanly attributed per
+    // substrate without bracketing every applyBandUpdate vs semHit/semCarve with
+    // a clock read — two steady_clock::now() calls per voxel would dominate and
+    // distort the very cost being measured in this hot Bresenham loop. We
+    // therefore report the COMBINED TSDF+semantic time under tsdf_ns_ and leave
+    // semdir_ns_ untouched on the fused path (it reads 0). For a true
+    // per-substrate split, run the non-fused integrateHitSplit walker, which
+    // times the two DDAs separately. See tsdfTimeUs()/semdirTimeUs() docs.
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
 
@@ -240,7 +266,15 @@ class ScovoxMapSplit {
   // Per-call timing accumulators
   // -------------------------------------------------------------------
 
+  /// Accumulated TSDF time. NOTE: on the fused walker (fused_walker=true, the
+  /// default) this is the COMBINED TSDF+semantic integration time — the fused
+  /// loop interleaves both substrates and is not separable without per-voxel
+  /// clock overhead. Only the non-fused integrateHitSplit / integrateMiss paths
+  /// attribute TSDF and semantic time to separate accumulators.
   std::int64_t tsdfTimeUs()   const noexcept { return tsdf_ns_   / 1000; }
+  /// Accumulated semantic-substrate time. On the fused walker this is 0 by
+  /// design (the combined cost is reported under tsdfTimeUs()); it is non-zero
+  /// only via integrateHitSplit (non-fused) and integrateMiss.
   std::int64_t semdirTimeUs() const noexcept { return semdir_ns_ / 1000; }
   void         resetTiming()        noexcept { tsdf_ns_ = 0; semdir_ns_ = 0; }
 

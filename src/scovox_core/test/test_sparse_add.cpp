@@ -138,13 +138,26 @@ TEST(SparseAdd, NullAUnkStillWorks) {
 // Edge cases
 // =====================================================================
 
-TEST(SparseAdd, ZeroIncrementIgnored) {
+TEST(SparseAdd, ZeroIncrementLandsInEmptySlot) {
+  // Pin the zero-increment contract. Tracing sparse_add() on an empty voxel:
+  //   - match loop:  needs sem_cnt[i] > 0.0f, false for every empty slot -> no match.
+  //   - empty loop:  sem_cnt[i] <= 0.0f is true for slot 0 (0.0f) -> the slot is
+  //                  claimed with sem_cls[0] = cls and sem_cnt[0] = inc (== 0.0f).
+  // So a zero increment is NOT dropped: it occupies slot 0 with the given class id
+  // and a zero count, and leaves a_unk untouched (no eviction/drop path is hit).
   Voxel v = makeEmpty();
   sparse_add(v.sem_cnt, v.sem_cls, 1, 0.0f, &v.a_unk);
-  // 0.0 is not > 0.0, so it won't match existing slots or fill empty ones
-  // It falls through to the empty-slot branch since sem_cnt[0] <= 0
-  // Actually 0.0f will match sem_cnt[i] <= 0.0f, so it goes into the slot
-  // This is fine — the slot gets assigned but with zero count
+  EXPECT_EQ(v.sem_cls[0], 1);
+  EXPECT_FLOAT_EQ(v.sem_cnt[0], 0.0f);
+  EXPECT_FLOAT_EQ(v.a_unk, 0.0f);
+
+  // Because the slot now holds a zero count, the match guard (sem_cnt[i] > 0.0f)
+  // still treats it as empty: a second zero-increment for a different class
+  // re-claims the SAME slot rather than accumulating, and a_unk stays 0.
+  sparse_add(v.sem_cnt, v.sem_cls, 7, 0.0f, &v.a_unk);
+  EXPECT_EQ(v.sem_cls[0], 7);
+  EXPECT_FLOAT_EQ(v.sem_cnt[0], 0.0f);
+  EXPECT_FLOAT_EQ(v.a_unk, 0.0f);
 }
 
 TEST(SparseAdd, RepeatedEvictionsAccumulateAUnk) {

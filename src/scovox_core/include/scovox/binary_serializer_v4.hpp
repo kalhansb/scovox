@@ -217,6 +217,13 @@ class BinarySerializerV4 {
     uint32_t tsdf_count = 0;
     std::memcpy(&tsdf_count, data.data() + off, sizeof(tsdf_count));
     off += sizeof(tsdf_count);
+    // Bound the reserve by the bytes actually present: each record is a fixed
+    // 20 B on the wire, so a count claiming more records than the remaining
+    // buffer can hold is a truncated/forged frame. Validate BEFORE reserve so
+    // an attacker-controlled count (e.g. 0xFFFFFFFF) raises the documented
+    // runtime_error rather than a multi-GB length_error/bad_alloc.
+    if (tsdf_count > (data.size() - off) / 20)
+      throw std::runtime_error("BinarySerializerV4: truncated frame");
     f.tsdf_deltas.reserve(tsdf_count);
     for (uint32_t i = 0; i < tsdf_count; ++i) {
       need(20);
@@ -234,6 +241,10 @@ class BinarySerializerV4 {
     uint32_t beta_count = 0;
     std::memcpy(&beta_count, data.data() + off, sizeof(beta_count));
     off += sizeof(beta_count);
+    // Same DoS guard as the TSDF stream: each Beta record is a fixed 20 B, so
+    // reject a count that exceeds the remaining bytes before reserving.
+    if (beta_count > (data.size() - off) / 20)
+      throw std::runtime_error("BinarySerializerV4: truncated frame");
     f.beta_deltas.reserve(beta_count);
     for (uint32_t i = 0; i < beta_count; ++i) {
       need(20);
@@ -251,8 +262,12 @@ class BinarySerializerV4 {
     uint32_t dir_count = 0;
     std::memcpy(&dir_count, data.data() + off, sizeof(dir_count));
     off += sizeof(dir_count);
-    f.dir_deltas.reserve(dir_count);
     const std::size_t per_dir = 12 + 4 + 4 * K_TOP + 2 * K_TOP;
+    // Same DoS guard: each Dir record is a fixed per_dir bytes (28 B at
+    // K_TOP=2), so reject a count exceeding the remaining bytes before reserve.
+    if (dir_count > (data.size() - off) / per_dir)
+      throw std::runtime_error("BinarySerializerV4: truncated frame");
+    f.dir_deltas.reserve(dir_count);
     for (uint32_t i = 0; i < dir_count; ++i) {
       need(per_dir);
       DirDelta d{};

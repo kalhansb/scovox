@@ -321,7 +321,7 @@ uint16_t SemSplitMap::dominantClassAt(const Eigen::Vector3f& pos) const {
   const CoordT c = dir_grid_.posToCoord(pos.x(), pos.y(), pos.z());
   const DirVoxel* v = acc.value(c);
   if (!v) return 0xFFFF;
-  return dominantClass(*v, params_.alpha_0);
+  return dominantClass(*v, params_.alpha_0, params_.num_classes);
 }
 
 std::size_t SemSplitMap::betaVoxelCount() const { return beta_grid_.activeCellsCount(); }

@@ -205,6 +205,16 @@ public:
         sizeof(scovox::TsdfVoxel), sizeof(scovox::SemDirVoxel));
     }
   }
+  ~SCovoxNode() override {
+    // Join the diagnostic memlog worker (scheduleMemUsage) before any node
+    // member is destroyed. The worker holds a shared_lock on map_mtx_ and
+    // dereferences map_/split_map_/logger via the captured `this`; if it
+    // were detached (the prior behaviour) it could still be walking the grid
+    // when rclcpp::spin() returns and this object is torn down → UAF. Joining
+    // here makes shutdown deterministic; the worker is read-only and bounded
+    // by one grid walk, so the join is short.
+    if (mem_log_thread_.joinable()) mem_log_thread_.join();
+  }
 private:
   scovox::Params declareMapParams() {
     scovox::Params P;
@@ -856,7 +866,21 @@ private:
 
   void scheduleMemUsage() {
     if (!mem_log_) return;   // diagnostic-only; gated by log_mem_usage param
-    std::thread([this]() {
+    // Single-in-flight guard: if the previous walk is still running (a grid
+    // walk can outlast the ~10-frame relaunch cadence on large maps), skip
+    // this tick instead of spawning a second worker. Two concurrent workers
+    // would both open ${tsdf_dump_path_}.tmp and race on std::rename,
+    // producing a truncated/corrupt dump. CAS so only one launcher wins.
+    bool expected = false;
+    if (!mem_log_inflight_.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acq_rel))
+      return;
+    // Join the previous (already-finished) worker handle before reusing the
+    // member; the inflight flag guarantees it has run to completion. The
+    // worker is OWNED (not detached) so ~SCovoxNode can join an in-flight
+    // walk and avoid a use-after-free of `this`/map_mtx_/map_ at shutdown.
+    if (mem_log_thread_.joinable()) mem_log_thread_.join();
+    mem_log_thread_ = std::thread([this]() {
       std::shared_lock<std::shared_mutex> lock(map_mtx_);
       auto d = map_->grid().memUsageDetailed();
       auto dt = map_->transientGrid().memUsageDetailed();
@@ -912,7 +936,11 @@ private:
           }
         }
       }
-    }).detach();
+      // Release the in-flight slot last so the next tick can relaunch. The
+      // handle itself is joined by the next scheduleMemUsage() or the
+      // destructor; we deliberately do NOT detach (see member comment).
+      mem_log_inflight_.store(false, std::memory_order_release);
+    });
   }
 
   // Compute the voxel coord for an endpoint position. Used to add the hit
@@ -1054,8 +1082,16 @@ private:
     }
     topk_cache_probs_.resize(total);
     f.read(reinterpret_cast<char*>(topk_cache_probs_.data()), total);
-    if (!f.good() && !f.eof()) {
-      RCLCPP_WARN(get_logger(), "topk: short read for %s", path);
+    // Detect a truncated payload by the bytes actually delivered, NOT by the
+    // stream flags: a short read sets BOTH failbit and eofbit, so the old
+    // `!f.good() && !f.eof()` test was (true && false) == false and silently
+    // accepted the partial buffer — the zero-filled tail (from resize) would
+    // then be fed to the Dirichlet update as legitimate zero-probability
+    // classes, corrupting semantics for the whole frame. gcount() is the only
+    // reliable short-read signal here.
+    if (static_cast<size_t>(f.gcount()) != total) {
+      RCLCPP_WARN(get_logger(), "topk: short read for %s (got %zu of %zu bytes)",
+                  path, static_cast<size_t>(f.gcount()), total);
       topk_cache_valid_ = false;
       ++topk_load_failure_;
       return false;
@@ -1336,12 +1372,20 @@ private:
       auto sacc = sem_grid.createAccessor();
       auto emit_sem = [&](const scovox::SemDirVoxel& v, const Bonxai::CoordT& c) {
         // Drop voxels still at the symmetric Dirichlet prior with no
-        // accumulated evidence — they carry no information.
-        const float prior_s_occ  = v.s_occ() - v.alpha_other;  // K_TOP slot priors
-        (void)prior_s_occ;
+        // accumulated evidence — they carry no information. Derive the FREE
+        // and OTHER prior masses from the CONFIGURED priors (alpha_0_ and
+        // (num_classes_ − K_TOP)·alpha_0_), matching the v3/v4 emit gates and
+        // the SemDirMap factory. The old 1×/12×kDefaultDirichletPrior
+        // constants assumed C=14, α_0=0.01: on a non-default dataset
+        // (e.g. KITTI C=20 ⇒ OTHER prior 0.18) genuinely-prior voxels failed
+        // the at_prior test and were serialized as deltas (bandwidth bloat),
+        // and with α_0>0.01 lightly-evidenced voxels were wrongly dropped.
+        const float free_prior  = alpha_0_;
+        const float other_prior =
+            static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
         const bool at_prior =
-            (v.alpha_free <= scovox::kDefaultDirichletPrior + 1e-4f) &&
-            (v.alpha_other <= 12.f * scovox::kDefaultDirichletPrior + 1e-4f);
+            (v.alpha_free <= free_prior + 1e-4f) &&
+            (v.alpha_other <= other_prior + 1e-4f);
         if (at_prior) {
           bool any_sem = false;
           for (int i = 0; i < scovox::K_TOP; ++i)
@@ -1754,7 +1798,10 @@ private:
         // argmax tracked class — consistent with semanticEntropy /
         // semanticVariance. See node_utils.hpp::argmaxClassConfidence.
         const auto [best_cls, p_best] = scovox::argmaxClassConfidence(v);
-        bc = static_cast<uint8_t>(best_cls);
+        // semantic_class is a UINT8 PointField (locked wire/NPZ schema); a
+        // class id >= 256 would alias to id % 256 and silently collide with an
+        // unrelated label/colour. Emit 0 (unknown) for out-of-range ids.
+        bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
         cf = p_best;
         float vis_gate = sem_vis_thresh_ >= 0 ? (float)sem_vis_thresh_ : P.semantic_occ_gate;
         if (cf>=vis_gate && bc<sem_col_.size()) { auto& c=sem_col_[bc]; r=c.r; g=c.g; b=c.b; }
@@ -1812,11 +1859,17 @@ private:
       "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
       "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
     // Project SemDir → SemBeta on the fly; "has evidence beyond prior" gate
-    // becomes "s_occ > 14·α_0 + ε" / "alpha_free > α_0 + ε".
-    auto has_evidence = [](const scovox::SemDirVoxel& v) {
-      constexpr float prior_s_occ = 14.f * scovox::kDefaultDirichletPrior; // (C-K)·α + K·α at C=14, K=2
+    // becomes "s_occ > C·α_0 + ε" / "alpha_free > α_0 + ε". Use the CONFIGURED
+    // priors (num_classes_·alpha_0_, alpha_0_) rather than the compile-time
+    // 14·kDefaultDirichletPrior constant: a fresh SemDir voxel's s_occ prior is
+    // s_occ() = (C-K)·α_0 [OTHER] + K·α_0 [slots] = C·α_0, so on a non-default
+    // dataset (e.g. KITTI C=20, or dirichlet_prior≠0.01) the old constant
+    // misclassified prior-only voxels as observed and emitted them, polluting
+    // the ~/pointcloud / NPZ capture. Mirrors publishPointCloudV4's runtime gate.
+    const float prior_s_occ = static_cast<float>(num_classes_) * alpha_0_;
+    auto has_evidence = [&](const scovox::SemDirVoxel& v) {
       return v.s_occ() > prior_s_occ + 1e-3f ||
-             v.alpha_free > scovox::kDefaultDirichletPrior + 1e-3f;
+             v.alpha_free > alpha_0_ + 1e-3f;
     };
     const auto& g = split_map_->semdir().grid();
     size_t cnt = 0;
@@ -1846,7 +1899,9 @@ private:
       uint8_t bc = 0; float cf = 0, r = 1, gg = 1, b = 1;
       if (v.a0() > 0 && scovox::K_TOP > 0) {
         const auto [best_cls, p_best] = scovox::argmaxClassConfidence(v);
-        bc = static_cast<uint8_t>(best_cls);
+        // UINT8 semantic_class field — guard ids >= 256 (see the other
+        // pointcloud publisher above); aliasing would mislabel/miscolour.
+        bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
         cf = p_best;
         if (cf >= vis_gate && bc < sem_col_.size()) { auto& c = sem_col_[bc]; r = c.r; gg = c.g; b = c.b; }
       }
@@ -2096,9 +2151,19 @@ private:
   std::string mode_, base_frame_, map_frame_, int_frame_, depth_topic_, di_topic_, seg_topic_, input_pc_topic_, robot_id_;
   bool dataset_mode_{false}, pointcloud_mode_{false};
   // Diagnostic-only: periodic per-grid memory/RSS logging. Off by default —
-  // when on, scheduleMemUsage spawns a detached reader thread every ~10
-  // frames and walks the whole grid. Enable via `log_mem_usage:=true`.
+  // when on, scheduleMemUsage spawns a reader thread every ~10 frames and
+  // walks the whole grid. Enable via `log_mem_usage:=true`.
   bool mem_log_{false};
+  // The memlog worker is OWNED (not detached) so the destructor can join it:
+  // a detached thread captures `this` and the grid/mutex/logger, and would
+  // use-after-free if it were still walking the grid when rclcpp::spin()
+  // returns and the node is torn down. mem_log_inflight_ enforces a single
+  // worker at a time — if a grid walk outlasts 10 frames of integration we
+  // skip launching a second one rather than letting two threads race on the
+  // ${tsdf_dump_path_}.tmp file (interleaved writes + a racing std::rename
+  // corrupt the dump). The previous worker is joined before a new one starts.
+  std::thread mem_log_thread_;
+  std::atomic<bool> mem_log_inflight_{false};
   // TF stability gate
   double startup_tf_stable_sec_{2.0}, startup_tf_jump_thresh_{0.5};
   bool tf_stable_{false}, tf_prev_valid_{false};

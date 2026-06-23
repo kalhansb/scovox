@@ -86,6 +86,7 @@
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
+#include <atomic>  // last_pc_pub_ns_ rate-limiter (shared-lock concurrent access)
 
 namespace {
 using Ser = scovox::ScovoxBinarySerializer;
@@ -138,6 +139,16 @@ inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::TransformStamped
 }
 
 static constexpr float PRIOR_THRESH = 1.01f;
+
+// Shared at-prior epsilon for the v3/v4 receiver isPrior* tests. This MUST
+// match the sender's at-prior emit gate (scovox_node.cpp uses + 1e-4f on the
+// alpha_free / alpha_other / beta priors). If the receiver slop is looser than
+// the sender gate (the old max(0.01, 0.01·α_0)), a barely-observed voxel that
+// the sender deliberately put on the wire — e.g. a_free = α_0 + 0.005, which
+// clears the sender's 1e-4 gate — is classified "at prior" here and silently
+// dropped from the fused map. Keeping the two epsilons identical guarantees
+// every emitted voxel survives the refold.
+static constexpr float kPriorSlop = 1e-4f;
 inline bool isPrior(const scovox::Voxel& v) {
   return v.a_occ <= PRIOR_THRESH && v.a_free <= PRIOR_THRESH;
 }
@@ -151,12 +162,18 @@ inline bool isPrior(const scovox::SemBetaVoxel& v) {
 /// the frame header so the test matches the sender's prior exactly.
 inline bool isPriorSemDir(const scovox::SemDirVoxel& v,
                           uint16_t num_classes, float alpha_0) {
+  // Clamp residual_dims at 0 exactly like defaultSemDirVoxel/defaultDirVoxel:
+  // for num_classes <= K_TOP the OTHER prior is 0 (no residual classes), NOT a
+  // negative mass. Without the clamp a single-class (C<K_TOP) sender's at-prior
+  // voxels would be misclassified as observed, so the test must match the
+  // factory's clamped derivation.
+  const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
   const float other_prior =
-      static_cast<float>(static_cast<int>(num_classes) - scovox::K_TOP) * alpha_0;
-  // The "slop" floor matches the 1.01 absolute threshold for SemBeta: one
-  // wire-quantisation worth of inflation past the analytic prior. For
-  // ship α_0 = 0.01 this is ~1% slack on every test.
-  const float slop = std::max(0.01f, 0.01f * alpha_0);
+      (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
+  // Match the sender's at-prior emit gate exactly (kPriorSlop = 1e-4). A looser
+  // slop here would drop voxels the v3 sender deliberately emitted just above
+  // prior. See kPriorSlop.
+  const float slop = kPriorSlop;
   if (v.alpha_free  > alpha_0     + slop) return false;
   if (v.alpha_other > other_prior + slop) return false;
   for (int i = 0; i < scovox::K_TOP; ++i)
@@ -189,16 +206,24 @@ inline scovox::SemBetaVoxel projectSemDirToSemBetaForViz(
 inline bool isPriorBeta(const scovox::BetaVoxel& v,
                         uint16_t num_classes, float alpha_0) {
   const float occ_prior = static_cast<float>(num_classes) * alpha_0;
-  const float slop = std::max(0.01f, 0.01f * alpha_0);
+  // Match the v4 sender's at-prior emit gate (kPriorSlop = 1e-4) so a barely-
+  // observed Beta voxel the sender put on the wire is not dropped on refold.
+  const float slop = kPriorSlop;
   return v.a_occ <= occ_prior + slop && v.a_free <= alpha_0 + slop;
 }
 
 /// DirVoxel "is at prior" check: OTHER ≈ (C−K)·α_0 and no slot filled.
 inline bool isPriorDir(const scovox::DirVoxel& v,
                        uint16_t num_classes, float alpha_0) {
+  // Clamp residual_dims at 0 to match defaultDirVoxel: for num_classes <= K_TOP
+  // the OTHER prior is 0, not (C-K)*alpha_0 < 0. A negative other_prior would
+  // make `v.other > other_prior + slop` true for genuine prior voxels and so
+  // misclassify them as observed.
+  const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
   const float other_prior =
-      static_cast<float>(static_cast<int>(num_classes) - scovox::K_TOP) * alpha_0;
-  const float slop = std::max(0.01f, 0.01f * alpha_0);
+      (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
+  // Match the v4 sender's at-prior emit gate (kPriorSlop = 1e-4). See kPriorSlop.
+  const float slop = kPriorSlop;
   if (v.other > other_prior + slop) return false;
   for (int i = 0; i < scovox::K_TOP; ++i)
     if (v.cls[i] != 0xFFFF) return false;
@@ -210,12 +235,23 @@ inline bool isPriorDir(const scovox::DirVoxel& v,
 /// Dir pointer may be null (occupancy-only voxel). Per-class evidence has the
 /// α_0 prior subtracted so empty slots read 0, matching the sender's viz.
 inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
-    const scovox::BetaVoxel& b, const scovox::DirVoxel* d, float alpha_0) {
+    const scovox::BetaVoxel& b, const scovox::DirVoxel* d, float alpha_0,
+    uint16_t num_classes) {
   scovox::SemBetaVoxel out{};
   out.a_occ  = b.a_occ;
   out.a_free = b.a_free;
   if (d) {
-    out.a_unk = d->other;
+    // RAW-evidence convention: subtract the OTHER bucket's (C-K)*alpha_0 prior
+    // (clamped at 0 for C<=K_TOP, matching defaultDirVoxel) just as the RPC
+    // projectBetaDirToVoxel does. argmaxClassConfidence / effectiveResidual /
+    // semanticVariance all assume a_unk holds raw evicted mass with no prior;
+    // leaving the prior in (out.a_unk = d->other) inflated the confidence
+    // denominator by (C-K)*alpha_0 and made the published semantic_confidence
+    // disagree with the GetRegion RPC for the identical voxel.
+    const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
+    const float other_prior =
+        (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
+    out.a_unk = std::max(0.f, d->other - other_prior);
     for (int i = 0; i < scovox::K_TOP; ++i) {
       out.sem_cnt[i] = std::max(0.f, d->cnt[i] - alpha_0);
       out.sem_cls[i] = d->cls[i];
@@ -255,8 +291,14 @@ inline scovox::Voxel projectBetaDirToVoxel(
   out.a_occ  = b.a_occ;
   out.a_free = b.a_free;
   if (d) {
+    // Clamp residual_dims at 0 to mirror defaultDirVoxel: when num_classes <=
+    // K_TOP there are no residual classes, so the OTHER prior is 0 (defaultDir
+    // stored other=0). An unclamped (C-K)*alpha_0 < 0 would make the subtraction
+    // d->other - other_prior = d->other + |prior| ADD a phantom alpha_0 of
+    // unknown mass, skewing every projected voxel's entropy/EIG/argmax.
+    const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
     const float other_prior =
-        static_cast<float>(static_cast<int>(num_classes) - scovox::K_TOP) * alpha_0;
+        (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
     out.a_unk = std::max(0.f, d->other - other_prior);
     for (int i = 0; i < scovox::K_TOP; ++i) {
       out.sem_cnt[i] = std::max(0.f, d->cnt[i] - alpha_0);
@@ -367,7 +409,7 @@ public:
     // triggered by binary callbacks. Default 0.1s = 10 Hz cap. Lower this
     // for snappier RViz updates at the cost of CPU; raise it to throttle.
     pc_min_interval_s_ = declare_parameter<double>("pointcloud_min_interval_s", 0.1);
-    last_pc_pub_time_ = get_clock()->now();
+    last_pc_pub_ns_.store(get_clock()->now().nanoseconds(), std::memory_order_relaxed);
     pub_plan_ = declare_parameter<bool>("publish_planning_map", false);
     plan_res_ = declare_parameter<double>("planning_map_resolution", 0.20);
     plan_sz_ = declare_parameter<double>("planning_map_size_m", 80.0);
@@ -884,12 +926,24 @@ private:
 
     {
       std::unique_lock<std::shared_mutex> lk(mu_);
+      // Reject num_classes==0 outright: it is an invalid Dirichlet dimension
+      // (no classes) and, if pinned, would re-pin/re-log every frame and bypass
+      // the mismatch guard below (see prior_pinned_). Throttled so a stuck
+      // sender does not spam the log.
+      if (frame.num_classes == 0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "v3 frame from '%s' has num_classes=0 (invalid) — dropping", sf.c_str());
+        return;
+      }
       // Pin the symmetric-Dirichlet prior on first valid frame, then
       // assert match on every subsequent frame. Cross-prior fusion is
       // a correctness bug (the OTHER subtraction in mergeSemDir uses
       // the receiver's stored α_0; mismatched senders would over- or
-      // under-subtract).
-      if (fused_num_classes_ == 0) {
+      // under-subtract). prior_pinned_ (not fused_num_classes_==0) is the
+      // "not yet pinned" sentinel so a num_classes==0 sender can never wedge
+      // the pin into a re-pinning loop.
+      if (!prior_pinned_) {
+        prior_pinned_ = true;
         fused_num_classes_ = frame.num_classes;
         fused_alpha_0_     = frame.alpha_0;
         RCLCPP_INFO(get_logger(),
@@ -1062,9 +1116,20 @@ private:
 
     {
       std::unique_lock<std::shared_mutex> lk(mu_);
+      // Reject num_classes==0 outright (invalid Dirichlet dimension): pinning it
+      // would re-pin/re-log every frame and bypass the mismatch guard, letting a
+      // second num_classes==0 source with a different alpha_0 fuse unchecked.
+      if (frame.num_classes == 0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "v4 frame from '%s' has num_classes=0 (invalid) — dropping", sf.c_str());
+        return;
+      }
       // Pin the symmetric-Dirichlet prior on first valid frame, then assert
       // match (cross-prior fusion mis-subtracts in mergeBeta/mergeDir).
-      if (fused_num_classes_ == 0) {
+      // prior_pinned_ (not fused_num_classes_==0) is the "not yet pinned"
+      // sentinel — see the v3 path and the prior_pinned_ member comment.
+      if (!prior_pinned_) {
+        prior_pinned_ = true;
         fused_num_classes_ = frame.num_classes;
         fused_alpha_0_     = frame.alpha_0;
         RCLCPP_INFO(get_logger(),
@@ -1266,9 +1331,22 @@ private:
   // Caller must hold mu_ (shared). The lock is hoisted to the call sites so
   // every publisher in a single timer tick sees the same fused state.
   void maybePublishPointCloud() {
-    auto now = get_clock()->now();
-    if ((now - last_pc_pub_time_).seconds() < pc_min_interval_s_) return;
-    last_pc_pub_time_ = now;
+    // Race-free rate limit: this runs under only a SHARED lock and can execute
+    // concurrently from the timer and a binary callback. Claim the window with a
+    // single atomic compare_exchange so exactly one caller proceeds per interval
+    // (a plain read-then-write of a non-atomic timestamp would be a data race
+    // and could let both publish in the same window). See last_pc_pub_ns_.
+    const int64_t now_ns = get_clock()->now().nanoseconds();
+    const int64_t min_dt_ns =
+        static_cast<int64_t>(pc_min_interval_s_ * 1e9);
+    int64_t last_ns = last_pc_pub_ns_.load(std::memory_order_relaxed);
+    if (now_ns - last_ns < min_dt_ns) return;
+    // Only the thread that wins the CAS publishes; a loser (last_ns advanced
+    // under us) bails to avoid a double publish in the same window.
+    if (!last_pc_pub_ns_.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+      return;
+    }
     if (use_split_) {
       if (wire_format_v4_)      publishPointCloudV4();
       else if (wire_format_v3_) publishPointCloudV3();
@@ -1323,7 +1401,14 @@ private:
       // argmax tracked class — consistent with semanticEntropy /
       // semanticVariance. See node_utils.hpp::argmaxClassConfidence.
       const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
-      const uint8_t bc = static_cast<uint8_t>(best_cls);
+      // The semantic_class PointField is UINT8 (wire/schema locked — RViz and
+      // pointcloud_to_npz.py read it as one byte), but argmaxClassConfidence
+      // returns a uint16_t class id. A naive static_cast<uint8_t> of an id >=256
+      // (e.g. a 360-class taxonomy) would silently alias to id%256 and collide
+      // with an unrelated class for BOTH the label and the palette colour. Emit
+      // 0 (unknown) instead so the >255 case is unambiguous rather than wrong.
+      // Mirror this same UINT8 limit in scovox_node.cpp's pointcloud publishers.
+      const uint8_t bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
       *ik = bc; *ic = cf;
       float r = 1, gg = 1, b = 1;
       if (v.a0() > 0 && cf >= sem_gate_ && bc < sem_col_.size()) {
@@ -1391,7 +1476,14 @@ private:
       auto p = g.coordToPos(co);
       *ix = p.x; *iy = p.y; *iz = p.z; *ip = pr;
       const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
-      const uint8_t bc = static_cast<uint8_t>(best_cls);
+      // The semantic_class PointField is UINT8 (wire/schema locked — RViz and
+      // pointcloud_to_npz.py read it as one byte), but argmaxClassConfidence
+      // returns a uint16_t class id. A naive static_cast<uint8_t> of an id >=256
+      // (e.g. a 360-class taxonomy) would silently alias to id%256 and collide
+      // with an unrelated class for BOTH the label and the palette colour. Emit
+      // 0 (unknown) instead so the >255 case is unambiguous rather than wrong.
+      // Mirror this same UINT8 limit in scovox_node.cpp's pointcloud publishers.
+      const uint8_t bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
       *ik = bc; *ic = cf;
       float r = 1, gg = 1, b = 1;
       if (v.a0() > 0 && cf >= sem_gate_ && bc < sem_col_.size()) {
@@ -1458,7 +1550,14 @@ private:
       auto p = g.coordToPos(co);
       *ix = p.x; *iy = p.y; *iz = p.z; *ip = pr;
       const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
-      const uint8_t bc = static_cast<uint8_t>(best_cls);
+      // The semantic_class PointField is UINT8 (wire/schema locked — RViz and
+      // pointcloud_to_npz.py read it as one byte), but argmaxClassConfidence
+      // returns a uint16_t class id. A naive static_cast<uint8_t> of an id >=256
+      // (e.g. a 360-class taxonomy) would silently alias to id%256 and collide
+      // with an unrelated class for BOTH the label and the palette colour. Emit
+      // 0 (unknown) instead so the >255 case is unambiguous rather than wrong.
+      // Mirror this same UINT8 limit in scovox_node.cpp's pointcloud publishers.
+      const uint8_t bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
       *ik = bc; *ic = cf;
       float r = 1, gg = 1, b = 1;
       if (v.a0() > 0 && cf >= sem_gate_ && bc < sem_col_.size()) {
@@ -1529,11 +1628,18 @@ private:
       if (pr < ot) return;
       const scovox::DirVoxel* dv = dacc.value(co);
       const scovox::SemBetaVoxel v =
-          projectBetaDirToSemBetaForViz(vb, dv, fused_alpha_0_);
+          projectBetaDirToSemBetaForViz(vb, dv, fused_alpha_0_, fused_num_classes_);
       auto p = g.coordToPos(co);
       *ix = p.x; *iy = p.y; *iz = p.z; *ip = pr;
       const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
-      const uint8_t bc = static_cast<uint8_t>(best_cls);
+      // The semantic_class PointField is UINT8 (wire/schema locked — RViz and
+      // pointcloud_to_npz.py read it as one byte), but argmaxClassConfidence
+      // returns a uint16_t class id. A naive static_cast<uint8_t> of an id >=256
+      // (e.g. a 360-class taxonomy) would silently alias to id%256 and collide
+      // with an unrelated class for BOTH the label and the palette colour. Emit
+      // 0 (unknown) instead so the >255 case is unambiguous rather than wrong.
+      // Mirror this same UINT8 limit in scovox_node.cpp's pointcloud publishers.
+      const uint8_t bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
       *ik = bc; *ic = cf;
       float r = 1, gg = 1, b = 1;
       if (v.a0() > 0 && cf >= sem_gate_ && bc < sem_col_.size()) {
@@ -1786,11 +1892,19 @@ private:
   // (EIG / entropy / SSMI KL / frontier) are occupancy-only, so the projection
   // may leave semantics empty; v4 passes the Beta grid with a Dir-free
   // projection. One body ⇒ the raycast math can never drift between substrates.
+  //
+  // `unobserved_prior` is the scovox::Voxel used for cells a ray traverses that
+  // are NOT allocated/observed. It MUST carry the SAME occupancy prior the
+  // substrate uses for its observed cells, otherwise the SSMI reach *= (1-p)
+  // accumulation and KL terms mix two occupancy priors and skew candidate
+  // ranking: v1 passes Beta(1,1) (defaultVoxel, p_occ=0.5), v4 passes the
+  // calibrated split prior Beta(C·α_0, α_0) (p_occ ≈ C/(C+1)).
   template <typename CellT, typename ProjectFn, typename IsPriorFn>
   void scoreCandidatesOnGrid(
       const scovox_msgs::srv::ScoreCandidates::Request::SharedPtr rq,
       scovox_msgs::srv::ScoreCandidates::Response::SharedPtr rs,
-      Bonxai::VoxelGrid<CellT>& g, ProjectFn project, IsPriorFn isPriorCell)
+      Bonxai::VoxelGrid<CellT>& g, ProjectFn project, IsPriorFn isPriorCell,
+      const scovox::Voxel& unobserved_prior)
   {
     const size_t n = rq->candidates.size();
 
@@ -1856,20 +1970,31 @@ private:
               [&](const Bonxai::CoordT& c) -> bool {
                 const CellT* ptr = acc.value(c);
                 const bool obs = ptr && !isPriorCell(*ptr);
-                scovox::Voxel v = obs ? project(*ptr) : scovox::defaultVoxel();
+                // Use the substrate's calibrated unobserved prior (not a
+                // hardcoded Beta(1,1)) so the reach/KL accumulation stays on one
+                // consistent occupancy prior across observed and unobserved
+                // cells — on v4 the free-space prior is Beta(C·α_0, α_0), not 0.5.
+                scovox::Voxel v = obs ? project(*ptr) : unobserved_prior;
                 float p = v.p_occ();
                 float kl_occ  = scovox::ssmiOccKL(v);
                 float kl_free = scovox::ssmiFreeKL(v);
 
-                total_score += reach * p * (kl_occ + free_kl_acc);
-                free_kl_acc += kl_free;
+                // Guard each KL term so one non-finite voxel (e.g. digamma
+                // underflow on a near-point-mass cell) drops only that term
+                // instead of poisoning the whole candidate's accumulated score
+                // (which the post-hoc isfinite(total_score) below would then
+                // zero entirely). Mirrors the map-stats per-term isfinite skip.
+                const float term = reach * p * (kl_occ + free_kl_acc);
+                if (std::isfinite(term)) total_score += term;
+                if (std::isfinite(kl_free)) free_kl_acc += kl_free;
                 reach *= (1.0f - p);
 
                 if (obs && p >= occ_stop) return false;
                 return true;
               });
           // "No hit" event: all voxels observed as free.
-          total_score += reach * free_kl_acc;
+          const float no_hit = reach * free_kl_acc;
+          if (std::isfinite(no_hit)) total_score += no_hit;
         }
       } else {
         // Original per-voxel scoring (EIG / entropy / frontier / random).
@@ -1902,7 +2027,11 @@ private:
                     case SM_RANDOM:   s = 0.0f; break;
                     case SM_SSMI:     break;  // handled above
                   }
-                  total_score += s;
+                  // Per-term isfinite guard: a single non-finite EIG (e.g. a
+                  // projected Beta voxel whose digamma args underflow) must drop
+                  // only this voxel, not collapse the candidate's whole score to
+                  // 0 via the post-hoc isfinite(total_score) check below.
+                  if (std::isfinite(s)) total_score += s;
                   if (v.p_occ() >= occ_stop) return false;
                 } else {
                   switch (mode) {
@@ -1920,7 +2049,8 @@ private:
                     case SM_RANDOM:   s = 0.0f; break;
                     case SM_SSMI:     break;
                   }
-                  total_score += s;
+                  // Same per-term isfinite guard as the observed branch.
+                  if (std::isfinite(s)) total_score += s;
                 }
                 return true;
               });
@@ -1935,6 +2065,13 @@ private:
     auto mn = g.posToCoord(rq->min_corner.x, rq->min_corner.y, rq->min_corner.z);
     auto mx = g.posToCoord(rq->max_corner.x, rq->max_corner.y, rq->max_corner.z);
     uint32_t obs_count = 0;
+    // finite_eig_count tracks only the voxels actually summed into sum_eig.
+    // EIG terms that are non-finite are skipped (below) but obs_count still
+    // increments for them; dividing sum_eig by obs_count would bias mean_eig
+    // toward zero. Divide by finite_eig_count so the mean reflects the summed
+    // voxels. (sum_ent is always finite — the entropy term clamps to 0 outside
+    // the open (0,1) range — so it keeps dividing by obs_count.)
+    uint32_t finite_eig_count = 0;
     double sum_eig = 0.0, sum_ent = 0.0;
     uint32_t frontier_count = 0;
     auto stats_acc = g.createConstAccessor();
@@ -1947,7 +2084,7 @@ private:
       const scovox::Voxel v = project(cell);
       obs_count++;
       const float eig = scovox::expectedInformationGain(v);
-      if (std::isfinite(eig)) sum_eig += eig;
+      if (std::isfinite(eig)) { sum_eig += eig; ++finite_eig_count; }
       // mean_entropy is documented (MapStats.msg) as "Mean Shannon entropy":
       // the BOUNDED Bernoulli occupancy entropy H(p_occ) ∈ [0, ln2], identical
       // to the SM_ENTROPY scoring mode above. scovox::entropy() is instead the
@@ -1956,6 +2093,14 @@ private:
       // absurd negatives (≈ −1e28, formerly −inf), poisoning the mean. Compute
       // the documented Shannon entropy directly so the stat stays finite and
       // meaningful on every substrate.
+      //
+      // BEHAVIOUR CHANGE (v1 path too): onScoreCandidates routes the legacy v1
+      // Voxel grid through this same templated core, so MapStats.mean_entropy
+      // for a use_split_=false deployment now reports bounded Bernoulli entropy
+      // ∈ [0, ln2] instead of the old (possibly large/negative) Beta differential
+      // entropy. This is the intended fix — it matches the MapStats.msg contract
+      // — but any planner comparing the field against a historical threshold
+      // tuned on the old differential-entropy scale must re-tune. Flag in the PR.
       const float p = v.p_occ();
       sum_ent += (p > 1e-7f && p < 1.f - 1e-7f)
           ? -p * std::log(p) - (1.f - p) * std::log(1.f - p) : 0.f;
@@ -1968,7 +2113,7 @@ private:
       }
     });
     rs->stats.observed_voxels = obs_count;
-    rs->stats.mean_eig = obs_count > 0 ? (float)(sum_eig / obs_count) : 0.0f;
+    rs->stats.mean_eig = finite_eig_count > 0 ? (float)(sum_eig / finite_eig_count) : 0.0f;
     rs->stats.mean_entropy = obs_count > 0 ? (float)(sum_ent / obs_count) : 0.0f;
     rs->stats.frontier_voxels = frontier_count;
   }
@@ -1986,17 +2131,25 @@ private:
       const uint16_t C = fused_num_classes_;
       const float a0 = fused_alpha_0_;
       // Scoring is occupancy-only ⇒ a Dir-free projection (semantics stay empty).
+      // The unobserved-cell prior is the calibrated split Beta prior projected
+      // through the same path, so SSMI reach/KL on unallocated v4 cells uses
+      // p_occ ≈ C/(C+1) — consistent with the observed cells (finding: do NOT
+      // fall back to Beta(1,1) here).
+      const scovox::Voxel v4_unobserved = projectBetaDirToVoxel(
+          scovox::defaultBetaVoxel(static_cast<float>(C) * a0, a0), nullptr, C, a0);
       scoreCandidatesOnGrid<scovox::BetaVoxel>(
           rq, rs, *split_fused_beta_,
           [C, a0](const scovox::BetaVoxel& b) { return projectBetaDirToVoxel(b, nullptr, C, a0); },
-          [this](const scovox::BetaVoxel& b) { return isPriorBeta(b, fused_num_classes_, fused_alpha_0_); });
+          [this](const scovox::BetaVoxel& b) { return isPriorBeta(b, fused_num_classes_, fused_alpha_0_); },
+          v4_unobserved);
       return;
     }
     if (!fused_) return;
     scoreCandidatesOnGrid<scovox::Voxel>(
         rq, rs, fused_->grid(),
         [](const scovox::Voxel& v) { return v; },
-        [](const scovox::Voxel& v) { return isPrior(v); });
+        [](const scovox::Voxel& v) { return isPrior(v); },
+        scovox::defaultVoxel());  // v1 unobserved prior = Beta(1,1), p_occ=0.5
   }
 
   // Substrate-agnostic GetOccupancyGrid core. 2D max-projection of p_occ over
@@ -2072,7 +2225,14 @@ private:
   double min_occ_, sem_gate_;
   double kl_thresh_, tau_gate_, pub_hz_;
   double pc_min_interval_s_;
-  rclcpp::Time last_pc_pub_time_;
+  // Rate-limiter timestamp for the visualisation pointcloud, stored as raw
+  // nanoseconds in a std::atomic. maybePublishPointCloud() runs under only a
+  // SHARED lock (from both the binary-callback tail and the publish timer), so
+  // two readers can execute concurrently; a plain rclcpp::Time would be torn /
+  // race-written here. The atomic + compare_exchange below makes the
+  // read-decide-update a single race-free claim so exactly one caller publishes
+  // per window even under a multi-threaded executor.
+  std::atomic<int64_t> last_pc_pub_ns_{0};
   int top_k_;
   bool pub_plan_;
   double plan_res_, plan_sz_, plan_ox_, plan_oy_, plan_zmin_, plan_zmax_, plan_inf_;
@@ -2091,8 +2251,8 @@ private:
   std::unique_ptr<Bonxai::VoxelGrid<scovox::SemBetaVoxel>> split_fused_sem_;
   // Step 8 — v3 SemDir fused grid + pinned priors. Allocated lazily on the
   // first v3 frame; null while wire_format=v2 (or before any frame arrives).
-  // fused_num_classes_ is 0 until pinned, which is the also the sentinel
-  // "not yet seen" check in onBinaryMapV3.
+  // The "not yet pinned" sentinel is prior_pinned_ (below), NOT
+  // fused_num_classes_==0, so a num_classes==0 sender cannot wedge the pin.
   std::unique_ptr<Bonxai::VoxelGrid<scovox::SemDirVoxel>> split_fused_semdir_;
   // Step 8 v4 — split Beta/Dirichlet fused grids. Allocated lazily on the
   // first v4 frame; null otherwise. Occupancy ∥ semantics, merged independently
@@ -2101,6 +2261,13 @@ private:
   std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  split_fused_dir_;
   uint16_t fused_num_classes_{0};
   float    fused_alpha_0_{scovox::kDefaultDirichletPrior};
+  // Dedicated "prior has been pinned" flag for the v3/v4 receive paths. We must
+  // NOT overload fused_num_classes_==0 as the "not yet pinned" sentinel: a
+  // sender that ships num_classes==0 (misconfig/upstream bug) would store 0 and
+  // re-pin/re-log every frame, and the cross-prior mismatch guard would never
+  // run (so a second num_classes==0 source with a different alpha_0 would fuse
+  // without rejection). num_classes==0 frames are rejected explicitly below.
+  bool     prior_pinned_{false};
   bool use_split_{false};
   bool share_tsdf_{false};
   bool wire_format_v3_{false};

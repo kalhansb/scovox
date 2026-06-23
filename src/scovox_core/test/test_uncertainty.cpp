@@ -84,6 +84,50 @@ TEST(Uncertainty, EntropySymmetric) {
   EXPECT_NEAR(entropy(makeBeta(5, 10)), entropy(makeBeta(10, 5)), 1e-5f);
 }
 
+// scovox::entropy() is the Beta DIFFERENTIAL entropy, which is unbounded
+// BELOW and diverges to large negatives on near-point-mass voxels — the
+// documented "entropy trap". This is exactly the state every occupied
+// split-substrate voxel reaches: a_occ = C*alpha_0 + accumulated evidence
+// while a_free stays pinned at the prior alpha_0 (=0.01, C=14 -> occ prior
+// 0.14). Pin the divergence so nobody re-uses entropy() as if it were a
+// bounded Shannon stat: at Beta(0.14+50, 0.01) the closed form is ~-99
+// (not in [0, ln2]). MapStats "mean Shannon entropy" deliberately uses the
+// bounded Bernoulli form below precisely because this poisons the mean.
+TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
+  const float alpha0 = 0.01f;     // kDefaultDirichletPrior
+  const float C = 14.f;           // default num_classes
+  // Calibrated occupied split voxel: occ prior C*alpha_0 + heavy evidence,
+  // free still at its alpha_0 prior.
+  float h = entropy(makeBeta(C * alpha0 + 50.f, alpha0));
+  EXPECT_TRUE(std::isfinite(h)) << "differential entropy must stay finite, got " << h;
+  EXPECT_LT(h, -10.f) << "Beta differential entropy must diverge negative on a "
+                         "near-point-mass voxel, got " << h;
+}
+
+// The bounded occupancy-uncertainty stat that production code (e.g. the
+// MapStats aggregator in scoreCandidatesOnGrid, and the H_y term inside
+// expectedInformationGain) uses INSTEAD of entropy() on the same near-
+// point-mass voxel: Bernoulli Shannon entropy H(p_occ) with p_occ =
+// a_occ/(a_occ+a_free). It is bounded in [0, ln2] regardless of how
+// concentrated the Beta is — the property entropy() above lacks.
+TEST(Uncertainty, BernoulliShannonEntropyBoundedOnNearPointMass) {
+  const float alpha0 = 0.01f;
+  const float C = 14.f;
+  auto v = makeBeta(C * alpha0 + 50.f, alpha0);
+  const float s = v.a_occ + v.a_free;
+  const float p = v.a_occ / s;
+  // Mirror the production H_y guard in uncertainty.cpp.
+  float h_bern = 0.f;
+  if (p > 1e-7f && p < 1.f - 1e-7f)
+    h_bern = -p * std::log(p) - (1.f - p) * std::log(1.f - p);
+  EXPECT_GE(h_bern, 0.f);
+  EXPECT_LE(h_bern, static_cast<float>(M_LN2) + 1e-6f)
+      << "Bernoulli Shannon entropy must be bounded by ln2, got " << h_bern;
+  // And it is a small positive number here (near-certain occupancy), NOT the
+  // ~-99 the differential entropy reports for the identical voxel.
+  EXPECT_LT(h_bern, 0.1f);
+}
+
 // =====================================================================
 // Expected Information Gain
 // =====================================================================

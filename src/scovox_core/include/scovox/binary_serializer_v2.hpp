@@ -160,6 +160,11 @@ class BinarySerializerV2 {
     uint32_t tsdf_count = 0;
     std::memcpy(&tsdf_count, data.data() + off, sizeof(tsdf_count));
     off += sizeof(tsdf_count);
+    // DoS guard: each TSDF record is a fixed 20 B on the wire, so a count
+    // claiming more records than the remaining buffer can hold is a forged /
+    // truncated frame. Reject BEFORE reserve() to avoid a huge speculative alloc.
+    if (tsdf_count > (data.size() - off) / 20)
+      throw std::runtime_error("BinarySerializerV2: tsdf_count exceeds remaining bytes");
     f.tsdf_deltas.reserve(tsdf_count);
     for (uint32_t i = 0; i < tsdf_count; ++i) {
       need(20);
@@ -176,6 +181,10 @@ class BinarySerializerV2 {
     uint32_t sembeta_count = 0;
     std::memcpy(&sembeta_count, data.data() + off, sizeof(sembeta_count));
     off += sizeof(sembeta_count);
+    // DoS guard: each SemBeta record is a fixed 37 B on the wire.
+    const std::size_t per_sembeta = 12 + 12 + 1 + K_TOP * (sizeof(uint16_t) + sizeof(float));
+    if (sembeta_count > (data.size() - off) / per_sembeta)
+      throw std::runtime_error("BinarySerializerV2: sembeta_count exceeds remaining bytes");
     f.sembeta_deltas.reserve(sembeta_count);
     for (uint32_t i = 0; i < sembeta_count; ++i) {
       need(12 + 12 + 1 + K_TOP * (sizeof(uint16_t) + sizeof(float)));

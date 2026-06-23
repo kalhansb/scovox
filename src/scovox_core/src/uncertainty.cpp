@@ -38,6 +38,17 @@ float variance(const Voxel& v) {
 }
 
 float entropy(const Voxel& v) {
+  // NOTE: this is the Beta *differential* entropy (closed form below), kept
+  // verbatim for the legacy v1 fused `scovox::Map` path so existing v1 consumers
+  // and tests retain their historical scale. It is UNBOUNDED BELOW: for a
+  // near-point-mass voxel (e.g. a_occ=100, a_free=alpha_0=0.01, which survives
+  // the a<=0/b<=0 guard) it returns a large NEGATIVE value, NOT a bounded
+  // [0, ln2] occupancy uncertainty. Do NOT treat the result as Bernoulli/Shannon
+  // entropy. Consumers that need a bounded occupancy-uncertainty signal must
+  // compute Bernoulli H(p_occ) = -p ln p - (1-p) ln(1-p) at the call site
+  // (as expectedInformationGain does for its H_y term, and as the MapStats
+  // mean-entropy aggregator in dscovox_node does); we intentionally do not
+  // change this function's semantics to avoid a silent v1 behavior regression.
   const float a = v.a_occ;
   const float b = v.a_free;
   if (a <= 0.f || b <= 0.f) return 0.f;
@@ -68,6 +79,18 @@ float expectedInformationGain(const Voxel& v) {
 }
 
 float semanticEntropy(const Voxel& v) {
+  // Discrete categorical (Shannon) entropy over the mean Dirichlet
+  // probabilities p_i = alpha_i / a0, bounded in [0, ln(K)].
+  //
+  // We deliberately do NOT return the Dirichlet *differential* entropy here:
+  // like the Beta differential entropy in entropy() it is unbounded below and
+  // dives to large negatives on concentrated/heavily-observed voxels (e.g.
+  // sem_cnt={1000,0} → Dirichlet(1001, …) gives a strongly negative value),
+  // which is meaningless as a per-voxel "semantic uncertainty" and poisons any
+  // map-level mean. The plug-in mean-probability Shannon entropy is the bounded
+  // categorical uncertainty downstream consumers (labelling/ranking) expect and
+  // is monotone in how peaked the categorical is, matching the documented
+  // contract of the existing semanticEntropy tests.
   float alphas[K_TOP + 1];
   int K = 0;
 
@@ -76,22 +99,22 @@ float semanticEntropy(const Voxel& v) {
       alphas[K++] = v.sem_cnt[i] + 1.f;
     }
   }
-  // Query-time Hutter floor on the residual — see uncertainty.hpp.
+  // Query-time Hutter floor on the residual — see uncertainty.hpp. This is
+  // already bounded by N (no effectiveResidual blow-up leaks into an alpha).
   alphas[K++] = effectiveResidual(v) + 1.f;
 
   if (K < 2) return 0.f;
 
   float a0 = 0.f;
   for (int i = 0; i < K; ++i) a0 += alphas[i];
+  if (a0 <= 0.f) return 0.f;
 
-  float lmvb = -std::lgamma(a0);
-  float sum_psi = 0.f;
+  float H = 0.f;
   for (int i = 0; i < K; ++i) {
-    lmvb += std::lgamma(alphas[i]);
-    sum_psi += (alphas[i] - 1.f) * digamma(alphas[i]);
+    const float p = alphas[i] / a0;
+    if (p > 1e-7f) H -= p * std::log(p);  // skip p≈0 to avoid 0·log0 = NaN
   }
-
-  return lmvb + (a0 - static_cast<float>(K)) * digamma(a0) - sum_psi;
+  return H;  // bounded in [0, ln(K)] ⊆ [0, ln(K_TOP+1)]
 }
 
 float semanticVariance(const Voxel& v, uint16_t class_id) {

@@ -30,20 +30,24 @@ void Map::beta_update_free(Voxel* v, float range_w) const {
 void Map::apply_evidence_saturation(Voxel* v) const {
   const float cap = static_cast<float>(params_.evidence_saturation);
   if (cap <= 0.f) return;
-  // Beta proportional saturation: scale (a_occ, a_free) so the larger
-  // bucket lands at `cap`, preserving the ratio (and therefore p_occ).
-  // The Beta(1,1) prior floor guards against α drifting toward 0.
-  if (v->a_occ > cap) {
-    float s = cap / v->a_occ;
-    v->a_occ = cap;
-    v->a_free *= s;
-    if (v->a_free < 1.0f) v->a_free = 1.0f;
-  }
-  if (v->a_free > cap) {
-    float s = cap / v->a_free;
-    v->a_free = cap;
+  // Beta proportional saturation: scale (a_occ, a_free) by a SINGLE factor so
+  // the larger bucket lands at `cap`, preserving the ratio (and therefore
+  // p_occ). Must be one shared factor: chaining two independent
+  // scale-and-floor blocks (one per bucket) would double-scale when both
+  // buckets exceed cap (neither bucket lands at cap, ratio drifts) and lets
+  // the per-block 1.0 floor distort p_occ on lopsided voxels. We compute the
+  // factor from max(a_occ, a_free) and apply it to both at once.
+  const float max_beta = std::max(v->a_occ, v->a_free);
+  if (max_beta > cap) {
+    const float s = cap / max_beta;
     v->a_occ *= s;
+    v->a_free *= s;
+    // Beta(1,1) prior floor: a last-resort guard against an α drifting toward
+    // 0 (e.g. a near-point-mass voxel whose minority bucket scales below the
+    // prior). This is a safety net only; with the single shared factor above
+    // the ratio is preserved in the common case and the floor rarely binds.
     if (v->a_occ < 1.0f) v->a_occ = 1.0f;
+    if (v->a_free < 1.0f) v->a_free = 1.0f;
   }
   // Dirichlet: cap proportionally to preserve class ratios.
   float max_sem = v->a_unk;

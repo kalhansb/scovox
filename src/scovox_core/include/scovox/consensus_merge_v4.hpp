@@ -151,6 +151,15 @@ inline BinarySerializerV4::Frame mergeFramesV4(
   if (std::abs(a.alpha_0 - b.alpha_0) > 1e-7f) {
     throw std::runtime_error("mergeFramesV4: alpha_0 mismatch");
   }
+  // Both frames must share a voxel lattice: coords are integer lattice indices,
+  // so a resolution mismatch makes union-by-coord misplace every b voxel. A
+  // zero resolution means "empty side" (the non-zero side is taken below).
+  if (a.resolution > 0.f && b.resolution > 0.f &&
+      std::abs(a.resolution - b.resolution) > 1e-6f) {
+    throw std::runtime_error(
+        "mergeFramesV4: resolution mismatch ("
+        + std::to_string(a.resolution) + " vs " + std::to_string(b.resolution) + ")");
+  }
 
   BinarySerializerV4::Frame fused;
   fused.resolution  = (a.resolution > 0.f) ? a.resolution : b.resolution;

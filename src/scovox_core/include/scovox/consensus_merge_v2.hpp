@@ -16,7 +16,10 @@
 ///                    Dirichlet: replay each tracked slot of B through
 ///                    sparse_add against A's slots.
 
+#include <cmath>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -83,6 +86,20 @@ inline BinarySerializerV2::Frame mergeFrames(
     const BinarySerializerV2::Frame& a,
     const BinarySerializerV2::Frame& b)
 {
+  // Both frames must be sampled on the same voxel lattice. The coords in
+  // tsdf_deltas/sembeta_deltas are integer lattice indices; if a and b were
+  // built at different resolutions, identical (x,y,z) indices denote different
+  // physical locations, so union-by-coord silently misplaces every b voxel and
+  // overlap detection against a is meaningless. Guard exactly like the v3/v4
+  // mergers guard num_classes/alpha_0. A zero resolution means "empty side"
+  // (the non-zero side is taken below), so only enforce when both are positive.
+  if (a.resolution > 0.f && b.resolution > 0.f &&
+      std::abs(a.resolution - b.resolution) > 1e-6f) {
+    throw std::runtime_error(
+        "mergeFrames: resolution mismatch ("
+        + std::to_string(a.resolution) + " vs " + std::to_string(b.resolution) + ")");
+  }
+
   BinarySerializerV2::Frame fused;
   fused.resolution = (a.resolution > 0.f) ? a.resolution : b.resolution;
 

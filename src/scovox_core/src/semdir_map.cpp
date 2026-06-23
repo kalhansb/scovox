@@ -59,7 +59,15 @@ inline void sparse_add_unified(float*    cnt,
   // (voxel.hpp:99-128) — see there for the derivation.
   int min_i = 0;
   for (int i = 1; i < K_TOP; ++i) if (cnt[i] < cnt[min_i]) min_i = i;
-  const float evicted_evidence = cnt[min_i] - alpha_0;
+  // Clamp the displaced slot's observed evidence at 0. A filled slot must
+  // hold ≥ α_0 (it is α_0 + evidence by construction), so cnt[min_i] − α_0
+  // is normally ≥ 0. Evidence saturation (applyEvidenceSaturation) now
+  // floors filled slots at α_0 to keep that invariant, but we clamp here as
+  // well so a slot that ever dips below α_0 (defensive) can never make
+  // `*alpha_other += evicted_evidence` a NEGATIVE add — which would drain
+  // (and potentially drive negative) the OTHER bucket, violating the strict
+  // ΔΣα == Σ Δ inputs mass invariant this routine advertises.
+  const float evicted_evidence = std::max(0.f, cnt[min_i] - alpha_0);
   if (inc > evicted_evidence) {
     // Evict: incoming class displaces slot min_i. The displaced slot's
     // accumulated evidence flows to OTHER; the α_0 prior stays as the
@@ -192,9 +200,7 @@ SemDirMap::SemDirMap(const Params& p)
     : params_(sanitise(p))
     , grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
     , acc_(grid_.createAccessor())
-    , touched_()
-    , other_prior_(static_cast<float>(static_cast<int>(params_.num_classes) - K_TOP)
-                   * params_.alpha_0) {}
+    , touched_() {}
 
 // ===========================================================================
 // Allocation
@@ -374,6 +380,18 @@ void SemDirMap::applyEvidenceSaturation(SemDirVoxel* v) const {
   v->alpha_other *= k;
   for (int i = 0; i < K_TOP; ++i) {
     v->cnt[i] *= k;
+    // Floor FILLED slots at α_0. Scaling a weakly-evidenced filled slot
+    // (cnt ≈ α_0 + tiny) by k < 1 can push cnt below α_0, breaking the
+    // slot invariant "filled ⇒ cnt ≥ α_0" that sparse_add_unified relies on:
+    // its eviction key cnt[min_i] − α_0 would go negative and subtract mass
+    // from OTHER (see sparse_add_unified). EMPTY slots (cls == 0xFFFF) are
+    // left scaled and NOT floored: their cnt is a placeholder that
+    // sparse_add_unified overwrites on fill, and flooring them back to α_0
+    // would re-add α_0·(1−k) per empty slot, pushing s_total() back above the
+    // saturation cap (breaks the "marginals invariant under saturation"
+    // property and the cap itself).
+    if (v->cls[i] != 0xFFFF && v->cnt[i] < params_.alpha_0)
+      v->cnt[i] = params_.alpha_0;
   }
 }
 

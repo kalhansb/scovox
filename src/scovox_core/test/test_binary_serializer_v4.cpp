@@ -5,6 +5,9 @@
 #include <gtest/gtest.h>
 
 #include <bonxai/bonxai.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -115,6 +118,93 @@ TEST(BinarySerializerV4, TruncatedFrameThrows) {
   auto blob = scovox::BinarySerializerV4::serialize(
       f, scovox::BinarySerializerV4::Options{/*share_tsdf=*/true});
   blob.resize(blob.size() - 5);  // chop the tail of the last Dir record
+  EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::runtime_error);
+}
+
+// Regression for the forged-record-count DoS (review finding 38 / 8): a frame
+// with a valid MAGIC/VERSION/header but a record count (tsdf/beta/dir) far
+// larger than the bytes actually present must be REJECTED, not silently
+// accepted nor allowed to drive an unbounded reserve(). We forge each of the
+// three counts in turn (with an otherwise-empty body) and assert deserialize
+// throws so the receiver can drop the frame instead of integrating garbage.
+//
+// NOTE on the exception type: deserialize() documents std::runtime_error for a
+// truncated frame, but the CURRENT code reserve()s the untrusted count BEFORE
+// the per-record need() guard runs, so an out-of-range count actually surfaces
+// as std::length_error / std::bad_alloc (both derive from std::exception, NOT
+// from std::runtime_error). We therefore assert the broad std::exception
+// contract here: every forged count is rejected. Tightening this to
+// std::runtime_error requires capping the count against the remaining byte
+// budget before the reserve in binary_serializer_v4.hpp (review finding 8),
+// which lives in another file — see cross_file_needed.
+TEST(BinarySerializerV4, ForgedRecordCountIsRejected) {
+  // Build a minimal, otherwise-valid v4 header so the forged count is the only
+  // anomaly. Layout (little-endian, 16 B): MAGIC u32, VERSION u8, resolution
+  // f32, num_classes u16, K_TOP u8, alpha_0 f32 — then the three stream counts.
+  auto makeHeader = []() {
+    std::string h;
+    const uint32_t magic   = scovox::BinarySerializerV4::MAGIC;
+    const uint8_t  version = scovox::BinarySerializerV4::FORMAT_VERSION;
+    const float    res     = 0.05f;
+    const uint16_t nclass  = 14;
+    const uint8_t  k_top   = static_cast<uint8_t>(scovox::K_TOP);
+    const float    alpha0  = scovox::kDefaultDirichletPrior;
+    auto app = [&h](const void* p, std::size_t n) {
+      h.append(reinterpret_cast<const char*>(p), n);
+    };
+    app(&magic, sizeof(magic));
+    app(&version, sizeof(version));
+    app(&res, sizeof(res));
+    app(&nclass, sizeof(nclass));
+    app(&k_top, sizeof(k_top));
+    app(&alpha0, sizeof(alpha0));
+    return h;
+  };
+  auto appendU32 = [](std::string& s, uint32_t v) {
+    s.append(reinterpret_cast<const char*>(&v), sizeof(v));
+  };
+
+  const uint32_t kForged = 0xFFFFFFFFu;  // ~4 G records, ~120 GB of payload
+
+  // (a) Forged TSDF count, no payload following it.
+  {
+    std::string blob = makeHeader();
+    appendU32(blob, kForged);  // tsdf_count = huge, then nothing
+    EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::exception);
+  }
+  // (b) Valid empty TSDF stream, forged Beta count, no payload.
+  {
+    std::string blob = makeHeader();
+    appendU32(blob, 0u);       // tsdf_count = 0
+    appendU32(blob, kForged);  // beta_count = huge, then nothing
+    EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::exception);
+  }
+  // (c) Valid empty TSDF + Beta streams, forged Dir count, no payload.
+  {
+    std::string blob = makeHeader();
+    appendU32(blob, 0u);       // tsdf_count = 0
+    appendU32(blob, 0u);       // beta_count = 0
+    appendU32(blob, kForged);  // dir_count = huge, then nothing
+    EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::exception);
+  }
+}
+
+// Companion check: a modestly-forged count whose payload is short but whose
+// reserve() succeeds must still be caught by the per-record need() guard and
+// throw the documented std::runtime_error (this exercises the truncation path
+// that is NOT short-circuited by an allocation failure).
+TEST(BinarySerializerV4, ModestForgedCountTruncationThrowsRuntimeError) {
+  auto f = makeFrame();
+  // Serialize a real frame (share_tsdf=false): header(16) + tsdf_count(4,=0)
+  // + beta_count(4)=2 + beta payload + dir_count(4)=2 + dir payload.
+  auto blob = scovox::BinarySerializerV4::serialize(f);
+  // Overwrite the Beta count (immediately after header(16) + tsdf_count(4)) with
+  // a small-but-too-large value: 1000 records is a trivially-satisfiable
+  // reserve() yet the body only holds 2, so the loop's need(20) guard trips on
+  // record #3 and throws the documented truncated-frame runtime_error.
+  const std::size_t beta_count_off = 16 + 4;
+  const uint32_t modest = 1000u;
+  std::memcpy(&blob[beta_count_off], &modest, sizeof(modest));
   EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::runtime_error);
 }
 

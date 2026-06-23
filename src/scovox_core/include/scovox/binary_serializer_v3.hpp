@@ -183,6 +183,10 @@ class BinarySerializerV3 {
     uint32_t tsdf_count = 0;
     std::memcpy(&tsdf_count, data.data() + off, sizeof(tsdf_count));
     off += sizeof(tsdf_count);
+    // DoS guard: each TSDF record is a fixed 20 B on the wire; reject a count
+    // exceeding the remaining bytes before reserve() (forged/truncated frame).
+    if (tsdf_count > (data.size() - off) / 20)
+      throw std::runtime_error("BinarySerializerV3: tsdf_count exceeds remaining bytes");
     f.tsdf_deltas.reserve(tsdf_count);
     for (uint32_t i = 0; i < tsdf_count; ++i) {
       need(20);
@@ -199,8 +203,12 @@ class BinarySerializerV3 {
     uint32_t semdir_count = 0;
     std::memcpy(&semdir_count, data.data() + off, sizeof(semdir_count));
     off += sizeof(semdir_count);
-    f.semdir_deltas.reserve(semdir_count);
     const std::size_t per_record = 12 + 8 + 4 * K_TOP + 2 * K_TOP;
+    // DoS guard: each SemDir record is a fixed per_record bytes (32 B at
+    // K_TOP=2); reject a count exceeding the remaining bytes before reserve().
+    if (semdir_count > (data.size() - off) / per_record)
+      throw std::runtime_error("BinarySerializerV3: semdir_count exceeds remaining bytes");
+    f.semdir_deltas.reserve(semdir_count);
     for (uint32_t i = 0; i < semdir_count; ++i) {
       need(per_record);
       SemDirDelta d{};

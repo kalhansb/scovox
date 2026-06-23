@@ -67,7 +67,10 @@ class SemDirMap {
                                                   ///< quality is computed by caller)
 
     /// Dataset class count `C`. Determines the OTHER prior
-    /// `(C − K_TOP − 1) · alpha_0`. Plumbed through the v3 wire format header
+    /// `(C − K_TOP) · alpha_0` (matches the authoritative derivation in
+    /// `defaultSemDirVoxel` / the SemDirMap ctor; OTHER covers the `C − K_TOP`
+    /// non-top-K classes, each carrying its symmetric `alpha_0` prior).
+    /// Plumbed through the v3 wire format header
     /// so per-robot mappers and consensus_node agree. Default 14 (NYU13);
     /// SemanticKITTI uses 19.
     uint16_t num_classes               = 14;
@@ -173,8 +176,6 @@ class SemDirMap {
   Grid                grid_;
   Grid::Accessor      acc_;
   std::vector<CoordT> touched_;
-  /// Pre-computed OTHER prior `(C − K_TOP − 1) · α_0`. Hot-path constant.
-  float               other_prior_;
 
   /// Carve free along the ray. `inclusive_endpoint` controls whether the
   /// endpoint voxel is also bumped (for misses) or skipped (for hits, where

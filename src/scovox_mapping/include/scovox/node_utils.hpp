@@ -74,8 +74,14 @@ inline TopKSemantics selectTopKSemantics(const Voxel& v, int top_k) {
             });
 
   TopKSemantics out;
+  // Clamp the request to [0, K_TOP]. A negative `top_k` is treated as 0 (not 1):
+  // a caller asking for "no semantic slots" (occupancy-only emit) must get
+  // kept_count == 0 and have the *entire* semantic mass folded into
+  // `dropped_mass`, rather than silently keeping one class and under-folding by
+  // one slot. The previous std::max(1, top_k) floor violated that intent and
+  // leaked the strongest slot's mass past the dropped_mass accumulation.
   const size_t cap = std::min<size_t>(static_cast<size_t>(K_TOP),
-                                      static_cast<size_t>(std::max(1, top_k)));
+                                      top_k < 0 ? 0u : static_cast<size_t>(top_k));
   out.kept_count = std::min(n, cap);
   for (size_t i = 0; i < out.kept_count; ++i) out.kept[i] = pairs[i];
   for (size_t i = out.kept_count; i < n; ++i) out.dropped_mass += pairs[i].second;
@@ -129,6 +135,17 @@ inline std::pair<uint16_t, float> argmaxClassConfidence(const V& v) {
     }
   }
   if (n_active == 0) return {0, 0.f};
+  // The residual term here is `effectiveResidual(v)`, which is now bounded above
+  // by N = Σ sem_cnt + a_unk (the Hutter escape mass is clamped to N in
+  // uncertainty.hpp). That bound is what keeps this confidence denominator sane
+  // for weakly-observed voxels: e.g. sem_cnt={0.05}, a_unk=0 gives residual 0.05
+  // (not the unbounded ~10 the raw m/(2 ln ratio) term used to produce), so
+  // p_best ≈ 1.05/2.1 ≈ 0.5 rather than collapsing to ~0.087 below the labelling
+  // threshold. We deliberately do NOT add a second, tighter cap (e.g. clamp the
+  // residual to sum_cnt) here: this categorical must stay identical to the one
+  // used by semanticEntropy / semanticVariance so all three uncertainty signals
+  // remain mutually consistent, and the bound that fixes the collapse lives in
+  // the shared effectiveResidual helper.
   const float denom = sum_cnt + static_cast<float>(n_active)
                     + effectiveResidual(v) + 1.f;
   if (denom <= 0.f) return {best_cls, 0.f};

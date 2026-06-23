@@ -117,6 +117,19 @@ inline void sparse_add_class(float*    cnt,
                              float     inc,
                              float*    other,
                              float     alpha_0) {
+  // (0) Sentinel guard. `0xFFFF` is the empty-slot marker in `cls[]`, so a real
+  // observation of class id 0xFFFF (e.g. a 65535-class taxonomy, or a classifier
+  // whose argmax index hits 0xFFFF) must NOT be written into a slot: it would
+  // fill `cls[i] = 0xFFFF` with real mass yet still read as EMPTY, so the next
+  // add re-fills the slot from scratch (losing the prior inc) and isPriorDir /
+  // dominantClass mis-treat it as unfilled — breaking the strict invariant
+  // Δ(other + Σcnt) == inc. Route the (untrackable) sentinel class straight to
+  // OTHER, which both conserves mass and keeps every slot's sentinel meaning intact.
+  if (c == 0xFFFF) {
+    *other += inc;
+    g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   // (1) Match — incoming class already tracked in a slot.
   for (int i = 0; i < K_TOP; ++i) {
     if (cls[i] != 0xFFFF && cls[i] == c) {
@@ -154,12 +167,22 @@ inline void sparse_add_class(float*    cnt,
 }
 
 /// Argmax of the top-K class slots by observed evidence (`cnt − α₀`). Returns
-/// 0xFFFF if no slot is filled, or if `other` exceeds every slot's evidence
-/// (the bulk of the class mass is on out-of-K classes, so committing to a
-/// tracked class would be misleading). Mirrors the `SemDirVoxel` overload in
-/// mesh_labelling.hpp, restricted to the occupied-class Dirichlet.
+/// 0xFFFF if no slot is filled, or if `OTHER`'s *observed* evidence exceeds
+/// every slot's evidence (the bulk of the class mass is on out-of-K classes,
+/// so committing to a tracked class would be misleading). Mirrors the
+/// `SemDirVoxel` overload in mesh_labelling.hpp, restricted to the
+/// occupied-class Dirichlet.
+///
+/// The slot key subtracts each slot's `α₀` placeholder; the OTHER key must
+/// subtract OTHER's own prior `(C − K_TOP)·α₀` (the collapsed out-of-K
+/// dimensions, set by `defaultDirVoxel`) for an apples-to-apples comparison —
+/// otherwise OTHER's prior mass alone (0.12 at C=14, α₀=0.01) spuriously
+/// dominates a legitimately-observed slot and the only seen class is hidden.
+/// `num_classes` defaults to 14 (matching `defaultDirVoxel`); the residual is
+/// clamped at 0 to match `defaultDirVoxel`'s `num_classes < K_TOP` convention.
 inline uint16_t dominantClass(const DirVoxel& v,
-                              float alpha_0 = kDefaultDirichletPrior) noexcept {
+                              float    alpha_0     = kDefaultDirichletPrior,
+                              uint16_t num_classes = 14) noexcept {
   uint16_t cls = 0xFFFF;
   float best_evidence = 0.f;
   for (int i = 0; i < K_TOP; ++i) {
@@ -170,7 +193,13 @@ inline uint16_t dominantClass(const DirVoxel& v,
       cls           = v.cls[i];
     }
   }
-  if (v.other > best_evidence) return 0xFFFF;
+  // OTHER's observed evidence = bucket minus its (C − K_TOP)·α₀ prior, clamped
+  // at 0 (defaultDirVoxel clamps the residual when num_classes ≤ K_TOP). Only
+  // genuine out-of-K evidence — not the prior — may veto the tracked argmax.
+  const int   residual_dims = static_cast<int>(num_classes) - K_TOP;
+  const float other_prior   = (residual_dims > 0) ? (residual_dims * alpha_0) : 0.f;
+  const float other_evidence = v.other - other_prior;
+  if (other_evidence > best_evidence) return 0xFFFF;
   return cls;
 }
 
