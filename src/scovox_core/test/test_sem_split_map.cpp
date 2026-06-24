@@ -49,13 +49,17 @@ TEST(SplitVoxelLayout, Sizes) {
   EXPECT_EQ(sizeof(scovox::DirVoxel),  16u);  // SemDirVoxel 20 B − 4 B FREE
 }
 
-TEST(SplitVoxelLayout, BetaPriorMatchesSemDirOccupancyMarginal) {
-  // Beta(C·α₀, α₀) → p_occ_prior = C/(C+1), matching the unified SemDirVoxel
-  // marginal (NOT the legacy Beta(1,1) → 0.5).
-  auto b = scovox::defaultBetaVoxel(kC * kAlpha, kAlpha);
-  EXPECT_NEAR(b.a_occ,  kC * kAlpha, 1e-7f);
-  EXPECT_NEAR(b.a_free, kAlpha, 1e-7f);
-  EXPECT_NEAR(b.p_occ(), float(kC) / float(kC + 1), 1e-5f);
+TEST(SplitVoxelLayout, ShippedBetaPriorIsSymmetricHalf) {
+  // Shipped split-path occupancy prior is symmetric Beta(1,1) → p_occ = 0.5
+  // (docs/occupancy_prior.md), decoupled from the semantic (C, α₀).
+  auto b = scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
+  EXPECT_NEAR(b.a_occ,  1.0f, 1e-7f);
+  EXPECT_NEAR(b.a_free, 1.0f, 1e-7f);
+  EXPECT_NEAR(b.p_occ(), 0.5f, 1e-6f);
+  // Ablation: the prior-agnostic factory still reproduces the calibrated
+  // Beta(C·α₀, α₀) → C/(C+1) marginal on explicit request.
+  auto calib = scovox::defaultBetaVoxel(kC * kAlpha, kAlpha);
+  EXPECT_NEAR(calib.p_occ(), float(kC) / float(kC + 1), 1e-5f);
 }
 
 TEST(SplitVoxelLayout, DirPriorIsSymmetricMinusFree) {
@@ -100,13 +104,15 @@ TEST(SemSplitMap, FirstHitTwoStreamMatchesAnalytic) {
   ASSERT_TRUE(b.has_value());
   ASSERT_TRUE(d.has_value());
 
-  // Stream A: a_occ = C·α₀ + w_occ·q ; a_free untouched at prior α₀.
+  // Stream A: a_occ = occ_prior + w_occ·q ; a_free untouched at the Beta(1,1)
+  // prior. Occupancy prior is symmetric Beta(1,1) → p_occ_prior=0.5.
   const float w_occ_share = 1.0f;
-  EXPECT_NEAR(b->a_occ,  kC * kAlpha + w_occ_share, 1e-5f);
-  EXPECT_NEAR(b->a_free, kAlpha, 1e-5f);
+  EXPECT_NEAR(b->a_occ,  scovox::kBetaOccPrior + w_occ_share, 1e-5f);
+  EXPECT_NEAR(b->a_free, scovox::kBetaFreePrior, 1e-5f);
 
   // p_occ_post read after Stream A; Stream B class_share = kappa0·p_occ·q.
-  const float p_occ_post  = (kC * kAlpha + w_occ_share) / ((kC + 1) * kAlpha + w_occ_share);
+  const float p_occ_post  = (scovox::kBetaOccPrior + w_occ_share)
+                          / (scovox::kBetaOccPrior + scovox::kBetaFreePrior + w_occ_share);
   const float class_share = 1.0f * p_occ_post * 1.0f;
   EXPECT_EQ(d->cls[0], uint16_t(5));
   EXPECT_NEAR(d->cnt[0], kAlpha + class_share, 1e-5f);  // one-hot → all to slot 0
@@ -132,11 +138,12 @@ TEST(SemSplitMap, MassConservationStrictPerGrid) {
   ASSERT_TRUE(d.has_value());
 
   const float w_occ_share = 1.0f;                                  // Stream A input
-  const float p_occ_post  = (kC * kAlpha + w_occ_share) / ((kC + 1) * kAlpha + w_occ_share);
+  const float p_occ_post  = (scovox::kBetaOccPrior + w_occ_share)
+                          / (scovox::kBetaOccPrior + scovox::kBetaFreePrior + w_occ_share);
   const float class_share = 1.0f * p_occ_post * 1.0f;              // Stream B input
 
-  // Beta: prior (C+1)·α₀... no — Beta prior is just a_occ+a_free = C·α₀ + α₀.
-  const float beta_prior = kC * kAlpha + kAlpha;
+  // Beta prior total mass = a_occ + a_free = kBetaOccPrior + kBetaFreePrior (Beta(1,1)).
+  const float beta_prior = scovox::kBetaOccPrior + scovox::kBetaFreePrior;
   EXPECT_NEAR(b->s_total(), beta_prior + w_occ_share, 1e-5f)
       << "Beta mass conservation violated";
 
@@ -204,8 +211,8 @@ TEST(SemSplitMap, MissDrivesOccupancyDownAndAllocatesNoDir) {
                   /*quality=*/1.0f);
   auto b = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));
   ASSERT_TRUE(b.has_value());
-  EXPECT_LT(b->p_occ(), float(kC) / float(kC + 1))
-      << "carve must drive p_occ below the prior";
+  EXPECT_LT(b->p_occ(), 0.5f)
+      << "carve must drive p_occ below the symmetric Beta(1,1) prior (0.5)";
   EXPECT_EQ(m.dirVoxelCount(), 0u) << "a miss must never allocate a DirVoxel";
 }
 
@@ -225,7 +232,7 @@ TEST(SemSplitMap, BelowGateCommitsNoClassAndNoDirVoxel) {
   // Occupancy evidence still landed in Beta...
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
   ASSERT_TRUE(b.has_value());
-  EXPECT_GT(b->a_occ, kC * kAlpha) << "Stream A occupancy mass lands even below gate";
+  EXPECT_GT(b->a_occ, scovox::kBetaOccPrior) << "Stream A occupancy mass lands even below gate";
   // ...but no class was committed and no DirVoxel was allocated.
   EXPECT_EQ(m.dirVoxelCount(), 0u);
   EXPECT_EQ(m.dominantClassAt(Eigen::Vector3f(1.0f, 0, 0)), uint16_t(0xFFFF));

@@ -9,9 +9,9 @@
 ///
 ///   BetaVoxel (occupancy): generalises the Beta-consensus rule
 ///       a_fused = a_A + a_B − prior
-///     to both dimensions:
-///       a_occ  ← A.a_occ  + B.a_occ  − occ_prior   (occ_prior  = C·α₀)
-///       a_free ← A.a_free + B.a_free − free_prior  (free_prior = α₀)
+///     to both dimensions, with the SYMMETRIC Beta(1,1) prior (p_occ=0.5):
+///       a_occ  ← A.a_occ  + B.a_occ  − occ_prior   (occ_prior  = kBetaOccPrior  = 1)
+///       a_free ← A.a_free + B.a_free − free_prior  (free_prior = kBetaFreePrior = 1)
 ///
 ///   DirVoxel (semantics): identical to v3's `mergeSemDir` minus the FREE
 ///     dimension:
@@ -42,15 +42,19 @@
 
 namespace scovox {
 
-/// Per-voxel BetaVoxel merge under the calibrated occupancy prior.
-/// `num_classes` / `alpha_0` reconstruct the prior the sender used
-/// (`occ_prior = C·α₀`, `free_prior = α₀`), matching `defaultBetaVoxel`.
+/// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) occupancy prior.
+/// The `num_classes` / `alpha_0` params are retained for call-site symmetry with
+/// `mergeDir` but are UNUSED for occupancy: the prior is now the decoupled
+/// constant `kBetaOccPrior` = `kBetaFreePrior` = 1.0 (docs/occupancy_prior.md),
+/// not the old calibrated `C·α₀`. Sender and receiver share this compile-time
+/// constant, so the prior-subtraction below stays consistent across nodes.
 inline BetaVoxel mergeBeta(const BetaVoxel& a,
                            const BetaVoxel& b,
                            uint16_t         num_classes,
                            float            alpha_0) {
-  const float occ_prior  = static_cast<float>(num_classes) * alpha_0;
-  const float free_prior = alpha_0;
+  (void)num_classes; (void)alpha_0;  // occupancy prior is the symmetric constant
+  const float occ_prior  = kBetaOccPrior;
+  const float free_prior = kBetaFreePrior;
   BetaVoxel f{};
   // Floor each fused α at its prior. For valid inputs (each source at-or-above
   // prior) a+b−prior ≥ prior already, so this is a no-op; it only guards a

@@ -205,11 +205,14 @@ inline scovox::SemBetaVoxel projectSemDirToSemBetaForViz(
 /// prior). `slop` matches isPriorSemDir's one-quantum tolerance.
 inline bool isPriorBeta(const scovox::BetaVoxel& v,
                         uint16_t num_classes, float alpha_0) {
-  const float occ_prior = static_cast<float>(num_classes) * alpha_0;
-  // Match the v4 sender's at-prior emit gate (kPriorSlop = 1e-4) so a barely-
-  // observed Beta voxel the sender put on the wire is not dropped on refold.
+  (void)num_classes; (void)alpha_0;  // occupancy prior is the symmetric constant
+  // Shipped occupancy prior is symmetric Beta(1,1) (kBetaOccPrior=kBetaFreePrior
+  // =1, p_occ=0.5) — decoupled from (num_classes, α₀); see docs/occupancy_prior.md.
+  // slop = kPriorSlop (1e-4) matches the v4 sender's at-prior emit gate so a
+  // barely-observed Beta voxel the sender put on the wire is not dropped on refold.
   const float slop = kPriorSlop;
-  return v.a_occ <= occ_prior + slop && v.a_free <= alpha_0 + slop;
+  return v.a_occ <= scovox::kBetaOccPrior + slop &&
+         v.a_free <= scovox::kBetaFreePrior + slop;
 }
 
 /// DirVoxel "is at prior" check: OTHER ≈ (C−K)·α_0 and no slot filled.
@@ -1268,8 +1271,9 @@ private:
   {
     auto* fv = fa.value(mc, true);
     if (!fv) return;
-    *fv = scovox::defaultBetaVoxel(
-        static_cast<float>(fused_num_classes_) * fused_alpha_0_, fused_alpha_0_);
+    // Reset to the shipped symmetric Beta(1,1) occupancy prior (p_occ=0.5);
+    // must match mergeBeta + isPriorBeta. See docs/occupancy_prior.md.
+    *fv = scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
     bool seeded = false;
     for (auto& sa : source_accs) {
       auto* sv = sa.value(mc, false);
@@ -2131,12 +2135,14 @@ private:
       const uint16_t C = fused_num_classes_;
       const float a0 = fused_alpha_0_;
       // Scoring is occupancy-only ⇒ a Dir-free projection (semantics stay empty).
-      // The unobserved-cell prior is the calibrated split Beta prior projected
-      // through the same path, so SSMI reach/KL on unallocated v4 cells uses
-      // p_occ ≈ C/(C+1) — consistent with the observed cells (finding: do NOT
-      // fall back to Beta(1,1) here).
+      // The unobserved-cell prior is the SHIPPED split Beta prior — symmetric
+      // Beta(1,1), p_occ=0.5 — so SSMI reach/KL on unallocated v4 cells uses the
+      // SAME prior as freshly-allocated observed cells (the key invariant: the
+      // unobserved baseline must equal the allocation prior). See
+      // docs/occupancy_prior.md.
       const scovox::Voxel v4_unobserved = projectBetaDirToVoxel(
-          scovox::defaultBetaVoxel(static_cast<float>(C) * a0, a0), nullptr, C, a0);
+          scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior),
+          nullptr, C, a0);
       scoreCandidatesOnGrid<scovox::BetaVoxel>(
           rq, rs, *split_fused_beta_,
           [C, a0](const scovox::BetaVoxel& b) { return projectBetaDirToVoxel(b, nullptr, C, a0); },

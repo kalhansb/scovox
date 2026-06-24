@@ -202,8 +202,8 @@ constexpr float    kAlpha = scovox::kDefaultDirichletPrior;  // 0.01
 constexpr uint16_t kC     = 14;
 
 scovox::BetaVoxel betaPriorV4() {
-  // Calibrated occupancy prior: a_occ = C·α₀, a_free = α₀ (p_occ = C/(C+1)).
-  return scovox::defaultBetaVoxel(kC * kAlpha, kAlpha);
+  // Shipped occupancy prior: symmetric Beta(1,1) → p_occ=0.5 (docs/occupancy_prior.md).
+  return scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
 }
 scovox::DirVoxel dirPriorV4() { return scovox::defaultDirVoxel(kC, kAlpha); }
 
@@ -295,8 +295,8 @@ TEST(V4SplitRefold, DuplicateSnapshotIsIdempotent) {
 // behaviour change. Pin that here at the merge level.
 TEST(V4SplitRefold, RefoldingAtPriorVoxelIsNoOp) {
   auto beta = scovox::mergeBeta(betaPriorV4(), betaPriorV4(), kC, kAlpha);
-  EXPECT_FLOAT_EQ(beta.a_occ,  kC * kAlpha);
-  EXPECT_FLOAT_EQ(beta.a_free, kAlpha);
+  EXPECT_FLOAT_EQ(beta.a_occ,  scovox::kBetaOccPrior);
+  EXPECT_FLOAT_EQ(beta.a_free, scovox::kBetaFreePrior);
   auto dir = scovox::mergeDir(dirPriorV4(), dirPriorV4(), kC, kAlpha);
   EXPECT_EQ(dir.cls[0], uint16_t(0xFFFF));
   EXPECT_EQ(dir.cls[1], uint16_t(0xFFFF));

@@ -21,14 +21,15 @@
 ///     (where the Dirichlet update is gated on this grid's `p_occ`), so the
 ///     extra accessor lookup is paid once per ray, not per carved voxel.
 ///
-/// Calibration note: the default prior is chosen to match the **occupancy
-/// marginal of the live `SemDirVoxel` path**, not the legacy `SemBetaVoxel`
-/// `Beta(1,1)`. Under the unified Dirichlet the prior occupancy is
-/// `p_occ = s_occ / s_total = (C·α₀) / ((C+1)·α₀) = C/(C+1)` (≈0.933 for
-/// NYU13 C=14). `defaultBetaVoxel(C·α₀, α₀)` reproduces that exactly, so this
-/// substrate is a faithful de-unification of the live path rather than a
-/// behavioural revert to the SemBeta era. Pass `defaultBetaVoxel(1.f, 1.f)`
-/// for the legacy `Beta(1,1)` ablation.
+/// Prior choice: the **shipped** split-path occupancy prior is symmetric
+/// **Beta(1,1)** (`kBetaOccPrior`/`kBetaFreePrior` below), so an unobserved
+/// voxel has `p_occ = 0.5`. This was chosen over the calibrated
+/// `Beta(C·α₀, α₀)` prior (`p_occ = C/(C+1) ≈ 0.933`, which matched the unified
+/// `SemDirVoxel` occupancy marginal) and over the Jeffreys prior
+/// `Beta(0.5,0.5)` — for single-ray-noise robustness against the carve
+/// wall-guard; see docs/occupancy_prior.md for the full derivation and the
+/// Jeffreys runner-up. The factory is prior-agnostic, so the calibrated prior
+/// `defaultBetaVoxel(C·α₀, α₀)` remains available as an ablation.
 
 #include <cstddef>
 #include <type_traits>
@@ -66,6 +67,19 @@ static_assert(std::is_standard_layout_v<BetaVoxel>,
     "BetaVoxel must have standard layout for byte-for-byte wire emit.");
 static_assert(offsetof(BetaVoxel, a_free) == offsetof(BetaVoxel, a_occ) + sizeof(float),
     "BetaVoxel layout: a_free must immediately follow a_occ.");
+
+/// Shipped split-substrate occupancy prior: symmetric **Beta(1,1)** (uniform /
+/// Bayes–Laplace) → prior `p_occ = 0.5`. SINGLE SOURCE OF TRUTH for the split
+/// occupancy prior: allocation (`SemSplitMap`), the consensus merge's
+/// prior-subtraction (`mergeBeta`), the receiver's at-prior detection
+/// (`isPriorBeta`), the sender's emit gate, and the SSMI unobserved baseline
+/// all reference these constants, so sender and receiver stay consistent — the
+/// prior is a compile-time constant, NOT carried on the wire. Decoupled from
+/// the semantic `(num_classes, α₀)` because occupancy and semantics are
+/// independent priors. See docs/occupancy_prior.md (incl. the Jeffreys
+/// `Beta(0.5,0.5)` runner-up and the conditions to switch).
+constexpr float kBetaOccPrior  = 1.0f;
+constexpr float kBetaFreePrior = 1.0f;
 
 /// Beta prior factory. **Required at every allocation**: Bonxai's pool
 /// allocator zero-initialises new leaf blocks, leaving `a_occ = a_free = 0`.

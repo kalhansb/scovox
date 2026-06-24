@@ -17,7 +17,8 @@ constexpr float    kAlpha = scovox::kDefaultDirichletPrior;  // 0.01
 constexpr uint16_t kC     = 14;
 
 scovox::BetaVoxel betaPrior() {
-  return scovox::defaultBetaVoxel(kC * kAlpha, kAlpha);  // a_occ=C·α₀, a_free=α₀
+  // Shipped occupancy prior: symmetric Beta(1,1) → p_occ=0.5 (docs/occupancy_prior.md).
+  return scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
 }
 scovox::DirVoxel dirPrior() {
   return scovox::defaultDirVoxel(kC, kAlpha);
@@ -38,8 +39,9 @@ TEST(ConsensusMergeV4, BetaMergeWithPriorPreservesEvidence) {
 
 TEST(ConsensusMergeV4, BetaMergeOfTwoPriorsIsPrior) {
   auto f = scovox::mergeBeta(betaPrior(), betaPrior(), kC, kAlpha);
-  EXPECT_FLOAT_EQ(f.a_occ,  kC * kAlpha);
-  EXPECT_FLOAT_EQ(f.a_free, kAlpha);
+  EXPECT_FLOAT_EQ(f.a_occ,  scovox::kBetaOccPrior);   // two priors fold back to the prior
+  EXPECT_FLOAT_EQ(f.a_free, scovox::kBetaFreePrior);
+  EXPECT_NEAR(f.p_occ(), 0.5f, 1e-6f);                // symmetric prior → p_occ stays 0.5
 }
 
 TEST(ConsensusMergeV4, BetaMergeIsSymmetricAndAdditive) {
@@ -49,17 +51,17 @@ TEST(ConsensusMergeV4, BetaMergeIsSymmetricAndAdditive) {
   auto ba = scovox::mergeBeta(b, a, kC, kAlpha);
   EXPECT_FLOAT_EQ(ab.a_occ,  ba.a_occ);
   EXPECT_FLOAT_EQ(ab.a_free, ba.a_free);
-  // a_occ = 3 + 1 − C·α₀ ; a_free = 1 + 4 − α₀.
-  EXPECT_FLOAT_EQ(ab.a_occ,  4.0f - kC * kAlpha);
-  EXPECT_FLOAT_EQ(ab.a_free, 5.0f - kAlpha);
+  // a_occ = 3 + 1 − occ_prior ; a_free = 1 + 4 − free_prior (symmetric Beta(1,1)).
+  EXPECT_FLOAT_EQ(ab.a_occ,  4.0f - scovox::kBetaOccPrior);
+  EXPECT_FLOAT_EQ(ab.a_free, 5.0f - scovox::kBetaFreePrior);
 }
 
 TEST(ConsensusMergeV4, BetaMassConservation) {
-  // Δ(a_occ + a_free) = a.total + b.total − (C+1)·α₀ (one prior removed).
+  // Δ(a_occ + a_free) = a.total + b.total − (occ_prior + free_prior) (one prior removed).
   scovox::BetaVoxel a{2.5f, 1.5f};
   scovox::BetaVoxel b{0.5f, 3.0f};
   auto f = scovox::mergeBeta(a, b, kC, kAlpha);
-  const float beta_prior_total = (kC + 1) * kAlpha;
+  const float beta_prior_total = scovox::kBetaOccPrior + scovox::kBetaFreePrior;
   EXPECT_FLOAT_EQ(f.s_total(), a.s_total() + b.s_total() - beta_prior_total);
 }
 
@@ -229,8 +231,8 @@ TEST(ConsensusMergeV4, FrameMergeUnionsCoordsIndependently) {
 
   // Beta: one shared coord → merged.
   ASSERT_EQ(F.beta_deltas.size(), 1u);
-  EXPECT_FLOAT_EQ(F.beta_deltas[0].data.a_occ,  2.0f + 3.0f - kC * kAlpha);
-  EXPECT_FLOAT_EQ(F.beta_deltas[0].data.a_free, 1.0f + 2.0f - kAlpha);
+  EXPECT_FLOAT_EQ(F.beta_deltas[0].data.a_occ,  2.0f + 3.0f - scovox::kBetaOccPrior);
+  EXPECT_FLOAT_EQ(F.beta_deltas[0].data.a_free, 1.0f + 2.0f - scovox::kBetaFreePrior);
 
   // Dir: two coords, the shared one merged.
   ASSERT_EQ(F.dir_deltas.size(), 2u);
@@ -307,8 +309,8 @@ TEST(ConsensusMergeV4, EndToEndWireMergeRoundTrip) {
   // Shared Beta voxel merged with one prior removed.
   const auto* bshared = findBeta(F2, 1, 2, 3);
   ASSERT_NE(bshared, nullptr);
-  EXPECT_FLOAT_EQ(bshared->data.a_occ,  2.0f + 3.0f - kC * kAlpha);
-  EXPECT_FLOAT_EQ(bshared->data.a_free, 1.0f + 2.0f - kAlpha);
+  EXPECT_FLOAT_EQ(bshared->data.a_occ,  2.0f + 3.0f - scovox::kBetaOccPrior);
+  EXPECT_FLOAT_EQ(bshared->data.a_free, 1.0f + 2.0f - scovox::kBetaFreePrior);
 
   // Unique Beta voxels pass through unchanged.
   ASSERT_NE(findBeta(F2, 9, 9, 9), nullptr);

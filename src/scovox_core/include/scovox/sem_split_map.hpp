@@ -64,9 +64,9 @@ class SemSplitMap {
     float   carve_skip_occ_threshold   = 0.95f;  ///< wall-blocking guard
     float   range_decay_length         = 50.0f;  ///< exp(-r/L); 0 disables (caller-applied)
 
-    /// Dataset class count `C`. Sets the OTHER prior `(C − K_TOP)·α₀` and the
-    /// Beta occupancy prior `a_occ = C·α₀` so `p_occ_prior = C/(C+1)` matches
-    /// the unified path.
+    /// Dataset class count `C`. Sets the semantic OTHER prior `(C − K_TOP)·α₀`.
+    /// (The occupancy prior is the symmetric Beta(1,1) constant `kBetaOccPrior`,
+    /// independent of `C` — see docs/occupancy_prior.md.)
     uint16_t num_classes               = 14;
     /// Symmetric per-dim Dirichlet prior `α₀`.
     float    alpha_0                   = kDefaultDirichletPrior;
@@ -191,10 +191,10 @@ class SemSplitMap {
   std::vector<CoordT>  touched_beta_;
   std::vector<CoordT>  touched_dir_;
 
-  /// Beta priors derived from (num_classes, alpha_0) to match SemDir's p_occ
-  /// marginal. Hot-path constants.
-  float                beta_occ_prior_;   ///< C · α₀
-  float                beta_free_prior_;  ///< α₀
+  /// Symmetric Beta(1,1) occupancy prior (kBetaOccPrior/kBetaFreePrior) →
+  /// p_occ_prior = 0.5. Hot-path constants; see docs/occupancy_prior.md.
+  float                beta_occ_prior_;   ///< 1.0
+  float                beta_free_prior_;  ///< 1.0
 
   void carveRay(const Eigen::Vector3f& origin,
                 const Eigen::Vector3f& endpoint,

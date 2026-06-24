@@ -1586,7 +1586,7 @@ private:
     frame.num_classes = static_cast<uint16_t>(num_classes_);
     frame.alpha_0     = alpha_0_;
 
-    const float beta_occ_prior = static_cast<float>(num_classes_) * alpha_0_;
+    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
     const float dir_other_prior =
         static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
 
@@ -1615,8 +1615,8 @@ private:
       auto bacc = bgrid.createAccessor();
       auto emit_beta = [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         // At prior → no posterior information; keep off the wire.
-        const bool at_prior = (v.a_occ  <= beta_occ_prior + 1e-4f) &&
-                              (v.a_free <= alpha_0_       + 1e-4f);
+        const bool at_prior = (v.a_occ  <= beta_occ_prior        + 1e-4f) &&
+                              (v.a_free <= scovox::kBetaFreePrior + 1e-4f);
         if (at_prior) return;
         frame.beta_deltas.push_back({c, v});
       };
@@ -1954,9 +1954,9 @@ private:
       "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
       "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
 
-    const float beta_occ_prior = static_cast<float>(num_classes_) * alpha_0_;
+    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
     auto has_beta_evidence = [&](const scovox::BetaVoxel& b) {
-      return b.a_occ > beta_occ_prior + 1e-3f || b.a_free > alpha_0_ + 1e-3f;
+      return b.a_occ > beta_occ_prior + 1e-3f || b.a_free > scovox::kBetaFreePrior + 1e-3f;
     };
     // Project Beta(occupancy) + Dir(semantics) → SemBetaVoxel for the shared
     // helpers. Occupancy from Beta; per-class evidence from Dir (subtract the

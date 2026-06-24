@@ -99,8 +99,10 @@ SemSplitMap::SemSplitMap(const Params& p)
     , dir_acc_(dir_grid_.createAccessor())
     , touched_beta_()
     , touched_dir_()
-    , beta_occ_prior_(static_cast<float>(params_.num_classes) * params_.alpha_0)
-    , beta_free_prior_(params_.alpha_0) {}
+    // Shipped occupancy prior is symmetric Beta(1,1) → p_occ=0.5, decoupled from
+    // the semantic (num_classes, α₀). See docs/occupancy_prior.md.
+    , beta_occ_prior_(kBetaOccPrior)
+    , beta_free_prior_(kBetaFreePrior) {}
 
 // ===========================================================================
 // Allocation (enforce prior at first touch — Bonxai zero-inits leaf blocks)
