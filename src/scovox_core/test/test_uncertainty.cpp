@@ -96,8 +96,10 @@ TEST(Uncertainty, EntropySymmetric) {
 TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
   const float alpha0 = 0.01f;     // kDefaultDirichletPrior
   const float C = 14.f;           // default num_classes
-  // Calibrated occupied split voxel: occ prior C*alpha_0 + heavy evidence,
-  // free still at its alpha_0 prior.
+  // Near-point-mass occupied voxel (huge a_occ, tiny a_free) — exercises the
+  // Beta differential-entropy divergence regardless of the prior. The C*alpha0
+  // term is just a convenient large offset, NOT the shipped occupancy prior
+  // (now symmetric Beta(1,1); see docs/occupancy_prior.md).
   float h = entropy(makeBeta(C * alpha0 + 50.f, alpha0));
   EXPECT_TRUE(std::isfinite(h)) << "differential entropy must stay finite, got " << h;
   EXPECT_LT(h, -10.f) << "Beta differential entropy must diverge negative on a "

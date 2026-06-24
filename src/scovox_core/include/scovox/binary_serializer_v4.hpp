@@ -16,8 +16,11 @@
 /// rather than collapsed into one Dirichlet vector.
 ///
 /// Header mirrors v3 (so the receiver reconstructs priors without sharing
-/// launch params) and bumps VERSION to 4. Receivers route on the VERSION byte;
-/// v1/v2/v3 stay in tree.
+/// launch params). The blob VERSION byte is the codec revision: now 5 (was 4)
+/// because the occupancy prior changed to symmetric Beta(1,1) — same wire
+/// layout, incompatible merge prior, so deserialize rejects a mismatched
+/// revision and a mixed-prior fleet fails loud. The ROS envelope `version` (=4)
+/// remains the v4 format-family router; v1/v2/v3 stay in tree.
 ///
 /// Frame layout (uncompressed, little-endian):
 ///   [MAGIC: u32 = "SCVX"] [VERSION: u8 = 4]
@@ -64,7 +67,15 @@ namespace scovox {
 class BinarySerializerV4 {
  public:
   static constexpr uint32_t MAGIC          = 0x53435658;  // "SCVX" (shared v1–v4)
-  static constexpr uint8_t  FORMAT_VERSION = 4;
+  // Blob codec revision (distinct from the ROS envelope `version`=4 that routes
+  // the v4 format family). Bumped 4→5 when the split occupancy prior changed
+  // from the calibrated Beta(C·α₀, α₀) to symmetric Beta(1,1)
+  // (docs/occupancy_prior.md): the wire LAYOUT is byte-identical to revision 4,
+  // but the prior the consensus merge subtracts differs, so a revision-4 sender
+  // talking to a revision-5 receiver would silently corrupt fused occupancy
+  // mass. deserialize() rejects a mismatched VERSION, so a mixed-prior fleet
+  // fails loud (the frame is dropped with a warning) instead.
+  static constexpr uint8_t  FORMAT_VERSION = 5;
 
   struct TsdfDelta { Bonxai::CoordT coord; TsdfVoxel data; };
   struct BetaDelta { Bonxai::CoordT coord; BetaVoxel data; };
@@ -197,12 +208,13 @@ class BinarySerializerV4 {
     off += sizeof(float);
 
     // Validate the header-supplied prior parameters before any voxel is
-    // reconstructed from them. consensus_merge_v4 rebuilds the Beta/Dirichlet
-    // prior as num_classes·alpha_0 and (num_classes − K_TOP)·alpha_0, so a
-    // corrupt header — num_classes < K_TOP, or a non-finite/non-positive
+    // reconstructed from them. consensus_merge_v4 rebuilds the Dirichlet
+    // (semantic) prior as (num_classes − K_TOP)·alpha_0 with per-slot alpha_0,
+    // so a corrupt header — num_classes < K_TOP, or a non-finite/non-positive
     // alpha_0 — would silently inject negative or NaN mass into the live map
-    // (and two re-sent snapshots from the same bad sender agree with each
-    // other, so the per-frame equality check cannot catch it).
+    // (and two re-sent snapshots from the same bad sender agree with each other,
+    // so the per-frame equality check cannot catch it). The OCCUPANCY Beta prior
+    // is the symmetric constant kBetaOccPrior, independent of these fields.
     if (f.num_classes < static_cast<uint16_t>(K_TOP)) {
       throw std::runtime_error(
           "BinarySerializerV4: num_classes (" + std::to_string(f.num_classes)

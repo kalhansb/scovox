@@ -201,8 +201,9 @@ inline scovox::SemBetaVoxel projectSemDirToSemBetaForViz(
 }
 
 /// BetaVoxel "is at prior" check for the split (v4) consensus refold. A voxel
-/// is at prior iff a_occ ≈ C·α_0 and a_free ≈ α_0 (the calibrated occupancy
-/// prior). `slop` matches isPriorSemDir's one-quantum tolerance.
+/// is at prior iff a_occ ≈ kBetaOccPrior and a_free ≈ kBetaFreePrior (the
+/// symmetric Beta(1,1) occupancy prior; see docs/occupancy_prior.md). `slop`
+/// matches isPriorSemDir's one-quantum tolerance.
 inline bool isPriorBeta(const scovox::BetaVoxel& v,
                         uint16_t num_classes, float alpha_0) {
   (void)num_classes; (void)alpha_0;  // occupancy prior is the symmetric constant
@@ -280,13 +281,13 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
 /// (cnt == α_0) collapse to sem_cnt == 0 and are skipped by every consumer's
 /// `sem_cnt > 0` test.
 ///
-/// OCCUPANCY is NOT v1-equivalent: a_occ / a_free are copied verbatim from the
-/// BetaVoxel, which carries the calibrated split prior (a_occ = C·α_0,
-/// a_free = α_0 → prior p_occ = C/(C+1) ≈ 0.933), whereas the v1 fused Voxel
-/// uses Beta(1,1) (prior p_occ = 0.5). For the same physical observation history
-/// the two substrates report different p_occ / variance / EIG / SSMI; this is by
-/// design (the split prior is calibrated to the unified-Dirichlet occupancy
-/// marginal), not a parity bug — so do NOT claim occupancy parity with v1.
+/// OCCUPANCY now uses the SAME prior as v1: a_occ / a_free are copied verbatim
+/// from the BetaVoxel, which ships the symmetric Beta(1,1) prior
+/// (a_occ = a_free = 1.0 → prior p_occ = 0.5) — identical to the v1 fused Voxel
+/// (defaultVoxel). So there is no longer a prior-induced p_occ / variance / EIG /
+/// SSMI gap vs v1 at the prior. (Historically the split path used a calibrated
+/// Beta(C·α_0, α_0) prior, p_occ = C/(C+1) ≈ 0.933; that was switched to
+/// Beta(1,1) — see docs/occupancy_prior.md.)
 inline scovox::Voxel projectBetaDirToVoxel(
     const scovox::BetaVoxel& b, const scovox::DirVoxel* d,
     uint16_t num_classes, float alpha_0) {
@@ -1066,9 +1067,9 @@ private:
   // wire_format_v4_) to a substrate-agnostic templated core that projects the
   // split Beta(+Dir) grids into a transient scovox::Voxel. The SEMANTIC query
   // math is byte-identical to the legacy v1 path (raw-evidence convention); the
-  // OCCUPANCY math is NOT — the Beta grid carries the calibrated split prior
-  // (prior p_occ ≈ C/(C+1), not v1's 0.5), so p_occ / EIG / SSMI differ from v1
-  // for the same evidence by design (see projectBetaDirToVoxel). Occupancy-only
+  // OCCUPANCY math now uses the SAME symmetric Beta(1,1) prior (p_occ=0.5) as v1
+  // (the split prior was switched from the calibrated Beta(C·α_0, α_0) — see
+  // projectBetaDirToVoxel / docs/occupancy_prior.md). Occupancy-only
   // services
   // (ScoreCandidates / GetOccupancyGrid) read just the Beta grid; GetRegion
   // joins the Dir grid for per-class evidence. The v2/v3 fused substrates are
@@ -1262,8 +1263,8 @@ private:
     }
   }
 
-  // BetaVoxel-typed refold. Reset fused[mc] to the calibrated occupancy prior,
-  // then fold every source's value via mergeBeta (conjugate Beta consensus).
+  // BetaVoxel-typed refold. Reset fused[mc] to the symmetric Beta(1,1) occupancy
+  // prior, then fold every source's value via mergeBeta (conjugate Beta consensus).
   void refoldCellBeta(
       const Bonxai::CoordT& mc,
       Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor& fa,
@@ -1589,10 +1590,11 @@ private:
     const float ot = (float)min_occ_;
     size_t cnt = 0;
     g.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT&) {
-      // Skip prior-only cells: the calibrated Beta prior is p_occ = C/(C+1) ≈
-      // 0.933, which exceeds the default 0.7 threshold, so without this guard
-      // every allocated-but-unobserved voxel would be published as a phantom
-      // occupied point. Mirror the isPrior gate the RPC walkers use.
+      // Skip prior-only cells via isPriorBeta, independent of the prior's p_occ.
+      // (Gating on isPriorBeta rather than a p_occ threshold keeps this correct
+      // for any prior: the old calibrated prior p_occ ≈ 0.933 exceeded the 0.7
+      // threshold and would publish as phantom occupied; the prior is now
+      // Beta(1,1)/0.5. See docs/occupancy_prior.md.) Mirror the RPC walkers' gate.
       if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
       if (v.p_occ() >= ot) ++cnt;
     });
@@ -1901,8 +1903,9 @@ private:
   // are NOT allocated/observed. It MUST carry the SAME occupancy prior the
   // substrate uses for its observed cells, otherwise the SSMI reach *= (1-p)
   // accumulation and KL terms mix two occupancy priors and skew candidate
-  // ranking: v1 passes Beta(1,1) (defaultVoxel, p_occ=0.5), v4 passes the
-  // calibrated split prior Beta(C·α_0, α_0) (p_occ ≈ C/(C+1)).
+  // ranking. Both v1 and v4 now ship the symmetric Beta(1,1) prior (p_occ=0.5)
+  // — v1 via defaultVoxel(), v4 via defaultBetaVoxel(kBetaOccPrior,
+  // kBetaFreePrior); see docs/occupancy_prior.md.
   template <typename CellT, typename ProjectFn, typename IsPriorFn>
   void scoreCandidatesOnGrid(
       const scovox_msgs::srv::ScoreCandidates::Request::SharedPtr rq,
@@ -1974,10 +1977,10 @@ private:
               [&](const Bonxai::CoordT& c) -> bool {
                 const CellT* ptr = acc.value(c);
                 const bool obs = ptr && !isPriorCell(*ptr);
-                // Use the substrate's calibrated unobserved prior (not a
-                // hardcoded Beta(1,1)) so the reach/KL accumulation stays on one
-                // consistent occupancy prior across observed and unobserved
-                // cells — on v4 the free-space prior is Beta(C·α_0, α_0), not 0.5.
+                // Use the substrate's own unobserved prior so the reach/KL
+                // accumulation stays on one consistent occupancy prior across
+                // observed and unobserved cells. Both substrates ship the
+                // symmetric Beta(1,1) prior (p_occ=0.5); see docs/occupancy_prior.md.
                 scovox::Voxel v = obs ? project(*ptr) : unobserved_prior;
                 float p = v.p_occ();
                 float kl_occ  = scovox::ssmiOccKL(v);
@@ -2038,15 +2041,22 @@ private:
                   if (std::isfinite(s)) total_score += s;
                   if (v.p_occ() >= occ_stop) return false;
                 } else {
+                  // Unobserved cell: score against the substrate's occupancy
+                  // prior (`unobserved_prior`), NOT a hardcoded Beta(1,1). This
+                  // matches the SSMI branch above and a freshly-allocated
+                  // observed cell, so EIG/entropy stay on ONE consistent
+                  // occupancy prior even if kBetaOccPrior is retuned (e.g. to the
+                  // Jeffreys Beta(0.5,0.5) runner-up). With today's Beta(1,1) the
+                  // result is identical to the previous hardcoded p=0.5.
                   switch (mode) {
-                    case SM_EIG: {
-                      scovox::Voxel prior;
-                      prior.a_occ = 1.0f; prior.a_free = 1.0f;
-                      s = scovox::expectedInformationGain(prior);
+                    case SM_EIG:
+                      s = scovox::expectedInformationGain(unobserved_prior);
                       break;
-                    }
                     case SM_ENTROPY: {
-                      s = -0.5f * std::log(0.5f) - 0.5f * std::log(0.5f);
+                      const float p = unobserved_prior.p_occ();
+                      s = (p > 1e-7f && p < 1.f - 1e-7f)
+                          ? -p * std::log(p) - (1.f - p) * std::log(1.f - p)
+                          : 0.f;
                       break;
                     }
                     case SM_FRONTIER: s = 1.0f; break;

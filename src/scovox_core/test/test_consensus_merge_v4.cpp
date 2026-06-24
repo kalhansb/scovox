@@ -31,7 +31,7 @@ scovox::DirVoxel dirPrior() {
 // ===========================================================================
 
 TEST(ConsensusMergeV4, BetaMergeWithPriorPreservesEvidence) {
-  scovox::BetaVoxel v{2.0f, 1.0f};
+  scovox::BetaVoxel v{2.0f, 3.0f};      // both dims strictly above the prior (1,1)
   auto f = scovox::mergeBeta(v, betaPrior(), kC, kAlpha);
   EXPECT_FLOAT_EQ(f.a_occ,  v.a_occ);   // duplicated prior cancels
   EXPECT_FLOAT_EQ(f.a_free, v.a_free);

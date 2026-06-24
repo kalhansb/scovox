@@ -88,11 +88,11 @@ constexpr float kBetaFreePrior = 1.0f;
 /// (the same first-touch invariant as `defaultSemBetaVoxel` /
 /// `defaultSemDirVoxel`).
 ///
-/// Defaults reproduce the unified-Dirichlet occupancy marginal: pass
-/// `occ_prior = C·α₀`, `free_prior = α₀` (computed by `SemSplitMap` from its
-/// `num_classes` / `alpha_0` params). The 1.0/1.0 default here is only the
-/// "no priors supplied" fallback — `SemSplitMap` always passes calibrated
-/// values.
+/// The factory is prior-agnostic. The 1.0/1.0 default IS the shipped symmetric
+/// Beta(1,1) occupancy prior (`p_occ = 0.5`), which `SemSplitMap` passes
+/// explicitly via `kBetaOccPrior` / `kBetaFreePrior`. Pass `occ_prior = C·α₀`,
+/// `free_prior = α₀` to reproduce the old calibrated unified-Dirichlet marginal
+/// (`p_occ = C/(C+1)`) as an ablation. See docs/occupancy_prior.md.
 inline BetaVoxel defaultBetaVoxel(float occ_prior = 1.0f,
                                   float free_prior = 1.0f) noexcept {
   BetaVoxel v{};            // zero-init

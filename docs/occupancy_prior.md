@@ -116,9 +116,14 @@ prior shared by both sources is not double-counted. With the symmetric
 **class-count-independent** (no `C` to reconstruct on the occupancy side — the
 prior is now decoupled from `(num_classes, α₀)`), and the floor `max(1, ·)`
 keeps fused alphas `≥ 1`, preserving properness. Because the prior is a
-compile-time constant on both ends, it is **not carried on the wire**; sender and
-receiver must be built from the same constant (as with any wire-semantics
-change).
+compile-time constant on both ends, it is **not carried on the wire**. To stop a
+mixed-prior fleet from silently corrupting fused mass, the v4 blob codec
+revision (`BinarySerializerV4::FORMAT_VERSION`) was bumped **4 → 5** with this
+change: the wire *layout* is byte-identical, but a revision-4 (calibrated-prior)
+node and a revision-5 (`Beta(1,1)`) node now reject each other's frames at
+`deserialize` (the frame is dropped with a warning) instead of merging under
+mismatched priors. The ROS envelope `version` stays `4` (the v4 format-family
+router).
 
 ## 10. Entropy / EIG / SSMI
 

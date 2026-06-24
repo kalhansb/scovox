@@ -49,8 +49,10 @@ class SemSplitMap {
   using CoordT   = Bonxai::CoordT;
 
   /// Knobs mirror `SemDirMap::Params` 1:1 so a launch file porting between the
-  /// two substrates needs no edits. The occupancy prior is derived from
-  /// `num_classes` / `alpha_0` to match the unified path's `p_occ` marginal.
+  /// two substrates needs no edits. The occupancy prior is the symmetric
+  /// Beta(1,1) constant (`kBetaOccPrior`), independent of `num_classes` /
+  /// `alpha_0` (which set only the semantic Dirichlet prior); see
+  /// docs/occupancy_prior.md.
   struct Params {
     double  resolution                 = 0.05;
     uint8_t inner_bits                 = 2;
