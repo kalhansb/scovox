@@ -174,12 +174,6 @@ dscovox_node:
 
     # === Map algorithm params [M] ===
 
-    consensus_kl_threshold:         # float, default 5.0, nats
-      # KL divergence threshold above which source cells are flagged as conflicting.
-
-    tau_occ_gate:                   # float, default 0.6, dimensionless [0,1]
-      # Minimum p_occ for semantic evidence to be merged during consensus.
-
     semantic_occ_gate:              # float, default 0.5, dimensionless [0,1]
       # (Forwarded from SCovoxNode) p_occ hard threshold for semantic merging.
 

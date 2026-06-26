@@ -206,13 +206,11 @@ def generate_launch_description():
             # k_conflict  double  2.0   -    Conflict penalty scale factor
             # epsilon_sem double  1e-3  -    Semantic evidence floor
             # lambda_sem  double  5.0   -    Semantic consensus weight
-            # tau_occ_gate double 0.6   -    Min P(occ) gate for semantic consensus
             "epsilon_w":   1e-3,
             "Lsat":        3.0,
             "k_conflict":  2.0,
             "epsilon_sem": 1e-3,
             "lambda_sem":  5.0,
-            "tau_occ_gate": 0.6,
 
             # -- Semantics (1) [KEEP] -------------------------------------------------
             # semantic_top_k  int  10  -  Max named classes per fused voxel

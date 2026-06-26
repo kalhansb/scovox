@@ -71,11 +71,6 @@
     startup_tf_jump_threshold: 10.0  # tolerate fast platform motion at startup
 
     # --- Mode ------------------------------------------------------------
-    # Pin the legacy fused substrate: a single Beta-occupancy grid (geometry
-    # only). use_split=true would allocate the split TSDF + Dirichlet-semantic
-    # substrate instead — not wanted here, and it would also ignore enable_tsdf.
-    use_split: false
-
     # "persistent": single continuous local map, no inter-robot binary
     # publishing. Use "rolling" only for multi-robot dscovox fusion.
     mode: "persistent"
