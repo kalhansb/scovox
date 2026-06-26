@@ -117,13 +117,13 @@ prior shared by both sources is not double-counted. With the symmetric
 prior is now decoupled from `(num_classes, α₀)`), and the floor `max(1, ·)`
 keeps fused alphas `≥ 1`, preserving properness. Because the prior is a
 compile-time constant on both ends, it is **not carried on the wire**. To stop a
-mixed-prior fleet from silently corrupting fused mass, the v4 blob codec
-revision (`BinarySerializerV4::FORMAT_VERSION`) was bumped **4 → 5** with this
+mixed-prior fleet from silently corrupting fused mass, the blob codec
+revision (`BinarySerializer::FORMAT_VERSION`) was bumped **4 → 5** with this
 change: the wire *layout* is byte-identical, but a revision-4 (calibrated-prior)
 node and a revision-5 (`Beta(1,1)`) node now reject each other's frames at
 `deserialize` (the frame is dropped with a warning) instead of merging under
-mismatched priors. The ROS envelope `version` stays `4` (the v4 format-family
-router).
+mismatched priors. The ROS envelope `version` stays `4` (it routes to this
+codec).
 
 ## 10. Entropy / EIG / SSMI
 
@@ -168,12 +168,12 @@ These are referenced — identically on sender and receiver — at every site th
 | site | file | role |
 |---|---|---|
 | allocation | `sem_split_map.cpp` `beta_occ_prior_/beta_free_prior_` | first-touch `BetaVoxel` |
-| merge | `consensus_merge_v4.hpp` `mergeBeta` | `a_fused = a_A+a_B − prior` |
+| merge | `consensus_merge.hpp` `mergeBeta` | `a_fused = a_A+a_B − prior` |
 | at-prior detection | `dscovox_node.cpp` `isPriorBeta` | refold / publish gate |
 | refold reset | `dscovox_node.cpp` `refoldCellBeta` | reset before fold |
-| sender emit gate | `scovox_node.cpp` (v4 `emit_beta`) | keep prior-only voxels off the wire |
+| sender emit gate | `scovox_node.cpp` (`emit_beta`) | keep prior-only voxels off the wire |
 | viz gate | `scovox_node.cpp` `has_beta_evidence` | don't publish prior-only cells |
-| SSMI baseline | `dscovox_node.cpp` (v4 `unobserved`) | unallocated-cell scoring prior |
+| SSMI baseline | `dscovox_node.cpp` (`unobserved`) | unallocated-cell scoring prior |
 
 `mergeBeta` / `isPriorBeta` keep their `(num_classes, α₀)` parameters for
 call-site symmetry with the *semantic* (`mergeDir` / `isPriorDir`) path but
@@ -181,9 +181,9 @@ ignore them for occupancy. The prior-agnostic factory
 `defaultBetaVoxel(occ, free)` still reproduces the **calibrated** prior
 `Beta(C·α₀, α₀)` on explicit request, so that marginal-matching ablation remains
 available. Guarded by the `p_occ == 0.5` fresh-voxel + two-source-merge tests in
-`test_sem_split_map.cpp` / `test_consensus_merge_v4.cpp`.
+`test_sem_split_map.cpp` / `test_consensus_merge.cpp`.
 
-**Scope:** this change is the **split (v4) `BetaVoxel` path only**. The unified
+**Scope:** this change is the **split `BetaVoxel` path only**. The unified
 `SemDirVoxel` substrate keeps its calibrated `C/(C+1)` occupancy marginal (its
 `s_occ` is structural and feeds the semantic Dirichlet; flipping it to `0.5`
 needs the FREE-dual technique — `alpha_free = C·α₀` — and is out of scope here).

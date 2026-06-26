@@ -32,7 +32,7 @@
 #include "scovox_msgs/msg/scovox_voxel.hpp"
 #include "scovox_msgs/msg/scovox_semantic_evidence.hpp"
 #include "scovox_msgs/msg/scovox_map_binary.hpp"
-#include "scovox/binary_serializer_v4.hpp"
+#include "scovox/binary_serializer.hpp"
 #include "scovox/lz4_codec.hpp"
 #include "scovox/marching_cubes.hpp"
 #include "scovox/mesh_labelling.hpp"
@@ -56,7 +56,7 @@ public:
     // ~/extract_mesh service, and publishTSDFPointCloud gate on this cached
     // launch value rather than the (always-positive) TsdfMap::params().sdf_trunc.
     sdf_trunc_launch_ = P.sdf_trunc;
-    // Split-grid v4 substrate. ScovoxMapSplit::Params shares
+    // Split-grid substrate. ScovoxMapSplit::Params shares
     // (resolution, inner_bits, leaf_bits) across both grids; per-substrate
     // params (sdf_trunc, w_occ/w_free/kappa0, evidence_saturation, …) flow
     // through from launch params via TsdfMap::Params and SemSplitMap::Params.
@@ -240,11 +240,11 @@ private:
     // per-grid memUsageDetailed walk + detached reader thread don't run on
     // the production mapping hot path; set true to profile memory.
     mem_log_ = dp("log_mem_usage", false);
-    // Sender-side wire toggle for the v4 TSDF stream:
+    // Sender-side wire toggle for the TSDF stream:
     //   share_tsdf=false (default): emit Beta + Dir only (dscovox-fusion-only
     //     path; each robot keeps its local TSDF).
     //   share_tsdf=true: also emit the TSDF stream (opt-in for fused-geometry
-    //     consensus). Maps to BinarySerializerV4::Options.share_tsdf.
+    //     consensus). Maps to BinarySerializer::Options.share_tsdf.
     share_tsdf_ = dp("share_tsdf", false);
     // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default true.
     // Set false to fall back to the two-DDA split path for A/B parity testing.
@@ -532,7 +532,7 @@ private:
     size_t bin_bytes_ = 0;
     if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
     else {
-      // No bin_pub_ in persistent mode → publishBinaryMapV4 is never
+      // No bin_pub_ in persistent mode → publishBinaryMap is never
       // called → TsdfMap/SemSplitMap touched buffers grow unbounded
       // (every integrated ray appends coords). Clear via the O(n)
       // path: drainTouched* sorts+uniques, but the result is unused here,
@@ -675,7 +675,7 @@ private:
     size_t bin_bytes_ = 0;
     if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
     else {
-      // No bin_pub_ in persistent mode → publishBinaryMapV4 is never
+      // No bin_pub_ in persistent mode → publishBinaryMap is never
       // called → TsdfMap/SemSplitMap touched buffers grow unbounded
       // (every integrated ray appends coords). Clear via the O(n)
       // path: drainTouched* sorts+uniques, but the result is unused here,
@@ -977,7 +977,7 @@ private:
     m.semantic_threshold=P.semantic_occ_gate; m.max_semantic_classes=max_sem_;
     // Walk the Beta (occupancy) grid; join the Dir (semantics) grid at the same
     // coord. a_occ/a_free come from Beta; a_unk = Dir OTHER; per-class evidence
-    // = cnt[i] − α_0 so empty slots read 0 (mirrors the v4 pointcloud project).
+    // = cnt[i] − α_0 so empty slots read 0 (mirrors the pointcloud project).
     const auto& bgrid = ss.betaGrid();
     auto dacc = ss.dirGrid().createConstAccessor();
     m.voxels.reserve(bgrid.activeCellsCount());
@@ -1011,22 +1011,17 @@ private:
   // To handle a fresh dscovox connecting after this node has already started,
   // we detect subscriber-count transitions from 0 to >0 and re-mark every
   // non-prior cell as dirty so the next publish carries a full snapshot.
-  std::pair<size_t,double> publishBinaryMap() {
-    if (!bin_pub_) return {0, 0};
-    return publishBinaryMapV4();
-  }
-
-  // Split-substrate v4 binary publish path. Drains touched TSDF + Beta + Dir
+  // Split-substrate binary publish path. Drains touched TSDF + Beta + Dir
   // coords from the SemSplitMap substrate, reads each voxel's current state,
-  // builds a BinarySerializerV4::Frame (three streams), optionally elides the
+  // builds a BinarySerializer::Frame (three streams), optionally elides the
   // TSDF section per share_tsdf_, LZ4-compresses, and publishes with
   // msg->version=4. Beta (occupancy) and Dir (semantics) cross the wire as
   // SEPARATE streams — the receiver merges each with its own conjugate rule
-  // (consensus_merge_v4.hpp), losslessly.
+  // (consensus_merge.hpp), losslessly.
   //
   // Snapshot-on-resub + at-prior elision are applied per grid. This is the
   // node's only wire path; the SPLIT substrate (semsplit()) is always valid.
-  std::pair<size_t,double> publishBinaryMapV4() {
+  std::pair<size_t,double> publishBinaryMap() {
     if (!bin_pub_) return {0, 0};
     auto& ss = split_map_->semsplit();
 
@@ -1040,7 +1035,7 @@ private:
       return {0, 0};
     }
 
-    scovox::BinarySerializerV4::Frame frame;
+    scovox::BinarySerializer::Frame frame;
     frame.resolution  = static_cast<float>(split_map_->resolution());
     frame.num_classes = static_cast<uint16_t>(num_classes_);
     frame.alpha_0     = alpha_0_;
@@ -1114,15 +1109,15 @@ private:
       return {0, 0};
     }
 
-    scovox::BinarySerializerV4::Options opts;
+    scovox::BinarySerializer::Options opts;
     opts.share_tsdf = share_tsdf_;
-    auto data = scovox::BinarySerializerV4::serialize(frame, opts);
+    auto data = scovox::BinarySerializer::serialize(frame, opts);
     auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
 
     scovox_msgs::msg::ScovoxMapBinary bin;
     bin.header.stamp    = get_clock()->now();
     bin.header.frame_id = int_frame_;
-    bin.version         = 4;   // v4 envelope — dscovox onBinaryMapV4 routes
+    bin.version         = 4;   // envelope version — dscovox onBinaryMap routes on it
 #if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
     bin.little_endian = true;
 #else
@@ -1133,7 +1128,7 @@ private:
       // on a genuine LZ4 error. The consumer always expects the LZ4 framing, so
       // shipping the raw blob would be undecodable — drop the frame instead.
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "publishBinaryMapV4: LZ4 compression failed; dropping frame");
+        "publishBinaryMap: LZ4 compression failed; dropping frame");
       return {0, 0};
     }
     bin.data = std::move(comp);
@@ -1205,16 +1200,12 @@ private:
   }
   // Caller must hold map_mtx_ (shared). The timer body locks once for both
   // publishScovoxMap and publishPointCloud so they see the same map state.
-  void publishPointCloud() {
-    publishPointCloudV4();
-  }
-
-  // Split-substrate (v4) pointcloud publisher. Occupancy comes from the Beta
+  // Split-substrate pointcloud publisher. Occupancy comes from the Beta
   // grid; semantics from the Dir grid at the same coord. The two are projected
   // into a SemBetaVoxel so the shared viz helpers (argmaxClassConfidence /
   // variance / expectedInformationGain) and the 16-field schema stay stable
   // for pointcloud_to_npz.py / RViz / eval scripts.
-  void publishPointCloudV4() {
+  void publishPointCloud() {
     if (!pc_pub_ || !split_map_ || pc_pub_->get_subscription_count() == 0) return;
     auto& ss = split_map_->semsplit();
     sensor_msgs::msg::PointCloud2 cl;
@@ -1222,7 +1213,7 @@ private:
     cl.header.stamp = get_clock()->now();
     cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
     sensor_msgs::PointCloud2Modifier mod(cl);
-    static_assert(scovox::K_TOP >= 1, "publishPointCloudV4 requires at least 1 sparse slot");
+    static_assert(scovox::K_TOP >= 1, "publishPointCloud requires at least 1 sparse slot");
     mod.setPointCloud2Fields(16,
       "x",1,sensor_msgs::msg::PointField::FLOAT32, "y",1,sensor_msgs::msg::PointField::FLOAT32,
       "z",1,sensor_msgs::msg::PointField::FLOAT32, "rgb",1,sensor_msgs::msg::PointField::FLOAT32,
@@ -1286,7 +1277,11 @@ private:
       uint8_t bc = 0; float cf = 0, r = 1, gg = 1, bb = 1;
       if (v.a0() > 0 && scovox::K_TOP > 0) {
         const auto [best_cls, p_best] = scovox::argmaxClassConfidence(v);
-        bc = static_cast<uint8_t>(best_cls);
+        // argmaxClassConfidence returns a uint16_t id, but `semantic_class` is a
+        // UINT8 PointField; a naive cast of an id >=256 would alias to id%256 and
+        // collide with an unrelated class for both the label and the palette
+        // colour. Emit 0 (unknown) instead. (Mirrors dscovox_node.cpp's guard.)
+        bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
         cf = p_best;
         if (cf >= vis_gate && bc < sem_col_.size()) { auto& c = sem_col_[bc]; r = c.r; gg = c.g; bb = c.b; }
       }
@@ -1461,10 +1456,10 @@ private:
   // up internally, so the tsdf publisher / extract_mesh service / TSDF cloud
   // gate on this rather than TsdfMap::params().sdf_trunc.
   float sdf_trunc_launch_{0.f};
-  // Split-grid v4 substrate. Owns one TsdfMap + one SemSplitMap
+  // Split-grid substrate. Owns one TsdfMap + one SemSplitMap
   // (BetaVoxel ∥ DirVoxel). Always allocated — the node has one path.
   std::unique_ptr<scovox::ScovoxMapSplit> split_map_;
-  bool share_tsdf_{false};        // v4 TSDF stream toggle (wire opts.share_tsdf)
+  bool share_tsdf_{false};        // TSDF stream toggle (wire opts.share_tsdf)
   bool fused_walker_{true};       // Step 12.10 — single-DDA hit-ray walker
   // Semantic dataset priors. Defaults match SemSplitMap::Params; KITTI launches
   // override via num_classes:=20.

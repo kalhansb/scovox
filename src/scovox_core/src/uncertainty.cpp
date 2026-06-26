@@ -39,7 +39,7 @@ float variance(const Voxel& v) {
 
 float entropy(const Voxel& v) {
   // NOTE: this is the Beta *differential* entropy (closed form below), kept
-  // verbatim for the legacy v1 fused `scovox::Map` path so existing v1 consumers
+  // verbatim for the legacy fused `scovox::Map` path so existing fused-path consumers
   // and tests retain their historical scale. It is UNBOUNDED BELOW: for a
   // near-point-mass voxel (e.g. a_occ=100, a_free=alpha_0=0.01, which survives
   // the a<=0/b<=0 guard) it returns a large NEGATIVE value, NOT a bounded
@@ -48,7 +48,7 @@ float entropy(const Voxel& v) {
   // compute Bernoulli H(p_occ) = -p ln p - (1-p) ln(1-p) at the call site
   // (as expectedInformationGain does for its H_y term, and as the MapStats
   // mean-entropy aggregator in dscovox_node does); we intentionally do not
-  // change this function's semantics to avoid a silent v1 behavior regression.
+  // change this function's semantics to avoid a silent behavior regression.
   const float a = v.a_occ;
   const float b = v.a_free;
   if (a <= 0.f || b <= 0.f) return 0.f;

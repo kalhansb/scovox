@@ -1,29 +1,29 @@
 #pragma once
 
-/// @file binary_serializer_v4.hpp
-/// @brief Wire format v4 for the split Beta/Dirichlet SCovox substrate.
+/// @file binary_serializer.hpp
+/// @brief Wire format for the split Beta/Dirichlet SCovox substrate.
 ///
 /// Triple-stream codec carrying:
-///   - TSDF deltas      (20 B/voxel on wire — unchanged from v2/v3, optional)
+///   - TSDF deltas      (20 B/voxel on wire, optional)
 ///   - BetaVoxel deltas (20 B/voxel: coord + a_occ + a_free)
 ///   - DirVoxel deltas  (28 B/voxel at K_TOP=2: coord + other + cnt[K] + cls[K])
 ///
 /// This is the faithful wire counterpart of `SemSplitMap`: occupancy
 /// (`BetaVoxel`) and semantics (`DirVoxel`) cross the wire as SEPARATE streams,
 /// so the receiver reconstructs two independent grids and merges each with its
-/// own conjugate rule (see consensus_merge_v4.hpp). Unlike a v3 projection it
-/// is lossless — `p_occ` and the class distribution are carried independently
-/// rather than collapsed into one Dirichlet vector.
+/// own conjugate rule (see consensus_merge.hpp). It is lossless — `p_occ` and
+/// the class distribution are carried independently rather than collapsed into
+/// one Dirichlet vector.
 ///
-/// Header mirrors v3 (so the receiver reconstructs priors without sharing
-/// launch params). The blob VERSION byte is the codec revision: now 5 (was 4)
-/// because the occupancy prior changed to symmetric Beta(1,1) — same wire
-/// layout, incompatible merge prior, so deserialize rejects a mismatched
+/// The header carries the priors so the receiver reconstructs them without
+/// sharing launch params. The blob VERSION byte is the codec revision: now 5
+/// (was 4) because the occupancy prior changed to symmetric Beta(1,1) — same
+/// wire layout, incompatible merge prior, so deserialize rejects a mismatched
 /// revision and a mixed-prior fleet fails loud. The ROS envelope `version` (=4)
-/// remains the v4 format-family router; v1/v2/v3 stay in tree.
+/// routes to this codec.
 ///
 /// Frame layout (uncompressed, little-endian):
-///   [MAGIC: u32 = "SCVX"] [VERSION: u8 = 4]
+///   [MAGIC: u32 = "SCVX"] [VERSION: u8 = 5]
 ///   [resolution: f32]
 ///   [num_classes: u16]   ← C
 ///   [K_TOP_wire: u8]     ← K_TOP at sender; receiver asserts match
@@ -38,16 +38,15 @@
 ///                                                        × dir_count   // 28 B
 ///
 /// `Options{.share_tsdf=false}` (default) writes `tsdf_count=0` and elides the
-/// TSDF payload — same wire-elision scheme as v2/v3; each robot keeps a local
-/// TSDF for mesh extraction. Beta and Dir streams are always written (they are
-/// the split substrate's payload).
+/// TSDF payload; each robot keeps a local TSDF for mesh extraction. Beta and
+/// Dir streams are always written (they are the split substrate's payload).
 ///
 /// @warning K_TOP is locked at compile time. The Dir record size scales with
 /// it (28 B at K_TOP=2), so sender and receiver MUST be compiled with the same
 /// K_TOP. A mismatch is detected during `deserialize` (the K_TOP_wire byte) and
 /// throws fatally — there is NO forward/backward compatibility across K_TOP
-/// values. If K_TOP must change on the wire, bump FORMAT_VERSION to v5 and add
-/// a new serializer; all existing v4 frames become invalid.
+/// values. If K_TOP must change on the wire, bump FORMAT_VERSION and add
+/// a new serializer; all existing frames become invalid.
 
 #include <cmath>
 #include <cstdint>
@@ -64,11 +63,11 @@
 
 namespace scovox {
 
-class BinarySerializerV4 {
+class BinarySerializer {
  public:
-  static constexpr uint32_t MAGIC          = 0x53435658;  // "SCVX" (shared v1–v4)
+  static constexpr uint32_t MAGIC          = 0x53435658;  // "SCVX"
   // Blob codec revision (distinct from the ROS envelope `version`=4 that routes
-  // the v4 format family). Bumped 4→5 when the split occupancy prior changed
+  // to this codec). Bumped 4→5 when the split occupancy prior changed
   // from the calibrated Beta(C·α₀, α₀) to symmetric Beta(1,1)
   // (docs/occupancy_prior.md): the wire LAYOUT is byte-identical to revision 4,
   // but the prior the consensus merge subtracts differs, so a revision-4 sender
@@ -162,13 +161,13 @@ class BinarySerializerV4 {
 
   /// Deserialise. Throws on bad MAGIC, bad VERSION, K_TOP mismatch, or
   /// truncated frame. K_TOP mismatch is fatal (the cnt[]/cls[] arrays are
-  /// length-implicit, locked by the header — same contract as v3).
+  /// length-implicit, locked by the header).
   static Frame deserialize(const std::string& data) {
     Frame f;
     std::size_t off = 0;
     auto need = [&](std::size_t n) {
       if (off + n > data.size())
-        throw std::runtime_error("BinarySerializerV4: truncated frame");
+        throw std::runtime_error("BinarySerializer: truncated frame");
     };
 
     need(sizeof(MAGIC));
@@ -176,14 +175,14 @@ class BinarySerializerV4 {
     std::memcpy(&magic, data.data() + off, sizeof(magic));
     off += sizeof(magic);
     if (magic != MAGIC)
-      throw std::runtime_error("BinarySerializerV4: bad MAGIC");
+      throw std::runtime_error("BinarySerializer: bad MAGIC");
 
     need(sizeof(FORMAT_VERSION));
     uint8_t version = 0;
     std::memcpy(&version, data.data() + off, sizeof(version));
     off += sizeof(version);
     if (version != FORMAT_VERSION)
-      throw std::runtime_error("BinarySerializerV4: bad VERSION");
+      throw std::runtime_error("BinarySerializer: bad VERSION");
 
     need(sizeof(float));
     std::memcpy(&f.resolution, data.data() + off, sizeof(float));
@@ -199,7 +198,7 @@ class BinarySerializerV4 {
     off += sizeof(uint8_t);
     if (k_top_wire != static_cast<uint8_t>(K_TOP)) {
       throw std::runtime_error(
-          "BinarySerializerV4: K_TOP mismatch — receiver compiled with K_TOP="
+          "BinarySerializer: K_TOP mismatch — receiver compiled with K_TOP="
           + std::to_string(K_TOP) + ", wire says " + std::to_string(k_top_wire));
     }
 
@@ -208,7 +207,7 @@ class BinarySerializerV4 {
     off += sizeof(float);
 
     // Validate the header-supplied prior parameters before any voxel is
-    // reconstructed from them. consensus_merge_v4 rebuilds the Dirichlet
+    // reconstructed from them. consensus_merge rebuilds the Dirichlet
     // (semantic) prior as (num_classes − K_TOP)·alpha_0 with per-slot alpha_0,
     // so a corrupt header — num_classes < K_TOP, or a non-finite/non-positive
     // alpha_0 — would silently inject negative or NaN mass into the live map
@@ -217,11 +216,11 @@ class BinarySerializerV4 {
     // is the symmetric constant kBetaOccPrior, independent of these fields.
     if (f.num_classes < static_cast<uint16_t>(K_TOP)) {
       throw std::runtime_error(
-          "BinarySerializerV4: num_classes (" + std::to_string(f.num_classes)
+          "BinarySerializer: num_classes (" + std::to_string(f.num_classes)
           + ") < K_TOP (" + std::to_string(K_TOP) + ")");
     }
     if (!std::isfinite(f.alpha_0) || f.alpha_0 <= 0.f) {
-      throw std::runtime_error("BinarySerializerV4: alpha_0 must be finite and > 0");
+      throw std::runtime_error("BinarySerializer: alpha_0 must be finite and > 0");
     }
 
     // TSDF stream.
@@ -235,7 +234,7 @@ class BinarySerializerV4 {
     // an attacker-controlled count (e.g. 0xFFFFFFFF) raises the documented
     // runtime_error rather than a multi-GB length_error/bad_alloc.
     if (tsdf_count > (data.size() - off) / 20)
-      throw std::runtime_error("BinarySerializerV4: truncated frame");
+      throw std::runtime_error("BinarySerializer: truncated frame");
     f.tsdf_deltas.reserve(tsdf_count);
     for (uint32_t i = 0; i < tsdf_count; ++i) {
       need(20);
@@ -256,7 +255,7 @@ class BinarySerializerV4 {
     // Same DoS guard as the TSDF stream: each Beta record is a fixed 20 B, so
     // reject a count that exceeds the remaining bytes before reserving.
     if (beta_count > (data.size() - off) / 20)
-      throw std::runtime_error("BinarySerializerV4: truncated frame");
+      throw std::runtime_error("BinarySerializer: truncated frame");
     f.beta_deltas.reserve(beta_count);
     for (uint32_t i = 0; i < beta_count; ++i) {
       need(20);
@@ -278,7 +277,7 @@ class BinarySerializerV4 {
     // Same DoS guard: each Dir record is a fixed per_dir bytes (28 B at
     // K_TOP=2), so reject a count exceeding the remaining bytes before reserve.
     if (dir_count > (data.size() - off) / per_dir)
-      throw std::runtime_error("BinarySerializerV4: truncated frame");
+      throw std::runtime_error("BinarySerializer: truncated frame");
     f.dir_deltas.reserve(dir_count);
     for (uint32_t i = 0; i < dir_count; ++i) {
       need(per_dir);

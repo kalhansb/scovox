@@ -34,7 +34,7 @@ static_assert(sizeof(TsdfVoxel) == 8,
 static_assert(std::is_trivial_v<TsdfVoxel>,
     "TsdfVoxel must be trivial for Bonxai's pool allocator (zero-init).");
 static_assert(std::is_standard_layout_v<TsdfVoxel>,
-    "TsdfVoxel must have standard layout for the v2 wire format's "
+    "TsdfVoxel must have standard layout for the wire format's "
     "byte-for-byte reinterpret_cast emit path.");
 
 /// Default-constructed TSDF voxel: distance=0, weight=0 (= unobserved).

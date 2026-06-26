@@ -1,11 +1,11 @@
 #pragma once
 
 /// @file scovox_map_split.hpp
-/// @brief Composer for the split-grid SCovox substrate (v4).
+/// @brief Composer for the split-grid SCovox substrate (split).
 ///
 /// Owns one `TsdfMap` (band-only, SLIM-VDB-equivalent) and one `SemSplitMap`
 /// semantic substrate — a `BetaVoxel` occupancy grid ∥ a `DirVoxel` semantics
-/// grid (de-unified). This is the v4 wire path; it is the only substrate.
+/// grid (de-unified). This is the wire path; it is the only substrate.
 ///
 /// Per-frame integration dispatches to TSDF + the SemSplitMap substrate.
 /// Mesh / pointcloud extraction comes from TsdfMap geometry + labelMesh /
@@ -270,7 +270,7 @@ class ScovoxMapSplit {
 
   std::vector<CoordT> drainTouchedTsdf() { return tsdf_.drainTouched(); }
 
-  /// SPLIT substrate: per-grid touched sets (v4 publish). Beta is full-ray;
+  /// SPLIT substrate: per-grid touched sets (split publish). Beta is full-ray;
   /// Dir is hit-sparse.
   std::vector<CoordT> drainTouchedBeta() { return semsplit_.drainTouchedBeta(); }
   std::vector<CoordT> drainTouchedDir()  { return semsplit_.drainTouchedDir(); }
@@ -292,7 +292,7 @@ class ScovoxMapSplit {
     return semsplit_.betaGridMemoryBytes() + semsplit_.dirGridMemoryBytes();
   }
 
-  // SPLIT per-grid accounting (for v4 memlog / parity reporting).
+  // SPLIT per-grid accounting (for memlog / parity reporting).
   std::size_t betaVoxelCount() const { return semsplit_.betaVoxelCount(); }
   std::size_t dirVoxelCount()  const { return semsplit_.dirVoxelCount();  }
   std::size_t betaGridBytes()  const { return semsplit_.betaGridMemoryBytes(); }

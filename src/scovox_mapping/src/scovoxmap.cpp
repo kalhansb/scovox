@@ -252,7 +252,7 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
   // distance), not a fresh exp(-segment_depth/decay) over the carve segment.
   // For the partial-ray (carve_band > 0) case `origin` is a truncated
   // origin and depth ≈ carve_band, so an in-function recomputation would
-  // diverge from v1 by orders of magnitude. Use the caller's value.
+  // diverge from the unified model by orders of magnitude. Use the caller's value.
   const float carve_w = range_w;
 
   const CoordT k_hit = posToCoord(hit);

@@ -151,7 +151,14 @@ inline void sparse_add_class(float*    cnt,
   // the comparison key (posterior-predictive Space-Saving; see voxel.hpp).
   int min_i = 0;
   for (int i = 1; i < K_TOP; ++i) if (cnt[i] < cnt[min_i]) min_i = i;
-  const float evicted_evidence = cnt[min_i] - alpha_0;
+  // Clamp at 0. A filled slot should always hold >= α₀ (prior + observed
+  // evidence), but an evidence-saturation rescale can erode it below α₀; an
+  // unclamped `cnt[min_i] − α₀` would then be NEGATIVE and turn the
+  // `*other += evicted_evidence` below into a mass SUBTRACTION (driving OTHER
+  // negative, breaking the Δ(other + Σcnt) == inc invariant). The saturation
+  // path also floors filled slots at α₀, so this is normally a no-op safety net.
+  const float raw_evicted = cnt[min_i] - alpha_0;
+  const float evicted_evidence = raw_evicted > 0.f ? raw_evicted : 0.f;
   if (inc > evicted_evidence) {
     // Evict: incoming class displaces slot min_i. Displaced accumulated
     // evidence flows to OTHER; the α₀ placeholder stays for the new class.

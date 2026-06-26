@@ -1,7 +1,7 @@
 # Multi-robot exploration claim. Each planner publishes its currently
 # selected viewpoint so peers can avoid contesting the same hotspot.
 # Used by Coordination::onIntent / claimMatching / selfWinsAgainst
-# (see eig_exploration_planner/coordination.hpp).
+# (see explo_planner/coordination.hpp).
 #
 # header.stamp = sim time of the claim
 # header.frame_id = the planning map frame (e.g. "map")

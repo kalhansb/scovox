@@ -1,11 +1,11 @@
 #pragma once
 
-/// @file consensus_merge_v4.hpp
+/// @file consensus_merge.hpp
 /// @brief Per-voxel and per-frame consensus merge for the split Beta/Dirichlet
-/// v4 pipeline (BetaVoxel occupancy grid ∥ DirVoxel semantics grid).
+/// pipeline (BetaVoxel occupancy grid ∥ DirVoxel semantics grid).
 ///
 /// The two grids merge INDEPENDENTLY — occupancy and semantics never cross —
-/// which is the whole point of the split (vs. v3's single unified Dirichlet).
+/// which is the whole point of the split (vs. a single unified Dirichlet).
 ///
 ///   BetaVoxel (occupancy): generalises the Beta-consensus rule
 ///       a_fused = a_A + a_B − prior
@@ -13,18 +13,18 @@
 ///       a_occ  ← A.a_occ  + B.a_occ  − occ_prior   (occ_prior  = kBetaOccPrior  = 1)
 ///       a_free ← A.a_free + B.a_free − free_prior  (free_prior = kBetaFreePrior = 1)
 ///
-///   DirVoxel (semantics): identical to v3's `mergeSemDir` minus the FREE
+///   DirVoxel (semantics): the slot-reconciling Dirichlet rule with no FREE
 ///     dimension:
 ///       other ← A.other + B.other − (C − K_TOP)·α₀
 ///       top-K slots: union, sum coinciding counts (subtract one duplicated α₀
 ///         prior per coincidence), sort by count, re-truncate to K_TOP;
 ///         the remainder's observed evidence flows to OTHER.
 ///
-/// The α₀ subtractions correspond to the Beta v2 rule's `−1`: every dimension
+/// The α₀ subtractions correspond to the Beta rule's `−1`: every dimension
 /// carries its prior on both sides of the merge, so we subtract one prior once.
-/// Both frames must share `α_0` and `num_classes`; `mergeFramesV4` asserts this.
+/// Both frames must share `α_0` and `num_classes`; `mergeFrames` asserts this.
 ///
-/// TSDF merge is identical to v3 (Curless–Levoy weighted average); reused.
+/// TSDF merge is the Curless–Levoy weighted average.
 
 #include <algorithm>
 #include <cmath>
@@ -35,28 +35,26 @@
 #include <vector>
 
 #include "scovox/beta_voxel.hpp"
-#include "scovox/binary_serializer_v4.hpp"
+#include "scovox/binary_serializer.hpp"
 #include "scovox/dir_voxel.hpp"
 #include "scovox/tsdf_voxel.hpp"
 
 namespace scovox {
 
 // =====================================================================
-// TSDF merge + coordinate hashers, relocated from the (now-removed)
-// consensus_merge_v3.hpp. TSDF merge is wire-version-agnostic; keeping
-// the `mergeTsdfV3` / `detail_v3` names avoids churn at the call sites
-// in mergeFramesV4 below.
+// TSDF merge + coordinate hashers. TSDF merge is wire-agnostic and shared
+// by mergeFrames below.
 // =====================================================================
 
 /// Per-voxel TSDF merge: weighted average distance, summed weights
-/// (Curless–Levoy). Version-agnostic — depends only on TsdfVoxel.
-inline TsdfVoxel mergeTsdfV3(const TsdfVoxel& a, const TsdfVoxel& b) {
+/// (Curless–Levoy). Depends only on TsdfVoxel.
+inline TsdfVoxel mergeTsdf(const TsdfVoxel& a, const TsdfVoxel& b) {
   const float w = a.weight + b.weight;
   if (w <= 0.f) return {0.0f, 0.0f};
   return {(a.distance * a.weight + b.distance * b.weight) / w, w};
 }
 
-namespace detail_v3 {
+namespace detail {
 
 struct CoordHash {
   size_t operator()(const Bonxai::CoordT& c) const noexcept {
@@ -73,7 +71,7 @@ struct CoordEq {
   }
 };
 
-}  // namespace detail_v3
+}  // namespace detail
 
 /// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) occupancy prior.
 /// The `num_classes` / `alpha_0` params are retained for call-site symmetry with
@@ -98,8 +96,8 @@ inline BetaVoxel mergeBeta(const BetaVoxel& a,
   return f;
 }
 
-/// Per-voxel DirVoxel merge under symmetric Dirichlet prior. Mirrors
-/// `mergeSemDir` (consensus_merge_v3.hpp) with no FREE dimension.
+/// Per-voxel DirVoxel merge under symmetric Dirichlet prior — the
+/// slot-reconciling Dirichlet rule with no FREE dimension.
 inline DirVoxel mergeDir(const DirVoxel& a,
                          const DirVoxel& b,
                          uint16_t        num_classes,
@@ -165,28 +163,28 @@ inline DirVoxel mergeDir(const DirVoxel& a,
   return f;
 }
 
-/// Per-frame merge for v4: union of coords from a and b, per-voxel rule at
+/// Per-frame merge: union of coords from a and b, per-voxel rule at
 /// overlaps, copy-through for singletons. TSDF, Beta, and Dir grids merge
 /// independently. Both frames must agree on `num_classes` and `alpha_0`.
-inline BinarySerializerV4::Frame mergeFramesV4(
-    const BinarySerializerV4::Frame& a,
-    const BinarySerializerV4::Frame& b)
+inline BinarySerializer::Frame mergeFrames(
+    const BinarySerializer::Frame& a,
+    const BinarySerializer::Frame& b)
 {
   if (a.num_classes != b.num_classes) {
     throw std::runtime_error(
-        "mergeFramesV4: num_classes mismatch ("
+        "mergeFrames: num_classes mismatch ("
         + std::to_string(a.num_classes) + " vs " + std::to_string(b.num_classes) + ")");
   }
   if (a.num_classes < static_cast<uint16_t>(K_TOP)) {
     throw std::runtime_error(
-        "mergeFramesV4: num_classes (" + std::to_string(a.num_classes)
+        "mergeFrames: num_classes (" + std::to_string(a.num_classes)
         + ") < K_TOP (" + std::to_string(K_TOP) + ")");
   }
   if (!std::isfinite(a.alpha_0) || a.alpha_0 <= 0.f) {
-    throw std::runtime_error("mergeFramesV4: alpha_0 must be finite and > 0");
+    throw std::runtime_error("mergeFrames: alpha_0 must be finite and > 0");
   }
   if (std::abs(a.alpha_0 - b.alpha_0) > 1e-7f) {
-    throw std::runtime_error("mergeFramesV4: alpha_0 mismatch");
+    throw std::runtime_error("mergeFrames: alpha_0 mismatch");
   }
   // Both frames must share a voxel lattice: coords are integer lattice indices,
   // so a resolution mismatch makes union-by-coord misplace every b voxel. A
@@ -194,30 +192,30 @@ inline BinarySerializerV4::Frame mergeFramesV4(
   if (a.resolution > 0.f && b.resolution > 0.f &&
       std::abs(a.resolution - b.resolution) > 1e-6f) {
     throw std::runtime_error(
-        "mergeFramesV4: resolution mismatch ("
+        "mergeFrames: resolution mismatch ("
         + std::to_string(a.resolution) + " vs " + std::to_string(b.resolution) + ")");
   }
 
-  BinarySerializerV4::Frame fused;
+  BinarySerializer::Frame fused;
   fused.resolution  = (a.resolution > 0.f) ? a.resolution : b.resolution;
   fused.num_classes = a.num_classes;
   fused.alpha_0     = a.alpha_0;
 
-  // TSDF — reuse the v3 Curless–Levoy merge.
+  // TSDF — Curless–Levoy merge.
   std::unordered_map<Bonxai::CoordT, TsdfVoxel,
-                     detail_v3::CoordHash, detail_v3::CoordEq> tsdf_map;
+                     detail::CoordHash, detail::CoordEq> tsdf_map;
   for (const auto& d : a.tsdf_deltas) tsdf_map[d.coord] = d.data;
   for (const auto& d : b.tsdf_deltas) {
     auto it = tsdf_map.find(d.coord);
     if (it == tsdf_map.end()) tsdf_map[d.coord] = d.data;
-    else                       it->second = mergeTsdfV3(it->second, d.data);
+    else                       it->second = mergeTsdf(it->second, d.data);
   }
   fused.tsdf_deltas.reserve(tsdf_map.size());
   for (auto& kv : tsdf_map) fused.tsdf_deltas.push_back({kv.first, kv.second});
 
   // Beta (occupancy) — conjugate Beta merge.
   std::unordered_map<Bonxai::CoordT, BetaVoxel,
-                     detail_v3::CoordHash, detail_v3::CoordEq> beta_map;
+                     detail::CoordHash, detail::CoordEq> beta_map;
   for (const auto& d : a.beta_deltas) beta_map[d.coord] = d.data;
   for (const auto& d : b.beta_deltas) {
     auto it = beta_map.find(d.coord);
@@ -230,7 +228,7 @@ inline BinarySerializerV4::Frame mergeFramesV4(
 
   // Dir (semantics) — slot-reconciling Dirichlet merge, independent of Beta.
   std::unordered_map<Bonxai::CoordT, DirVoxel,
-                     detail_v3::CoordHash, detail_v3::CoordEq> dir_map;
+                     detail::CoordHash, detail::CoordEq> dir_map;
   for (const auto& d : a.dir_deltas) dir_map[d.coord] = d.data;
   for (const auto& d : b.dir_deltas) {
     auto it = dir_map.find(d.coord);

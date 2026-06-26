@@ -1,5 +1,5 @@
 /// @file
-/// @brief v4 consensus merge: independent BetaVoxel (occupancy) + DirVoxel
+/// @brief Consensus merge: independent BetaVoxel (occupancy) + DirVoxel
 /// (semantics) merges, each conjugate and mass-conserving.
 
 #include <gtest/gtest.h>
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "scovox/consensus_merge_v4.hpp"
+#include "scovox/consensus_merge.hpp"
 
 namespace {
 
@@ -30,21 +30,21 @@ scovox::DirVoxel dirPrior() {
 // BetaVoxel merge (conjugate Beta)
 // ===========================================================================
 
-TEST(ConsensusMergeV4, BetaMergeWithPriorPreservesEvidence) {
+TEST(ConsensusMerge, BetaMergeWithPriorPreservesEvidence) {
   scovox::BetaVoxel v{2.0f, 3.0f};      // both dims strictly above the prior (1,1)
   auto f = scovox::mergeBeta(v, betaPrior(), kC, kAlpha);
   EXPECT_FLOAT_EQ(f.a_occ,  v.a_occ);   // duplicated prior cancels
   EXPECT_FLOAT_EQ(f.a_free, v.a_free);
 }
 
-TEST(ConsensusMergeV4, BetaMergeOfTwoPriorsIsPrior) {
+TEST(ConsensusMerge, BetaMergeOfTwoPriorsIsPrior) {
   auto f = scovox::mergeBeta(betaPrior(), betaPrior(), kC, kAlpha);
   EXPECT_FLOAT_EQ(f.a_occ,  scovox::kBetaOccPrior);   // two priors fold back to the prior
   EXPECT_FLOAT_EQ(f.a_free, scovox::kBetaFreePrior);
   EXPECT_NEAR(f.p_occ(), 0.5f, 1e-6f);                // symmetric prior → p_occ stays 0.5
 }
 
-TEST(ConsensusMergeV4, BetaMergeIsSymmetricAndAdditive) {
+TEST(ConsensusMerge, BetaMergeIsSymmetricAndAdditive) {
   scovox::BetaVoxel a{3.0f, 1.0f};
   scovox::BetaVoxel b{1.0f, 4.0f};
   auto ab = scovox::mergeBeta(a, b, kC, kAlpha);
@@ -56,7 +56,7 @@ TEST(ConsensusMergeV4, BetaMergeIsSymmetricAndAdditive) {
   EXPECT_FLOAT_EQ(ab.a_free, 5.0f - scovox::kBetaFreePrior);
 }
 
-TEST(ConsensusMergeV4, BetaMassConservation) {
+TEST(ConsensusMerge, BetaMassConservation) {
   // Δ(a_occ + a_free) = a.total + b.total − (occ_prior + free_prior) (one prior removed).
   scovox::BetaVoxel a{2.5f, 1.5f};
   scovox::BetaVoxel b{0.5f, 3.0f};
@@ -69,7 +69,7 @@ TEST(ConsensusMergeV4, BetaMassConservation) {
 // DirVoxel merge (slot reconciliation, no FREE dimension)
 // ===========================================================================
 
-TEST(ConsensusMergeV4, DirMergeWithPriorPreservesEvidence) {
+TEST(ConsensusMerge, DirMergeWithPriorPreservesEvidence) {
   auto v = dirPrior();
   v.other = 0.30f;
   v.cls[0] = 7; v.cnt[0] = 1.5f;
@@ -80,7 +80,7 @@ TEST(ConsensusMergeV4, DirMergeWithPriorPreservesEvidence) {
   EXPECT_EQ(f.cls[1], v.cls[1]); EXPECT_FLOAT_EQ(f.cnt[1], v.cnt[1]);
 }
 
-TEST(ConsensusMergeV4, DirCoincidingClassSumsObservedEvidence) {
+TEST(ConsensusMerge, DirCoincidingClassSumsObservedEvidence) {
   auto a = dirPrior(); a.cls[0] = 5; a.cnt[0] = kAlpha + 1.0f;
   auto b = dirPrior(); b.cls[0] = 5; b.cnt[0] = kAlpha + 2.0f;
   auto f = scovox::mergeDir(a, b, kC, kAlpha);
@@ -88,7 +88,7 @@ TEST(ConsensusMergeV4, DirCoincidingClassSumsObservedEvidence) {
   EXPECT_NEAR(f.cnt[0], kAlpha + 3.0f, 1e-5f);  // one duplicated prior removed
 }
 
-TEST(ConsensusMergeV4, DirEvictionRoutesToOther) {
+TEST(ConsensusMerge, DirEvictionRoutesToOther) {
   auto a = dirPrior(); a.cls[0] = 1; a.cnt[0] = kAlpha + 5.0f; a.cls[1] = 2; a.cnt[1] = kAlpha + 4.0f;
   auto b = dirPrior(); b.cls[0] = 3; b.cnt[0] = kAlpha + 3.0f; b.cls[1] = 4; b.cnt[1] = kAlpha + 2.0f;
   auto f = scovox::mergeDir(a, b, kC, kAlpha);
@@ -102,7 +102,7 @@ TEST(ConsensusMergeV4, DirEvictionRoutesToOther) {
   EXPECT_NEAR(f.other, (kC - scovox::K_TOP) * kAlpha + 3.0f + 2.0f, 1e-5f);
 }
 
-TEST(ConsensusMergeV4, DirMassConservation) {
+TEST(ConsensusMerge, DirMassConservation) {
   // Δ(other + Σcnt) = a.s_class + b.s_class − C·α₀ (one prior removed), holds
   // through eviction (evicted mass routes to OTHER, never lost).
   auto a = dirPrior(); a.cls[0] = 1; a.cnt[0] = kAlpha + 5.0f; a.cls[1] = 2; a.cnt[1] = kAlpha + 4.0f;
@@ -119,10 +119,10 @@ TEST(ConsensusMergeV4, DirMassConservation) {
 // so the prior subtraction in mergeDir can never become prior INFLATION. These
 // pin that clamp on the reachable scovox_core path (the receiver-side
 // projectBetaDirToVoxel / isPriorDir helpers live in the mapping node and are
-// covered by the explicit mergeFramesV4 reject below + node tests).
+// covered by the explicit mergeFrames reject below + node tests).
 // ===========================================================================
 
-TEST(ConsensusMergeV4, DefaultDirVoxelClampsOtherPriorAtKTop) {
+TEST(ConsensusMerge, DefaultDirVoxelClampsOtherPriorAtKTop) {
   // num_classes == K_TOP: residual_dims == 0 → OTHER prior is exactly 0, not α₀.
   auto v2 = scovox::defaultDirVoxel(scovox::K_TOP, kAlpha);
   EXPECT_FLOAT_EQ(v2.other, 0.f);
@@ -134,7 +134,7 @@ TEST(ConsensusMergeV4, DefaultDirVoxelClampsOtherPriorAtKTop) {
   EXPECT_FLOAT_EQ(v2.s_class(), scovox::K_TOP * kAlpha);
 }
 
-TEST(ConsensusMergeV4, DefaultDirVoxelClampsNegativeResidualToZero) {
+TEST(ConsensusMerge, DefaultDirVoxelClampsNegativeResidualToZero) {
   // num_classes == 1 < K_TOP: residual_dims == −1 → without the clamp OTHER
   // would be −α₀; defaultDirVoxel must floor it at 0.
   auto v1 = scovox::defaultDirVoxel(/*num_classes=*/1, kAlpha);
@@ -142,7 +142,7 @@ TEST(ConsensusMergeV4, DefaultDirVoxelClampsNegativeResidualToZero) {
   for (int i = 0; i < scovox::K_TOP; ++i) EXPECT_FLOAT_EQ(v1.cnt[i], kAlpha);
 }
 
-TEST(ConsensusMergeV4, DirMergeAtKTopDoesNotInflateOther) {
+TEST(ConsensusMerge, DirMergeAtKTopDoesNotInflateOther) {
   // At num_classes==K_TOP the merged OTHER prior is 0, so merging two priors
   // must leave OTHER at 0 (no phantom (C−K)·α₀ reintroduced) — the regression
   // the clamp guards: an unclamped negative other_prior would ADD mass here.
@@ -156,7 +156,7 @@ TEST(ConsensusMergeV4, DirMergeAtKTopDoesNotInflateOther) {
               a.s_class() + b.s_class() - kc * kAlpha, 1e-6f);
 }
 
-TEST(ConsensusMergeV4, DirMergeAtKTopEvictionRoutesRawEvidenceToOther) {
+TEST(ConsensusMerge, DirMergeAtKTopEvictionRoutesRawEvidenceToOther) {
   // With C==K_TOP the OTHER prior is 0, so an evicted class dumps ONLY its raw
   // evidence (cnt − α₀) into OTHER — there is no (C−K)·α₀ prior to add on top.
   const uint16_t kc = scovox::K_TOP;  // 2 == K_TOP: all input slots full
@@ -178,29 +178,29 @@ TEST(ConsensusMergeV4, DirMergeAtKTopEvictionRoutesRawEvidenceToOther) {
   EXPECT_NEAR(f.other, 3.0f + 2.0f, 1e-5f);
 }
 
-TEST(ConsensusMergeV4, FrameMergeRejectsNumClassesBelowKTop) {
-  // num_classes < K_TOP cannot yield a valid OTHER prior; mergeFramesV4 must
+TEST(ConsensusMerge, FrameMergeRejectsNumClassesBelowKTop) {
+  // num_classes < K_TOP cannot yield a valid OTHER prior; mergeFrames must
   // reject the configuration upstream rather than fold with inflated unknowns.
-  scovox::BinarySerializerV4::Frame A;
+  scovox::BinarySerializer::Frame A;
   A.num_classes = 1; A.alpha_0 = kAlpha;
-  scovox::BinarySerializerV4::Frame B;
+  scovox::BinarySerializer::Frame B;
   B.num_classes = 1; B.alpha_0 = kAlpha;
-  EXPECT_THROW(scovox::mergeFramesV4(A, B), std::runtime_error);
+  EXPECT_THROW(scovox::mergeFrames(A, B), std::runtime_error);
 }
 
-TEST(ConsensusMergeV4, FrameMergeAcceptsNumClassesEqualKTop) {
+TEST(ConsensusMerge, FrameMergeAcceptsNumClassesEqualKTop) {
   // num_classes == K_TOP is the boundary: residual_dims == 0 is valid (OTHER
   // prior 0), so the merge must SUCCEED — the reject guard is strictly `< K_TOP`.
   const uint16_t kc = scovox::K_TOP;
-  scovox::BinarySerializerV4::Frame A;
+  scovox::BinarySerializer::Frame A;
   A.num_classes = kc; A.alpha_0 = kAlpha; A.resolution = 0.05f;
   { auto va = scovox::defaultDirVoxel(kc, kAlpha); va.cls[0] = 0; va.cnt[0] = kAlpha + 1.0f;
     A.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, va}); }
-  scovox::BinarySerializerV4::Frame B;
+  scovox::BinarySerializer::Frame B;
   B.num_classes = kc; B.alpha_0 = kAlpha; B.resolution = 0.05f;
   { auto vb = scovox::defaultDirVoxel(kc, kAlpha); vb.cls[0] = 0; vb.cnt[0] = kAlpha + 2.0f;
     B.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, vb}); }
-  auto F = scovox::mergeFramesV4(A, B);
+  auto F = scovox::mergeFrames(A, B);
   ASSERT_EQ(F.dir_deltas.size(), 1u);
   EXPECT_EQ(F.dir_deltas[0].data.cls[0], uint16_t(0));
   EXPECT_NEAR(F.dir_deltas[0].data.cnt[0], kAlpha + 3.0f, 1e-5f);
@@ -212,14 +212,14 @@ TEST(ConsensusMergeV4, FrameMergeAcceptsNumClassesEqualKTop) {
 // Frame merge — Beta + Dir merged independently; coords unioned
 // ===========================================================================
 
-TEST(ConsensusMergeV4, FrameMergeUnionsCoordsIndependently) {
-  scovox::BinarySerializerV4::Frame A;
+TEST(ConsensusMerge, FrameMergeUnionsCoordsIndependently) {
+  scovox::BinarySerializer::Frame A;
   A.num_classes = kC; A.alpha_0 = kAlpha; A.resolution = 0.05f;
   A.beta_deltas.push_back({Bonxai::CoordT{1, 2, 3}, scovox::BetaVoxel{2.0f, 1.0f}});
   { auto va = dirPrior(); va.cls[0] = 5; va.cnt[0] = kAlpha + 1.0f;
     A.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, va}); }
 
-  scovox::BinarySerializerV4::Frame B;
+  scovox::BinarySerializer::Frame B;
   B.num_classes = kC; B.alpha_0 = kAlpha; B.resolution = 0.05f;
   B.beta_deltas.push_back({Bonxai::CoordT{1, 2, 3}, scovox::BetaVoxel{3.0f, 2.0f}});  // same coord
   { auto vb = dirPrior(); vb.cls[0] = 5; vb.cnt[0] = kAlpha + 2.0f;
@@ -227,7 +227,7 @@ TEST(ConsensusMergeV4, FrameMergeUnionsCoordsIndependently) {
   { auto vb2 = dirPrior(); vb2.cls[0] = 9; vb2.cnt[0] = kAlpha + 0.5f;
     B.dir_deltas.push_back({Bonxai::CoordT{4, 5, 6}, vb2}); }  // unique coord
 
-  auto F = scovox::mergeFramesV4(A, B);
+  auto F = scovox::mergeFrames(A, B);
 
   // Beta: one shared coord → merged.
   ASSERT_EQ(F.beta_deltas.size(), 1u);
@@ -247,16 +247,16 @@ TEST(ConsensusMergeV4, FrameMergeUnionsCoordsIndependently) {
   EXPECT_TRUE(seen_shared);
 }
 
-TEST(ConsensusMergeV4, FrameMergeRejectsClassCountMismatch) {
-  scovox::BinarySerializerV4::Frame A; A.num_classes = 14; A.alpha_0 = kAlpha;
-  scovox::BinarySerializerV4::Frame B; B.num_classes = 19; B.alpha_0 = kAlpha;
-  EXPECT_THROW(scovox::mergeFramesV4(A, B), std::runtime_error);
+TEST(ConsensusMerge, FrameMergeRejectsClassCountMismatch) {
+  scovox::BinarySerializer::Frame A; A.num_classes = 14; A.alpha_0 = kAlpha;
+  scovox::BinarySerializer::Frame B; B.num_classes = 19; B.alpha_0 = kAlpha;
+  EXPECT_THROW(scovox::mergeFrames(A, B), std::runtime_error);
 }
 
-TEST(ConsensusMergeV4, FrameMergeRejectsAlphaMismatch) {
-  scovox::BinarySerializerV4::Frame A; A.num_classes = 14; A.alpha_0 = 0.01f;
-  scovox::BinarySerializerV4::Frame B; B.num_classes = 14; B.alpha_0 = 0.05f;
-  EXPECT_THROW(scovox::mergeFramesV4(A, B), std::runtime_error);
+TEST(ConsensusMerge, FrameMergeRejectsAlphaMismatch) {
+  scovox::BinarySerializer::Frame A; A.num_classes = 14; A.alpha_0 = 0.01f;
+  scovox::BinarySerializer::Frame B; B.num_classes = 14; B.alpha_0 = 0.05f;
+  EXPECT_THROW(scovox::mergeFrames(A, B), std::runtime_error);
 }
 
 // ===========================================================================
@@ -266,30 +266,30 @@ TEST(ConsensusMergeV4, FrameMergeRejectsAlphaMismatch) {
 // ===========================================================================
 
 namespace {
-const scovox::BinarySerializerV4::BetaDelta* findBeta(
-    const scovox::BinarySerializerV4::Frame& f, int x, int y, int z) {
+const scovox::BinarySerializer::BetaDelta* findBeta(
+    const scovox::BinarySerializer::Frame& f, int x, int y, int z) {
   for (const auto& d : f.beta_deltas)
     if (d.coord.x == x && d.coord.y == y && d.coord.z == z) return &d;
   return nullptr;
 }
-const scovox::BinarySerializerV4::DirDelta* findDir(
-    const scovox::BinarySerializerV4::Frame& f, int x, int y, int z) {
+const scovox::BinarySerializer::DirDelta* findDir(
+    const scovox::BinarySerializer::Frame& f, int x, int y, int z) {
   for (const auto& d : f.dir_deltas)
     if (d.coord.x == x && d.coord.y == y && d.coord.z == z) return &d;
   return nullptr;
 }
 }  // namespace
 
-TEST(ConsensusMergeV4, EndToEndWireMergeRoundTrip) {
+TEST(ConsensusMerge, EndToEndWireMergeRoundTrip) {
   // Two robots observe the same voxel (1,2,3) plus one unique voxel each.
-  scovox::BinarySerializerV4::Frame A;
+  scovox::BinarySerializer::Frame A;
   A.num_classes = kC; A.alpha_0 = kAlpha; A.resolution = 0.05f;
   A.beta_deltas.push_back({Bonxai::CoordT{1, 2, 3}, scovox::BetaVoxel{2.0f, 1.0f}});
   { auto va = dirPrior(); va.cls[0] = 5; va.cnt[0] = kAlpha + 1.0f;
     A.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, va}); }
   A.beta_deltas.push_back({Bonxai::CoordT{9, 9, 9}, scovox::BetaVoxel{3.0f, 0.5f}});
 
-  scovox::BinarySerializerV4::Frame B;
+  scovox::BinarySerializer::Frame B;
   B.num_classes = kC; B.alpha_0 = kAlpha; B.resolution = 0.05f;
   B.beta_deltas.push_back({Bonxai::CoordT{1, 2, 3}, scovox::BetaVoxel{3.0f, 2.0f}});
   { auto vb = dirPrior(); vb.cls[0] = 5; vb.cnt[0] = kAlpha + 2.0f;
@@ -297,10 +297,10 @@ TEST(ConsensusMergeV4, EndToEndWireMergeRoundTrip) {
   B.beta_deltas.push_back({Bonxai::CoordT{7, 7, 7}, scovox::BetaVoxel{1.5f, 1.5f}});
 
   // Wire round-trip each (default: no TSDF), then merge, then round-trip again.
-  auto A2 = scovox::BinarySerializerV4::deserialize(scovox::BinarySerializerV4::serialize(A));
-  auto B2 = scovox::BinarySerializerV4::deserialize(scovox::BinarySerializerV4::serialize(B));
-  auto F  = scovox::mergeFramesV4(A2, B2);
-  auto F2 = scovox::BinarySerializerV4::deserialize(scovox::BinarySerializerV4::serialize(F));
+  auto A2 = scovox::BinarySerializer::deserialize(scovox::BinarySerializer::serialize(A));
+  auto B2 = scovox::BinarySerializer::deserialize(scovox::BinarySerializer::serialize(B));
+  auto F  = scovox::mergeFrames(A2, B2);
+  auto F2 = scovox::BinarySerializer::deserialize(scovox::BinarySerializer::serialize(F));
 
   // Union of coords: {(1,2,3),(9,9,9),(7,7,7)} for Beta; {(1,2,3)} for Dir.
   EXPECT_EQ(F2.beta_deltas.size(), 3u);

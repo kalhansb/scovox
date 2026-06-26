@@ -1,5 +1,5 @@
 /// @file
-/// @brief Wire format v4 (triple-stream: TSDF + BetaVoxel + DirVoxel) round-trip
+/// @brief Wire format (triple-stream: TSDF + BetaVoxel + DirVoxel) round-trip
 /// and header validation.
 
 #include <gtest/gtest.h>
@@ -11,12 +11,12 @@
 #include <stdexcept>
 #include <string>
 
-#include "scovox/binary_serializer_v4.hpp"
+#include "scovox/binary_serializer.hpp"
 
 namespace {
 
-scovox::BinarySerializerV4::Frame makeFrame() {
-  scovox::BinarySerializerV4::Frame f;
+scovox::BinarySerializer::Frame makeFrame() {
+  scovox::BinarySerializer::Frame f;
   f.resolution  = 0.05f;
   f.num_classes = 14;
   f.alpha_0     = scovox::kDefaultDirichletPrior;
@@ -42,8 +42,8 @@ scovox::BinarySerializerV4::Frame makeFrame() {
   return f;
 }
 
-void expectFrameEq(const scovox::BinarySerializerV4::Frame& a,
-                   const scovox::BinarySerializerV4::Frame& b,
+void expectFrameEq(const scovox::BinarySerializer::Frame& a,
+                   const scovox::BinarySerializer::Frame& b,
                    bool expect_tsdf) {
   EXPECT_FLOAT_EQ(a.resolution, b.resolution);
   EXPECT_EQ(a.num_classes,      b.num_classes);
@@ -86,39 +86,39 @@ void expectFrameEq(const scovox::BinarySerializerV4::Frame& a,
 
 }  // namespace
 
-TEST(BinarySerializerV4, TripleStreamRoundTripWithShareTsdf) {
+TEST(BinarySerializer, TripleStreamRoundTripWithShareTsdf) {
   auto f = makeFrame();
-  auto blob = scovox::BinarySerializerV4::serialize(
-      f, scovox::BinarySerializerV4::Options{/*share_tsdf=*/true});
-  auto g = scovox::BinarySerializerV4::deserialize(blob);
+  auto blob = scovox::BinarySerializer::serialize(
+      f, scovox::BinarySerializer::Options{/*share_tsdf=*/true});
+  auto g = scovox::BinarySerializer::deserialize(blob);
   expectFrameEq(f, g, /*expect_tsdf=*/true);
 }
 
-TEST(BinarySerializerV4, BetaDirOnlyDefaultElidesTsdfSection) {
+TEST(BinarySerializer, BetaDirOnlyDefaultElidesTsdfSection) {
   auto f = makeFrame();
-  auto blob = scovox::BinarySerializerV4::serialize(f);  // default: share_tsdf=false
-  auto g = scovox::BinarySerializerV4::deserialize(blob);
+  auto blob = scovox::BinarySerializer::serialize(f);  // default: share_tsdf=false
+  auto g = scovox::BinarySerializer::deserialize(blob);
   expectFrameEq(f, g, /*expect_tsdf=*/false);
 }
 
-TEST(BinarySerializerV4, BadMagicThrows) {
+TEST(BinarySerializer, BadMagicThrows) {
   std::string blob("garbage payload here");
-  EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::runtime_error);
+  EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::runtime_error);
 }
 
-TEST(BinarySerializerV4, BadVersionThrows) {
+TEST(BinarySerializer, BadVersionThrows) {
   auto f = makeFrame();
-  auto blob = scovox::BinarySerializerV4::serialize(f);
-  blob[4] = static_cast<char>(3);  // stomp version to v3
-  EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::runtime_error);
+  auto blob = scovox::BinarySerializer::serialize(f);
+  blob[4] = static_cast<char>(3);  // stomp version byte to an invalid value
+  EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::runtime_error);
 }
 
-TEST(BinarySerializerV4, TruncatedFrameThrows) {
+TEST(BinarySerializer, TruncatedFrameThrows) {
   auto f = makeFrame();
-  auto blob = scovox::BinarySerializerV4::serialize(
-      f, scovox::BinarySerializerV4::Options{/*share_tsdf=*/true});
+  auto blob = scovox::BinarySerializer::serialize(
+      f, scovox::BinarySerializer::Options{/*share_tsdf=*/true});
   blob.resize(blob.size() - 5);  // chop the tail of the last Dir record
-  EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::runtime_error);
+  EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::runtime_error);
 }
 
 // Regression for the forged-record-count DoS (review finding 38 / 8): a frame
@@ -135,16 +135,16 @@ TEST(BinarySerializerV4, TruncatedFrameThrows) {
 // from std::runtime_error). We therefore assert the broad std::exception
 // contract here: every forged count is rejected. Tightening this to
 // std::runtime_error requires capping the count against the remaining byte
-// budget before the reserve in binary_serializer_v4.hpp (review finding 8),
+// budget before the reserve in binary_serializer.hpp (review finding 8),
 // which lives in another file — see cross_file_needed.
-TEST(BinarySerializerV4, ForgedRecordCountIsRejected) {
-  // Build a minimal, otherwise-valid v4 header so the forged count is the only
+TEST(BinarySerializer, ForgedRecordCountIsRejected) {
+  // Build a minimal, otherwise-valid header so the forged count is the only
   // anomaly. Layout (little-endian, 16 B): MAGIC u32, VERSION u8, resolution
   // f32, num_classes u16, K_TOP u8, alpha_0 f32 — then the three stream counts.
   auto makeHeader = []() {
     std::string h;
-    const uint32_t magic   = scovox::BinarySerializerV4::MAGIC;
-    const uint8_t  version = scovox::BinarySerializerV4::FORMAT_VERSION;
+    const uint32_t magic   = scovox::BinarySerializer::MAGIC;
+    const uint8_t  version = scovox::BinarySerializer::FORMAT_VERSION;
     const float    res     = 0.05f;
     const uint16_t nclass  = 14;
     const uint8_t  k_top   = static_cast<uint8_t>(scovox::K_TOP);
@@ -170,14 +170,14 @@ TEST(BinarySerializerV4, ForgedRecordCountIsRejected) {
   {
     std::string blob = makeHeader();
     appendU32(blob, kForged);  // tsdf_count = huge, then nothing
-    EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::exception);
+    EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::exception);
   }
   // (b) Valid empty TSDF stream, forged Beta count, no payload.
   {
     std::string blob = makeHeader();
     appendU32(blob, 0u);       // tsdf_count = 0
     appendU32(blob, kForged);  // beta_count = huge, then nothing
-    EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::exception);
+    EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::exception);
   }
   // (c) Valid empty TSDF + Beta streams, forged Dir count, no payload.
   {
@@ -185,7 +185,7 @@ TEST(BinarySerializerV4, ForgedRecordCountIsRejected) {
     appendU32(blob, 0u);       // tsdf_count = 0
     appendU32(blob, 0u);       // beta_count = 0
     appendU32(blob, kForged);  // dir_count = huge, then nothing
-    EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::exception);
+    EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::exception);
   }
 }
 
@@ -193,11 +193,11 @@ TEST(BinarySerializerV4, ForgedRecordCountIsRejected) {
 // reserve() succeeds must still be caught by the per-record need() guard and
 // throw the documented std::runtime_error (this exercises the truncation path
 // that is NOT short-circuited by an allocation failure).
-TEST(BinarySerializerV4, ModestForgedCountTruncationThrowsRuntimeError) {
+TEST(BinarySerializer, ModestForgedCountTruncationThrowsRuntimeError) {
   auto f = makeFrame();
   // Serialize a real frame (share_tsdf=false): header(16) + tsdf_count(4,=0)
   // + beta_count(4)=2 + beta payload + dir_count(4)=2 + dir payload.
-  auto blob = scovox::BinarySerializerV4::serialize(f);
+  auto blob = scovox::BinarySerializer::serialize(f);
   // Overwrite the Beta count (immediately after header(16) + tsdf_count(4)) with
   // a small-but-too-large value: 1000 records is a trivially-satisfiable
   // reserve() yet the body only holds 2, so the loop's need(20) guard trips on
@@ -205,21 +205,21 @@ TEST(BinarySerializerV4, ModestForgedCountTruncationThrowsRuntimeError) {
   const std::size_t beta_count_off = 16 + 4;
   const uint32_t modest = 1000u;
   std::memcpy(&blob[beta_count_off], &modest, sizeof(modest));
-  EXPECT_THROW(scovox::BinarySerializerV4::deserialize(blob), std::runtime_error);
+  EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::runtime_error);
 }
 
-TEST(BinarySerializerV4, EmitSizeMatchesSpec) {
+TEST(BinarySerializer, EmitSizeMatchesSpec) {
   auto f = makeFrame();
   // Header: 4 + 1 + 4 + 2 + 1 + 4 = 16 B
   // TSDF:   4 (count) + 2 × 20 = 44 B
   // Beta:   4 (count) + 2 × 20 = 44 B   (coord 12 + a_occ 4 + a_free 4)
   // Dir:    4 (count) + 2 × 28 = 60 B   (coord 12 + other 4 + cnt 4·K + cls 2·K)
   if (scovox::K_TOP == 2) {
-    auto full = scovox::BinarySerializerV4::serialize(
-        f, scovox::BinarySerializerV4::Options{/*share_tsdf=*/true});
+    auto full = scovox::BinarySerializer::serialize(
+        f, scovox::BinarySerializer::Options{/*share_tsdf=*/true});
     EXPECT_EQ(full.size(), 16u + 44u + 44u + 60u) << "share_tsdf=true emit size";  // 164
 
-    auto no_tsdf = scovox::BinarySerializerV4::serialize(f);
+    auto no_tsdf = scovox::BinarySerializer::serialize(f);
     EXPECT_EQ(no_tsdf.size(), 16u + 4u + 44u + 60u) << "share_tsdf=false emit size";  // 124
   }
 }

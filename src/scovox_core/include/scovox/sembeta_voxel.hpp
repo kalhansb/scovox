@@ -85,8 +85,8 @@ struct SemBetaVoxel {
 // rounded up to 4-byte alignment for the trailing uint16_t pair.
 // 2026-05-10: relaxed from K=2-only to allow K_TOP sweeps. K=2 remains the
 // production / paper default; only solo non-fusion runs are exercised at K!=2.
-// (The v1/v2 wire formats that also pinned K=2 were removed in the v4-only
-// refactor; SemBetaVoxel now survives only as a projection / viz type.)
+// (The older wire formats that also pinned K=2 were removed when the wire
+// format was unified; SemBetaVoxel now survives only as a projection / viz type.)
 constexpr std::size_t kSemBetaExpectedSize =
     ((12u + 6u * static_cast<std::size_t>(K_TOP) + 3u) / 4u) * 4u;
 static_assert(sizeof(SemBetaVoxel) == kSemBetaExpectedSize,

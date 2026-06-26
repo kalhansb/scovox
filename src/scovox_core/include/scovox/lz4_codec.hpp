@@ -3,10 +3,10 @@
 /// @file lz4_codec.hpp
 /// @brief Standalone LZ4 (de)compression for the binary map wire payload.
 ///
-/// These two helpers used to live on the v1 `ScovoxBinarySerializer` class in
-/// `binary_serializer.hpp`. The v4 wire path (the only surviving codec) reuses
+/// These two helpers used to live on the `ScovoxBinarySerializer` class in
+/// `binary_serializer.hpp`. The wire path (the only codec) reuses
 /// them to compress the serialized blob before it goes on the ROS topic, so
-/// they were lifted here verbatim when the v1/v2/v3 headers were removed. The
+/// they were lifted here verbatim when the older serializer headers were removed. The
 /// enclosing struct name is kept (`ScovoxBinarySerializer`) so the call sites
 /// `scovox::ScovoxBinarySerializer::compressLZ4 / ::decompressLZ4` are byte
 /// identical to before.

@@ -261,9 +261,18 @@ void SemSplitMap::applyDirSaturation(DirVoxel* d) const {
   if (cap <= 0.f) return;
   const float s = d->s_class();
   if (s <= cap) return;
-  const float k = cap / s;            // preserves per-class probabilities
+  const float k       = cap / s;      // preserves per-class probabilities
+  const float alpha_0 = params_.alpha_0;
   d->other *= k;
-  for (int i = 0; i < K_TOP; ++i) d->cnt[i] *= k;
+  for (int i = 0; i < K_TOP; ++i) {
+    d->cnt[i] *= k;
+    // A FILLED slot must never scale below its α₀ prior: a slot conceptually
+    // holds α₀ + observed evidence, and eroding α₀ makes sparse_add_class read a
+    // negative evicted_evidence (cnt − α₀ < 0) and subtract mass from OTHER. Floor
+    // FILLED slots only — flooring empty slots (cnt ≈ k·α₀) would re-inflate
+    // s_class back above the saturation cap.
+    if (d->cls[i] != 0xFFFF && d->cnt[i] < alpha_0) d->cnt[i] = alpha_0;
+  }
 }
 
 // ===========================================================================
