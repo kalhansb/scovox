@@ -11,12 +11,12 @@
 /// `scovox::ScovoxBinarySerializer::compressLZ4 / ::decompressLZ4` are byte
 /// identical to before.
 ///
-/// Wire framing: a 4-byte little-endian original-size header is prepended to
-/// the LZ4 payload so the decompressor knows the exact allocation. A 256 MB
-/// sanity cap rejects obviously corrupt sizes.
+/// Wire framing: a 4-byte big-endian (network byte order) original-size header
+/// is prepended to the LZ4 payload so the decompressor knows the exact
+/// allocation independent of host endianness. A 256 MB sanity cap rejects
+/// obviously corrupt sizes.
 
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -29,9 +29,13 @@ struct ScovoxBinarySerializer {
     if (data.empty()) return {};
     const uint32_t orig_size = static_cast<uint32_t>(data.size());
     const int max_compressed_size = LZ4_compressBound(static_cast<int>(data.size()));
-    // Prepend 4-byte original size so decompressor knows exact allocation
+    // Prepend the original size as a 4-byte big-endian (network byte order)
+    // header so the decompressor sizes its buffer independent of host endianness.
     std::vector<uint8_t> compressed(sizeof(uint32_t) + static_cast<size_t>(max_compressed_size));
-    std::memcpy(compressed.data(), &orig_size, sizeof(orig_size));
+    compressed[0] = static_cast<uint8_t>((orig_size >> 24) & 0xFFu);
+    compressed[1] = static_cast<uint8_t>((orig_size >> 16) & 0xFFu);
+    compressed[2] = static_cast<uint8_t>((orig_size >> 8) & 0xFFu);
+    compressed[3] = static_cast<uint8_t>(orig_size & 0xFFu);
     const int compressed_size = LZ4_compress_default(
         data.c_str(), reinterpret_cast<char*>(compressed.data() + sizeof(uint32_t)),
         static_cast<int>(data.size()), max_compressed_size);
@@ -43,9 +47,12 @@ struct ScovoxBinarySerializer {
   static std::string decompressLZ4(const std::vector<uint8_t>& compressed) {
     const int comp_size = static_cast<int>(compressed.size());
     if (comp_size <= static_cast<int>(sizeof(uint32_t))) return {};
-    // Read prepended original size
-    uint32_t orig_size = 0;
-    std::memcpy(&orig_size, compressed.data(), sizeof(orig_size));
+    // Read the prepended 4-byte big-endian (network byte order) original size.
+    const uint32_t orig_size =
+        (static_cast<uint32_t>(compressed[0]) << 24) |
+        (static_cast<uint32_t>(compressed[1]) << 16) |
+        (static_cast<uint32_t>(compressed[2]) << 8) |
+        static_cast<uint32_t>(compressed[3]);
     const int payload_size = comp_size - static_cast<int>(sizeof(uint32_t));
     // Sanity cap: reject obviously corrupt sizes (>256 MB)
     if (orig_size == 0 || orig_size > 256u * 1024u * 1024u) return {};

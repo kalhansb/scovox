@@ -1128,9 +1128,15 @@ private:
 #else
     bin.little_endian = false;
 #endif
-    if (!comp.empty()) bin.data = std::move(comp);
-    else bin.data.assign(reinterpret_cast<const uint8_t*>(data.data()),
-                         reinterpret_cast<const uint8_t*>(data.data()) + data.size());
+    if (comp.empty()) {
+      // data is non-empty by the guard above, so compressLZ4 only returns empty
+      // on a genuine LZ4 error. The consumer always expects the LZ4 framing, so
+      // shipping the raw blob would be undecodable — drop the frame instead.
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "publishBinaryMapV4: LZ4 compression failed; dropping frame");
+      return {0, 0};
+    }
+    bin.data = std::move(comp);
     const size_t emitted = frame.tsdf_deltas.size() + frame.beta_deltas.size()
                          + frame.dir_deltas.size();
     double mb = double(bin.data.size()) / (1024.0 * 1024.0);

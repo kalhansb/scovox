@@ -83,9 +83,10 @@ struct SemBetaVoxel {
 // At other K_TOP values (P6.1/P6.2 K_TOP sweep): the layout still has
 //   12 B (a_occ + a_free + a_unk) + 4*K (sem_cnt) + 2*K (sem_cls)
 // rounded up to 4-byte alignment for the trailing uint16_t pair.
-// 2026-05-10: relaxed from K=2-only to allow K_TOP sweeps. Wire format
-// (binary_serializer.hpp) and v2 fusion still assume K=2; only solo
-// non-fusion runs are exercised at K!=2.
+// 2026-05-10: relaxed from K=2-only to allow K_TOP sweeps. K=2 remains the
+// production / paper default; only solo non-fusion runs are exercised at K!=2.
+// (The v1/v2 wire formats that also pinned K=2 were removed in the v4-only
+// refactor; SemBetaVoxel now survives only as a projection / viz type.)
 constexpr std::size_t kSemBetaExpectedSize =
     ((12u + 6u * static_cast<std::size_t>(K_TOP) + 3u) / 4u) * 4u;
 static_assert(sizeof(SemBetaVoxel) == kSemBetaExpectedSize,
@@ -93,12 +94,12 @@ static_assert(sizeof(SemBetaVoxel) == kSemBetaExpectedSize,
     "rounded up to 4-byte alignment.");
 static_assert(K_TOP != 2 || sizeof(SemBetaVoxel) == 24,
     "Production K_TOP=2 invariant: SemBetaVoxel must be exactly 24 B "
-    "(paper memory claim + 37 B/voxel v2 wire format depend on this).");
+    "(the paper's 24 B/voxel memory claim depends on this).");
 static_assert(std::is_trivial_v<SemBetaVoxel>,
     "SemBetaVoxel must be trivial for Bonxai's pool allocator (zero-init).");
 static_assert(std::is_standard_layout_v<SemBetaVoxel>,
-    "SemBetaVoxel must have standard layout for the v2 wire format's "
-    "byte-for-byte reinterpret_cast emit path.");
+    "SemBetaVoxel must have standard layout for the offsetof() invariants "
+    "below to be well-defined.");
 static_assert(offsetof(SemBetaVoxel, a_free)
     == offsetof(SemBetaVoxel, a_occ) + sizeof(float),
     "Beta layout: a_free must immediately follow a_occ.");

@@ -106,10 +106,10 @@ inline std::vector<uint16_t> labelPointCloud(
 // DirVoxel overloads (split Beta/Dirichlet substrate — SemSplitMap's Dir grid)
 // ---------------------------------------------------------------------------
 //
-// Same anchor-via-centroid strategy as the SemDir overloads; argmax uses the
-// occupied-class `dominantClass(const DirVoxel&, alpha_0)` from dir_voxel.hpp,
-// which (like the SemDir version) refuses to commit when `other` exceeds every
-// top-K slot's observed evidence. Occupancy is *not* consulted here — in the
+// Same anchor-via-centroid strategy as the SemBeta overloads above; argmax uses
+// the occupied-class `dominantClass(const DirVoxel&, alpha_0)` from
+// dir_voxel.hpp, which refuses to commit when `other` exceeds every top-K
+// slot's observed evidence. Occupancy is *not* consulted here — in the
 // split substrate the surface geometry comes from the TSDF grid and per-point
 // occupancy from the Beta grid; this function answers only "which class".
 
