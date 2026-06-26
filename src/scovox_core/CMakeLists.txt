@@ -15,8 +15,6 @@ pkg_check_modules(LZ4 REQUIRED liblz4)
 add_library(scovox_core
     src/uncertainty.cpp
     src/tsdf_map.cpp
-    src/sembeta_map.cpp
-    src/semdir_map.cpp
     src/sem_split_map.cpp)
 
 target_link_libraries(scovox_core
@@ -45,9 +43,6 @@ target_link_libraries(test_uncertainty scovox_core Eigen3::Eigen)
 ament_add_gtest(test_sparse_add test/test_sparse_add.cpp)
 target_link_libraries(test_sparse_add scovox_core Eigen3::Eigen)
 
-ament_add_gtest(test_binary_serializer test/test_binary_serializer.cpp)
-target_link_libraries(test_binary_serializer scovox_core Eigen3::Eigen ${LZ4_LIBRARIES})
-
 # Step-1 gate of the split-grid refactor (see docs/design/slimvdb_like_tsdf_mapping_plan.md):
 # forces tsdf_voxel.hpp and sembeta_voxel.hpp through the compiler so the
 # header-side static_asserts on layout / sizes / triviality fire.
@@ -59,11 +54,6 @@ target_link_libraries(test_voxel_layouts scovox_core Eigen3::Eigen)
 ament_add_gtest(test_tsdf_map test/test_tsdf_map.cpp)
 target_link_libraries(test_tsdf_map scovox_core Eigen3::Eigen)
 
-# Step-3 gate: SemBetaMap Beta(1,1) prior + miss-no-occ + Dirichlet gating
-# + carve free + wall blocking + evidence saturation + drainTouched.
-ament_add_gtest(test_sembeta_map test/test_sembeta_map.cpp)
-target_link_libraries(test_sembeta_map scovox_core Eigen3::Eigen)
-
 # Step-4 gate: TSDF-typed extractMesh / extractZeroCrossing / extractPointCloud
 # overloads + free labelMesh / labelPointCloud functions.
 ament_add_gtest(test_mesh_labelling test/test_mesh_labelling.cpp)
@@ -72,27 +62,6 @@ target_link_libraries(test_mesh_labelling scovox_core Eigen3::Eigen)
 # Step-5 gate: ScovoxMapSplit composer end-to-end (integrate, mesh, drain).
 ament_add_gtest(test_scovox_map_split test/test_scovox_map_split.cpp)
 target_link_libraries(test_scovox_map_split scovox_core Eigen3::Eigen)
-
-# Step-6 gate: dual-stream wire format v2 round-trip + magic/version validation.
-ament_add_gtest(test_binary_serializer_v2 test/test_binary_serializer_v2.cpp)
-target_link_libraries(test_binary_serializer_v2 scovox_core Eigen3::Eigen)
-
-# Step-7 gate: per-voxel + per-frame consensus merge for the v2 dual-stream format.
-ament_add_gtest(test_consensus_merge_v2 test/test_consensus_merge_v2.cpp)
-target_link_libraries(test_consensus_merge_v2 scovox_core Eigen3::Eigen)
-
-# Step-7.5 gate: unified-Dirichlet SemDirMap (Beta+Dirichlet → single Dir).
-# Symmetric prior + mass-conservation strict equality + dirichlet_min_p_occ gate.
-ament_add_gtest(test_semdir_map test/test_semdir_map.cpp)
-target_link_libraries(test_semdir_map scovox_core Eigen3::Eigen)
-
-# Step-7.5 gate: v3 wire format (semdir-only by default, dual-stream optional).
-ament_add_gtest(test_binary_serializer_v3 test/test_binary_serializer_v3.cpp)
-target_link_libraries(test_binary_serializer_v3 scovox_core Eigen3::Eigen)
-
-# Step-7.5 gate: v3 consensus merge (TSDF + unified-Dirichlet SemDir).
-ament_add_gtest(test_consensus_merge_v3 test/test_consensus_merge_v3.cpp)
-target_link_libraries(test_consensus_merge_v3 scovox_core Eigen3::Eigen)
 
 # Split Beta/Dirichlet substrate (SemSplitMap): de-unifies SemDir into a
 # BetaVoxel occupancy grid + DirVoxel semantics grid. Layout/prior, two-stream

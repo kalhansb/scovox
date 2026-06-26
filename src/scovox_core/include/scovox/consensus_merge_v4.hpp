@@ -36,11 +36,44 @@
 
 #include "scovox/beta_voxel.hpp"
 #include "scovox/binary_serializer_v4.hpp"
-#include "scovox/consensus_merge_v3.hpp"  // mergeTsdfV3 (reused), detail_v3 hashers
 #include "scovox/dir_voxel.hpp"
 #include "scovox/tsdf_voxel.hpp"
 
 namespace scovox {
+
+// =====================================================================
+// TSDF merge + coordinate hashers, relocated from the (now-removed)
+// consensus_merge_v3.hpp. TSDF merge is wire-version-agnostic; keeping
+// the `mergeTsdfV3` / `detail_v3` names avoids churn at the call sites
+// in mergeFramesV4 below.
+// =====================================================================
+
+/// Per-voxel TSDF merge: weighted average distance, summed weights
+/// (Curless–Levoy). Version-agnostic — depends only on TsdfVoxel.
+inline TsdfVoxel mergeTsdfV3(const TsdfVoxel& a, const TsdfVoxel& b) {
+  const float w = a.weight + b.weight;
+  if (w <= 0.f) return {0.0f, 0.0f};
+  return {(a.distance * a.weight + b.distance * b.weight) / w, w};
+}
+
+namespace detail_v3 {
+
+struct CoordHash {
+  size_t operator()(const Bonxai::CoordT& c) const noexcept {
+    return std::hash<int64_t>{}(
+        (int64_t(c.x) * 73856093) ^
+        (int64_t(c.y) * 19349669) ^
+        (int64_t(c.z) * 83492791));
+  }
+};
+
+struct CoordEq {
+  bool operator()(const Bonxai::CoordT& a, const Bonxai::CoordT& b) const noexcept {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+  }
+};
+
+}  // namespace detail_v3
 
 /// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) occupancy prior.
 /// The `num_classes` / `alpha_0` params are retained for call-site symmetry with

@@ -5,6 +5,7 @@
 #include <Eigen/Core>
 #include <vector>
 
+#include "scovox/dir_voxel.hpp"
 #include "scovox/scovox_map_split.hpp"
 
 namespace {
@@ -13,8 +14,8 @@ scovox::ScovoxMapSplit makeMap() {
   scovox::ScovoxMapSplit::Params p;
   p.resolution        = 0.05;
   p.tsdf.sdf_trunc    = 0.15f;
-  p.semdir.kappa0    = 1.0f;
-  p.semdir.dirichlet_min_p_occ = 0.5f;
+  p.semsplit.kappa0    = 1.0f;
+  p.semsplit.dirichlet_min_p_occ = 0.5f;
   return scovox::ScovoxMapSplit(p);
 }
 
@@ -32,14 +33,18 @@ TEST(ScovoxMapSplit, IntegrateHitTouchesBothGrids) {
   EXPECT_GT(m.semdirVoxelCount(), 0u);
 }
 
-TEST(ScovoxMapSplit, IntegrateMissTouchesSemDirOnly) {
+TEST(ScovoxMapSplit, IntegrateMissCarvesOccupancyOnly) {
   auto m = makeMap();
   m.integrateMiss(Eigen::Vector3f(0, 0, 0),
                   Eigen::Vector3f(0.50f, 0, 0),
                   /*quality=*/1.0f);
 
-  EXPECT_EQ(m.tsdfVoxelCount(),    0u) << "miss must NOT allocate TSDF voxels";
-  EXPECT_GT(m.semdirVoxelCount(), 0u);
+  EXPECT_EQ(m.tsdfVoxelCount(),  0u) << "miss must NOT allocate TSDF voxels";
+  // SPLIT substrate: a no-return ray carves the full-ray Beta (occupancy)
+  // grid but commits no class, so the hit-sparse Dir (semantics) grid stays
+  // empty. (Under the old unified SemDir grid both lived in one voxel.)
+  EXPECT_GT(m.betaVoxelCount(), 0u) << "miss must carve occupancy (Beta grid)";
+  EXPECT_EQ(m.dirVoxelCount(),  0u) << "miss commits no semantics (Dir grid empty)";
 }
 
 TEST(ScovoxMapSplit, ExtractMeshHasConsistentLabelArray) {
@@ -78,11 +83,15 @@ TEST(ScovoxMapSplit, MemoryAccountingSplitsCleanly) {
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
                  nullptr, 1.0f);
-  // SemDir should always have more voxels than TSDF (full-ray carve vs band).
-  EXPECT_GE(m.semdirVoxelCount(), m.tsdfVoxelCount());
+  // The full-ray occupancy (Beta) grid should always have at least as many
+  // voxels as the band-only TSDF grid (full-ray carve vs band).
+  EXPECT_GE(m.betaVoxelCount(), m.tsdfVoxelCount());
   // Memory matches struct sizes (modulo Bonxai overhead).
   EXPECT_GT(m.tsdfGridBytes(),   m.tsdfVoxelCount()   * sizeof(scovox::TsdfVoxel)   - 1);
-  EXPECT_GT(m.semdirGridBytes(), m.semdirVoxelCount() * sizeof(scovox::SemDirVoxel) - 1);
+  // Split grid is Beta∥Dir: semdirGridBytes() == Beta bytes + Dir bytes, so it
+  // must exceed the raw Dir-cell footprint (and the raw Beta footprint too).
+  EXPECT_GT(m.semdirGridBytes(), m.dirVoxelCount()  * sizeof(scovox::DirVoxel)  - 1);
+  EXPECT_GT(m.semdirGridBytes(), m.betaVoxelCount() * sizeof(scovox::BetaVoxel) - 1);
 }
 
 TEST(ScovoxMapSplit, DrainTouchedSplitsByGrid) {
@@ -91,12 +100,15 @@ TEST(ScovoxMapSplit, DrainTouchedSplitsByGrid) {
                  Eigen::Vector3f(0.50f, 0, 0),
                  nullptr, 1.0f);
   auto t = m.drainTouchedTsdf();
-  auto s = m.drainTouchedSemDir();
-  EXPECT_GT(t.size(), 0u);
-  EXPECT_GT(s.size(), 0u);
+  auto sb = m.drainTouchedBeta();
+  auto sd = m.drainTouchedDir();
+  EXPECT_GT(t.size(),  0u);
+  EXPECT_GT(sb.size(), 0u);
+  EXPECT_GT(sd.size(), 0u);
   // Second drain should be empty (buffers cleared).
-  EXPECT_EQ(m.drainTouchedTsdf().size(),   0u);
-  EXPECT_EQ(m.drainTouchedSemDir().size(), 0u);
+  EXPECT_EQ(m.drainTouchedTsdf().size(), 0u);
+  EXPECT_EQ(m.drainTouchedBeta().size(), 0u);
+  EXPECT_EQ(m.drainTouchedDir().size(),  0u);
 }
 
 // ===========================================================================
@@ -119,8 +131,8 @@ scovox::ScovoxMapSplit::Params splitParams() {
   scovox::ScovoxMapSplit::Params p;
   p.resolution        = 0.05;
   p.tsdf.sdf_trunc    = 0.15f;
-  p.semdir.kappa0    = 1.0f;
-  p.semdir.dirichlet_min_p_occ = 0.5f;
+  p.semsplit.kappa0    = 1.0f;
+  p.semsplit.dirichlet_min_p_occ = 0.5f;
   return p;
 }
 
@@ -165,16 +177,24 @@ TEST(ScovoxMapSplitFusedWalker, AxisAlignedParityWithSplitWalker) {
   // would pick walking [co, Hp).
   EXPECT_EQ(m_fused.semdirVoxelCount(), m_split.semdirVoxelCount());
 
-  // Hit voxel — unified-Dirichlet state must match exactly.
-  auto h_f = m_fused.semdir().getVoxel(Hp);
-  auto h_s = m_split.semdir().getVoxel(Hp);
-  ASSERT_TRUE(h_f.has_value());
-  ASSERT_TRUE(h_s.has_value());
-  EXPECT_FLOAT_EQ(h_f->alpha_free,  h_s->alpha_free);
-  EXPECT_FLOAT_EQ(h_f->alpha_other, h_s->alpha_other);
+  // Hit voxel — split Beta occupancy state must match exactly.
+  auto b_f = m_fused.semsplit().getBetaVoxel(Hp);
+  auto b_s = m_split.semsplit().getBetaVoxel(Hp);
+  ASSERT_TRUE(b_f.has_value());
+  ASSERT_TRUE(b_s.has_value());
+  EXPECT_FLOAT_EQ(b_f->a_occ,  b_s->a_occ);
+  EXPECT_FLOAT_EQ(b_f->a_free, b_s->a_free);
+  EXPECT_FLOAT_EQ(b_f->p_occ(), b_s->p_occ());
+
+  // Hit voxel — split Dir class evidence must match exactly.
+  auto d_f = m_fused.semsplit().getDirVoxel(Hp);
+  auto d_s = m_split.semsplit().getDirVoxel(Hp);
+  ASSERT_TRUE(d_f.has_value());
+  ASSERT_TRUE(d_s.has_value());
+  EXPECT_FLOAT_EQ(d_f->other, d_s->other);
   for (int i = 0; i < scovox::K_TOP; ++i) {
-    EXPECT_FLOAT_EQ(h_f->cnt[i], h_s->cnt[i]);
-    EXPECT_EQ(h_f->cls[i],       h_s->cls[i]);
+    EXPECT_FLOAT_EQ(d_f->cnt[i], d_s->cnt[i]);
+    EXPECT_EQ(d_f->cls[i],       d_s->cls[i]);
   }
 }
 
@@ -253,25 +273,18 @@ scovox::ScovoxMapSplit makeSplitMap(bool fused = true) {
   scovox::ScovoxMapSplit::Params p;
   p.resolution                 = 0.05;
   p.tsdf.sdf_trunc             = 0.15f;
-  p.semdir.kappa0              = 1.0f;
-  p.semdir.dirichlet_min_p_occ = 0.5f;
-  p.semdir.num_classes         = 14;
-  p.semdir.alpha_0             = scovox::kDefaultDirichletPrior;
-  p.substrate                  = scovox::SemanticSubstrate::SPLIT;
+  p.semsplit.kappa0              = 1.0f;
+  p.semsplit.dirichlet_min_p_occ = 0.5f;
+  p.semsplit.num_classes         = 14;
+  p.semsplit.alpha_0             = scovox::kDefaultDirichletPrior;
   p.fused_walker               = fused;
   return scovox::ScovoxMapSplit(p);
 }
 
 }  // namespace
 
-TEST(ScovoxMapSplitSubstrate, DefaultIsSemDir) {
-  auto m = makeMap();
-  EXPECT_FALSE(m.usesSplit());
-}
-
 TEST(ScovoxMapSplitSubstrate, IntegrateHitTouchesAllThreeGrids) {
   auto m = makeSplitMap();
-  EXPECT_TRUE(m.usesSplit());
   std::vector<float> probs{0.f, 1.f, 0.f, 0.f};  // class 1
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
@@ -323,18 +336,4 @@ TEST(ScovoxMapSplitSubstrate, DrainTouchedPerGrid) {
   // Buffers cleared.
   EXPECT_EQ(m.drainTouchedBeta().size(), 0u);
   EXPECT_EQ(m.drainTouchedDir().size(),  0u);
-}
-
-TEST(ScovoxMapSplitSubstrate, OccupancyParityWithSemDirFullRayCarve) {
-  // Both substrates carve occupancy along the full ray, so the occupancy
-  // voxel set (TSDF band + carved free) should have the same extent. Compare
-  // the carved-occupancy voxel counts: SPLIT's Beta grid vs SEMDIR's SemDir
-  // grid for the identical ray.
-  auto m_split  = makeSplitMap();
-  auto m_semdir = makeMap();
-  std::vector<float> probs{0.f, 1.f, 0.f, 0.f};
-  m_split.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(0.50f, 0, 0), &probs, 1.0f);
-  m_semdir.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(0.50f, 0, 0), &probs, 1.0f);
-  EXPECT_EQ(m_split.betaVoxelCount(), m_semdir.semdirVoxelCount())
-      << "both carve occupancy full-ray over the same voxel set";
 }

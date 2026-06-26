@@ -4,7 +4,7 @@
 ///
 /// Purpose: produce the "system characteristics" number for the paper
 ///   TsdfMap   : X MB  (band-only, byte-equivalent to SLIM-VDB TSDF)
-///   SemDirMap: Y MB  (SCovox contribution: Beta + sparse Dirichlet)
+///   SemSplit  : Y MB  (SCovox contribution: Beta ∥ sparse Dirichlet)
 ///   Total     : X + Y MB
 ///
 /// without depending on the ROS layer (Steps 8-9 of the refactor are
@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "scovox/dir_voxel.hpp"
 #include "scovox/scovox_map_split.hpp"
 
 namespace {
@@ -90,10 +91,10 @@ int main(int argc, char** argv) {
   p.resolution           = args.resolution;
   p.tsdf.sdf_trunc       = args.sdf_trunc;
   p.tsdf.space_carving   = false;            // SLIM-VDB default
-  p.semdir.dirichlet_min_p_occ = 0.5f;
-  p.semdir.kappa0       = 1.0f;
-  p.semdir.range_decay_length  = 50.0f;
-  p.semdir.num_classes   = 4;  // matches the demo's 4-class softmax
+  p.semsplit.dirichlet_min_p_occ = 0.5f;
+  p.semsplit.kappa0       = 1.0f;
+  p.semsplit.range_decay_length  = 50.0f;
+  p.semsplit.num_classes   = 4;  // matches the demo's 4-class softmax
   scovox::ScovoxMapSplit map(p);
 
   std::mt19937 rng(args.seed);
@@ -141,7 +142,7 @@ int main(int argc, char** argv) {
     // Drain touched-set every 10 frames to mimic the per-publish cycle.
     if ((f + 1) % 10 == 0) {
       auto t = map.drainTouchedTsdf();
-      auto s = map.drainTouchedSemDir();
+      auto s = map.drainTouchedDir();
       (void)t; (void)s;
     }
   }
@@ -155,8 +156,8 @@ int main(int argc, char** argv) {
   const std::size_t tsdf_bytes    = map.tsdfGridBytes();
   const std::size_t semdir_bytes  = map.semdirGridBytes();
 
-  const double tsdf_raw_mb   = double(tsdf_voxels   * sizeof(scovox::TsdfVoxel))   / (1024.0 * 1024.0);
-  const double semdir_raw_mb = double(semdir_voxels * sizeof(scovox::SemDirVoxel)) / (1024.0 * 1024.0);
+  const double tsdf_raw_mb   = double(tsdf_voxels   * sizeof(scovox::TsdfVoxel))  / (1024.0 * 1024.0);
+  const double semdir_raw_mb = double(semdir_voxels * sizeof(scovox::DirVoxel))  / (1024.0 * 1024.0);
   const double tsdf_total_mb   = double(tsdf_bytes)   / (1024.0 * 1024.0);
   const double semdir_total_mb = double(semdir_bytes) / (1024.0 * 1024.0);
 
@@ -169,23 +170,23 @@ int main(int argc, char** argv) {
             << sizeof(scovox::TsdfVoxel) << " B/voxel)\n";
   std::cout << "    Bonxai total:  " << tsdf_total_mb << " MB (incl. leaf metadata)\n";
 
-  std::cout << "\n  SemDirMap:\n";
+  std::cout << "\n  SemSplit (Beta∥Dir):\n";
   std::cout << "    voxels:        " << semdir_voxels << "\n";
   std::cout << "    raw cells:     " << semdir_raw_mb << " MB ("
-            << sizeof(scovox::SemDirVoxel) << " B/voxel)\n";
+            << sizeof(scovox::DirVoxel) << " B/Dir voxel)\n";
   std::cout << "    Bonxai total:  " << semdir_total_mb << " MB (incl. leaf metadata)\n";
 
   std::cout << "\n  Total:           " << (tsdf_total_mb + semdir_total_mb) << " MB\n";
 
   if (semdir_voxels > 0) {
-    std::cout << "  TSDF/SemDir voxel ratio:  "
+    std::cout << "  TSDF/SemSplit voxel ratio:  "
               << double(tsdf_voxels) / double(semdir_voxels) << " ("
-              << "TSDF is band-only, SemDir is full-ray)\n";
+              << "TSDF is band-only, SemSplit Dir is hit-sparse)\n";
   }
   if (semdir_voxels >= tsdf_voxels) {
-    std::cout << "  Sanity (SemDir >= TSDF): PASS\n";
+    std::cout << "  Sanity (SemSplit >= TSDF): PASS\n";
   } else {
-    std::cout << "  Sanity (SemDir >= TSDF): FAIL — bug in carve geometry?\n";
+    std::cout << "  Sanity (SemSplit >= TSDF): FAIL — bug in carve geometry?\n";
     return 1;
   }
 

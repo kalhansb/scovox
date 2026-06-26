@@ -25,149 +25,82 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include "scovox/scovoxmap.hpp"
+#include "scovox/map_interface.hpp"   // scovox::Params (launch-param plumbing)
 #include "scovox/scovox_map_split.hpp"
 #include "scovox/node_utils.hpp"
 #include "scovox_msgs/msg/scovox_map.hpp"
 #include "scovox_msgs/msg/scovox_voxel.hpp"
 #include "scovox_msgs/msg/scovox_semantic_evidence.hpp"
 #include "scovox_msgs/msg/scovox_map_binary.hpp"
-#include "scovox/binary_serializer.hpp"
-#include "scovox/binary_serializer_v2.hpp"
-#include "scovox/binary_serializer_v3.hpp"
 #include "scovox/binary_serializer_v4.hpp"
+#include "scovox/lz4_codec.hpp"
 #include "scovox/marching_cubes.hpp"
 #include "scovox/mesh_labelling.hpp"
 #include "scovox_msgs/srv/extract_mesh.hpp"
 
 namespace enc = sensor_msgs::image_encodings;
 
-namespace {
-/// SemDir → SemBeta projection for the v2-shaped wire / publishPointCloudV2
-/// fields. The composer's substrate is now SemDirVoxel (unified Dirichlet,
-/// Step 7.5) but the v2 BinarySerializerV2 wire format + the per-voxel
-/// PointCloud2 field schema (a_occ, a_free, a_unk, sem_cnt0/cls0/cnt1/cls1)
-/// still expect the SemBeta layout. The projection is lossless on p_occ
-/// (`s_occ()` collapses into a_occ, alpha_free → a_free, alpha_other → a_unk)
-/// and on per-class accumulated evidence (cnt[i] − α_0 → sem_cnt[i]).
-/// Empty slots (cls[i] == 0xFFFF) project to SemBeta's "empty slot" with
-/// sem_cnt = 0.
-/// **DEPRECATED — retire after v3 wire format is the default**.  Step 8
-/// landed the v3 sender (publishBinaryMapV3) and the dscovox v3 receiver
-/// (onBinaryMapV3 in dscovox_node.cpp).  v3 carries SemDirVoxel as-is at
-/// 32 B/voxel vs the v2 SemBeta block's 37 B/voxel, and the receiver
-/// rebuilds the symmetric Dirichlet prior from the wire header rather
-/// than the sender's launch params.
-///
-/// Currently still alive because:
-///   1. wire_format launch arg defaults to "v2" for backward compat
-///      (existing dscovox receivers, NPZ analysis tooling, …)
-///   2. publishPointCloudV2 / publishTSDFPointCloudV2 / NPZ-dump paths
-///      still call this on a hot path to bridge SemDir → SemBeta-shaped
-///      visualisation fields (a_occ, a_free, a_unk, sem_cnt0/cls0/…).
-/// Removal plan: (a) flip wire_format default to v3 once the 8-scene
-/// E2.1 fusion batch confirms parity with the v2 numbers; (b) drop
-/// publishBinaryMapV2 + projectSemDirToSemBeta; (c) replace the
-/// publishPointCloudV2 SemBeta-field walker with a SemDir-native
-/// publisher that calls SemDirVoxel-typed variance/EIG helpers (the
-/// same uncertainty.hpp cleanup the dscovox v3 publisher already needs).
-inline scovox::SemBetaVoxel projectSemDirToSemBeta(const scovox::SemDirVoxel& v) {
-  scovox::SemBetaVoxel p{};
-  p.a_occ  = v.s_occ();
-  p.a_free = v.alpha_free;
-  p.a_unk  = v.alpha_other;
-  for (int i = 0; i < scovox::K_TOP; ++i) {
-    if (v.cls[i] == 0xFFFF) {
-      p.sem_cnt[i] = 0.f;
-      p.sem_cls[i] = 0xFFFF;
-    } else {
-      // Subtract the per-slot α_0 prior so the SemBeta projection sees
-      // observed evidence only (matching legacy sem_cnt semantics where
-      // empty slots had cnt=0 and filled slots had cnt=Σ_observations).
-      p.sem_cnt[i] = std::max(0.f, v.cnt[i] - scovox::kDefaultDirichletPrior);
-      p.sem_cls[i] = v.cls[i];
-    }
-  }
-  return p;
-}
-}  // namespace
-
 class SCovoxNode : public rclcpp::Node {
 public:
   SCovoxNode() : Node("scovox_node"), tf_buffer_(this->get_clock(), tf2::Duration(std::chrono::seconds(600))), tf_listener_(tf_buffer_) {
     auto P = declareMapParams();
-    // Always allocate the legacy `map_` so its params() are available to
+    declareNodeParams();
+    // Cache the launch param block. scovox::Params still carries the
     // node-level sensor filters (range_decay_length, min_range, max_range,
-    // grazing_angle_threshold, …) regardless of mode. In split mode no rays
-    // are integrated into it; the empty grid + params block costs only a
-    // few hundred bytes of overhead.
-    map_ = std::make_unique<scovox::Map>(P);
-    declareNodeParams();   // sets use_split_ / share_tsdf_ before substrate creation
-    if (use_split_ && P.sdf_trunc == 0.f) {
-      RCLCPP_WARN(get_logger(),
-        "TSDF off (enable_tsdf=false or sdf_trunc_voxels=0) has no clean effect in split "
-        "mode (use_split=true): TsdfMap clamps sdf_trunc back up so it keeps integrating a "
-        "surface, yet ~/tsdf_pointcloud is suppressed (the publisher is gated on the legacy "
-        "map's sdf_trunc=0). Use the legacy fused path (use_split=false) for TSDF-free mapping.");
-    }
-    if (use_split_) {
-      // Step 8 (D7) — split-grid v2 substrate. ScovoxMapSplit::Params shares
-      // (resolution, inner_bits, leaf_bits) across both grids; per-substrate
-      // params (sdf_trunc, w_occ/w_free/kappa0, evidence_saturation, …) flow
-      // through from launch params via TsdfMap::Params and SemBetaMap::Params.
-      scovox::ScovoxMapSplit::Params SP;
-      SP.resolution = P.resolution;
-      SP.inner_bits = P.inner_bits;
-      SP.leaf_bits  = P.leaf_bits;
-      // TsdfMap: SLIM-VDB-equivalent defaults; only sdf_trunc + space_carving
-      // carry over from P. weighting_function defaults to constant(1).
-      SP.tsdf.sdf_trunc     = P.sdf_trunc;
-      SP.tsdf.space_carving = P.tsdf_space_carving;
-      // SemDirMap (Step 7.5: unified Dirichlet, supersedes SemBetaMap as the
-      // composer's semantic substrate): every Bayesian / sparse-Dirichlet knob
-      // from legacy P maps 1:1. semantic_occ_gate / min_range / max_range /
-      // grazing_angle_threshold are node-level sensor filters consumed
-      // BEFORE integrateHit so they are not mirrored. evidence_saturation
-      // widens uint16→float.
-      SP.semdir.w_free                  = P.w_free;
-      SP.semdir.w_occ                   = P.w_occ;
-      SP.semdir.kappa0                  = P.kappa0;
-      SP.semdir.carve_skip_occ_threshold = P.carve_skip_occ_threshold;
-      SP.semdir.evidence_saturation     = static_cast<float>(P.evidence_saturation);
-      SP.semdir.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
-      SP.semdir.range_decay_length      = static_cast<float>(P.range_decay_length);
-      SP.semdir.semantic_mode           = P.semantic_mode;
-      // num_classes / alpha_0 — dataset-dependent priors that govern the
-      // OTHER bucket's prior mass `(C − K_TOP)·α_0` and the FREE prior
-      // `α_0`. Wrong num_classes shifts p_occ_prior and the eviction
-      // capacity (KITTI=20 vs NYU13=14 gives p_occ_prior=0.952 vs 0.933);
-      // post-SemDir KITTI mIoU regression analysis 2026-05-14 traced
-      // ~0.005 of a 0.025 gap to C=14 leaking into seq08. Defaults match
-      // SemDirMap::Params defaults (NYU13 / 0.01) so legacy launches still
-      // boot. The two new launch params (declared in declareNodeParams)
-      // are pure SemDir knobs — ignored on the legacy fused-Voxel path.
-      SP.semdir.num_classes             = num_classes_;
-      SP.semdir.alpha_0                 = alpha_0_;
-      // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default
-      // true; set false via `fused_walker:=false` launch arg for A/B
-      // parity testing against the legacy two-DDA split path.
-      SP.fused_walker = fused_walker_;
-      // Semantic substrate: SPLIT de-unifies SemDir into Beta ∥ Dir grids
-      // (wire format v4). Default SEMDIR keeps the unified-Dirichlet path.
-      SP.substrate = split_substrate_ ? scovox::SemanticSubstrate::SPLIT
-                                      : scovox::SemanticSubstrate::SEMDIR;
-      split_map_ = std::make_unique<scovox::ScovoxMapSplit>(SP);
-    }
+    // grazing_angle_threshold, semantic_occ_gate, resolution, top_k) that the
+    // integration + publish paths read; with the legacy map_ object gone this
+    // is their owner.
+    map_params_ = P;
+    // Raw launch sdf_trunc (0 == "TSDF off"). TsdfMap re-clamps a <=0 value
+    // back up internally, so the ~/tsdf_pointcloud publisher, the
+    // ~/extract_mesh service, and publishTSDFPointCloud gate on this cached
+    // launch value rather than the (always-positive) TsdfMap::params().sdf_trunc.
+    sdf_trunc_launch_ = P.sdf_trunc;
+    // Split-grid v4 substrate. ScovoxMapSplit::Params shares
+    // (resolution, inner_bits, leaf_bits) across both grids; per-substrate
+    // params (sdf_trunc, w_occ/w_free/kappa0, evidence_saturation, …) flow
+    // through from launch params via TsdfMap::Params and SemSplitMap::Params.
+    scovox::ScovoxMapSplit::Params SP;
+    SP.resolution = P.resolution;
+    SP.inner_bits = P.inner_bits;
+    SP.leaf_bits  = P.leaf_bits;
+    // TsdfMap: SLIM-VDB-equivalent defaults; only sdf_trunc + space_carving
+    // carry over from P. weighting_function defaults to constant(1).
+    SP.tsdf.sdf_trunc     = P.sdf_trunc;
+    SP.tsdf.space_carving = P.tsdf_space_carving;
+    // SemSplitMap (de-unified BetaVoxel ∥ DirVoxel substrate): every
+    // Bayesian / sparse-Dirichlet knob from launch P maps 1:1.
+    // semantic_occ_gate / min_range / max_range / grazing_angle_threshold are
+    // node-level sensor filters consumed BEFORE integrateHit so they are not
+    // mirrored. evidence_saturation widens uint16→float.
+    SP.semsplit.w_free                  = P.w_free;
+    SP.semsplit.w_occ                   = P.w_occ;
+    SP.semsplit.kappa0                  = P.kappa0;
+    SP.semsplit.carve_skip_occ_threshold = P.carve_skip_occ_threshold;
+    SP.semsplit.evidence_saturation     = static_cast<float>(P.evidence_saturation);
+    SP.semsplit.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
+    SP.semsplit.range_decay_length      = static_cast<float>(P.range_decay_length);
+    SP.semsplit.semantic_mode           = P.semantic_mode;
+    // num_classes / alpha_0 — dataset-dependent priors that govern the
+    // OTHER bucket's prior mass `(C − K_TOP)·α_0`. Wrong num_classes shifts
+    // the semantic prior and the eviction capacity (KITTI=20 vs NYU13=14).
+    // Defaults match SemSplitMap::Params defaults (NYU13 / 0.01). KITTI
+    // launches override num_classes:=20.
+    SP.semsplit.num_classes             = num_classes_;
+    SP.semsplit.alpha_0                 = alpha_0_;
+    // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default
+    // true; set false via `fused_walker:=false` launch arg for A/B
+    // parity testing against the two-DDA split path.
+    SP.fused_walker = fused_walker_;
+    split_map_ = std::make_unique<scovox::ScovoxMapSplit>(SP);
     loadSemanticColorMap();  initializeSemanticColors();
     setupSubscribers();
     setupPublishers();
-    if (pub_tsdf_ && map_->params().sdf_trunc > 0.f && !use_split_) {
-      // ExtractMesh service walks the legacy fused grid; not yet ported to
-      // ScovoxMapSplit. RViz mesh consumers in split mode can still get
-      // the surface point cloud via ~/tsdf_pointcloud (publishTSDFPointCloudV2
-      // does the cross-grid label join). Triangle-mesh extraction in split
-      // mode is a follow-on (composer.extractMesh exists; just needs the
-      // service plumbing once a paper figure or planner consumer demands it).
+    if (pub_tsdf_ && P.sdf_trunc > 0.f) {
+      // Triangle-mesh extraction from the split substrate (TSDF geometry +
+      // Dir-grid labels). RViz mesh consumers can also get the surface point
+      // cloud via ~/tsdf_pointcloud (publishTSDFPointCloud does the cross-grid
+      // label join).
       extract_mesh_srv_ = create_service<scovox_msgs::srv::ExtractMesh>(
           "~/extract_mesh",
           std::bind(&SCovoxNode::onExtractMesh, this,
@@ -189,21 +122,19 @@ public:
         if (pub_pc_) publishPointCloud();
         if (tsdf_pub_) publishTSDFPointCloud();
       });
-    RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s use_split=%d share_tsdf=%d fused_walker=%d",
-      P.resolution, mode_.c_str(), int_frame_.c_str(), (int)use_split_, (int)share_tsdf_, (int)fused_walker_);
-    RCLCPP_INFO(get_logger(), "grid leaf_bits=%u inner_bits=%u block=%ux%ux%u voxels_per_leaf=%u",
-      map_->grid().leafBits(), map_->grid().innetBits(),
-      1u << map_->grid().leafBits(), 1u << map_->grid().leafBits(), 1u << map_->grid().leafBits(),
-      1u << (3u * map_->grid().leafBits()));
-    RCLCPP_INFO(get_logger(), "sizeof(Mask)=%zu sizeof(LeafGrid)=%zu sizeof(Voxel)=%zu trivial=%d",
-      sizeof(Bonxai::Mask), sizeof(scovox::Map::Grid::LeafGrid), sizeof(scovox::Voxel),
-      (int)std::is_trivial_v<scovox::Voxel>);
+    RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s share_tsdf=%d fused_walker=%d",
+      P.resolution, mode_.c_str(), int_frame_.c_str(), (int)share_tsdf_, (int)fused_walker_);
+    {
+      const auto& tg = split_map_->tsdf().grid();
+      RCLCPP_INFO(get_logger(), "grid leaf_bits=%u inner_bits=%u block=%ux%ux%u voxels_per_leaf=%u",
+        tg.leafBits(), tg.innetBits(),
+        1u << tg.leafBits(), 1u << tg.leafBits(), 1u << tg.leafBits(),
+        1u << (3u * tg.leafBits()));
+    }
     RCLCPP_INFO(get_logger(), "TSDF: sdf_trunc=%.3f m space_carving=%d band_only=%d (sdf_trunc=0 means off; set via enable_tsdf / sdf_trunc_voxels)",
       P.sdf_trunc, (int)P.tsdf_space_carving, (int)P.band_only_integration);
-    if (use_split_) {
-      RCLCPP_INFO(get_logger(), "split substrate: sizeof(TsdfVoxel)=%zu sizeof(SemDirVoxel)=%zu",
-        sizeof(scovox::TsdfVoxel), sizeof(scovox::SemDirVoxel));
-    }
+    RCLCPP_INFO(get_logger(), "split substrate: sizeof(TsdfVoxel)=%zu sizeof(BetaVoxel)=%zu sizeof(DirVoxel)=%zu",
+      sizeof(scovox::TsdfVoxel), sizeof(scovox::BetaVoxel), sizeof(scovox::DirVoxel));
   }
   ~SCovoxNode() override {
     // Join the diagnostic memlog worker (scheduleMemUsage) before any node
@@ -309,104 +240,25 @@ private:
     // per-grid memUsageDetailed walk + detached reader thread don't run on
     // the production mapping hot path; set true to profile memory.
     mem_log_ = dp("log_mem_usage", false);
-    // Step 8 (D7) — split-grid v2 toggle. When true, this node integrates
-    // into a `ScovoxMapSplit` (TsdfMap + SemBetaMap) instead of the legacy
-    // fused `scovox::Map`, walks SemBeta on ~/pointcloud, walks TsdfMap +
-    // labelPointCloud on ~/tsdf_pointcloud, and emits BinarySerializerV2
-    // frames (msg->version=2) on ~/scovox_bin. Default false for backward
-    // compat — legacy Replica/KITTI experiments reproduce verbatim.
-    use_split_ = dp("use_split", false);
-    // Sender-side wire toggle. When use_split_=true:
-    //   share_tsdf=false (default): emit SemBeta-only frames (37 B/voxel,
-    //     dscovox-fusion-only path; each robot keeps its local TSDF).
-    //   share_tsdf=true: emit dual-stream TSDF + SemBeta (57 B/voxel,
-    //     opt-in for fused-geometry consensus).
-    // Ignored when use_split_=false (legacy v1 wire format has no
-    // share_tsdf concept). Defaults match BinarySerializerV2::Options.
+    // Sender-side wire toggle for the v4 TSDF stream:
+    //   share_tsdf=false (default): emit Beta + Dir only (dscovox-fusion-only
+    //     path; each robot keeps its local TSDF).
+    //   share_tsdf=true: also emit the TSDF stream (opt-in for fused-geometry
+    //     consensus). Maps to BinarySerializerV4::Options.share_tsdf.
     share_tsdf_ = dp("share_tsdf", false);
     // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default true.
-    // Set false to fall back to the legacy two-DDA split path
-    // (TsdfMap::integrateRay + SemBetaMap::integrateHit) for A/B parity
-    // testing. Ignored when use_split_=false (legacy fused-Voxel path).
+    // Set false to fall back to the two-DDA split path for A/B parity testing.
     fused_walker_ = dp("fused_walker", true);
-    // SemDir priors (use_split=true only). num_classes is the dataset's
-    // total class count — sets the OTHER bucket's prior mass to
-    // (num_classes − K_TOP) · alpha_0 so the implicit Dirichlet still
-    // marginalises onto the true (C+1)-category distribution. Defaults
-    // match SemDirMap::Params (NYU13 / 0.01). KITTI launches override
-    // num_classes:=20; Replica/SceneNet stay at 14.
+    // Semantic priors. num_classes is the dataset's total class count — sets
+    // the OTHER bucket's prior mass to (num_classes − K_TOP) · alpha_0 so the
+    // implicit Dirichlet still marginalises onto the true (C+1)-category
+    // distribution. Defaults match SemSplitMap::Params (NYU13 / 0.01). KITTI
+    // launches override num_classes:=20; Replica/SceneNet stay at 14.
     num_classes_ = std::max<int>(scovox::K_TOP + 1,
-                                 dp("num_classes", (int)scovox::SemDirMap::Params{}.num_classes));
+                                 dp("num_classes", (int)scovox::SemSplitMap::Params{}.num_classes));
     alpha_0_     = (float)dp("dirichlet_prior",
-                             (double)scovox::SemDirMap::Params{}.alpha_0);
+                             (double)scovox::SemSplitMap::Params{}.alpha_0);
     if (alpha_0_ <= 0.f) alpha_0_ = scovox::kDefaultDirichletPrior;
-    // Wire-format selector (use_split=true only). v2 keeps the SemBeta-
-    // projected wire so the existing dscovox_node v2 receiver still works
-    // — production safe default during the SemDir transition. v3 emits
-    // SemDirVoxel-native frames (20 B/voxel vs v2's 37 B/voxel projected)
-    // and carries num_classes/alpha_0 in the header so the receiver doesn't
-    // need to share launch params. Set v3 once the dscovox receiver lands.
-    {
-      const std::string fmt = dp("wire_format", std::string("v2"));
-      if (fmt == "v4")      { wire_format_v4_ = true; }
-      else if (fmt == "v3") { wire_format_v3_ = true; }
-      else if (fmt == "v2") { /* SemBeta-projected default */ }
-      else {
-        RCLCPP_WARN(get_logger(),
-          "wire_format='%s' unrecognised (want v2|v3|v4); defaulting v2.", fmt.c_str());
-      }
-    }
-    // Semantic substrate selector inside ScovoxMapSplit (use_split=true only):
-    //   "semdir" (default): unified-Dirichlet SemDirVoxel — wire v2/v3.
-    //   "split":            de-unified BetaVoxel ∥ DirVoxel — wire v4.
-    {
-      const std::string sub = dp("semantic_substrate", std::string("semdir"));
-      if (sub == "split")       split_substrate_ = true;
-      else if (sub == "semdir") split_substrate_ = false;
-      else {
-        RCLCPP_WARN(get_logger(),
-          "semantic_substrate='%s' unrecognised (want semdir|split); defaulting semdir.",
-          sub.c_str());
-      }
-    }
-    // Coherence guards — ORDER MATTERS (single-pass, no re-check loop):
-    //   G1: wire_format=v4 ⇒ split_substrate   (set split if v4 was asked)
-    //   G2: split_substrate ⇒ use_split         (undo split+v4 if no ScovoxMapSplit)
-    //   G3: split_substrate ⇒ wire_format=v4    (split has no SemDir grid)
-    // G1 must precede G2 so G2 can undo a v4-implied split when use_split is
-    // off; G3 is the idempotent final step. Reordering can leave the invalid
-    // state {split_substrate && !use_split} — do not reorder.
-    // v4 wire carries Beta + Dir streams — it requires the split substrate.
-    if (wire_format_v4_ && !split_substrate_) {
-      RCLCPP_WARN(get_logger(),
-        "wire_format=v4 requires semantic_substrate=split (it carries Beta+Dir "
-        "streams) — forcing split substrate.");
-      split_substrate_ = true;
-    }
-    // The split substrate lives inside ScovoxMapSplit; it needs use_split=true.
-    if (split_substrate_ && !use_split_) {
-      RCLCPP_WARN(get_logger(),
-        "semantic_substrate=split requires use_split=true — ignoring on the "
-        "legacy fused-Voxel path.");
-      split_substrate_ = false;
-      wire_format_v4_  = false;
-    }
-    // The split substrate has no SemDir grid → v2/v3 senders/publishers would
-    // read an empty grid. Require v4 when on the split substrate.
-    if (split_substrate_ && !wire_format_v4_) {
-      RCLCPP_WARN(get_logger(),
-        "semantic_substrate=split currently emits/visualises via the v4 path; "
-        "forcing wire_format=v4 (v2/v3 read the empty SemDir grid).");
-      wire_format_v4_ = true;
-      wire_format_v3_ = false;
-    }
-    // Consolidated reconciliation log: the final coherent state, so any
-    // auto-correction above is visible at a glance even if a WARN scrolled by.
-    RCLCPP_INFO(get_logger(),
-      "substrate reconciliation: semantic_substrate=%s wire_format=%s use_split=%d",
-      split_substrate_ ? "split" : "semdir",
-      wire_format_v4_ ? "v4" : (wire_format_v3_ ? "v3" : "v2"),
-      static_cast<int>(use_split_));
     // Audit hook (split-grid only): when non-empty, every periodic memlog
     // tick overwrites this path with a flat binary snapshot of TsdfMap:
     //   uint64_t n; then n × {float x, float y, float z, float distance,
@@ -505,7 +357,7 @@ private:
     pc_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         pc_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
     if (pub_plan_) pl_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(pl_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
-    if (pub_tsdf_ && map_->params().sdf_trunc > 0.f) {
+    if (pub_tsdf_ && sdf_trunc_launch_ > 0.f) {
       tsdf_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
           tsdf_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
     }
@@ -562,7 +414,7 @@ private:
 
   void onImages(const sensor_msgs::msg::Image::ConstSharedPtr& depth, const sensor_msgs::msg::Image::ConstSharedPtr& seg) {
     auto t_start = std::chrono::high_resolution_clock::now();
-    if (use_split_ && split_map_) split_map_->resetTiming();
+    split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
     if (!have_di_.load(std::memory_order_acquire)) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: waiting for CameraInfo", frame_recv_, replay_idx); return; }
@@ -581,7 +433,6 @@ private:
     const bool rgba = (seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
     const int sch = rgba ? 4 : 3;
     const bool srgb = (seg->encoding==enc::RGB8||seg->encoding==enc::RGBA8);
-    if (!dyn_cls_.empty()) map_->decayTransientGrid((float)transient_decay_rate_);
     Eigen::Isometry3f T_oo;
     bool tf_exact = false;
     try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rclcpp::Duration::from_seconds(0.2)));
@@ -623,8 +474,7 @@ private:
       }
     }
     auto t_tf = std::chrono::high_resolution_clock::now();
-    const auto& P = map_->params();
-    std::vector<scovox::Map::CoordT> rc;
+    const auto& P = map_params_;
     std::vector<Eigen::Vector3f> nr_eps;
     auto rdZ = [&](int pu, int pv) -> float {
       if (pu<0||pu>=W||pv<0||pv>=H) return 0.f;
@@ -675,20 +525,19 @@ private:
       float q = rw*aw;
       bool dyn = false;
       if (vs && !dyn_cls_.empty()) for (size_t i=0;i<cp.size();i++) if (cp[i] > 0.f && dyn_cls_.count((uint8_t)i)) { dyn=true; break; }
-      integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, aw, rc);
+      integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, aw);
     }
-    carveNoReturnRays(O, nr_eps, rc);
+    carveNoReturnRays(O, nr_eps);
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
     if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
-    else if (use_split_ && split_map_) {
-      // No bin_pub_ in persistent mode → publishBinaryMapV2 is never
-      // called → TsdfMap/SemBetaMap touched buffers grow unbounded
+    else {
+      // No bin_pub_ in persistent mode → publishBinaryMapV4 is never
+      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
       // (every integrated ray appends coords). Clear via the O(n)
-      // path: drainTouched* sorts+uniques (~1 s/frame at Replica res
-      // 0.05), but the result is unused here, so a plain clear is
-      // ~µs. The bin_pub_ branch above still uses drainTouched* for
-      // the wire-format dedup it needs.
+      // path: drainTouched* sorts+uniques, but the result is unused here,
+      // so a plain clear is ~µs. The bin_pub_ branch above still uses
+      // drainTouched* for the wire-format dedup it needs.
       split_map_->clearTouchedTsdf();
       split_map_->clearTouchedSemDir();
     }
@@ -700,7 +549,7 @@ private:
     float tf_ms = std::chrono::duration<float, std::milli>(t_tf - t_start).count();
     float integrate_ms = std::chrono::duration<float, std::milli>(t_integrate - t_tf).count();
     float publish_ms = std::chrono::duration<float, std::milli>(t_end - t_integrate).count();
-    if (use_split_ && split_map_) {
+    {
       const float t_ms = static_cast<float>(split_map_->tsdfTimeUs())    / 1000.0f;
       const float s_ms = static_cast<float>(split_map_->semdirTimeUs()) / 1000.0f;
       RCLCPP_INFO(get_logger(),
@@ -708,9 +557,6 @@ private:
                   "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu",
                   frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms,
                   publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_);
-    } else {
-      RCLCPP_INFO(get_logger(), "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f publish_ms=%.1f rss_mb=%.1f",
-                  frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms, publish_ms, mem_kb / 1024.0);
     }
     if (frame_recv_ % 10 == 1) scheduleMemUsage();
     logEvictionDelta(frame_recv_);
@@ -720,7 +566,7 @@ private:
   // ── PointCloud2 input path (LiDAR) ──────────────────────────────────────
   void onPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud) {
     auto t_start = std::chrono::high_resolution_clock::now();
-    if (use_split_ && split_map_) split_map_->resetTiming();
+    split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
     std::unique_lock<std::shared_mutex> lock(map_mtx_);
@@ -774,8 +620,7 @@ private:
     }
 
     auto t_tf = std::chrono::high_resolution_clock::now();
-    const auto& P = map_->params();
-    std::vector<scovox::Map::CoordT> rc;
+    const auto& P = map_params_;
 
     const uint8_t* data = cloud->data.data();
     const int step = (int)cloud->point_step;
@@ -823,20 +668,19 @@ private:
 
       bool dyn = false;
       if (vs && !dyn_cls_.empty()) for (size_t j=0;j<cp.size();j++) if (cp[j] > 0.f && dyn_cls_.count((uint8_t)j)) { dyn=true; break; }
-      integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, 1.f, rc);
+      integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, 1.f);
     }
 
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
     if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
-    else if (use_split_ && split_map_) {
-      // No bin_pub_ in persistent mode → publishBinaryMapV2 is never
-      // called → TsdfMap/SemBetaMap touched buffers grow unbounded
+    else {
+      // No bin_pub_ in persistent mode → publishBinaryMapV4 is never
+      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
       // (every integrated ray appends coords). Clear via the O(n)
-      // path: drainTouched* sorts+uniques (~1 s/frame at Replica res
-      // 0.05), but the result is unused here, so a plain clear is
-      // ~µs. The bin_pub_ branch above still uses drainTouched* for
-      // the wire-format dedup it needs.
+      // path: drainTouched* sorts+uniques, but the result is unused here,
+      // so a plain clear is ~µs. The bin_pub_ branch above still uses
+      // drainTouched* for the wire-format dedup it needs.
       split_map_->clearTouchedTsdf();
       split_map_->clearTouchedSemDir();
     }
@@ -847,7 +691,7 @@ private:
     float tf_ms = std::chrono::duration<float, std::milli>(t_tf - t_start).count();
     float integrate_ms = std::chrono::duration<float, std::milli>(t_integrate - t_tf).count();
     float publish_ms = std::chrono::duration<float, std::milli>(t_end - t_integrate).count();
-    if (use_split_ && split_map_) {
+    {
       const float t_ms = static_cast<float>(split_map_->tsdfTimeUs())    / 1000.0f;
       const float s_ms = static_cast<float>(split_map_->semdirTimeUs()) / 1000.0f;
       RCLCPP_INFO(get_logger(),
@@ -855,9 +699,6 @@ private:
                   "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu",
                   frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms,
                   publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_);
-    } else {
-      RCLCPP_INFO(get_logger(), "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f publish_ms=%.1f rss_mb=%.1f",
-                  frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms, publish_ms, mem_kb / 1024.0);
     }
     if (frame_recv_ % 10 == 1) scheduleMemUsage();
     logEvictionDelta(frame_recv_);
@@ -878,62 +719,44 @@ private:
     // Join the previous (already-finished) worker handle before reusing the
     // member; the inflight flag guarantees it has run to completion. The
     // worker is OWNED (not detached) so ~SCovoxNode can join an in-flight
-    // walk and avoid a use-after-free of `this`/map_mtx_/map_ at shutdown.
+    // walk and avoid a use-after-free of `this`/map_mtx_/split_map_ at shutdown.
     if (mem_log_thread_.joinable()) mem_log_thread_.join();
     mem_log_thread_ = std::thread([this]() {
       std::shared_lock<std::shared_mutex> lock(map_mtx_);
-      auto d = map_->grid().memUsageDetailed();
-      auto dt = map_->transientGrid().memUsageDetailed();
-      size_t total = d.total_bytes + dt.total_bytes;
-      RCLCPP_INFO(get_logger(), "[memUsage] voxels=%zu tvox=%zu bonxai_mb=%.1f rss_mb=%.1f bpv=%zu",
-                  d.active_voxels, dt.active_voxels, total / (1024.0 * 1024.0),
-                  getVmRSSKB() / 1024.0, d.active_voxels > 0 ? total / d.active_voxels : 0);
-      RCLCPP_INFO(get_logger(),
-                  "[memDetail] inner=%zu leaf=%zu vox/leaf=%.1f fill=%.1f%% "
-                  "root_mb=%.2f inner_mb=%.2f leafmeta_mb=%.2f pool_mb=%.2f "
-                  "pool_cap=%zu pool_used=%zu pool_waste_mb=%.2f",
-                  d.inner_count, d.leaf_count, d.avg_active_per_leaf(), d.leaf_fill_ratio() * 100.0f,
-                  d.root_map_bytes / (1024.0 * 1024.0),
-                  d.inner_grid_bytes / (1024.0 * 1024.0),
-                  d.leaf_meta_bytes / (1024.0 * 1024.0),
-                  d.pool_alloc_bytes / (1024.0 * 1024.0),
-                  d.pool_capacity, d.pool_used,
-                  d.pool_waste_bytes() / (1024.0 * 1024.0));
-      // Step 8 (D11) — split-grid per-substrate memory log. Consumed by
+      // Split-grid per-substrate memory log. Consumed by
       // eval_e13_byte_parity.py to compare TsdfMap bytes against
       // SLIM-VDB's vdb_tsdf_mb_final (acceptance gate 15%, paper headline
       // reports the actually-measured ratio).
-      if (split_map_) {
-        const double tsdf_mb    = static_cast<double>(split_map_->tsdfGridBytes())    / (1024.0 * 1024.0);
-        const double sembeta_mb = static_cast<double>(split_map_->semdirGridBytes()) / (1024.0 * 1024.0);
-        RCLCPP_INFO(get_logger(),
-                    "[memSplit] tsdf_voxels=%zu tsdf_grid_mb=%.3f "
-                    "semdir_voxels=%zu semdir_grid_mb=%.3f",
-                    split_map_->tsdfVoxelCount(), tsdf_mb,
-                    split_map_->semdirVoxelCount(), sembeta_mb);
-        if (!tsdf_dump_path_.empty()) {
-          // Overwrite snapshot of TsdfMap on every memlog tick — last
-          // write before kill -9 is what the parity tool consumes.
-          const std::string tmp = tsdf_dump_path_ + ".tmp";
-          std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-          if (f) {
-            const uint64_t n =
-                static_cast<uint64_t>(split_map_->tsdf().voxelCount());
-            f.write(reinterpret_cast<const char*>(&n), sizeof(n));
-            split_map_->tsdf().forEachVoxel(
-                [&](const scovox::TsdfVoxel& v, const Eigen::Vector3f& p) {
-                  const float buf[5] = {p.x(), p.y(), p.z(),
-                                        v.distance, v.weight};
-                  f.write(reinterpret_cast<const char*>(buf), sizeof(buf));
-                });
-            f.close();
-            std::rename(tmp.c_str(), tsdf_dump_path_.c_str());
-            RCLCPP_INFO(get_logger(),
-                        "[tsdf_dump] wrote %lu voxels (%.1f MB) to %s",
-                        static_cast<unsigned long>(n),
-                        n * 20.0 / (1024.0 * 1024.0),
-                        tsdf_dump_path_.c_str());
-          }
+      const double tsdf_mb    = static_cast<double>(split_map_->tsdfGridBytes())    / (1024.0 * 1024.0);
+      const double sembeta_mb = static_cast<double>(split_map_->semdirGridBytes()) / (1024.0 * 1024.0);
+      RCLCPP_INFO(get_logger(), "[memUsage] rss_mb=%.1f", getVmRSSKB() / 1024.0);
+      RCLCPP_INFO(get_logger(),
+                  "[memSplit] tsdf_voxels=%zu tsdf_grid_mb=%.3f "
+                  "semdir_voxels=%zu semdir_grid_mb=%.3f",
+                  split_map_->tsdfVoxelCount(), tsdf_mb,
+                  split_map_->semdirVoxelCount(), sembeta_mb);
+      if (!tsdf_dump_path_.empty()) {
+        // Overwrite snapshot of TsdfMap on every memlog tick — last
+        // write before kill -9 is what the parity tool consumes.
+        const std::string tmp = tsdf_dump_path_ + ".tmp";
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (f) {
+          const uint64_t n =
+              static_cast<uint64_t>(split_map_->tsdf().voxelCount());
+          f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+          split_map_->tsdf().forEachVoxel(
+              [&](const scovox::TsdfVoxel& v, const Eigen::Vector3f& p) {
+                const float buf[5] = {p.x(), p.y(), p.z(),
+                                      v.distance, v.weight};
+                f.write(reinterpret_cast<const char*>(buf), sizeof(buf));
+              });
+          f.close();
+          std::rename(tmp.c_str(), tsdf_dump_path_.c_str());
+          RCLCPP_INFO(get_logger(),
+                      "[tsdf_dump] wrote %lu voxels (%.1f MB) to %s",
+                      static_cast<unsigned long>(n),
+                      n * 20.0 / (1024.0 * 1024.0),
+                      tsdf_dump_path_.c_str());
         }
       }
       // Release the in-flight slot last so the next tick can relaunch. The
@@ -943,74 +766,30 @@ private:
     });
   }
 
-  // Compute the voxel coord for an endpoint position. Used to add the hit
-  // voxel to dirty_ for the integrateEndpointOnly branches (integrateRay
-  // already pushes the endpoint into rc itself, so this isn't needed there).
-  inline Bonxai::CoordT endpointCoord(const Eigen::Vector3f& Hp) const {
-    return map_->grid().posToCoord(Eigen::Vector3d(Hp.x(), Hp.y(), Hp.z()));
-  }
-
   void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp, float rng,
-                    bool dyn, const std::vector<float>* cp, float q, float rw, float aw,
-                    std::vector<scovox::Map::CoordT>& rc) {
-    rc.clear();
-    if (use_split_) {
-      // Split-grid path (Step 8). TsdfMap walks the SDF band, SemBetaMap
-      // walks the carve band leading up to the hit. dyn / rw / aw
-      // collapse: q already bakes in rw*aw; dyn (transient dynamic-class
-      // decay) is a legacy-only feature retired by D12.
-      //
-      // carve_band parity with legacy: when `carve_band_ > 0` (Replica /
-      // KITTI launch default = 0.1), walk SemBeta along only the last
-      // `carve_band` metres before the surface, matching the production
-      // mIoU baselines. This was originally elided ("full ray always" per
-      // D5) but cost ~5× FPS at Replica res 0.05 (~50 voxels/ray vs
-      // ~10 voxels/ray) without an mIoU benefit. carve_band <= 0 still
-      // falls back to full-ray for users who explicitly opt in.
-      (void)rng; (void)dyn; (void)rw; (void)aw;  // unused in split mode
-      Eigen::Vector3f co = O;
-      if (carve_band_ > 0) {
-        const float d = rng - static_cast<float>(carve_band_);
-        if (d > 0) co = O + (Hp - O).normalized() * d;
-      }
-      split_map_->integrateHit(co, Hp, cp, q);
-      sm_dirty_.store(true, std::memory_order_relaxed);
-      return;
+                    bool dyn, const std::vector<float>* cp, float q, float rw, float aw) {
+    // Split-grid path. TsdfMap walks the SDF band, SemSplitMap walks the carve
+    // band leading up to the hit. dyn / rw / aw collapse: q already bakes in
+    // rw*aw; dyn (transient dynamic-class decay) is a retired legacy feature.
+    //
+    // carve_band: when `carve_band_ > 0` (Replica / KITTI launch default =
+    // 0.1), walk the semantic carve along only the last `carve_band` metres
+    // before the surface, matching the production mIoU baselines. carve_band
+    // <= 0 falls back to full-ray.
+    (void)rng; (void)dyn; (void)rw; (void)aw;  // unused in split mode
+    Eigen::Vector3f co = O;
+    if (carve_band_ > 0) {
+      const float d = rng - static_cast<float>(carve_band_);
+      if (d > 0) co = O + (Hp - O).normalized() * d;
     }
-    if (carve_band_ == 0) {
-      map_->integrateEndpointOnly(Hp, dyn, cp, q, rw, aw);
-      if (bin_pub_) dirty_.insert(endpointCoord(Hp));
-    } else if (carve_band_ > 0) {
-      // Partial-ray mode: walk a band of carve_band metres in front of the
-      // surface (Beta-free) plus sdf_trunc metres behind (TSDF only). Both
-      // are handled by the fused walk by passing a truncated origin —
-      // earlier code split this into carve_free + integrateEndpointOnly,
-      // which left the TSDF band unpopulated (single-cell hit only).
-      float d = rng - (float)carve_band_;
-      Eigen::Vector3f co = (d > 0) ? O + (Hp - O).normalized() * d : O;
-      map_->integrateRay(co, Hp, rc, dyn, cp, q, rw, aw);
-      if (bin_pub_) for (auto& cc : rc) dirty_.insert(cc);
-    } else {
-      map_->integrateRay(O, Hp, rc, dyn, cp, q, rw, aw);
-      if (bin_pub_) for (auto& cc : rc) dirty_.insert(cc);
-    }
+    split_map_->integrateHit(co, Hp, cp, q);
     sm_dirty_.store(true, std::memory_order_relaxed);
   }
-  void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps,
-                         std::vector<scovox::Map::CoordT>& rc) {
-    if (use_split_) {
-      // SemBeta-only carve along no-return rays (no TSDF surface to anchor).
-      // q=1.0f matches the legacy carve_free which doesn't apply rw/aw.
-      for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f);
-      sm_dirty_.store(true, std::memory_order_relaxed);
-      return;
-    }
-    if (carve_band_ == 0) return;
-    for (auto& hf : nr_eps) {
-      rc.clear();
-      map_->carve_free(O, hf, rc);
-      if (bin_pub_) for (auto& cc : rc) dirty_.insert(cc);
-    }
+  void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps) {
+    // Beta-only carve along no-return rays (no TSDF surface to anchor).
+    // q=1.0f matches the legacy carve which doesn't apply rw/aw.
+    for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f);
+    sm_dirty_.store(true, std::memory_order_relaxed);
   }
   void loadSemanticColorMap() {
     const std::vector<int64_t> dk={0x4382,0x21C1,0x8605,0xCA88,0xA8C7,0x6544,0}, dc={1,2,4,6,5,3,0};
@@ -1176,22 +955,6 @@ private:
     }
     return any;
   }
-  // Hash/equality helpers so Bonxai::CoordT can live in an unordered_set.
-  // Used by dirty_ to track which voxels have been touched since the last
-  // ScovoxMapBinary publish.
-  struct CoordTHash {
-    std::size_t operator()(const Bonxai::CoordT& c) const noexcept {
-      auto h = std::hash<int32_t>{}(c.x);
-      h ^= std::hash<int32_t>{}(c.y) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-      h ^= std::hash<int32_t>{}(c.z) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-      return h;
-    }
-  };
-  struct CoordTEqual {
-    bool operator()(const Bonxai::CoordT& a, const Bonxai::CoordT& b) const noexcept {
-      return a.x == b.x && a.y == b.y && a.z == b.z;
-    }
-  };
   void initializeSemanticColors() {
     auto base = scovox::generateSemanticColors(static_cast<size_t>(max_sem_));
     sem_col_.clear();
@@ -1206,24 +969,35 @@ private:
   std::pair<size_t,double> publishScovoxMap() {
     if (sm_pub_->get_subscription_count() == 0) return {0, 0.0};
     if (!sm_dirty_.exchange(false)) return {0, 0.0};
+    auto& ss = split_map_->semsplit();
     scovox_msgs::msg::ScovoxMap m; m.header.stamp=get_clock()->now(); m.header.frame_id=int_frame_;
-    const auto& P=map_->params(); m.resolution=P.resolution; m.occupancy_threshold=min_occ_;
+    const auto& P=map_params_;
+    const double res = split_map_->resolution();
+    m.resolution=res; m.occupancy_threshold=min_occ_;
     m.semantic_threshold=P.semantic_occ_gate; m.max_semantic_classes=max_sem_;
-    m.voxels.reserve(map_->grid().activeCellsCount());
-    map_->grid().forEachCell([&](const scovox::Voxel& v, const Bonxai::CoordT& c) {
+    // Walk the Beta (occupancy) grid; join the Dir (semantics) grid at the same
+    // coord. a_occ/a_free come from Beta; a_unk = Dir OTHER; per-class evidence
+    // = cnt[i] − α_0 so empty slots read 0 (mirrors the v4 pointcloud project).
+    const auto& bgrid = ss.betaGrid();
+    auto dacc = ss.dirGrid().createConstAccessor();
+    m.voxels.reserve(bgrid.activeCellsCount());
+    bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& c) {
       scovox_msgs::msg::ScovoxVoxel vv;
-      vv.position.x=c.x*P.resolution; vv.position.y=float(c.y*P.resolution); vv.position.z=float(c.z*P.resolution);
-      vv.a_occ=v.a_occ; vv.a_free=v.a_free; vv.a_unk=v.a_unk;
-      // Pick the top P.top_k strongest classes (sparse_add doesn't sort) and
-      // fold dropped mass into a_unk so total semantic evidence is preserved.
-      const auto top = scovox::selectTopKSemantics(v, P.top_k);
-      for (size_t i = 0; i < top.kept_count; ++i) {
-        scovox_msgs::msg::ScovoxSemanticEvidence e;
-        e.class_id = top.kept[i].first;
-        e.evidence_count = top.kept[i].second;
-        vv.semantic_evidence.push_back(e);
+      vv.position.x=c.x*res; vv.position.y=float(c.y*res); vv.position.z=float(c.z*res);
+      vv.a_occ=b.a_occ; vv.a_free=b.a_free;
+      const scovox::DirVoxel* dv = dacc.value(c);
+      if (dv) {
+        vv.a_unk = dv->other;
+        for (int i = 0; i < scovox::K_TOP; ++i) {
+          if (dv->cls[i] == 0xFFFF) continue;
+          scovox_msgs::msg::ScovoxSemanticEvidence e;
+          e.class_id = dv->cls[i];
+          e.evidence_count = std::max(0.f, dv->cnt[i] - alpha_0_);
+          vv.semantic_evidence.push_back(e);
+        }
+      } else {
+        vv.a_unk = 0.f;
       }
-      vv.a_unk += top.dropped_mass;
       m.voxels.push_back(vv);
     });
     sm_pub_->publish(m); return {m.voxels.size(), 0.0};
@@ -1239,321 +1013,7 @@ private:
   // non-prior cell as dirty so the next publish carries a full snapshot.
   std::pair<size_t,double> publishBinaryMap() {
     if (!bin_pub_) return {0, 0};
-    if (use_split_) {
-      if (wire_format_v4_) return publishBinaryMapV4();
-      return wire_format_v3_ ? publishBinaryMapV3() : publishBinaryMapV2();
-    }
-
-    const size_t cur_sub = bin_pub_->get_subscription_count();
-    if (cur_sub > prev_sub_count_) {
-      // New subscriber appeared — flag everything non-prior so they get a
-      // complete snapshot, not just deltas observed since startup.
-      map_->grid().forEachCell([&](const scovox::Voxel& v, const Bonxai::CoordT& c) {
-        if (v.a_occ > 1.01f || v.a_free > 1.01f) dirty_.insert(c);
-      });
-    }
-    prev_sub_count_ = cur_sub;
-
-    if (cur_sub == 0) return {0, 0};   // no point shipping; keep dirty_
-    if (dirty_.empty()) return {0, 0}; // nothing changed since last publish
-
-    auto acc = map_->grid().createAccessor();
-    std::vector<scovox::ScovoxBinarySerializer::CoordVoxelPair> vps;
-    vps.reserve(dirty_.size());
-    for (const auto& coord : dirty_) {
-      auto* cell = acc.value(coord, false);
-      if (!cell) continue;
-      // Drop voxels that are still at the prior — they carry no information.
-      if (cell->a_occ <= 1.01f && cell->a_free <= 1.01f) continue;
-      scovox::ScovoxBinarySerializer::CoordVoxelPair cv;
-      cv.x = coord.x; cv.y = coord.y; cv.z = coord.z;
-      cv.a_occ = cell->a_occ; cv.a_free = cell->a_free; cv.a_unk = cell->a_unk;
-      for (int si = 0; si < scovox::K_TOP; ++si)
-        if (cell->sem_cnt[si] > 0)
-          cv.semantics.emplace_back((uint16_t)cell->sem_cls[si], cell->sem_cnt[si]);
-      vps.push_back(std::move(cv));
-    }
-
-    auto data = scovox::ScovoxBinarySerializer::serializeIncremental(
-      float(map_->params().resolution), vps, map_->params().top_k);
-    auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
-    scovox_msgs::msg::ScovoxMapBinary bin;
-    bin.header.stamp = get_clock()->now();
-    bin.header.frame_id = int_frame_;
-    bin.version = 1;
-#if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
-    bin.little_endian = true;
-#else
-    bin.little_endian = false;
-#endif
-    if (!comp.empty()) bin.data = std::move(comp);
-    else bin.data.assign(reinterpret_cast<const uint8_t*>(data.data()),
-                         reinterpret_cast<const uint8_t*>(data.data()) + data.size());
-    double mb = double(bin.data.size()) / (1024.0 * 1024.0);
-    bin_pub_->publish(std::move(bin));
-    dirty_.clear();
-    return {vps.size(), mb};
-  }
-
-  // Step 8 (D2/D8) — split-grid v2 binary publish path. Drains touched
-  // TSDF + SemBeta coords from the split substrate, reads each voxel's
-  // current state, builds a BinarySerializerV2::Frame, optionally elides
-  // the TSDF section per share_tsdf_, LZ4-compresses, and publishes with
-  // msg->version=2 so dscovox_node's onBinaryMapV2 router accepts it.
-  //
-  // share_tsdf_=false (the v2 default): tsdf_count=0, no TSDF deltas
-  // serialized — receiver gets SemBeta-only frame, ~35% wire savings vs
-  // dual-stream. share_tsdf_=true: full dual stream for fused-geometry
-  // consensus on the receiver side.
-  std::pair<size_t,double> publishBinaryMapV2() {
-    if (!bin_pub_) return {0, 0};
-
-    const size_t cur_sub = bin_pub_->get_subscription_count();
-    bool snapshot = false;
-    if (cur_sub > prev_sub_count_) {
-      // New subscriber → flag every non-prior voxel for emission so they
-      // get a full snapshot instead of just post-subscribe deltas. Same
-      // contract as the legacy v1 path.
-      snapshot = true;
-    }
-    prev_sub_count_ = cur_sub;
-    if (cur_sub == 0) {
-      // Drop the touched buffers when nobody is listening — otherwise
-      // they'd grow unbounded. Equivalent to legacy `dirty_.clear()`
-      // skip-on-no-subs behaviour.
-      (void)split_map_->drainTouchedTsdf();
-      (void)split_map_->drainTouchedSemDir();
-      return {0, 0};
-    }
-
-    scovox::BinarySerializerV2::Frame frame;
-    frame.resolution = static_cast<float>(split_map_->resolution());
-
-    // ----- TSDF section (elided when share_tsdf_=false) -----
-    if (share_tsdf_) {
-      auto& tsdf_grid = split_map_->tsdf().grid();
-      auto tacc = tsdf_grid.createAccessor();
-      auto emit_tsdf = [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
-        if (v.weight <= 0.f) return;  // unobserved
-        scovox::BinarySerializerV2::TsdfDelta d;
-        d.coord = c;
-        d.data = v;
-        frame.tsdf_deltas.push_back(d);
-      };
-      if (snapshot) {
-        // Snapshot: walk every active TSDF voxel.
-        tsdf_grid.forEachCell(emit_tsdf);
-        (void)split_map_->drainTouchedTsdf();  // discard (snapshot supersedes)
-      } else {
-        for (const auto& c : split_map_->drainTouchedTsdf()) {
-          if (auto* v = tacc.value(c, false)) emit_tsdf(*v, c);
-        }
-      }
-    } else {
-      // Drain the touched buffer even when not emitting so it doesn't
-      // accumulate; receiver elision is the share_tsdf=false contract.
-      (void)split_map_->drainTouchedTsdf();
-    }
-
-    // ----- SemDir section (always emitted) -----
-    // Substrate is now SemDirVoxel (unified Dirichlet, Step 7.5). The v2 wire
-    // format still expects SemBetaVoxel-shaped deltas; we project the SemDir
-    // state into the legacy Beta layout here. The projection is lossless on
-    // p_occ and per-class evidence:
-    //   a_occ  ≈ s_occ()      (Σ top-K + OTHER)
-    //   a_free ≈ alpha_free
-    //   a_unk  ≈ alpha_other
-    //   sem_cnt[i]/sem_cls[i] ← cnt[i]/cls[i]
-    // TODO Step 8: route this through BinarySerializerV3 directly (skip the
-    // SemDir → SemBeta projection — the v3 wire format carries SemDirVoxel
-    // as-is at 32 B/voxel vs v2's 37 B SemBeta).
-    {
-      auto& sem_grid = split_map_->semdir().grid();
-      auto sacc = sem_grid.createAccessor();
-      auto emit_sem = [&](const scovox::SemDirVoxel& v, const Bonxai::CoordT& c) {
-        // Drop voxels still at the symmetric Dirichlet prior with no
-        // accumulated evidence — they carry no information. Derive the FREE
-        // and OTHER prior masses from the CONFIGURED priors (alpha_0_ and
-        // (num_classes_ − K_TOP)·alpha_0_), matching the v3/v4 emit gates and
-        // the SemDirMap factory. The old 1×/12×kDefaultDirichletPrior
-        // constants assumed C=14, α_0=0.01: on a non-default dataset
-        // (e.g. KITTI C=20 ⇒ OTHER prior 0.18) genuinely-prior voxels failed
-        // the at_prior test and were serialized as deltas (bandwidth bloat),
-        // and with α_0>0.01 lightly-evidenced voxels were wrongly dropped.
-        const float free_prior  = alpha_0_;
-        const float other_prior =
-            static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
-        const bool at_prior =
-            (v.alpha_free <= free_prior + 1e-4f) &&
-            (v.alpha_other <= other_prior + 1e-4f);
-        if (at_prior) {
-          bool any_sem = false;
-          for (int i = 0; i < scovox::K_TOP; ++i)
-            if (v.cls[i] != 0xFFFF) { any_sem = true; break; }
-          if (!any_sem) return;
-        }
-        scovox::BinarySerializerV2::SemBetaDelta d;
-        d.coord = c;
-        scovox::SemBetaVoxel proj{};
-        proj.a_occ  = v.s_occ();
-        proj.a_free = v.alpha_free;
-        proj.a_unk  = v.alpha_other;
-        for (int i = 0; i < scovox::K_TOP; ++i) {
-          proj.sem_cnt[i] = v.cnt[i];
-          proj.sem_cls[i] = v.cls[i];
-        }
-        d.data = proj;
-        frame.sembeta_deltas.push_back(d);
-      };
-      if (snapshot) {
-        sem_grid.forEachCell(emit_sem);
-        (void)split_map_->drainTouchedSemDir();
-      } else {
-        for (const auto& c : split_map_->drainTouchedSemDir()) {
-          if (auto* v = sacc.value(c, false)) emit_sem(*v, c);
-        }
-      }
-    }
-
-    if (frame.tsdf_deltas.empty() && frame.sembeta_deltas.empty()) {
-      return {0, 0};  // nothing to ship; touched buffers already drained
-    }
-
-    scovox::BinarySerializerV2::Options opts;
-    opts.share_tsdf = share_tsdf_;
-    auto data = scovox::BinarySerializerV2::serialize(frame, opts);
-    auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
-
-    scovox_msgs::msg::ScovoxMapBinary bin;
-    bin.header.stamp = get_clock()->now();
-    bin.header.frame_id = int_frame_;
-    bin.version = 2;  // v2 envelope — dscovox_node onBinaryMapV2 routes on this
-#if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
-    bin.little_endian = true;
-#else
-    bin.little_endian = false;
-#endif
-    if (!comp.empty()) bin.data = std::move(comp);
-    else bin.data.assign(reinterpret_cast<const uint8_t*>(data.data()),
-                         reinterpret_cast<const uint8_t*>(data.data()) + data.size());
-    const size_t emitted = frame.tsdf_deltas.size() + frame.sembeta_deltas.size();
-    double mb = double(bin.data.size()) / (1024.0 * 1024.0);
-    bin_pub_->publish(std::move(bin));
-    return {emitted, mb};
-  }
-
-  // Step 8 — split-grid v3 binary publish path. Mirrors publishBinaryMapV2's
-  // touched-drain / snapshot-on-resub / share_tsdf elision contract, but
-  // serialises through BinarySerializerV3 directly from SemDirVoxel state
-  // (no SemBeta projection). Header carries num_classes + alpha_0 so the
-  // receiver can rebuild the symmetric Dirichlet prior without sharing
-  // launch params.
-  //
-  // Wire-format choice is the launch-time `wire_format` param (v2|v3);
-  // v3 stays opt-in until the dscovox consensus node lands an
-  // onBinaryMapV3 handler (otherwise v3 frames just get dropped by the
-  // receiver's "Bad version" guard).
-  std::pair<size_t,double> publishBinaryMapV3() {
-    if (!bin_pub_) return {0, 0};
-
-    const size_t cur_sub = bin_pub_->get_subscription_count();
-    bool snapshot = false;
-    if (cur_sub > prev_sub_count_) snapshot = true;
-    prev_sub_count_ = cur_sub;
-    if (cur_sub == 0) {
-      // Drain (drop) touched buffers so they don't grow unbounded while
-      // nobody listens. Matches v2 behaviour.
-      (void)split_map_->drainTouchedTsdf();
-      (void)split_map_->drainTouchedSemDir();
-      return {0, 0};
-    }
-
-    scovox::BinarySerializerV3::Frame frame;
-    frame.resolution  = static_cast<float>(split_map_->resolution());
-    frame.num_classes = static_cast<uint16_t>(num_classes_);
-    frame.alpha_0     = alpha_0_;
-
-    // ----- TSDF section (elided when share_tsdf_=false) -----
-    if (share_tsdf_) {
-      auto& tsdf_grid = split_map_->tsdf().grid();
-      auto tacc = tsdf_grid.createAccessor();
-      auto emit_tsdf = [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
-        if (v.weight <= 0.f) return;
-        scovox::BinarySerializerV3::TsdfDelta d;
-        d.coord = c;
-        d.data  = v;
-        frame.tsdf_deltas.push_back(d);
-      };
-      if (snapshot) {
-        tsdf_grid.forEachCell(emit_tsdf);
-        (void)split_map_->drainTouchedTsdf();
-      } else {
-        for (const auto& c : split_map_->drainTouchedTsdf()) {
-          if (auto* v = tacc.value(c, false)) emit_tsdf(*v, c);
-        }
-      }
-    } else {
-      (void)split_map_->drainTouchedTsdf();
-    }
-
-    // ----- SemDir section (always emitted, SemDirVoxel-native) -----
-    {
-      auto& sem_grid = split_map_->semdir().grid();
-      auto sacc = sem_grid.createAccessor();
-      // "At prior" check mirrors the v2 path: alpha_free still ≈ α_0, the
-      // OTHER bucket still ≈ (C − K) · α_0, and no slot has filled. Such
-      // voxels carry no posterior information and stay off the wire.
-      const float other_prior = static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
-      auto emit_sem = [&](const scovox::SemDirVoxel& v, const Bonxai::CoordT& c) {
-        const bool at_prior =
-            (v.alpha_free  <= alpha_0_     + 1e-4f) &&
-            (v.alpha_other <= other_prior  + 1e-4f);
-        if (at_prior) {
-          bool any_sem = false;
-          for (int i = 0; i < scovox::K_TOP; ++i)
-            if (v.cls[i] != 0xFFFF) { any_sem = true; break; }
-          if (!any_sem) return;
-        }
-        scovox::BinarySerializerV3::SemDirDelta d;
-        d.coord = c;
-        d.data  = v;
-        frame.semdir_deltas.push_back(d);
-      };
-      if (snapshot) {
-        sem_grid.forEachCell(emit_sem);
-        (void)split_map_->drainTouchedSemDir();
-      } else {
-        for (const auto& c : split_map_->drainTouchedSemDir()) {
-          if (auto* v = sacc.value(c, false)) emit_sem(*v, c);
-        }
-      }
-    }
-
-    if (frame.tsdf_deltas.empty() && frame.semdir_deltas.empty()) {
-      return {0, 0};
-    }
-
-    scovox::BinarySerializerV3::Options opts;
-    opts.share_tsdf = share_tsdf_;
-    auto data = scovox::BinarySerializerV3::serialize(frame, opts);
-    auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
-
-    scovox_msgs::msg::ScovoxMapBinary bin;
-    bin.header.stamp    = get_clock()->now();
-    bin.header.frame_id = int_frame_;
-    bin.version         = 3;   // v3 envelope — dscovox onBinaryMapV3 routes
-#if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
-    bin.little_endian = true;
-#else
-    bin.little_endian = false;
-#endif
-    if (!comp.empty()) bin.data = std::move(comp);
-    else bin.data.assign(reinterpret_cast<const uint8_t*>(data.data()),
-                         reinterpret_cast<const uint8_t*>(data.data()) + data.size());
-    const size_t emitted = frame.tsdf_deltas.size() + frame.semdir_deltas.size();
-    double mb = double(bin.data.size()) / (1024.0 * 1024.0);
-    bin_pub_->publish(std::move(bin));
-    return {emitted, mb};
+    return publishBinaryMapV4();
   }
 
   // Split-substrate v4 binary publish path. Drains touched TSDF + Beta + Dir
@@ -1562,11 +1022,10 @@ private:
   // TSDF section per share_tsdf_, LZ4-compresses, and publishes with
   // msg->version=4. Beta (occupancy) and Dir (semantics) cross the wire as
   // SEPARATE streams — the receiver merges each with its own conjugate rule
-  // (consensus_merge_v4.hpp), losslessly (no SemDir projection).
+  // (consensus_merge_v4.hpp), losslessly.
   //
-  // Snapshot-on-resub + at-prior elision mirror publishBinaryMapV3 exactly,
-  // per grid. Only reached when use_split_ && wire_format_v4_, which the param
-  // guards force to imply the SPLIT substrate (semsplit() is valid here).
+  // Snapshot-on-resub + at-prior elision are applied per grid. This is the
+  // node's only wire path; the SPLIT substrate (semsplit()) is always valid.
   std::pair<size_t,double> publishBinaryMapV4() {
     if (!bin_pub_) return {0, 0};
     auto& ss = split_map_->semsplit();
@@ -1720,8 +1179,9 @@ private:
     g.info.origin.position.y = oy;
     g.info.origin.orientation.w = 1.0;
     g.data.assign(w * h, -1);
-    map_->grid().forEachCell([&](const scovox::Voxel& v, const Bonxai::CoordT& c) {
-      auto p = map_->grid().coordToPos(c);
+    const auto& bgrid = split_map_->semsplit().betaGrid();
+    bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+      auto p = bgrid.coordToPos(c);
       if (p.z < plan_zmin_ || p.z > plan_zmax_) return;
       int gx = int(std::floor((p.x - ox) / plan_res_));
       int gy = int(std::floor((p.y - oy) / plan_res_));
@@ -1740,196 +1200,14 @@ private:
   // Caller must hold map_mtx_ (shared). The timer body locks once for both
   // publishScovoxMap and publishPointCloud so they see the same map state.
   void publishPointCloud() {
-    if (use_split_) {
-      if (split_substrate_) publishPointCloudV4();
-      else                  publishPointCloudV2();
-      return;
-    }
-    if (pc_pub_->get_subscription_count()==0) return;
-    sensor_msgs::msg::PointCloud2 cl; cl.header.frame_id=int_frame_; cl.header.stamp=get_clock()->now();
-    cl.height=1; cl.is_dense=true; cl.is_bigendian=false;
-    sensor_msgs::PointCloud2Modifier mod(cl);
-    // Layout: 11 base fields (xyz + rgb + occupancy/semantic summary + Beta a_occ/a_free)
-    // followed by E5.1 raw mass fields (a_unk, sem_cnt0, sem_cls0, sem_cnt1, sem_cls1).
-    // Adding the raw counts is what lets verify_mass_conservation.py check
-    // a_unk + Σ sem_cnt invariance externally.
-    // 2026-05-10: K_TOP sweep (P6.1/P6.2) — emit slot 0 + slot 1 always.
-    // For K=1 the second slot is dummy (cnt=0, cls=0xFFFF). For K>2 the
-    // emission is the first 2 Misra-Gries slots in registration order
-    // (not necessarily top-2 by count); semantic_class is still computed
-    // via argmaxClassConfidence() which walks all K, so mIoU is unaffected.
-    static_assert(scovox::K_TOP >= 1, "publishPointCloud requires at least 1 sparse slot");
-    mod.setPointCloud2Fields(16, "x",1,sensor_msgs::msg::PointField::FLOAT32, "y",1,sensor_msgs::msg::PointField::FLOAT32,
-      "z",1,sensor_msgs::msg::PointField::FLOAT32, "rgb",1,sensor_msgs::msg::PointField::FLOAT32,
-      "occupancy_prob",1,sensor_msgs::msg::PointField::FLOAT32, "semantic_class",1,sensor_msgs::msg::PointField::UINT8,
-      "semantic_confidence",1,sensor_msgs::msg::PointField::FLOAT32,
-      "posterior_variance",1,sensor_msgs::msg::PointField::FLOAT32,
-      "eig",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_occ",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_free",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_unk",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cnt0",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cls0",1,sensor_msgs::msg::PointField::UINT16,
-      "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
-    // Skip voxels still at the Beta prior (a_occ=a_free=1.0 → p_occ=0.5).
-    // The fused TSDF walk creates behind-surface band voxels with TSDF-only
-    // evidence (Beta untouched); they must NOT pollute the occupancy cloud
-    // when min_occ_=0.5 (which uses `>=`). The TSDF zero-crossing publisher
-    // already exposes those voxels separately.
-    auto has_beta_evidence=[](const scovox::Voxel& v){
-      return v.a_occ > 1.001f || v.a_free > 1.001f;
-    };
-    size_t cnt=0;
-    auto cntF=[&](const scovox::Voxel& v, const Bonxai::CoordT&){
-      if (v.p_occ()>=min_occ_ && has_beta_evidence(v)) ++cnt; };
-    map_->grid().forEachCell(cntF); map_->transientGrid().forEachCell(cntF); mod.resize(cnt);
-    sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"),iy(cl,"y"),iz(cl,"z"),ir(cl,"rgb"),ip(cl,"occupancy_prob"),ic2(cl,"semantic_confidence"),
-      iv(cl,"posterior_variance"),ie(cl,"eig"),iao(cl,"a_occ"),iaf(cl,"a_free"),
-      iau(cl,"a_unk"),isn0(cl,"sem_cnt0"),isn1(cl,"sem_cnt1");
-    sensor_msgs::PointCloud2Iterator<uint8_t> icl(cl,"semantic_class");
-    sensor_msgs::PointCloud2Iterator<uint16_t> isc0(cl,"sem_cls0"),isc1(cl,"sem_cls1");
-    const auto& P=map_->params();
-    auto emit=[&](const scovox::Voxel& v, const Bonxai::CoordT& co, const scovox::Map::Grid& sg) {
-      float pr=v.p_occ(); if (pr<min_occ_ || !has_beta_evidence(v)) return;
-      auto ps=sg.coordToPos(co); uint8_t bc=0; float cf=0,r=1,g=1,b=1;
-      if (v.a0()>0 && scovox::K_TOP>0) {
-        // Hutter-framework (K+1)-Dirichlet posterior probability of the
-        // argmax tracked class — consistent with semanticEntropy /
-        // semanticVariance. See node_utils.hpp::argmaxClassConfidence.
-        const auto [best_cls, p_best] = scovox::argmaxClassConfidence(v);
-        // semantic_class is a UINT8 PointField (locked wire/NPZ schema); a
-        // class id >= 256 would alias to id % 256 and silently collide with an
-        // unrelated label/colour. Emit 0 (unknown) for out-of-range ids.
-        bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
-        cf = p_best;
-        float vis_gate = sem_vis_thresh_ >= 0 ? (float)sem_vis_thresh_ : P.semantic_occ_gate;
-        if (cf>=vis_gate && bc<sem_col_.size()) { auto& c=sem_col_[bc]; r=c.r; g=c.g; b=c.b; }
-      }
-      uint32_t rp=(uint32_t(r*255)<<16)|(uint32_t(g*255)<<8)|uint32_t(b*255);
-      *ix=ps.x; *iy=ps.y; *iz=ps.z; *ir=*reinterpret_cast<float*>(&rp); *ip=pr; *icl=bc; *ic2=cf;
-      *iv=scovox::variance(v); *ie=scovox::expectedInformationGain(v);
-      *iao=v.a_occ; *iaf=v.a_free;
-      *iau=v.a_unk;
-      *isn0=v.sem_cnt[0]; *isc0=v.sem_cls[0];
-      // K=1: slot 1 is dummy. K>=2: emit slot 1 (first 2 Misra-Gries slots).
-      if constexpr (scovox::K_TOP >= 2) {
-        *isn1=v.sem_cnt[1]; *isc1=v.sem_cls[1];
-      } else {
-        *isn1=0.0f; *isc1=static_cast<uint16_t>(0xFFFF);
-      }
-      ++ix;++iy;++iz;++ir;++ip;++icl;++ic2;++iv;++ie;++iao;++iaf;
-      ++iau;++isn0;++isc0;++isn1;++isc1;
-    };
-    const auto& gr=map_->grid(); const auto& tg=map_->transientGrid();
-    gr.forEachCell([&](const scovox::Voxel& v, const Bonxai::CoordT& c){ emit(v,c,gr); });
-    tg.forEachCell([&](const scovox::Voxel& v, const Bonxai::CoordT& c){ emit(v,c,tg); });
-    pc_pub_->publish(cl);
-  }
-
-  // Step 8 (D4) — split-mode pointcloud publisher. Walks the SemBeta
-  // grid (the prediction-set grid post-refactor — has_beta_evidence
-  // gates apply directly to a_occ/a_free) and emits the same 16-field
-  // schema as publishPointCloud above so pointcloud_to_npz.py / RViz /
-  // eval scripts need no version-aware routing. The D6 helper overloads
-  // (variance / EIG / argmaxClassConfidence) keep the per-point body
-  // byte-identical to the legacy version up to voxel type. No transient
-  // grid in split mode (legacy-only feature, retired by D12 framing).
-  void publishPointCloudV2() {
-    if (!pc_pub_ || !split_map_ || pc_pub_->get_subscription_count() == 0) return;
-    sensor_msgs::msg::PointCloud2 cl;
-    cl.header.frame_id = int_frame_;
-    cl.header.stamp = get_clock()->now();
-    cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
-    sensor_msgs::PointCloud2Modifier mod(cl);
-    // 2026-05-10: same K-tolerance as publishPointCloud above (see comment).
-    static_assert(scovox::K_TOP >= 1, "publishPointCloudV2 requires at least 1 sparse slot");
-    mod.setPointCloud2Fields(16,
-      "x",1,sensor_msgs::msg::PointField::FLOAT32, "y",1,sensor_msgs::msg::PointField::FLOAT32,
-      "z",1,sensor_msgs::msg::PointField::FLOAT32, "rgb",1,sensor_msgs::msg::PointField::FLOAT32,
-      "occupancy_prob",1,sensor_msgs::msg::PointField::FLOAT32, "semantic_class",1,sensor_msgs::msg::PointField::UINT8,
-      "semantic_confidence",1,sensor_msgs::msg::PointField::FLOAT32,
-      "posterior_variance",1,sensor_msgs::msg::PointField::FLOAT32,
-      "eig",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_occ",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_free",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_unk",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cnt0",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cls0",1,sensor_msgs::msg::PointField::UINT16,
-      "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
-    // Project SemDir → SemBeta on the fly; "has evidence beyond prior" gate
-    // becomes "s_occ > C·α_0 + ε" / "alpha_free > α_0 + ε". Use the CONFIGURED
-    // priors (num_classes_·alpha_0_, alpha_0_) rather than the compile-time
-    // 14·kDefaultDirichletPrior constant: a fresh SemDir voxel's s_occ prior is
-    // s_occ() = (C-K)·α_0 [OTHER] + K·α_0 [slots] = C·α_0, so on a non-default
-    // dataset (e.g. KITTI C=20, or dirichlet_prior≠0.01) the old constant
-    // misclassified prior-only voxels as observed and emitted them, polluting
-    // the ~/pointcloud / NPZ capture. Mirrors publishPointCloudV4's runtime gate.
-    const float prior_s_occ = static_cast<float>(num_classes_) * alpha_0_;
-    auto has_evidence = [&](const scovox::SemDirVoxel& v) {
-      return v.s_occ() > prior_s_occ + 1e-3f ||
-             v.alpha_free > alpha_0_ + 1e-3f;
-    };
-    const auto& g = split_map_->semdir().grid();
-    size_t cnt = 0;
-    g.forEachCell([&](const scovox::SemDirVoxel& v, const Bonxai::CoordT&) {
-      if (v.p_occ() >= min_occ_ && has_evidence(v)) ++cnt;
-    });
-    if (!cnt) { pc_pub_->publish(cl); return; }
-    mod.resize(cnt);
-    sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"), iy(cl,"y"), iz(cl,"z"), ir(cl,"rgb"),
-      ip(cl,"occupancy_prob"), ic2(cl,"semantic_confidence"),
-      iv(cl,"posterior_variance"), ie(cl,"eig"),
-      iao(cl,"a_occ"), iaf(cl,"a_free"),
-      iau(cl,"a_unk"), isn0(cl,"sem_cnt0"), isn1(cl,"sem_cnt1");
-    sensor_msgs::PointCloud2Iterator<uint8_t>  icl(cl,"semantic_class");
-    sensor_msgs::PointCloud2Iterator<uint16_t> isc0(cl,"sem_cls0"), isc1(cl,"sem_cls1");
-    // Visualisation colour gate: prefer explicit override, else fall back
-    // to the SemBeta-default 0.5 (legacy used P.semantic_occ_gate which
-    // lives on the legacy Map::Params; in split mode it's a node-side
-    // sensor filter consumed before integrate, see declareNodeParams).
-    const float vis_gate = sem_vis_thresh_ >= 0 ? (float)sem_vis_thresh_ : 0.5f;
-    g.forEachCell([&](const scovox::SemDirVoxel& v_sd, const Bonxai::CoordT& co) {
-      float pr = v_sd.p_occ();
-      if (pr < min_occ_ || !has_evidence(v_sd)) return;
-      // Project once; reuse for argmax / variance / EIG / wire fields.
-      const scovox::SemBetaVoxel v = projectSemDirToSemBeta(v_sd);
-      auto ps = g.coordToPos(co);
-      uint8_t bc = 0; float cf = 0, r = 1, gg = 1, b = 1;
-      if (v.a0() > 0 && scovox::K_TOP > 0) {
-        const auto [best_cls, p_best] = scovox::argmaxClassConfidence(v);
-        // UINT8 semantic_class field — guard ids >= 256 (see the other
-        // pointcloud publisher above); aliasing would mislabel/miscolour.
-        bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
-        cf = p_best;
-        if (cf >= vis_gate && bc < sem_col_.size()) { auto& c = sem_col_[bc]; r = c.r; gg = c.g; b = c.b; }
-      }
-      uint32_t rp = (uint32_t(r * 255) << 16) | (uint32_t(gg * 255) << 8) | uint32_t(b * 255);
-      *ix = ps.x; *iy = ps.y; *iz = ps.z; *ir = *reinterpret_cast<float*>(&rp);
-      *ip = pr; *icl = bc; *ic2 = cf;
-      *iv = scovox::variance(v); *ie = scovox::expectedInformationGain(v);
-      *iao = v.a_occ; *iaf = v.a_free;
-      *iau = v.a_unk;
-      *isn0 = v.sem_cnt[0]; *isc0 = v.sem_cls[0];
-      if constexpr (scovox::K_TOP >= 2) {
-        *isn1 = v.sem_cnt[1]; *isc1 = v.sem_cls[1];
-      } else {
-        *isn1 = 0.0f; *isc1 = static_cast<uint16_t>(0xFFFF);
-      }
-      ++ix; ++iy; ++iz; ++ir; ++ip; ++icl; ++ic2; ++iv; ++ie; ++iao; ++iaf;
-      ++iau; ++isn0; ++isc0; ++isn1; ++isc1;
-    });
-    pc_pub_->publish(cl);
+    publishPointCloudV4();
   }
 
   // Split-substrate (v4) pointcloud publisher. Occupancy comes from the Beta
   // grid; semantics from the Dir grid at the same coord. The two are projected
   // into a SemBetaVoxel so the shared viz helpers (argmaxClassConfidence /
-  // variance / expectedInformationGain) and the 16-field schema stay identical
-  // to publishPointCloud / publishPointCloudV2 — no version-aware routing in
-  // pointcloud_to_npz.py / RViz / eval scripts. (publishPointCloudV2 walks the
-  // SemDir grid, which is empty under the split substrate, so we need this.)
+  // variance / expectedInformationGain) and the 16-field schema stay stable
+  // for pointcloud_to_npz.py / RViz / eval scripts.
   void publishPointCloudV4() {
     if (!pc_pub_ || !split_map_ || pc_pub_->get_subscription_count() == 0) return;
     auto& ss = split_map_->semsplit();
@@ -1960,7 +1238,7 @@ private:
     };
     // Project Beta(occupancy) + Dir(semantics) → SemBetaVoxel for the shared
     // helpers. Occupancy from Beta; per-class evidence from Dir (subtract the
-    // α_0 prior so empty slots read 0, matching projectSemDirToSemBeta).
+    // α_0 prior so empty slots read 0).
     const auto& bgrid = ss.betaGrid();
     auto dacc = ss.dirGrid().createConstAccessor();
     auto project = [&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
@@ -2025,50 +1303,12 @@ private:
   }
 
   // Publish a thin shell at the TSDF zero-crossing. Caller must hold
-  // map_mtx_ (shared); no transient grid involved (TSDF is persistent-only).
-  // Uses 3-axis sign-change with sub-voxel interpolation (extractZeroCrossing)
-  // and emits the dominant semantic class per surface point.
+  // map_mtx_ (shared). Walks TsdfMap for the surface geometry then runs
+  // labelPointCloud against the Dir (semantics) grid to attach the per-point
+  // semantic class. The cross-grid join uses the 0xFFFF sentinel where the Dir
+  // grid has no voxel at the surface coord (same convention labelMesh /
+  // extractZeroCrossing already produce). 5-field schema.
   void publishTSDFPointCloud() {
-    if (use_split_) { publishTSDFPointCloudV2(); return; }
-    if (!tsdf_pub_ || tsdf_pub_->get_subscription_count() == 0) return;
-    if (map_->params().sdf_trunc <= 0.f) return;
-
-    auto points = scovox::extractZeroCrossing(
-        map_->grid(), (float)min_tsdf_w_, map_->params().resolution);
-    if (points.empty()) return;
-
-    sensor_msgs::msg::PointCloud2 cl;
-    cl.header.frame_id = int_frame_;
-    cl.header.stamp = get_clock()->now();
-    cl.height = 1;
-    cl.is_dense = true;
-    cl.is_bigendian = false;
-    sensor_msgs::PointCloud2Modifier mod(cl);
-    mod.setPointCloud2Fields(5,
-        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "distance", 1, sensor_msgs::msg::PointField::FLOAT32,
-        "semantic_class", 1, sensor_msgs::msg::PointField::UINT16);
-    mod.resize(points.size());
-
-    sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"), iy(cl,"y"), iz(cl,"z"), id(cl,"distance");
-    sensor_msgs::PointCloud2Iterator<uint16_t> ic(cl,"semantic_class");
-    for (const auto& p : points) {
-      *ix = p.position.x(); *iy = p.position.y(); *iz = p.position.z();
-      *id = p.distance; *ic = p.semantic_class;
-      ++ix; ++iy; ++iz; ++id; ++ic;
-    }
-    tsdf_pub_->publish(cl);
-  }
-
-  // Step 8 (D5) — split-mode TSDF zero-crossing publisher. Walks
-  // TsdfMap for the surface geometry then runs labelPointCloud against
-  // SemBeta to attach the per-point semantic class. The cross-grid join
-  // uses the 0xFFFF sentinel where SemBeta has no voxel at the surface
-  // coord (D5 — same convention labelMesh / extractZeroCrossing already
-  // produce). 5-field schema matches the legacy publisher byte-for-byte.
-  void publishTSDFPointCloudV2() {
     if (!tsdf_pub_ || !split_map_ || tsdf_pub_->get_subscription_count() == 0) return;
     const auto& tsdf_grid = split_map_->tsdf().grid();
     const double res = split_map_->resolution();
@@ -2078,18 +1318,15 @@ private:
         tsdf_grid, (float)min_tsdf_w_, res);
     if (points.empty()) return;
 
-    // Cross-grid label join — labelPointCloud queries SemBeta at each
-    // surface vertex's anchor voxel and writes the argmax class
-    // (sentinel 0xFFFF if absent). Mirrors mesh_labelling.hpp::labelMesh
-    // for triangle-mesh consumers.
+    // Cross-grid label join — labelPointCloud queries the Dir grid at each
+    // surface vertex's anchor voxel and writes the argmax class (sentinel
+    // 0xFFFF if absent). Mirrors mesh_labelling.hpp::labelMesh for
+    // triangle-mesh consumers.
     std::vector<Eigen::Vector3f> positions;
     positions.reserve(points.size());
     for (const auto& p : points) positions.push_back(p.position);
-    // Cross-grid label join — query the active semantic substrate. Under the
-    // split substrate the SemDir grid is empty, so label against the Dir grid.
-    auto labels = split_substrate_
-        ? scovox::labelPointCloud(positions, split_map_->semsplit().dirGrid(), alpha_0_)
-        : scovox::labelPointCloud(positions, split_map_->semdir().grid());
+    auto labels =
+        scovox::labelPointCloud(positions, split_map_->semsplit().dirGrid(), alpha_0_);
 
     sensor_msgs::msg::PointCloud2 cl;
     cl.header.frame_id = int_frame_;
@@ -2119,14 +1356,14 @@ private:
       scovox_msgs::srv::ExtractMesh::Response::SharedPtr rs)
   {
     std::shared_lock<std::shared_mutex> lk(map_mtx_);
-    if (!map_ || map_->params().sdf_trunc <= 0.f) {
+    if (!split_map_ || sdf_trunc_launch_ <= 0.f) {
       rs->vertex_count = 0;
       rs->triangle_count = 0;
       return;
     }
 
-    auto mesh = scovox::extractMesh(
-        map_->grid(), rq->min_weight, map_->params().resolution);
+    // Split-substrate mesh: TSDF zero-crossing geometry + Dir-grid labels.
+    auto mesh = split_map_->extractMesh(rq->min_weight);
     rs->vertex_count = mesh.vertices.size();
     rs->triangle_count = mesh.triangles.size();
 
@@ -2209,43 +1446,33 @@ private:
   double plan_window_size_m_{20.0};
   std::atomic<bool> sm_dirty_{false};
   std::unordered_map<uint32_t,uint16_t> color_map_;
-  std::unique_ptr<scovox::Map> map_;
-  // Step 8 (D7) — split-grid v2 substrate. Allocated only when use_split_
-  // is true; legacy `map_` stays null in that case to make accidental
-  // legacy-path access null-deref loudly rather than silently produce an
-  // empty parallel grid. Owns one TsdfMap + one SemBetaMap.
+  // Launch param block (scovox::Params). Carries the node-level sensor filters
+  // (range_decay_length, min_range, max_range, grazing_angle_threshold,
+  // semantic_occ_gate, resolution, top_k) read by the integration + publish
+  // paths. Owner now that the legacy fused map_ is gone.
+  scovox::Params map_params_;
+  // Raw launch sdf_trunc (0 == "TSDF off"). TsdfMap re-clamps a <=0 value back
+  // up internally, so the tsdf publisher / extract_mesh service / TSDF cloud
+  // gate on this rather than TsdfMap::params().sdf_trunc.
+  float sdf_trunc_launch_{0.f};
+  // Split-grid v4 substrate. Owns one TsdfMap + one SemSplitMap
+  // (BetaVoxel ∥ DirVoxel). Always allocated — the node has one path.
   std::unique_ptr<scovox::ScovoxMapSplit> split_map_;
-  bool use_split_{false};
-  bool share_tsdf_{false};
+  bool share_tsdf_{false};        // v4 TSDF stream toggle (wire opts.share_tsdf)
   bool fused_walker_{true};       // Step 12.10 — single-DDA hit-ray walker
-  // Step 8 — SemDir dataset priors (use_split=true only). Defaults
-  // match SemDirMap::Params; KITTI launches override via num_classes:=20.
+  // Semantic dataset priors. Defaults match SemSplitMap::Params; KITTI launches
+  // override via num_classes:=20.
   int   num_classes_{14};
   float alpha_0_{scovox::kDefaultDirichletPrior};
-  // Step 8 — wire format selector. false = v2 (SemBeta-projected, current
-  // production); true = v3 (SemDir-native, 20 B/voxel + header priors).
-  bool  wire_format_v3_{false};
-  // Split Beta/Dirichlet wire format. true = v4 (TSDF + BetaVoxel + DirVoxel
-  // as three separate streams). Requires split_substrate_ (the param guards
-  // enforce the implication). Mutually exclusive with v3 at publish time.
-  bool  wire_format_v4_{false};
-  // Semantic substrate inside ScovoxMapSplit: false = unified-Dirichlet
-  // SemDirVoxel (default), true = de-unified BetaVoxel ∥ DirVoxel (SemSplitMap).
-  // Only meaningful when use_split_=true.
-  bool  split_substrate_{false};
   std::string tsdf_dump_path_{};  // audit hook — see [tsdf_dump] memlog branch
   std::vector<std_msgs::msg::ColorRGBA> sem_col_;
   std::unordered_set<uint8_t> dyn_cls_;
-  // Set of voxel coordinates touched by integration since the last binary
-  // publish. Each entry corresponds to a voxel whose state may have changed
-  // and needs to be re-shipped to dscovox. Cleared on successful publish.
-  std::unordered_set<Bonxai::CoordT, CoordTHash, CoordTEqual> dirty_;
   // Last observed binary subscriber count. When this transitions from 0 to
   // >0 the next publish ships a full snapshot so a freshly-connected dscovox
   // sees this robot's complete current state, not just deltas since startup.
   size_t prev_sub_count_{0};
   sensor_msgs::msg::CameraInfo di_; std::atomic<bool> have_di_{false};
-  mutable std::shared_mutex map_mtx_;  // protects map_, dirty_
+  mutable std::shared_mutex map_mtx_;  // protects split_map_
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr di_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr input_pc_sub_;
   std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> d_sub_, s_sub_;

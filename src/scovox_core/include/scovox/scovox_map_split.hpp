@@ -1,50 +1,32 @@
 #pragma once
 
 /// @file scovox_map_split.hpp
-/// @brief Composer for the split-grid SCovox refactor (Step 7.5: unified
-/// Dirichlet), extended with a selectable semantic substrate.
+/// @brief Composer for the split-grid SCovox substrate (v4).
 ///
-/// Owns one `TsdfMap` (band-only, SLIM-VDB-equivalent) and ONE of two semantic
-/// substrates, chosen by `Params::substrate`:
-///   - `SemanticSubstrate::SEMDIR` (default): a `SemDirMap` — full-ray, unified
-///     Dirichlet over `{top-K classes, OTHER, FREE}`. Wire format v3.
-///   - `SemanticSubstrate::SPLIT`: a `SemSplitMap` — a `BetaVoxel` occupancy
-///     grid ∥ a `DirVoxel` semantics grid (de-unified). Wire format v4.
+/// Owns one `TsdfMap` (band-only, SLIM-VDB-equivalent) and one `SemSplitMap`
+/// semantic substrate — a `BetaVoxel` occupancy grid ∥ a `DirVoxel` semantics
+/// grid (de-unified). This is the v4 wire path; it is the only substrate.
 ///
-/// Per-frame integration dispatches to TSDF + the active semantic substrate.
+/// Per-frame integration dispatches to TSDF + the SemSplitMap substrate.
 /// Mesh / pointcloud extraction comes from TsdfMap geometry + labelMesh /
-/// labelPointCloud against the active semantic grid.
-///
-/// Naming note: the legacy `scovox::Map` (in scovox_mapping/scovoxmap.hpp) is
-/// kept untouched for the existing pipeline. The pre-unified `SemBetaMap` is
-/// kept as orphan code. The SEMDIR substrate stays byte-for-byte the prior
-/// behaviour; SPLIT is the additive de-unification path (validate via the
-/// flag, then promote).
+/// labelPointCloud against the Dir (semantics) grid.
 
 #include <Eigen/Core>
 #include <algorithm>
 #include <bonxai/bonxai.hpp>
-#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <memory>
-#include <optional>
 #include <vector>
 
 #include "scovox/marching_cubes.hpp"
 #include "scovox/mesh_labelling.hpp"
 #include "scovox/ray_iterator.hpp"
 #include "scovox/sem_split_map.hpp"
-#include "scovox/semdir_map.hpp"
-#include "scovox/semdir_voxel.hpp"
 #include "scovox/tsdf_map.hpp"
 #include "scovox/tsdf_voxel.hpp"
 
 namespace scovox {
-
-/// Which semantic substrate the composer integrates into.
-enum class SemanticSubstrate { SEMDIR, SPLIT };
 
 class ScovoxMapSplit {
  public:
@@ -58,44 +40,29 @@ class ScovoxMapSplit {
     uint8_t inner_bits = 2;
     uint8_t leaf_bits  = 3;
 
-    TsdfMap::Params   tsdf;
-    SemDirMap::Params semdir;
-
-    /// Semantic substrate selector. Default SEMDIR keeps the prior behaviour;
-    /// SPLIT builds a `SemSplitMap` instead, deriving its knobs from `semdir`
-    /// (the two Params are field-for-field equivalent).
-    SemanticSubstrate substrate = SemanticSubstrate::SEMDIR;
+    TsdfMap::Params     tsdf;
+    SemSplitMap::Params semsplit;
 
     /// Fused ray walker. When true, `integrateHit` runs a single Bresenham
     /// DDA over the union range and feeds per-voxel updates into both the
-    /// TSDF and the active semantic substrate. When false, falls back to the
-    /// legacy split path (two DDAs). Default true.
+    /// TSDF and the semantic substrate. When false, falls back to the
+    /// two-DDA split path. Default true.
     bool fused_walker = true;
   };
 
   explicit ScovoxMapSplit(const Params& p)
-      : tsdf_(   [&]{ auto t = p.tsdf;
-                      t.resolution = p.resolution;
-                      t.inner_bits = p.inner_bits;
-                      t.leaf_bits  = p.leaf_bits;
-                      return t; }())
-      , semdir_( [&]{ auto s = p.semdir;
-                      s.resolution = p.resolution;
-                      s.inner_bits = p.inner_bits;
-                      s.leaf_bits  = p.leaf_bits;
-                      return s; }())
+      : tsdf_(    [&]{ auto t = p.tsdf;
+                       t.resolution = p.resolution;
+                       t.inner_bits = p.inner_bits;
+                       t.leaf_bits  = p.leaf_bits;
+                       return t; }())
+      , semsplit_([&]{ auto s = p.semsplit;
+                       s.resolution = p.resolution;
+                       s.inner_bits = p.inner_bits;
+                       s.leaf_bits  = p.leaf_bits;
+                       return s; }())
       , resolution_(p.resolution)
-      , fused_walker_(p.fused_walker)
-      , use_split_(p.substrate == SemanticSubstrate::SPLIT) {
-    // SPLIT: build the SemSplitMap, deriving its params from `semdir` (shared
-    // resolution/hierarchy + the identical Bayesian knobs). semdir_ remains
-    // constructed but unused (an empty grid + params, a few hundred bytes) so
-    // the SEMDIR accessors stay valid and the diff vs. the prior code is small.
-    if (use_split_) {
-      semsplit_.emplace(toSplitParams(p.semdir, p.resolution,
-                                      p.inner_bits, p.leaf_bits));
-    }
-  }
+      , fused_walker_(p.fused_walker) {}
 
   // -------------------------------------------------------------------
   // Per-frame integration
@@ -114,7 +81,7 @@ class ScovoxMapSplit {
 
   /// Fused walker — one Bresenham DDA, per-voxel SDF computed once and
   /// dispatched into both `TsdfMap::applyBandUpdate` and (in the carve zone)
-  /// the active semantic substrate's `applyCarveUpdate`/`applyHitUpdate`.
+  /// the semantic substrate's `applyCarveUpdate`/`applyHitUpdate`.
   void integrateHitFused(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
@@ -128,7 +95,7 @@ class ScovoxMapSplit {
       // Degenerate ray (origin≈endpoint): no TSDF or semantic work happens.
       // Attribute the (near-zero) bracket to tsdf_ns_ — same accumulator the
       // main return below uses — so the fused walker reports ALL of its time in
-      // one bucket. (Routing this to semdir_ns_ would be doubly wrong: it does
+      // one bucket. (Routing this to sem_ns_ would be doubly wrong: it does
       // no semantic work, and it splits the fused path's time across two
       // accumulators whose per-substrate split is meaningless on this path.)
       const auto t1 = clk::now();
@@ -173,7 +140,7 @@ class ScovoxMapSplit {
       // the proj≈0 early-return: when the endpoint lands exactly on a voxel
       // centre, v_point_voxel≈0 so proj≈0, and returning here would skip the
       // hit update entirely — leaving the surface voxel at prior and diverging
-      // the fused walker from the non-fused SemDirMap::integrateHit, which
+      // the fused walker from the non-fused SemSplitMap::integrateHit, which
       // applies the hit unconditionally. The TSDF band update below may still
       // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
       if (c == k_hit) {
@@ -228,13 +195,13 @@ class ScovoxMapSplit {
     // a clock read — two steady_clock::now() calls per voxel would dominate and
     // distort the very cost being measured in this hot Bresenham loop. We
     // therefore report the COMBINED TSDF+semantic time under tsdf_ns_ and leave
-    // semdir_ns_ untouched on the fused path (it reads 0). For a true
-    // per-substrate split, run the non-fused integrateHitSplit walker, which
-    // times the two DDAs separately. See tsdfTimeUs()/semdirTimeUs() docs.
+    // sem_ns_ untouched on the fused path (it reads 0). For a true per-substrate
+    // split, run the non-fused integrateHitSplit walker, which times the two
+    // DDAs separately. See tsdfTimeUs()/semdirTimeUs() docs.
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
 
-  /// Legacy split walker (two DDAs). Kept for A/B parity testing.
+  /// Non-fused split walker (two DDAs). Kept for A/B parity testing.
   void integrateHitSplit(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
@@ -243,11 +210,10 @@ class ScovoxMapSplit {
     const auto t0 = clk::now();
     tsdf_.integrateRay(origin, endpoint);
     const auto t1 = clk::now();
-    if (use_split_) semsplit_->integrateHit(origin, endpoint, sem_probs, quality);
-    else            semdir_.integrateHit(origin, endpoint, sem_probs, quality);
+    semsplit_.integrateHit(origin, endpoint, sem_probs, quality);
     const auto t2 = clk::now();
-    tsdf_ns_    += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    semdir_ns_  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+    tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    sem_ns_  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
   }
 
   /// No-return: semantic carve only; no TSDF update.
@@ -256,10 +222,9 @@ class ScovoxMapSplit {
                      float                  quality) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
-    if (use_split_) semsplit_->integrateMiss(origin, endpoint, quality);
-    else            semdir_.integrateMiss(origin, endpoint, quality);
+    semsplit_.integrateMiss(origin, endpoint, quality);
     const auto t1 = clk::now();
-    semdir_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    sem_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
 
   // -------------------------------------------------------------------
@@ -271,12 +236,12 @@ class ScovoxMapSplit {
   /// loop interleaves both substrates and is not separable without per-voxel
   /// clock overhead. Only the non-fused integrateHitSplit / integrateMiss paths
   /// attribute TSDF and semantic time to separate accumulators.
-  std::int64_t tsdfTimeUs()   const noexcept { return tsdf_ns_   / 1000; }
+  std::int64_t tsdfTimeUs()   const noexcept { return tsdf_ns_ / 1000; }
   /// Accumulated semantic-substrate time. On the fused walker this is 0 by
   /// design (the combined cost is reported under tsdfTimeUs()); it is non-zero
   /// only via integrateHitSplit (non-fused) and integrateMiss.
-  std::int64_t semdirTimeUs() const noexcept { return semdir_ns_ / 1000; }
-  void         resetTiming()        noexcept { tsdf_ns_ = 0; semdir_ns_ = 0; }
+  std::int64_t semdirTimeUs() const noexcept { return sem_ns_ / 1000; }
+  void         resetTiming()        noexcept { tsdf_ns_ = 0; sem_ns_ = 0; }
 
   // -------------------------------------------------------------------
   // Surface extraction
@@ -285,13 +250,8 @@ class ScovoxMapSplit {
   /// Triangle mesh from TSDF zero-crossing with per-triangle semantic labels.
   TriangleMesh extractMesh(float min_weight) const {
     auto geom = scovox::extractMesh(tsdf_.grid(), min_weight, resolution_);
-    if (use_split_) {
-      geom.tri_labels = scovox::labelMesh(geom, tsdf_.grid(),
-                                          semsplit_->dirGrid(), semsplit_->params().alpha_0);
-    } else {
-      geom.tri_labels = scovox::labelMesh(geom, tsdf_.grid(), semdir_.grid(),
-                                          semdir_.params().alpha_0);
-    }
+    geom.tri_labels = scovox::labelMesh(geom, tsdf_.grid(),
+                                        semsplit_.dirGrid(), semsplit_.params().alpha_0);
     return geom;
   }
 
@@ -299,14 +259,8 @@ class ScovoxMapSplit {
   std::pair<std::vector<Eigen::Vector3f>, std::vector<uint16_t>>
   extractPointCloud(float min_weight) const {
     auto positions = scovox::extractPointCloud(tsdf_.grid(), min_weight, resolution_);
-    std::vector<uint16_t> labels;
-    if (use_split_) {
-      labels = scovox::labelPointCloud(positions, semsplit_->dirGrid(),
-                                       semsplit_->params().alpha_0);
-    } else {
-      labels = scovox::labelPointCloud(positions, semdir_.grid(),
-                                       semdir_.params().alpha_0);
-    }
+    auto labels = scovox::labelPointCloud(positions, semsplit_.dirGrid(),
+                                          semsplit_.params().alpha_0);
     return {positions, labels};
   }
 
@@ -314,27 +268,15 @@ class ScovoxMapSplit {
   // Wire-format support (drain-on-publish)
   // -------------------------------------------------------------------
 
-  std::vector<CoordT> drainTouchedTsdf()   { return tsdf_.drainTouched(); }
-
-  /// SEMDIR substrate: the single unified-Dirichlet touched set (v3 publish).
-  /// Intended for `!usesSplit()`; harmless (empty) under SPLIT since `semdir_`
-  /// is never integrated into there.
-  std::vector<CoordT> drainTouchedSemDir() { return semdir_.drainTouched(); }
+  std::vector<CoordT> drainTouchedTsdf() { return tsdf_.drainTouched(); }
 
   /// SPLIT substrate: per-grid touched sets (v4 publish). Beta is full-ray;
-  /// Dir is hit-sparse. Return empty under SEMDIR (guards the empty optional).
-  std::vector<CoordT> drainTouchedBeta() {
-    return use_split_ ? semsplit_->drainTouchedBeta() : std::vector<CoordT>{};
-  }
-  std::vector<CoordT> drainTouchedDir() {
-    return use_split_ ? semsplit_->drainTouchedDir() : std::vector<CoordT>{};
-  }
+  /// Dir is hit-sparse.
+  std::vector<CoordT> drainTouchedBeta() { return semsplit_.drainTouchedBeta(); }
+  std::vector<CoordT> drainTouchedDir()  { return semsplit_.drainTouchedDir(); }
 
   void clearTouchedTsdf()   noexcept { tsdf_.clearTouched(); }
-  void clearTouchedSemDir() noexcept {
-    if (use_split_) semsplit_->clearTouched();
-    else            semdir_.clearTouched();
-  }
+  void clearTouchedSemDir() noexcept { semsplit_.clearTouched(); }
 
   // -------------------------------------------------------------------
   // Memory / diagnostics
@@ -343,24 +285,18 @@ class ScovoxMapSplit {
   std::size_t tsdfVoxelCount()   const { return tsdf_.voxelCount();      }
   std::size_t tsdfGridBytes()    const { return tsdf_.gridMemoryBytes(); }
 
-  /// In SEMDIR mode these report the SemDir grid. In SPLIT mode the voxel
-  /// count reports the Dir (semantics) grid and bytes report Beta + Dir
+  /// Voxel count reports the Dir (semantics) grid; bytes report Beta + Dir
   /// combined, so existing memlog call sites stay meaningful.
-  std::size_t semdirVoxelCount() const {
-    return use_split_ ? semsplit_->dirVoxelCount() : semdir_.voxelCount();
-  }
+  std::size_t semdirVoxelCount() const { return semsplit_.dirVoxelCount(); }
   std::size_t semdirGridBytes()  const {
-    return use_split_
-        ? (semsplit_->betaGridMemoryBytes() + semsplit_->dirGridMemoryBytes())
-        : semdir_.gridMemoryBytes();
+    return semsplit_.betaGridMemoryBytes() + semsplit_.dirGridMemoryBytes();
   }
 
-  // SPLIT-only per-grid accounting (for v4 memlog / parity reporting).
-  // Return 0 under SEMDIR so callers never deref the empty optional.
-  std::size_t betaVoxelCount() const { return use_split_ ? semsplit_->betaVoxelCount() : 0; }
-  std::size_t dirVoxelCount()  const { return use_split_ ? semsplit_->dirVoxelCount()  : 0; }
-  std::size_t betaGridBytes()  const { return use_split_ ? semsplit_->betaGridMemoryBytes() : 0; }
-  std::size_t dirGridBytes()   const { return use_split_ ? semsplit_->dirGridMemoryBytes()  : 0; }
+  // SPLIT per-grid accounting (for v4 memlog / parity reporting).
+  std::size_t betaVoxelCount() const { return semsplit_.betaVoxelCount(); }
+  std::size_t dirVoxelCount()  const { return semsplit_.dirVoxelCount();  }
+  std::size_t betaGridBytes()  const { return semsplit_.betaGridMemoryBytes(); }
+  std::size_t dirGridBytes()   const { return semsplit_.dirGridMemoryBytes();  }
 
   // -------------------------------------------------------------------
   // Direct grid / substrate access
@@ -369,64 +305,28 @@ class ScovoxMapSplit {
   TsdfMap&         tsdf()         { return tsdf_;   }
   const TsdfMap&   tsdf()   const { return tsdf_;   }
 
-  /// Valid only when `!usesSplit()`.
-  SemDirMap&       semdir()       { return semdir_; }
-  const SemDirMap& semdir() const { return semdir_; }
+  SemSplitMap&       semsplit()       { return semsplit_; }
+  const SemSplitMap& semsplit() const { return semsplit_; }
 
-  /// Valid only when `usesSplit()` — asserts the precondition (returning a
-  /// reference, there is no safe empty fallback).
-  SemSplitMap& semsplit() {
-    assert(use_split_ && "ScovoxMapSplit::semsplit() requires substrate == SPLIT");
-    return *semsplit_;
-  }
-  const SemSplitMap& semsplit() const {
-    assert(use_split_ && "ScovoxMapSplit::semsplit() requires substrate == SPLIT");
-    return *semsplit_;
-  }
-
-  bool   usesSplit()  const noexcept { return use_split_; }
   double resolution() const { return resolution_; }
 
  private:
-  static SemSplitMap::Params toSplitParams(const SemDirMap::Params& s,
-                                           double res, uint8_t ib, uint8_t lb) {
-    SemSplitMap::Params o;
-    o.resolution               = res;
-    o.inner_bits               = ib;
-    o.leaf_bits                = lb;
-    o.w_occ                    = s.w_occ;
-    o.w_free                   = s.w_free;
-    o.kappa0                   = s.kappa0;
-    o.dirichlet_min_p_occ      = s.dirichlet_min_p_occ;
-    o.evidence_saturation      = s.evidence_saturation;
-    o.carve_skip_occ_threshold = s.carve_skip_occ_threshold;
-    o.range_decay_length       = s.range_decay_length;
-    o.num_classes              = s.num_classes;
-    o.alpha_0                  = s.alpha_0;
-    o.semantic_mode            = s.semantic_mode;
-    return o;
-  }
-
-  /// Per-voxel semantic carve dispatch (active substrate).
+  /// Per-voxel semantic carve dispatch (SPLIT substrate).
   bool semCarve(const CoordT& c, float quality) {
-    return use_split_ ? semsplit_->applyCarveUpdate(c, quality)
-                      : semdir_.applyCarveUpdate(c, quality);
+    return semsplit_.applyCarveUpdate(c, quality);
   }
-  /// Per-voxel semantic hit dispatch (active substrate).
+  /// Per-voxel semantic hit dispatch (SPLIT substrate).
   void semHit(const CoordT& c, const std::vector<float>* sem_probs, float quality) {
-    if (use_split_) semsplit_->applyHitUpdate(c, sem_probs, quality);
-    else            semdir_.applyHitUpdate(c, sem_probs, quality);
+    semsplit_.applyHitUpdate(c, sem_probs, quality);
   }
 
-  TsdfMap                    tsdf_;
-  SemDirMap                  semdir_;       ///< SEMDIR substrate (always built)
-  std::optional<SemSplitMap> semsplit_;     ///< SPLIT substrate (built iff use_split_)
-  double                     resolution_;
-  bool                       fused_walker_;
-  bool                       use_split_;
+  TsdfMap     tsdf_;       ///< TSDF surface (band-only)
+  SemSplitMap semsplit_;   ///< Split Beta/Dir semantic substrate
+  double      resolution_;
+  bool        fused_walker_;
 
-  std::int64_t tsdf_ns_   = 0;
-  std::int64_t semdir_ns_ = 0;
+  std::int64_t tsdf_ns_ = 0;
+  std::int64_t sem_ns_  = 0;
 };
 
 }  // namespace scovox
