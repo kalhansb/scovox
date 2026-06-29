@@ -91,8 +91,8 @@ TEST(Uncertainty, EntropySymmetric) {
 // while a_free stays pinned at the prior alpha_0 (=0.01, C=14 -> occ prior
 // 0.14). Pin the divergence so nobody re-uses entropy() as if it were a
 // bounded Shannon stat: at Beta(0.14+50, 0.01) the closed form is ~-99
-// (not in [0, ln2]). MapStats "mean Shannon entropy" deliberately uses the
-// bounded Bernoulli form below precisely because this poisons the mean.
+// (not in [0, ln2]). The map's "mean Shannon entropy" stat deliberately uses
+// the bounded Bernoulli form below precisely because this poisons the mean.
 TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
   const float alpha0 = 0.01f;     // kDefaultDirichletPrior
   const float C = 14.f;           // default num_classes
@@ -107,7 +107,7 @@ TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
 }
 
 // The bounded occupancy-uncertainty stat that production code (e.g. the
-// MapStats aggregator in scoreCandidatesOnGrid, and the H_y term inside
+// occupancy map-stats aggregator, and the H_y term inside
 // expectedInformationGain) uses INSTEAD of entropy() on the same near-
 // point-mass voxel: Bernoulli Shannon entropy H(p_occ) with p_occ =
 // a_occ/(a_occ+a_free). It is bounded in [0, ln2] regardless of how

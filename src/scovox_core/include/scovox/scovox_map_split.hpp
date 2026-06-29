@@ -48,6 +48,14 @@ class ScovoxMapSplit {
     /// TSDF and the semantic substrate. When false, falls back to the
     /// two-DDA split path. Default true.
     bool fused_walker = true;
+
+    /// When false, the fused walker skips every TSDF band write, so the TsdfMap
+    /// grid stays empty. For callers that disabled TSDF (sdf_trunc passed as 0)
+    /// but whose TsdfMap::Params still sanitises sdf_trunc back to a positive
+    /// default — the band integration is then pure dead work if the TsdfMap grid
+    /// is never read. Default true → TSDF integrates exactly as before. The
+    /// occupancy (Beta) and semantic (Dir) substrates are unaffected either way.
+    bool tsdf_enabled = true;
   };
 
   explicit ScovoxMapSplit(const Params& p)
@@ -62,7 +70,8 @@ class ScovoxMapSplit {
                        s.leaf_bits  = p.leaf_bits;
                        return s; }())
       , resolution_(p.resolution)
-      , fused_walker_(p.fused_walker) {}
+      , fused_walker_(p.fused_walker)
+      , tsdf_enabled_(p.tsdf_enabled) {}
 
   // -------------------------------------------------------------------
   // Per-frame integration
@@ -163,7 +172,7 @@ class ScovoxMapSplit {
       //     applyBandUpdate clamps every in-front voxel (incl. sdf > trunc) to
       //     +trunc, so we drop the upper gate to integrate the full carve front.
       // applyBandUpdate owns the lower gate (`sdf <= -trunc` → drop) for both.
-      if (tparams.space_carving || sdf <= trunc + h) {
+      if (tsdf_enabled_ && (tparams.space_carving || sdf <= trunc + h)) {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
@@ -324,6 +333,7 @@ class ScovoxMapSplit {
   SemSplitMap semsplit_;   ///< Split Beta/Dir semantic substrate
   double      resolution_;
   bool        fused_walker_;
+  bool        tsdf_enabled_;
 
   std::int64_t tsdf_ns_ = 0;
   std::int64_t sem_ns_  = 0;

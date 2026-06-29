@@ -56,8 +56,6 @@
 #include <scovox/sembeta_voxel.hpp>
 #include <scovox_msgs/srv/get_region.hpp>
 #include <scovox_msgs/srv/get_occupancy_grid.hpp>
-#include <scovox_msgs/srv/score_candidates.hpp>
-#include <scovox_msgs/msg/map_stats.hpp>
 #include "scovox/scovoxmap.hpp"
 #include "scovox/node_utils.hpp"
 #include "scovox/dscovox_consensus.hpp"  // isPrior*/projectBetaDir*/refold* (shared w/ tests)
@@ -70,7 +68,6 @@
 #include <tf2/time.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <scovox/uncertainty.hpp>
-#include <scovox/ray_iterator.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <unordered_map>
@@ -79,6 +76,7 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <shared_mutex>
 #include <atomic>  // last_pc_pub_ns_ rate-limiter (shared-lock concurrent access)
@@ -183,6 +181,19 @@ public:
       declare_parameter<std::string>("pointcloud_topic", "~/pointcloud"),
       rclcpp::SystemDefaultsQoS());
 
+    // Fused-map topic for downstream consumers (planner, visualisation). Topic
+    // form of the on-demand GetRegion service: a full snapshot of the fused
+    // Beta/Dir grids projected to a ScovoxMap, published from the publish timer
+    // below when the map has changed and someone is subscribed (see
+    // publishFusedMap). Latched QoS — KeepLast(1) + reliable + transient_local —
+    // so the last published snapshot is retained and replayed to a (re)connecting
+    // subscriber; the very first subscriber receives it on the next publish tick
+    // after connecting. Only one full snapshot is ever retained (the voxel dump
+    // can be large). Any subscriber MUST match this QoS or it receives nothing.
+    scovox_map_pub_ = create_publisher<scovox_msgs::msg::ScovoxMap>(
+      declare_parameter<std::string>("scovox_topic", "~/scovox"),
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+
     // Reliable + deeper queue for binary submap deltas. The old
     // SystemDefaultsQoS resolved to BEST_EFFORT on this build, which
     // silently dropped large ScovoxMapBinary payloads under any
@@ -204,9 +215,6 @@ public:
     get_occ_srv_ = create_service<scovox_msgs::srv::GetOccupancyGrid>(
       "~/get_occupancy_grid",
       std::bind(&DSCovoxNode::onGetOccupancyGrid, this, std::placeholders::_1, std::placeholders::_2));
-    score_candidates_srv_ = create_service<scovox_msgs::srv::ScoreCandidates>(
-      "~/score_candidates",
-      std::bind(&DSCovoxNode::onScoreCandidates, this, std::placeholders::_1, std::placeholders::_2));
 
     if (pub_hz_ > 0.0) {
       // The fused grid is kept current incrementally inside onBinaryMap.
@@ -225,6 +233,12 @@ public:
         [this] {
           std::shared_lock<std::shared_mutex> lk(mu_);
           maybePublishPointCloud();
+          // Topic form of GetRegion: publish the whole fused map for the
+          // planner. Shares this tick's shared_lock (publishFusedMap must not
+          // re-lock the non-recursive shared_mutex). NOTE: gated on pub_hz_ > 0
+          // like every other publisher here — disabling the publish timer also
+          // disables the fused-map topic the planner depends on.
+          publishFusedMap();
           // Map size is keyed on occupancy (the fused Beta grid).
           size_t fc = split_fused_beta_ ? split_fused_beta_->activeCellsCount() : 0;
           size_t ts = 0;
@@ -272,20 +286,38 @@ private:
   // grids ingest + refold INDEPENDENTLY: a touched coord may be in either or
   // both. Priors are pinned from the first frame's header.
   //
-  // NOTE: the RPC query services (GetRegion / GetOccupancyGrid /
-  // ScoreCandidates) project the split Beta(+Dir) grids into a transient
-  // scovox::Voxel via a substrate-agnostic templated core. The SEMANTIC query
-  // math uses the raw-evidence convention; the OCCUPANCY math uses the
-  // symmetric Beta(1,1) prior (p_occ=0.5) — see projectBetaDirToVoxel /
-  // docs/occupancy_prior.md. Occupancy-only services (ScoreCandidates /
-  // GetOccupancyGrid) read just the Beta grid; GetRegion joins the Dir grid
-  // for per-class evidence.
+  // NOTE: the RPC query services (GetRegion / GetOccupancyGrid) project the
+  // split Beta(+Dir) grids into a transient scovox::Voxel via a
+  // substrate-agnostic templated core. The SEMANTIC query math uses the
+  // raw-evidence convention; the OCCUPANCY math uses the symmetric Beta(1,1)
+  // prior (p_occ=0.5) — see projectBetaDirToVoxel / docs/occupancy_prior.md.
+  // Occupancy-only services (GetOccupancyGrid) read just the Beta grid;
+  // GetRegion joins the Dir grid for per-class evidence.
   // ==================================================================
   void onBinaryMap(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
     if (msg->version != 4) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "wire receiver expects envelope version 4, got %d (dropping)",
         msg->version);
+      return;
+    }
+    // The frame body is serialized in host byte order (BinarySerializer uses raw
+    // field memcpy, not an endian-canonical encoding). The publisher stamps
+    // msg->little_endian from its host; until a byte-swapping decode path exists,
+    // a sender of the opposite endianness can only be mis-decoded. Reject it loud
+    // rather than silently corrupting the fused map. (No-op on a homogeneous
+    // little-endian fleet, which is every supported target today.)
+    constexpr bool kHostLittleEndian =
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        true;
+#else
+        false;
+#endif
+    if (msg->little_endian != kHostLittleEndian) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "wire endianness mismatch from '%s' (frame little_endian=%d, host=%d) — "
+        "cross-endian decode is unsupported; dropping",
+        msg->header.frame_id.c_str(), (int)msg->little_endian, (int)kHostLittleEndian);
       return;
     }
     const std::string sf = msg->header.frame_id;
@@ -462,6 +494,11 @@ private:
       }
     }  // unique_lock released
 
+    // The fused grid changed; mark it so the publish timer re-publishes the
+    // fused-map topic on its next tick (and only then). Reaching here implies
+    // non-empty deltas were fused (empty frames returned early above).
+    fused_dirty_.store(true, std::memory_order_relaxed);
+
     // Step 3 — visualisation publish.
     {
       std::shared_lock<std::shared_mutex> rlk(mu_);
@@ -606,7 +643,9 @@ private:
         r = sem_col_[bc][0]; gg = sem_col_[bc][1]; b = sem_col_[bc][2];
       }
       uint32_t rp = ((uint32_t)(r * 255) << 16) | ((uint32_t)(gg * 255) << 8) | (uint32_t)(b * 255);
-      *ir = *reinterpret_cast<float*>(&rp);
+      // Bit-pack RGB into the float field via memcpy (not a reinterpret_cast,
+      // which is a strict-aliasing UB the compiler warns on); folds to a move.
+      float rgb_f; std::memcpy(&rgb_f, &rp, sizeof(rgb_f)); *ir = rgb_f;
       *iv = scovox::variance(v);
       *ie = scovox::expectedInformationGain(v);
       *iao = v.a_occ; *iaf = v.a_free;
@@ -652,11 +691,14 @@ private:
     });
   }
 
-  void onGetRegion(const scovox_msgs::srv::GetRegion::Request::SharedPtr rq,
-                   scovox_msgs::srv::GetRegion::Response::SharedPtr rs)
+  // Lock-free GetRegion core, shared by the service handler and the fused-map
+  // topic publisher. Caller MUST already hold (at least) a shared lock on mu_:
+  // std::shared_mutex is non-recursive, so this function must never lock it
+  // itself. Fills rs->map header + the voxels inside rq's bbox (regionOnGrid
+  // does the clip) by projecting the fused split Beta/Dir grids.
+  void fillRegion(const scovox_msgs::srv::GetRegion::Request::SharedPtr& rq,
+                  const scovox_msgs::srv::GetRegion::Response::SharedPtr& rs)
   {
-    // split_fused_* is kept current incrementally — read lock.
-    std::shared_lock<std::shared_mutex> lk(mu_);
     auto& m = rs->map;
     m.header.stamp = get_clock()->now();
     m.header.frame_id = map_frame_;
@@ -676,268 +718,39 @@ private:
         });
   }
 
-  // ================================================================
-  // ScoreCandidates service — FOV raycasting on the fused Beta grid
-  // ================================================================
-
-  // Substrate-agnostic ScoreCandidates core (FOV raycast scoring + ROI map
-  // stats). Operates on any Bonxai grid whose cell type projects to a
-  // scovox::Voxel via `project(cell) -> scovox::Voxel`. All scoring signals
-  // (EIG / entropy / SSMI KL / frontier) are occupancy-only, so the projection
-  // may leave semantics empty; the wire path passes the Beta grid with a Dir-free
-  // projection. One body ⇒ the raycast math can never drift between substrates.
-  //
-  // `unobserved_prior` is the scovox::Voxel used for cells a ray traverses that
-  // are NOT allocated/observed. It MUST carry the SAME occupancy prior the
-  // substrate uses for its observed cells, otherwise the SSMI reach *= (1-p)
-  // accumulation and KL terms mix two occupancy priors and skew candidate
-  // ranking. Both the fused path and the wire path now ship the symmetric Beta(1,1) prior (p_occ=0.5)
-  // — the fused path via defaultVoxel(), the wire path via defaultBetaVoxel(kBetaOccPrior,
-  // kBetaFreePrior); see docs/occupancy_prior.md.
-  template <typename CellT, typename ProjectFn, typename IsPriorFn>
-  void scoreCandidatesOnGrid(
-      const scovox_msgs::srv::ScoreCandidates::Request::SharedPtr rq,
-      scovox_msgs::srv::ScoreCandidates::Response::SharedPtr rs,
-      Bonxai::VoxelGrid<CellT>& g, ProjectFn project, IsPriorFn isPriorCell,
-      const scovox::Voxel& unobserved_prior)
+  void onGetRegion(const scovox_msgs::srv::GetRegion::Request::SharedPtr rq,
+                   scovox_msgs::srv::GetRegion::Response::SharedPtr rs)
   {
-    const size_t n = rq->candidates.size();
-
-    // Select scoring function
-    enum ScoringMode { SM_EIG, SM_ENTROPY, SM_FRONTIER, SM_RANDOM, SM_SSMI };
-    ScoringMode mode = SM_EIG;
-    if (rq->scoring_mode == "entropy")       mode = SM_ENTROPY;
-    else if (rq->scoring_mode == "frontier") mode = SM_FRONTIER;
-    else if (rq->scoring_mode == "random")   mode = SM_RANDOM;
-    else if (rq->scoring_mode == "ssmi")     mode = SM_SSMI;
-
-    // Score candidates via FOV raycasting (skipped when n == 0; map
-    // stats below still run so the random planner gets diagnostic data).
-    if (n > 0) {
-
-    const float hfov = rq->fov_hfov;
-    const float vfov = rq->fov_vfov;
-    const int h_rays = rq->fov_h_rays > 0 ? rq->fov_h_rays : 16;
-    const int v_rays = rq->fov_v_rays > 0 ? rq->fov_v_rays : 12;
-    const float max_range = rq->fov_max_range > 0.f ? rq->fov_max_range : 10.0f;
-    const float occ_stop = rq->fov_occ_stop > 0.f ? rq->fov_occ_stop : 0.7f;
-
-    std::vector<Eigen::Vector3f> ray_dirs;
-    ray_dirs.reserve(h_rays * v_rays);
-    const float h_step = hfov / (float)h_rays;
-    const float v_step = vfov / (float)v_rays;
-    const float h_start = -hfov * 0.5f + h_step * 0.5f;
-    const float v_start = -vfov * 0.5f + v_step * 0.5f;
-    for (int vi = 0; vi < v_rays; ++vi) {
-      float pitch = v_start + (float)vi * v_step;
-      float cp = std::cos(pitch), sp = std::sin(pitch);
-      for (int hi = 0; hi < h_rays; ++hi) {
-        float yaw = h_start + (float)hi * h_step;
-        ray_dirs.emplace_back(cp * std::cos(yaw), cp * std::sin(yaw), sp);
-      }
-    }
-
-    for (size_t ci = 0; ci < n; ++ci) {
-      const auto& cand = rq->candidates[ci];
-      Eigen::Vector3f pos(cand.position.x, cand.position.y, cand.position.z);
-      float cy = std::cos(cand.yaw), sy = std::sin(cand.yaw);
-      float total_score = 0.0f;
-
-      auto acc = g.createConstAccessor();
-
-      if (mode == SM_SSMI) {
-        // SSMI-style MI lower bound with ray marginalisation.
-        // Per-ray: weight each voxel's KL contribution by the probability
-        // the ray reaches it, matching Asgharivaskasi & Atanasov (TRO 2023).
-        for (const auto& dir : ray_dirs) {
-          Eigen::Vector3f world_dir(
-              cy * dir.x() - sy * dir.y(),
-              sy * dir.x() + cy * dir.y(),
-              dir.z());
-          Eigen::Vector3f ray_end = pos + world_dir * max_range;
-          auto c_origin = g.posToCoord(pos.x(), pos.y(), pos.z());
-          auto c_end    = g.posToCoord(ray_end.x(), ray_end.y(), ray_end.z());
-
-          float reach = 1.0f;
-          float free_kl_acc = 0.0f;
-
-          scovox::RayIterator(c_origin, c_end,
-              [&](const Bonxai::CoordT& c) -> bool {
-                const CellT* ptr = acc.value(c);
-                const bool obs = ptr && !isPriorCell(*ptr);
-                // Use the substrate's own unobserved prior so the reach/KL
-                // accumulation stays on one consistent occupancy prior across
-                // observed and unobserved cells. Both substrates ship the
-                // symmetric Beta(1,1) prior (p_occ=0.5); see docs/occupancy_prior.md.
-                scovox::Voxel v = obs ? project(*ptr) : unobserved_prior;
-                float p = v.p_occ();
-                float kl_occ  = scovox::ssmiOccKL(v);
-                float kl_free = scovox::ssmiFreeKL(v);
-
-                // Guard each KL term so one non-finite voxel (e.g. digamma
-                // underflow on a near-point-mass cell) drops only that term
-                // instead of poisoning the whole candidate's accumulated score
-                // (which the post-hoc isfinite(total_score) below would then
-                // zero entirely). Mirrors the map-stats per-term isfinite skip.
-                const float term = reach * p * (kl_occ + free_kl_acc);
-                if (std::isfinite(term)) total_score += term;
-                if (std::isfinite(kl_free)) free_kl_acc += kl_free;
-                reach *= (1.0f - p);
-
-                if (obs && p >= occ_stop) return false;
-                return true;
-              });
-          // "No hit" event: all voxels observed as free.
-          const float no_hit = reach * free_kl_acc;
-          if (std::isfinite(no_hit)) total_score += no_hit;
-        }
-      } else {
-        // Original per-voxel scoring (EIG / entropy / frontier / random).
-        for (const auto& dir : ray_dirs) {
-          Eigen::Vector3f world_dir(
-              cy * dir.x() - sy * dir.y(),
-              sy * dir.x() + cy * dir.y(),
-              dir.z());
-          Eigen::Vector3f ray_end = pos + world_dir * max_range;
-
-          auto c_origin = g.posToCoord(pos.x(), pos.y(), pos.z());
-          auto c_end    = g.posToCoord(ray_end.x(), ray_end.y(), ray_end.z());
-
-          scovox::RayIterator(c_origin, c_end,
-              [&](const Bonxai::CoordT& c) -> bool {
-                const CellT* ptr = acc.value(c);
-                float s = 0.0f;
-                if (ptr && !isPriorCell(*ptr)) {
-                  const scovox::Voxel v = project(*ptr);
-                  switch (mode) {
-                    case SM_EIG:      s = scovox::expectedInformationGain(v); break;
-                    case SM_ENTROPY: {
-                      float p = v.p_occ();
-                      s = (p > 1e-7f && p < 1.f - 1e-7f)
-                          ? -p * std::log(p) - (1.f - p) * std::log(1.f - p)
-                          : 0.f;
-                      break;
-                    }
-                    case SM_FRONTIER: s = 0.0f; break;
-                    case SM_RANDOM:   s = 0.0f; break;
-                    case SM_SSMI:     break;  // handled above
-                  }
-                  // Per-term isfinite guard: a single non-finite EIG (e.g. a
-                  // projected Beta voxel whose digamma args underflow) must drop
-                  // only this voxel, not collapse the candidate's whole score to
-                  // 0 via the post-hoc isfinite(total_score) check below.
-                  if (std::isfinite(s)) total_score += s;
-                  if (v.p_occ() >= occ_stop) return false;
-                } else {
-                  // Unobserved cell: score against the substrate's occupancy
-                  // prior (`unobserved_prior`), NOT a hardcoded Beta(1,1). This
-                  // matches the SSMI branch above and a freshly-allocated
-                  // observed cell, so EIG/entropy stay on ONE consistent
-                  // occupancy prior even if kBetaOccPrior is retuned (e.g. to the
-                  // Jeffreys Beta(0.5,0.5) runner-up). With today's Beta(1,1) the
-                  // result is identical to the previous hardcoded p=0.5.
-                  switch (mode) {
-                    case SM_EIG:
-                      s = scovox::expectedInformationGain(unobserved_prior);
-                      break;
-                    case SM_ENTROPY: {
-                      const float p = unobserved_prior.p_occ();
-                      s = (p > 1e-7f && p < 1.f - 1e-7f)
-                          ? -p * std::log(p) - (1.f - p) * std::log(1.f - p)
-                          : 0.f;
-                      break;
-                    }
-                    case SM_FRONTIER: s = 1.0f; break;
-                    case SM_RANDOM:   s = 0.0f; break;
-                    case SM_SSMI:     break;
-                  }
-                  // Same per-term isfinite guard as the observed branch.
-                  if (std::isfinite(s)) total_score += s;
-                }
-                return true;
-              });
-        }
-      }
-      rs->scores[ci] = std::isfinite(total_score) ? total_score : 0.0f;
-    }
-
-    } // if (n > 0)
-
-    // Compute map stats within the ROI bounding box
-    auto mn = g.posToCoord(rq->min_corner.x, rq->min_corner.y, rq->min_corner.z);
-    auto mx = g.posToCoord(rq->max_corner.x, rq->max_corner.y, rq->max_corner.z);
-    uint32_t obs_count = 0;
-    // finite_eig_count tracks only the voxels actually summed into sum_eig.
-    // EIG terms that are non-finite are skipped (below) but obs_count still
-    // increments for them; dividing sum_eig by obs_count would bias mean_eig
-    // toward zero. Divide by finite_eig_count so the mean reflects the summed
-    // voxels. (sum_ent is always finite — the entropy term clamps to 0 outside
-    // the open (0,1) range — so it keeps dividing by obs_count.)
-    uint32_t finite_eig_count = 0;
-    double sum_eig = 0.0, sum_ent = 0.0;
-    uint32_t frontier_count = 0;
-    auto stats_acc = g.createConstAccessor();
-    static const Bonxai::CoordT nb_offsets[6] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-    g.forEachCell([&](const CellT& cell, const Bonxai::CoordT& c) {
-      if (isPriorCell(cell)) return;
-      if (c.x < mn.x || c.x > mx.x || c.y < mn.y || c.y > mx.y ||
-          c.z < mn.z || c.z > mx.z) return;
-      const scovox::Voxel v = project(cell);
-      obs_count++;
-      const float eig = scovox::expectedInformationGain(v);
-      if (std::isfinite(eig)) { sum_eig += eig; ++finite_eig_count; }
-      // mean_entropy is documented (MapStats.msg) as "Mean Shannon entropy":
-      // the BOUNDED Bernoulli occupancy entropy H(p_occ) ∈ [0, ln2], identical
-      // to the SM_ENTROPY scoring mode above. scovox::entropy() is instead the
-      // Beta *differential* entropy (unbounded below); on the split substrate's
-      // near-point-mass occupied voxels (a_free pinned at α_0) it diverges to
-      // absurd negatives (≈ −1e28, formerly −inf), poisoning the mean. Compute
-      // the documented Shannon entropy directly so the stat stays finite and
-      // meaningful: MapStats.mean_entropy reports bounded Bernoulli entropy
-      // ∈ [0, ln2], matching the MapStats.msg contract.
-      const float p = v.p_occ();
-      sum_ent += (p > 1e-7f && p < 1.f - 1e-7f)
-          ? -p * std::log(p) - (1.f - p) * std::log(1.f - p) : 0.f;
-      // Frontier check: free voxel with unknown neighbor
-      if (v.p_occ() < 0.5f) {
-        for (const auto& off : nb_offsets) {
-          Bonxai::CoordT nb{c.x + off.x, c.y + off.y, c.z + off.z};
-          if (!stats_acc.value(nb)) { frontier_count++; break; }
-        }
-      }
-    });
-    rs->stats.observed_voxels = obs_count;
-    rs->stats.mean_eig = finite_eig_count > 0 ? (float)(sum_eig / finite_eig_count) : 0.0f;
-    rs->stats.mean_entropy = obs_count > 0 ? (float)(sum_ent / obs_count) : 0.0f;
-    rs->stats.frontier_voxels = frontier_count;
+    // split_fused_* is kept current incrementally — read lock.
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    fillRegion(rq, rs);
   }
 
-  void onScoreCandidates(
-      const scovox_msgs::srv::ScoreCandidates::Request::SharedPtr rq,
-      scovox_msgs::srv::ScoreCandidates::Response::SharedPtr rs)
+  // Publish the ENTIRE fused map as a ScovoxMap topic. Called from the publish
+  // timer, which already holds a shared lock on mu_ — this must NOT lock mu_
+  // (non-recursive shared_mutex). Skipped when no one is subscribed (so a large
+  // voxel dump isn't built for nothing) and when the map hasn't changed since
+  // the last publish. The subscription check comes first so dirtiness is
+  // preserved while nobody listens, then delivered on the first tick after a
+  // subscriber connects. The latched (transient_local) QoS retains that last
+  // published snapshot and replays it to any later (re)connecting subscriber.
+  void publishFusedMap()
   {
-    std::shared_lock<std::shared_mutex> lk(mu_);
-    const size_t n = rq->candidates.size();
-    rs->scores.resize(n, 0.0f);
-
-    if (!split_fused_beta_) return;
-    const uint16_t C = fused_num_classes_;
-    const float a0 = fused_alpha_0_;
-    // Scoring is occupancy-only ⇒ a Dir-free projection (semantics stay empty).
-    // The unobserved-cell prior is the SHIPPED split Beta prior — symmetric
-    // Beta(1,1), p_occ=0.5 — so SSMI reach/KL on unallocated wire cells uses the
-    // SAME prior as freshly-allocated observed cells (the key invariant: the
-    // unobserved baseline must equal the allocation prior). See
-    // docs/occupancy_prior.md.
-    const scovox::Voxel split_unobserved = projectBetaDirToVoxel(
-        scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior),
-        nullptr, C, a0);
-    scoreCandidatesOnGrid<scovox::BetaVoxel>(
-        rq, rs, *split_fused_beta_,
-        [C, a0](const scovox::BetaVoxel& b) { return projectBetaDirToVoxel(b, nullptr, C, a0); },
-        [this](const scovox::BetaVoxel& b) { return isPriorBeta(b, fused_num_classes_, fused_alpha_0_); },
-        split_unobserved);
+    if (!scovox_map_pub_ || scovox_map_pub_->get_subscription_count() == 0)
+      return;
+    if (!fused_dirty_.exchange(false)) return;
+    // Full-coverage bbox: regionOnGrid clips in coord space via posToCoord
+    // (floor(corner/res_)). Size the corner relative to res_ so it lands at
+    // ±1e8 voxels — far outside any real map yet comfortably inside int32 at
+    // ANY resolution (a fixed metric constant would overflow the cast at very
+    // fine resolutions). Consumers re-apply their own ROI clip on ingest.
+    const double big = 1e8 * std::max(static_cast<double>(res_), 1e-3);
+    auto rq = std::make_shared<scovox_msgs::srv::GetRegion::Request>();
+    rq->min_corner.x = rq->min_corner.y = rq->min_corner.z = -big;
+    rq->max_corner.x = rq->max_corner.y = rq->max_corner.z =  big;
+    auto rs = std::make_shared<scovox_msgs::srv::GetRegion::Response>();
+    fillRegion(rq, rs);
+    scovox_map_pub_->publish(rs->map);
   }
 
   // Substrate-agnostic GetOccupancyGrid core. 2D max-projection of p_occ over
@@ -1014,6 +827,10 @@ private:
   // read-decide-update a single race-free claim so exactly one caller publishes
   // per window even under a multi-threaded executor.
   std::atomic<int64_t> last_pc_pub_ns_{0};
+  // Set when onBinaryMap fuses new data; consumed (exchanged false) by
+  // publishFusedMap so the fused-map topic is only rebuilt+serialized when it
+  // actually changed, not every publish tick. Mirrors scovox_node's sm_dirty_.
+  std::atomic<bool> fused_dirty_{false};
   int top_k_;
   float res_{0.f};
   std::vector<std::array<float, 3>> sem_col_;
@@ -1038,9 +855,9 @@ private:
   mutable std::shared_mutex mu_;
   std::vector<rclcpp::Subscription<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr> subs_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
+  rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_pub_;
   rclcpp::Service<scovox_msgs::srv::GetRegion>::SharedPtr get_region_srv_;
   rclcpp::Service<scovox_msgs::srv::GetOccupancyGrid>::SharedPtr get_occ_srv_;
-  rclcpp::Service<scovox_msgs::srv::ScoreCandidates>::SharedPtr score_candidates_srv_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 };
 

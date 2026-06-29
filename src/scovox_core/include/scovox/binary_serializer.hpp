@@ -66,6 +66,13 @@ namespace scovox {
 class BinarySerializer {
  public:
   static constexpr uint32_t MAGIC          = 0x53435658;  // "SCVX"
+  // Sane upper bound on the header-supplied class count. num_classes drives the
+  // reconstructed Dirichlet OTHER prior (num_classes − K_TOP)·alpha_0 in
+  // consensus_merge; a forged u16 near 65535 with alpha_0≈0.01 injects ~650
+  // pseudo-counts of "unknown" mass per voxel, swamping real evidence (and two
+  // re-sent snapshots from the same bad sender agree, so the per-frame equality
+  // check can't catch it). No real taxonomy approaches this ceiling.
+  static constexpr uint16_t MAX_NUM_CLASSES = 4096;
   // Blob codec revision (distinct from the ROS envelope `version`=4 that routes
   // to this codec). Bumped 4→5 when the split occupancy prior changed
   // from the calibrated Beta(C·α₀, α₀) to symmetric Beta(1,1)
@@ -219,8 +226,19 @@ class BinarySerializer {
           "BinarySerializer: num_classes (" + std::to_string(f.num_classes)
           + ") < K_TOP (" + std::to_string(K_TOP) + ")");
     }
+    if (f.num_classes > MAX_NUM_CLASSES) {
+      throw std::runtime_error(
+          "BinarySerializer: num_classes (" + std::to_string(f.num_classes)
+          + ") > MAX_NUM_CLASSES (" + std::to_string(MAX_NUM_CLASSES) + ")");
+    }
     if (!std::isfinite(f.alpha_0) || f.alpha_0 <= 0.f) {
       throw std::runtime_error("BinarySerializer: alpha_0 must be finite and > 0");
+    }
+    // resolution is reconstructed into world coords downstream (coord*res);
+    // a forged NaN/0/negative would yield NaN positions or a divide-by-zero.
+    // Validate it with the same rigor as alpha_0 (it had none before).
+    if (!std::isfinite(f.resolution) || f.resolution <= 0.f) {
+      throw std::runtime_error("BinarySerializer: resolution must be finite and > 0");
     }
 
     // TSDF stream.

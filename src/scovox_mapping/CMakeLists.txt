@@ -3,6 +3,16 @@ project(scovox_mapping VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Default to an optimized build (real-time mapping node hot path). colcon users
+# frequently omit -DCMAKE_BUILD_TYPE; without a default the per-ray integration
+# runs unoptimized with Eigen asserts on. Respect an explicit choice when given.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Wall -Wextra)
+endif()
+
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -15,6 +25,7 @@ find_package(tf2_sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(scovox_msgs REQUIRED)
 find_package(scovox_core REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -51,7 +62,7 @@ target_link_libraries(dscovox_mapping_node scovoxmap Eigen3::Eigen ${LZ4_LIBRARI
 add_executable(scovox_mapping_node src/scovox_node.cpp)
 ament_target_dependencies(scovox_mapping_node
   rclcpp sensor_msgs std_msgs geometry_msgs tf2 tf2_ros tf2_geometry_msgs
-  message_filters scovox_msgs scovox_core)
+  message_filters nav_msgs diagnostic_msgs scovox_msgs scovox_core)
 target_link_libraries(scovox_mapping_node scovoxmap ${LZ4_LIBRARIES})
 target_include_directories(scovox_mapping_node PRIVATE ${LZ4_INCLUDE_DIRS})
 

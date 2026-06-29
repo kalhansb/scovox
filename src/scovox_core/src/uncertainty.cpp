@@ -46,8 +46,8 @@ float entropy(const Voxel& v) {
   // [0, ln2] occupancy uncertainty. Do NOT treat the result as Bernoulli/Shannon
   // entropy. Consumers that need a bounded occupancy-uncertainty signal must
   // compute Bernoulli H(p_occ) = -p ln p - (1-p) ln(1-p) at the call site
-  // (as expectedInformationGain does for its H_y term, and as the MapStats
-  // mean-entropy aggregator in dscovox_node does); we intentionally do not
+  // (as expectedInformationGain does for its H_y term, and as occupancy
+  // map-stats mean-entropy aggregators do); we intentionally do not
   // change this function's semantics to avoid a silent behavior regression.
   const float a = v.a_occ;
   const float b = v.a_free;
@@ -75,7 +75,13 @@ float expectedInformationGain(const Voxel& v) {
                    - p        * digamma(a + 1.f)
                    - (1.f - p) * digamma(b + 1.f);
 
-  return H_y - E_H;
+  // EIG is a mutual information and must be >= 0. Near saturation (p -> 0 or 1)
+  // the bounded H_y term is clamped to 0 at the 1e-7 boundary while E_H stays
+  // strictly positive, so the raw H_y - E_H goes slightly negative (e.g.
+  // ~-8e-3 at Beta(1000,1)). A negative EIG mis-ranks saturated voxels in the
+  // next-best-view / frontier scorers and poisons mean_eig. Clamp to 0, matching
+  // the bernoulliKL noise clamp and the EIGAlwaysNonNegative test contract.
+  return std::max(0.f, H_y - E_H);
 }
 
 float semanticEntropy(const Voxel& v) {
@@ -207,7 +213,9 @@ float expectedInformationGain(const SemBetaVoxel& v) {
                    - p        * digamma(a + 1.f)
                    - (1.f - p) * digamma(b + 1.f);
 
-  return H_y - E_H;
+  // See the Voxel overload: clamp the mutual-information result at 0 so a
+  // near-saturated voxel cannot report a (spurious) negative information gain.
+  return std::max(0.f, H_y - E_H);
 }
 
 float betaKL(const Voxel& a, const Voxel& b) {
@@ -216,10 +224,14 @@ float betaKL(const Voxel& a, const Voxel& b) {
   if (a1 <= 0.f || b1 <= 0.f || a2 <= 0.f || b2 <= 0.f) return 0.f;
 
   const float s1 = a1 + b1;
-  return lbeta(a2, b2) - lbeta(a1, b1)
+  const float kl = lbeta(a2, b2) - lbeta(a1, b1)
        + (a1 - a2) * digamma(a1)
        + (b1 - b2) * digamma(b1)
        + (a2 - a1 + b2 - b1) * digamma(s1);
+  // KL >= 0 by Gibbs; clamp float round-off (the four-term sum can land a hair
+  // below 0 for nearly-identical Betas) so callers never see a negative
+  // divergence. Matches the bernoulliKL clamp above.
+  return std::max(0.f, kl);
 }
 
 } // namespace scovox

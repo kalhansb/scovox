@@ -105,9 +105,9 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
 }
 
 /// Project split Beta(occupancy) + Dir(semantics) → the legacy fused
-/// scovox::Voxel for the wire RPC query services (GetRegion / ScoreCandidates /
-/// GetOccupancyGrid). The Dir pointer may be null (occupancy-only voxel, or a
-/// caller that only needs occupancy — EIG/entropy/SSMI are occupancy-only).
+/// scovox::Voxel for the wire RPC query services (GetRegion / GetOccupancyGrid).
+/// The Dir pointer may be null (occupancy-only voxel, or a caller that only
+/// needs occupancy — EIG/entropy/SSMI are occupancy-only).
 ///
 /// scovox::Voxel stores RAW semantic evidence (the Dirichlet prior is applied
 /// at query time, not in storage), whereas DirVoxel stores prior-inflated

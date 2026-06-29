@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -9,6 +10,7 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -68,6 +70,15 @@ public:
     // carry over from P. weighting_function defaults to constant(1).
     SP.tsdf.sdf_trunc     = P.sdf_trunc;
     SP.tsdf.space_carving = P.tsdf_space_carving;
+    // enable_tsdf:false sets sdf_trunc=0, but TsdfMap::sanitise re-clamps that
+    // back up to 0.15 — silently keeping the fused walker's per-voxel TSDF band
+    // writes (TsdfVoxel alloc + Curless-Levoy average + touched push) running
+    // even though the occupancy/LiDAR config never reads the TsdfMap grid
+    // (tsdf_pub_ null, no extract_mesh, share_tsdf_=false). Thread the real
+    // intent through so those dead writes are skipped. Default true keeps every
+    // TSDF-on config — and all scovox_core gtests, which build with
+    // sdf_trunc=0.15 — byte-identical; only the (unread) TsdfMap grid changes.
+    SP.tsdf_enabled = (sdf_trunc_launch_ > 0.f);
     // SemSplitMap (de-unified BetaVoxel ∥ DirVoxel substrate): every
     // Bayesian / sparse-Dirichlet knob from launch P maps 1:1.
     // semantic_occ_gate / min_range / max_range / grazing_angle_threshold are
@@ -273,6 +284,31 @@ private:
     // Prevents ghost voxels at origin when TF is briefly wrong at startup.
     startup_tf_stable_sec_ = dp("startup_tf_stable_sec", 2.0);
     startup_tf_jump_thresh_ = dp("startup_tf_jump_threshold", 0.5);
+    // Runtime divergence guard. Once the startup gate has declared the pose
+    // stable, keep watching frame-to-frame pose jumps. A jump larger than
+    // runtime_tf_jump_threshold means localization has diverged / teleported
+    // (e.g. the NDT track lost lock): drop that frame AND re-arm the startup
+    // stabilization so we stop integrating against the bad pose until it
+    // settles again. Set runtime_tf_gate=false to keep the legacy
+    // startup-only behaviour. The runtime threshold should sit above real
+    // frame-to-frame motion (walking ~0.1-0.15 m at 10 Hz) so normal travel
+    // never trips it.
+    runtime_tf_gate_ = dp("runtime_tf_gate", true);
+    runtime_tf_jump_thresh_ = dp("runtime_tf_jump_threshold", 1.0);
+    // Localization reject gate. A frame-to-frame jump gate cannot see a pose
+    // that is *frozen* — when an external localizer (e.g. NDT map-matcher)
+    // loses lock it rejects scans, stops updating its pose, but keeps
+    // re-broadcasting the stale transform on a timer. The TF therefore looks
+    // fresh and jump-free while the robot keeps moving, so scovox would smear
+    // every new scan onto the stuck pose. This gate subscribes to the
+    // localizer's /alignment_status (diagnostic_msgs/DiagnosticArray) and skips
+    // integration whenever it reports the pose is stale: accepted_gap_sec (time
+    // since the last accepted update) exceeds reject_gate_max_accepted_gap_sec,
+    // or consecutive_rejected_updates reaches reject_gate_min_consecutive.
+    reject_gate_enable_ = dp("reject_gate_enable", false);
+    alignment_status_topic_ = dp("alignment_status_topic", std::string("/alignment_status"));
+    reject_gate_max_accepted_gap_sec_ = dp("reject_gate_max_accepted_gap_sec", 0.5);
+    reject_gate_min_consecutive_ = (int)dp("reject_gate_min_consecutive", 0);
     // Soft-probability ablation: directory of <frame>.topk flat-binary blobs
     // produced by topk_npz_to_bin.py. When non-empty, scovox_node uses the
     // frame index (low 16 bits of header.stamp.nanosec, set by the replay
@@ -309,6 +345,16 @@ private:
     last_match_ = m; last_empty_ = e; last_evict_ = v; last_drop_ = d;
   }
   void setupSubscribers() {
+    // Localization reject gate: listen to the localizer's diagnostic stream.
+    if (reject_gate_enable_) {
+      status_sub_ = create_subscription<diagnostic_msgs::msg::DiagnosticArray>(
+        alignment_status_topic_, rclcpp::QoS(10),
+        std::bind(&SCovoxNode::onAlignmentStatus, this, std::placeholders::_1));
+      RCLCPP_INFO(get_logger(),
+          "Reject gate ON: gating integration on %s (accepted_gap>=%.2fs%s)",
+          alignment_status_topic_.c_str(), reject_gate_max_accepted_gap_sec_,
+          reject_gate_min_consecutive_ > 0 ? " or consec rejects" : "");
+    }
     if (pointcloud_mode_) {
       auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
       input_pc_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(input_pc_topic_, qos,
@@ -412,11 +458,109 @@ private:
     return 0;
   }
 
+  // TF quality gate shared by the depth and LiDAR paths. Returns true when the
+  // observer pose `O` (sensor origin in the integration frame) is trustworthy
+  // enough to integrate this frame. Two stages:
+  //   (1) Startup stabilization — wait until the pose has been jump-free
+  //       (< startup_tf_jump_threshold) for startup_tf_stable_sec before EVER
+  //       integrating. Guards against ghost voxels at the origin while TF is
+  //       briefly wrong at startup.
+  //   (2) Runtime divergence guard — once stable, a frame-to-frame jump larger
+  //       than runtime_tf_jump_threshold means localization diverged: drop the
+  //       frame and re-arm stage (1) so integration pauses until the pose
+  //       settles again.
+  // Records tf_prev_pos_ on every frame (gated or not) so the jump is always
+  // measured against the immediately preceding pose (the legacy code froze
+  // tf_prev_pos_ once stable).
+  bool tfGatePass(const Eigen::Vector3f& O) {
+    const rclcpp::Time now = this->now();
+    // Jump vs the previous pose; record O now so all paths update the reference
+    // exactly once.
+    const bool have_prev = tf_prev_valid_;
+    const float jump = have_prev ? (O - tf_prev_pos_).norm() : 0.0f;
+    tf_prev_pos_ = O;
+    tf_prev_valid_ = true;
+
+    // (2) Runtime divergence guard — only meaningful once already stable.
+    if (tf_stable_ && runtime_tf_gate_ && have_prev && jump > runtime_tf_jump_thresh_) {
+      ++tf_rearm_count_;
+      RCLCPP_WARN(get_logger(),
+          "Runtime TF jump %.2f m > %.2f m — localization diverged; pausing "
+          "integration until pose re-stabilizes (rearm #%zu)",
+          jump, runtime_tf_jump_thresh_, tf_rearm_count_);
+      tf_stable_ = false;
+      tf_stable_since_ = now;
+    }
+    // (1) Stabilization wait. At first startup this uses the lenient
+    // startup_tf_jump_threshold (anti-stall while the TF chain warms up); after
+    // a runtime divergence re-arm it uses the strict runtime_tf_jump_threshold
+    // so we only resume once the pose is genuinely settled again.
+    if (!tf_stable_) {
+      const double settle_thresh =
+          did_initial_stabilize_ ? runtime_tf_jump_thresh_ : startup_tf_jump_thresh_;
+      if (!have_prev || jump > settle_thresh) {
+        tf_stable_since_ = now;
+      } else if ((now - tf_stable_since_).seconds() >= startup_tf_stable_sec_) {
+        tf_stable_ = true;
+        did_initial_stabilize_ = true;
+        RCLCPP_INFO(get_logger(), "TF stable for %.1f s — integration enabled", startup_tf_stable_sec_);
+      }
+      if (!tf_stable_) {
+        ++frames_gated_;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+            "Waiting for TF stabilization (%.1f / %.1f s, %zu frames gated)...",
+            (now - tf_stable_since_).seconds(), startup_tf_stable_sec_, frames_gated_);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Parse the localizer's /alignment_status DiagnosticArray and cache the
+  // tracking-quality scalars used by locRejecting(). accepted_gap_sec may be
+  // "nan" before the first accepted pose; std::stod yields NaN which the gate
+  // treats as "not rejecting" (the startup TF gate covers that window).
+  void onAlignmentStatus(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr& msg) {
+    for (const auto& st : msg->status) {
+      for (const auto& kv : st.values) {
+        if (kv.key == "accepted_gap_sec") {
+          try { loc_accepted_gap_sec_ = std::stod(kv.value); } catch (...) {}
+        } else if (kv.key == "consecutive_rejected_updates") {
+          try { loc_consec_rejects_ = std::stol(kv.value); } catch (...) {}
+        }
+      }
+    }
+    loc_status_received_ = true;
+  }
+
+  // True when the localizer reports its pose is currently stale/frozen, so this
+  // frame must NOT be integrated. Returns false (allow) until the first status
+  // arrives so we never stall waiting on a localizer that does not publish it.
+  bool locRejecting() const {
+    if (!reject_gate_enable_ || !loc_status_received_) return false;
+    const double gap = loc_accepted_gap_sec_;
+    if (std::isfinite(gap) && gap >= reject_gate_max_accepted_gap_sec_) return true;
+    if (reject_gate_min_consecutive_ > 0 &&
+        loc_consec_rejects_ >= reject_gate_min_consecutive_) return true;
+    return false;
+  }
+
+  // Single frame-admission gate: true only when this frame should be integrated.
+  // Combines the TF quality gate and the localization reject gate so callers
+  // (onImages / onPointCloud) share one check and all gate bookkeeping lives
+  // here — tfGatePass() tallies frames_gated_, the reject count is tallied here.
+  bool admitFrame(const Eigen::Vector3f& O) {
+    if (!tfGatePass(O)) return false;
+    if (locRejecting()) { ++frames_gated_reject_; return false; }
+    return true;
+  }
+
   void onImages(const sensor_msgs::msg::Image::ConstSharedPtr& depth, const sensor_msgs::msg::Image::ConstSharedPtr& seg) {
     auto t_start = std::chrono::high_resolution_clock::now();
     split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
+    last_input_stamp_ = rclcpp::Time(depth->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
     if (!have_di_.load(std::memory_order_acquire)) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: waiting for CameraInfo", frame_recv_, replay_idx); return; }
     std::unique_lock<std::shared_mutex> lock(map_mtx_);
     if (depth->width != seg->width || depth->height != seg->height) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: size mismatch", frame_recv_, replay_idx); return; }
@@ -450,29 +594,8 @@ private:
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
       RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: observer TF FALLBACK to Time(0)", frame_recv_, replay_idx);
     } catch (const std::exception& e) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF(o): %s", e.what()); return; } }
-    // --- TF stability gate: skip frames until pose is stable ----
-    if (!tf_stable_) {
-      if (tf_prev_valid_) {
-        float jump = (O - tf_prev_pos_).norm();
-        if (jump > startup_tf_jump_thresh_) {
-          tf_stable_since_ = this->now();
-          RCLCPP_WARN(get_logger(), "TF jump %.2f m during startup, resetting stability timer", jump);
-        } else if ((this->now() - tf_stable_since_).seconds() >= startup_tf_stable_sec_) {
-          tf_stable_ = true;
-          RCLCPP_INFO(get_logger(), "TF stable for %.1f s — starting integration", startup_tf_stable_sec_);
-        }
-      } else {
-        tf_stable_since_ = this->now();
-      }
-      tf_prev_pos_ = O;
-      tf_prev_valid_ = true;
-      if (!tf_stable_) {
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-            "Waiting for TF stabilization (%.1f / %.1f s)...",
-            (this->now() - tf_stable_since_).seconds(), startup_tf_stable_sec_);
-        return;
-      }
-    }
+    // --- Frame-admission gate: TF stability + runtime divergence + reject ---
+    if (!admitFrame(O)) return;
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
     std::vector<Eigen::Vector3f> nr_eps;
@@ -569,6 +692,7 @@ private:
     split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
+    last_input_stamp_ = rclcpp::Time(cloud->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
     std::unique_lock<std::shared_mutex> lock(map_mtx_);
 
     // Find field offsets
@@ -596,35 +720,49 @@ private:
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
     } catch (...) { return; } }
 
-    // --- TF stability gate (same as onImages path) ---
-    if (!tf_stable_) {
-      if (tf_prev_valid_) {
-        float jump = (O - tf_prev_pos_).norm();
-        if (jump > startup_tf_jump_thresh_) {
-          tf_stable_since_ = this->now();
-        } else if ((this->now() - tf_stable_since_).seconds() >= startup_tf_stable_sec_) {
-          tf_stable_ = true;
-          RCLCPP_INFO(get_logger(), "TF stable for %.1f s — starting integration", startup_tf_stable_sec_);
-        }
-      } else {
-        tf_stable_since_ = this->now();
-      }
-      tf_prev_pos_ = O;
-      tf_prev_valid_ = true;
-      if (!tf_stable_) {
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-            "Waiting for TF stabilization (%.1f / %.1f s)...",
-            (this->now() - tf_stable_since_).seconds(), startup_tf_stable_sec_);
-        return;
-      }
-    }
+    // --- Frame-admission gate (shared with onImages path) ---
+    if (!admitFrame(O)) return;
 
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
 
+    // Range gate in SQUARED distance: the per-point sqrt in (Hp-O).norm() is
+    // pure waste in the occupancy-only LiDAR config, where `rng` feeds only the
+    // gate (range_decay_length<=0 -> rw=1; carve_band<=0 -> integrateHit
+    // discards rng). Compare squared norms instead and take the sqrt lazily only
+    // when a downstream consumer actually needs the true range. The (>0?sq:raw)
+    // guard keeps the degenerate negative-threshold case bit-identical: x->x^2
+    // is monotonic only on [0,inf), and rng>=0 always, so a negative min/max
+    // threshold must be compared as-is (it can only ever always-pass/always-fail).
+    const bool need_rng = (P.range_decay_length > 0) || (carve_band_ > 0);
+    const float min_r2 = (P.min_range > 0.f) ? P.min_range * P.min_range : P.min_range;
+    const float max_r2 = (P.max_range > 0.f) ? P.max_range * P.max_range : P.max_range;
+
     const uint8_t* data = cloud->data.data();
     const int step = (int)cloud->point_step;
-    const int N = (int)(cloud->width * cloud->height);
+    const size_t N = (size_t)cloud->width * (size_t)cloud->height;
+
+    // Validate the buffer geometry before any reinterpret_cast read. A
+    // malformed or truncated PointCloud2 (point_step too small for the declared
+    // field offsets, or data shorter than width*height*point_step) would
+    // otherwise drive an out-of-bounds read in the per-point loop below — a
+    // crash or silent garbage integration on adversarial / buggy input. Valid
+    // clouds always satisfy these (data.size() == height*row_step >=
+    // width*height*point_step, and every field offset+size <= point_step).
+    if (step <= 0) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "PointCloud2 has point_step=%d; dropping", step); return; }
+    int max_field_end = std::max({off_x, off_y, off_z}) + (int)sizeof(float);
+    if (off_lbl >= 0) {
+      const int lbl_sz = (lbl_type == sensor_msgs::msg::PointField::UINT32) ? 4
+                       : (lbl_type == sensor_msgs::msg::PointField::UINT16) ? 2 : 1;
+      max_field_end = std::max(max_field_end, off_lbl + lbl_sz);
+    }
+    if (max_field_end > step || cloud->data.size() < N * (size_t)step) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "PointCloud2 buffer too small (point_step=%d field_end=%d size=%zu need=%zu); dropping",
+        step, max_field_end, cloud->data.size(), N * (size_t)step);
+      return;
+    }
 
     // Soft-prob: load the per-frame top-K table once. The replay node sets
     // soft_prob_passthrough so the cloud is in raw .bin order, matching
@@ -636,7 +774,7 @@ private:
     }
 
     std::vector<float> cp(max_sem_, 0.f);
-    for (int i = 0; i < N; ++i) {
+    for (size_t i = 0; i < N; ++i) {
       const uint8_t* p = data + i * step;
       float x = *reinterpret_cast<const float*>(p + off_x);
       float y = *reinterpret_cast<const float*>(p + off_y);
@@ -644,8 +782,9 @@ private:
       if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
 
       Eigen::Vector3f Hp = T_oi * Eigen::Vector3f(x, y, z);
-      float rng = (Hp - O).norm();
-      if (rng < P.min_range || rng > P.max_range) continue;
+      const float r2 = (Hp - O).squaredNorm();
+      if (r2 < min_r2 || r2 > max_r2) continue;
+      const float rng = need_rng ? std::sqrt(r2) : 0.f;
       float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
       float q = rw;
 
@@ -696,9 +835,11 @@ private:
       const float s_ms = static_cast<float>(split_map_->semdirTimeUs()) / 1000.0f;
       RCLCPP_INFO(get_logger(),
                   "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
-                  "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu",
+                  "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu "
+                  "gated=%zu rearm=%zu reject_gated=%zu",
                   frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms,
-                  publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_);
+                  publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_,
+                  frames_gated_, tf_rearm_count_, frames_gated_reject_);
     }
     if (frame_recv_ % 10 == 1) scheduleMemUsage();
     logEvictionDelta(frame_recv_);
@@ -1210,7 +1351,9 @@ private:
     auto& ss = split_map_->semsplit();
     sensor_msgs::msg::PointCloud2 cl;
     cl.header.frame_id = int_frame_;
-    cl.header.stamp = get_clock()->now();
+    // Stamp at the last integrated scan time (TF-resolvable), not now() — see
+    // last_input_stamp_ note. Falls back to now() before the first integration.
+    cl.header.stamp = (last_input_stamp_.nanoseconds() > 0) ? last_input_stamp_ : get_clock()->now();
     cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
     sensor_msgs::PointCloud2Modifier mod(cl);
     static_assert(scovox::K_TOP >= 1, "publishPointCloud requires at least 1 sparse slot");
@@ -1255,12 +1398,16 @@ private:
       return v;
     };
 
-    size_t cnt = 0;
-    bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT&) {
-      if (b.p_occ() >= min_occ_ && has_beta_evidence(b)) ++cnt;
+    // Single grid walk: collect the voxels that pass the publish gate, then size
+    // and fill the message from the scratch list (was two full forEachCell walks
+    // re-evaluating the same predicate). forEachCell order is deterministic, so
+    // the emitted cloud is byte-identical.
+    pc_scratch_.clear();
+    bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
+      if (b.p_occ() >= min_occ_ && has_beta_evidence(b)) pc_scratch_.emplace_back(co, b);
     });
-    if (!cnt) { pc_pub_->publish(cl); return; }
-    mod.resize(cnt);
+    if (pc_scratch_.empty()) { pc_pub_->publish(cl); return; }
+    mod.resize(pc_scratch_.size());
     sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"), iy(cl,"y"), iz(cl,"z"), ir(cl,"rgb"),
       ip(cl,"occupancy_prob"), ic2(cl,"semantic_confidence"),
       iv(cl,"posterior_variance"), ie(cl,"eig"),
@@ -1269,9 +1416,8 @@ private:
     sensor_msgs::PointCloud2Iterator<uint8_t>  icl(cl,"semantic_class");
     sensor_msgs::PointCloud2Iterator<uint16_t> isc0(cl,"sem_cls0"), isc1(cl,"sem_cls1");
     const float vis_gate = sem_vis_thresh_ >= 0 ? (float)sem_vis_thresh_ : 0.5f;
-    bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
+    for (const auto& [co, b] : pc_scratch_) {
       float pr = b.p_occ();
-      if (pr < min_occ_ || !has_beta_evidence(b)) return;
       const scovox::SemBetaVoxel v = project(b, co);
       auto ps = bgrid.coordToPos(co);
       uint8_t bc = 0; float cf = 0, r = 1, gg = 1, bb = 1;
@@ -1287,7 +1433,11 @@ private:
       }
       uint32_t rp = (uint32_t(r * 255) << 16) | (uint32_t(gg * 255) << 8) | uint32_t(bb * 255);
       *ix = float(ps.x); *iy = float(ps.y); *iz = float(ps.z);
-      *ir = *reinterpret_cast<float*>(&rp);
+      // Pack the RGB bit pattern into the float field without a strict-aliasing
+      // violation (a reinterpret_cast<float*> of a uint32_t* is UB and warns
+      // under -Wstrict-aliasing). memcpy is the canonical bit-cast; the
+      // optimizer folds it to a register move.
+      float rgb_f; std::memcpy(&rgb_f, &rp, sizeof(rgb_f)); *ir = rgb_f;
       *ip = pr; *icl = bc; *ic2 = cf;
       *iv = scovox::variance(v); *ie = scovox::expectedInformationGain(v);
       *iao = v.a_occ; *iaf = v.a_free; *iau = v.a_unk;
@@ -1299,7 +1449,7 @@ private:
       }
       ++ix; ++iy; ++iz; ++ir; ++ip; ++icl; ++ic2; ++iv; ++ie; ++iao; ++iaf;
       ++iau; ++isn0; ++isc0; ++isn1; ++isc1;
-    });
+    }
     pc_pub_->publish(cl);
   }
 
@@ -1331,7 +1481,8 @@ private:
 
     sensor_msgs::msg::PointCloud2 cl;
     cl.header.frame_id = int_frame_;
-    cl.header.stamp = get_clock()->now();
+    // Stamp at the last integrated scan time (TF-resolvable), not now().
+    cl.header.stamp = (last_input_stamp_.nanoseconds() > 0) ? last_input_stamp_ : get_clock()->now();
     cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
     sensor_msgs::PointCloud2Modifier mod(cl);
     mod.setPointCloud2Fields(5,
@@ -1404,9 +1555,24 @@ private:
   std::atomic<bool> mem_log_inflight_{false};
   // TF stability gate
   double startup_tf_stable_sec_{2.0}, startup_tf_jump_thresh_{0.5};
-  bool tf_stable_{false}, tf_prev_valid_{false};
+  bool runtime_tf_gate_{true};
+  double runtime_tf_jump_thresh_{1.0};
+  bool tf_stable_{false}, tf_prev_valid_{false}, did_initial_stabilize_{false};
   rclcpp::Time tf_stable_since_;
   Eigen::Vector3f tf_prev_pos_{Eigen::Vector3f::Zero()};
+  size_t tf_rearm_count_{0}, frames_gated_{0};
+  // Localization reject gate state (option 2): driven by /alignment_status.
+  bool reject_gate_enable_{false};
+  std::string alignment_status_topic_;
+  double reject_gate_max_accepted_gap_sec_{0.5};
+  int reject_gate_min_consecutive_{0};
+  rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr status_sub_;
+  // Plain members: the SingleThreadedExecutor serializes onAlignmentStatus
+  // against the frame callbacks, so no synchronization is needed.
+  bool loc_status_received_{false};
+  double loc_accepted_gap_sec_{0.0};
+  long loc_consec_rejects_{0};
+  size_t frames_gated_reject_{0};
   size_t frame_recv_{0};
   // E5.2 — per-frame eviction stats CSV writer.
   std::string evict_csv_path_;
@@ -1472,6 +1638,14 @@ private:
   // >0 the next publish ships a full snapshot so a freshly-connected dscovox
   // sees this robot's complete current state, not just deltas since startup.
   size_t prev_sub_count_{0};
+  // Timestamp of the most recent integrated input (scan / depth). The full-map
+  // republishers (publishPointCloud + the TSDF cloud) stamp with THIS, not
+  // now(): the localizer (e.g. GLIM) has a valid integration_frame<-...<-map TF
+  // at each scan time, but its TF can lag wall/playback time. Stamping the
+  // republished map at now() makes RViz fail "Could not transform <int_frame> ->
+  // map" (lookup into the future). Stamping at the last scan time keeps the map
+  // transformable into map/any frame at any playback rate.
+  rclcpp::Time last_input_stamp_{0, 0, RCL_ROS_TIME};
   sensor_msgs::msg::CameraInfo di_; std::atomic<bool> have_di_{false};
   mutable std::shared_mutex map_mtx_;  // protects split_map_
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr di_sub_;
@@ -1482,6 +1656,10 @@ private:
   rclcpp::TimerBase::SharedPtr sm_timer_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr sm_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
+  // Reused scratch for publishPointCloud's single grid walk (collect matching
+  // voxels once, then fill the message from this) so the Beta grid is traversed
+  // once per publish, not twice. clear() retains capacity across publishes.
+  std::vector<std::pair<Bonxai::CoordT, scovox::BetaVoxel>> pc_scratch_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tsdf_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr bin_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_pub_;

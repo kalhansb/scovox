@@ -14,11 +14,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ScovoxMap.msg"
   "msg/ScovoxMapBinary.msg"
   "msg/RobotIntent.msg"
-  "msg/CandidatePose.msg"
-  "msg/MapStats.msg"
   "srv/GetRegion.srv"
   "srv/GetOccupancyGrid.srv"
-  "srv/ScoreCandidates.srv"
   "srv/ExtractMesh.srv"
   DEPENDENCIES std_msgs geometry_msgs nav_msgs sensor_msgs
 )
