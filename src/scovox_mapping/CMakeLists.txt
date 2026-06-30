@@ -90,6 +90,13 @@ foreach(TEST_SRC ${SCOVOX_TEST_SOURCES})
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endforeach()
 
+# TopkProvider — header-only .topk loader/cache (extracted from scovox_node).
+# Needs rclcpp for the injected logger/clock; logging works without rclcpp::init.
+ament_add_gtest(test_topk_provider test/test_topk_provider.cpp)
+ament_target_dependencies(test_topk_provider rclcpp)
+target_include_directories(test_topk_provider PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # ==================================================================
 # Install
 # ==================================================================

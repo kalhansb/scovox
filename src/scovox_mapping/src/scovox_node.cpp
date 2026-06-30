@@ -31,6 +31,7 @@
 #include "scovox/map_interface.hpp"   // scovox::Params (launch-param plumbing)
 #include "scovox/scovox_map_split.hpp"
 #include "scovox/node_utils.hpp"
+#include "scovox/topk_provider.hpp"
 #include "scovox_msgs/msg/scovox_map.hpp"
 #include "scovox_msgs/msg/scovox_voxel.hpp"
 #include "scovox_msgs/msg/scovox_semantic_evidence.hpp"
@@ -54,6 +55,11 @@ public:
     // integration + publish paths read; with the legacy map_ object gone this
     // is their owner.
     map_params_ = P;
+    // Soft-probability (.topk) loader. Constructed here, after params, so it
+    // captures the configured dir + class count; topk_->enabled() gates the
+    // hot path in place of the old `!topk_probs_dir_.empty()` checks.
+    topk_ = std::make_unique<scovox::TopkProvider>(
+        get_logger(), get_clock(), topk_probs_dir_, max_sem_);
     // Raw launch sdf_trunc (0 == "TSDF off"). TsdfMap re-clamps a <=0 value
     // back up internally, so the ~/tsdf_pointcloud publisher, the
     // ~/extract_mesh service, and publishTSDFPointCloud gate on this cached
@@ -660,9 +666,9 @@ private:
     // depth-image stamp's low 16 bits as the frame index (same convention
     // the replay node sets via _stamp_from_index).
     bool use_topk = false;
-    if (!topk_probs_dir_.empty()) {
+    if (topk_->enabled()) {
       uint16_t fid = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
-      use_topk = loadTopkForFrame(fid, /*image_mode=*/true);
+      use_topk = topk_->loadFrame(fid, /*image_mode=*/true);
     }
 
     std::vector<float> cp(max_sem_, 0.f);
@@ -677,7 +683,7 @@ private:
       Eigen::Vector3f Hp = T_oo * Eigen::Vector3f(float((u-cx)*z/fx), float((v-cy)*z/fy), z);
       bool vs = false;
       if (use_topk) {
-        vs = fillCpFromTopkImage(u, v, cp);
+        vs = topk_->fillImage(u, v, cp);
       } else {
         const uint8_t* px = seg->data.data() + v*seg->step + sch*u;
         uint8_t r = srgb?px[0]:px[2], g = px[1], b = srgb?px[2]:px[0];
@@ -733,7 +739,7 @@ private:
     }
     if (frame_recv_ % 10 == 1) scheduleMemUsage();
     logEvictionDelta(frame_recv_);
-    logTopkSummary(/*throttle_ms=*/10000);
+    topk_->logSummary(/*throttle_ms=*/10000);
   }
 
   // ── Intra-scan deskew (gyro-based) ──────────────────────────────────────
@@ -942,9 +948,9 @@ private:
     // soft_prob_passthrough so the cloud is in raw .bin order, matching
     // the .topk row order; we apply the same range filter below.
     bool use_topk = false;
-    if (!topk_probs_dir_.empty()) {
+    if (topk_->enabled()) {
       uint16_t fid = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
-      use_topk = loadTopkForFrame(fid, /*image_mode=*/false);
+      use_topk = topk_->loadFrame(fid, /*image_mode=*/false);
     }
 
     // ── Intra-scan deskew decision (gyro-based rotation) ──────────────────
@@ -1091,7 +1097,7 @@ private:
 
       bool vs = false;
       if (use_topk) {
-        vs = fillCpFromTopkPoint((size_t)i, cp);
+        vs = topk_->fillPoint((size_t)i, cp);
       } else {
         // Semantic label from point cloud field
         uint16_t lbl = 0;
@@ -1145,7 +1151,7 @@ private:
     }
     if (frame_recv_ % 10 == 1) scheduleMemUsage();
     logEvictionDelta(frame_recv_);
-    logTopkSummary(/*throttle_ms=*/10000);
+    topk_->logSummary(/*throttle_ms=*/10000);
   }
 
   void scheduleMemUsage() {
@@ -1244,159 +1250,6 @@ private:
   }
   uint16_t lookupLabel(uint32_t k) const { auto it=color_map_.find(k); return it!=color_map_.end()?it->second:0; }
 
-  // Load the .topk flat-binary blob for `frame_id` from topk_probs_dir_.
-  // Pointcloud layout: [u32 N][u8 C][N*C u8 probs(×255)] — slot j == SCovox class id.
-  // Image     layout: [u16 H][u16 W][u8 C][H*W*C u8 probs(×255)] — slot j == SCovox class id.
-  // Slot 0 is unknown/unlabeled by convention. Returns true on success and
-  // populates the cache; false on missing/corrupt file (caller falls back
-  // to the legacy hard-label one-hot path).
-  bool loadTopkForFrame(uint16_t frame_id, bool image_mode) {
-    if (topk_cache_valid_ && topk_cache_frame_ == frame_id &&
-        topk_cache_is_image_ == image_mode) {
-      // Cache hit — the per-frame counter already incremented on the
-      // miss-and-load. Don't double-count.
-      return true;
-    }
-    char path[1024];
-    std::snprintf(path, sizeof(path), "%s/%06u.topk",
-                  topk_probs_dir_.c_str(), (unsigned)frame_id);
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "topk: cannot open %s — falling back to one-hot", path);
-      topk_cache_valid_ = false;
-      ++topk_load_failure_;
-      return false;
-    }
-    size_t total;
-    uint8_t C = 0;
-    if (image_mode) {
-      uint16_t H = 0, W = 0;
-      f.read(reinterpret_cast<char*>(&H), 2);
-      f.read(reinterpret_cast<char*>(&W), 2);
-      f.read(reinterpret_cast<char*>(&C), 1);
-      total = (size_t)H * W * C;
-      topk_cache_h_ = H; topk_cache_w_ = W; topk_cache_c_ = C;
-      topk_cache_n_ = 0;
-    } else {
-      uint32_t N = 0;
-      f.read(reinterpret_cast<char*>(&N), 4);
-      f.read(reinterpret_cast<char*>(&C), 1);
-      total = (size_t)N * C;
-      topk_cache_n_ = N; topk_cache_c_ = C;
-      topk_cache_h_ = 0; topk_cache_w_ = 0;
-    }
-    // Guard the header reads before sizing the buffer. An empty or truncated
-    // .topk file leaves the dimension fields at their zero-init (failed reads
-    // no-op), and a garbage `total` from a partially-read header would throw
-    // bad_alloc out of resize() — uncaught in the integration callback, that
-    // calls std::terminate and kills the mapper. Require a clean header read
-    // and a payload within a sane absolute ceiling.
-    static constexpr size_t kMaxTopkBytes = size_t(1) << 30;  // 1 GiB
-    if (!f.good() || total == 0 || total > kMaxTopkBytes) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "topk: bad/empty header in %s (total=%zu) — falling back to one-hot",
-                           path, total);
-      topk_cache_valid_ = false;
-      ++topk_load_failure_;
-      return false;
-    }
-    topk_cache_probs_.resize(total);
-    f.read(reinterpret_cast<char*>(topk_cache_probs_.data()), total);
-    // Detect a truncated payload by the bytes actually delivered, NOT by the
-    // stream flags: a short read sets BOTH failbit and eofbit, so the old
-    // `!f.good() && !f.eof()` test was (true && false) == false and silently
-    // accepted the partial buffer — the zero-filled tail (from resize) would
-    // then be fed to the Dirichlet update as legitimate zero-probability
-    // classes, corrupting semantics for the whole frame. gcount() is the only
-    // reliable short-read signal here.
-    if (static_cast<size_t>(f.gcount()) != total) {
-      RCLCPP_WARN(get_logger(), "topk: short read for %s (got %zu of %zu bytes)",
-                  path, static_cast<size_t>(f.gcount()), total);
-      topk_cache_valid_ = false;
-      ++topk_load_failure_;
-      return false;
-    }
-    topk_cache_frame_ = frame_id;
-    topk_cache_is_image_ = image_mode;
-    topk_cache_valid_ = true;
-    ++topk_load_success_;
-    if (!topk_first_load_logged_) {
-      // One-shot INFO so an operator can confirm soft-prob mode is live
-      // without grepping for the per-frame trace. After this, only the
-      // shutdown summary (in ~SCovoxNode) reports counters.
-      RCLCPP_INFO(get_logger(),
-                  "topk: first frame loaded from %s (image_mode=%d, C=%u%s)",
-                  topk_probs_dir_.c_str(), (int)image_mode, (unsigned)topk_cache_c_,
-                  image_mode ? "" : ", point-mode");
-      topk_first_load_logged_ = true;
-    }
-    return true;
-  }
-  static inline float dequantize_prob(uint8_t q) { return float(q) * (1.0f / 255.0f); }
-
-  // Emit a running tally of soft-prob loader outcomes. Guards the
-  // silent-fallback footgun: when `topk_probs_dir_` is set but loads
-  // intermittently fail, the per-frame WARN is throttled at 5 s and easy
-  // to miss in long batch runs; this INFO is throttled at the caller's
-  // rate (default 10 s in the per-frame paths) and shows running totals
-  // so the operator (or a smoke-gate assert) can verify soft-prob
-  // dispatched on every expected frame. No-op when topk is disabled.
-  void logTopkSummary(int throttle_ms) {
-    if (topk_probs_dir_.empty()) return;
-    const uint64_t total = topk_load_success_ + topk_load_failure_;
-    if (total == 0) return;
-    const double fail_pct = 100.0 * static_cast<double>(topk_load_failure_)
-                          / static_cast<double>(total);
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), throttle_ms,
-        "topk loader: loaded=%lu fallback_to_one_hot=%lu (%.1f%% miss) dir=%s",
-        (unsigned long)topk_load_success_,
-        (unsigned long)topk_load_failure_,
-        fail_pct,
-        topk_probs_dir_.c_str());
-  }
-
-  // Fill `cp` (size max_sem_) with the top-K probabilities for the given
-  // pointcloud row index. Returns true if any class with id in [1, max_sem_)
-  // got non-zero probability — false means the row is degenerate (all zero
-  // or all out-of-range), caller should treat as no semantic observation.
-  bool fillCpFromTopkPoint(size_t row, std::vector<float>& cp) const {
-    if (!topk_cache_valid_ || topk_cache_is_image_) return false;
-    if (row >= topk_cache_n_) return false;
-    std::fill(cp.begin(), cp.end(), 0.f);
-    const size_t base = row * topk_cache_c_;
-    const int C = std::min<int>(topk_cache_c_, max_sem_);
-    bool any = false;
-    // Slot index *is* the SCovox class id. Skip slot 0 (=unknown) so it
-    // contributes to a_unk (escape mass) rather than getting mapped to a
-    // real class.
-    for (int j = 1; j < C; ++j) {
-      const float p = dequantize_prob(topk_cache_probs_[base + j]);
-      if (p > 0.f) {
-        cp[j] = p;
-        any = true;
-      }
-    }
-    return any;
-  }
-
-  // Replica image variant: fill `cp` from per-pixel dense distribution at (u, v).
-  bool fillCpFromTopkImage(int u, int v, std::vector<float>& cp) const {
-    if (!topk_cache_valid_ || !topk_cache_is_image_) return false;
-    if (u < 0 || v < 0 || u >= (int)topk_cache_w_ || v >= (int)topk_cache_h_) return false;
-    std::fill(cp.begin(), cp.end(), 0.f);
-    const size_t base = ((size_t)v * topk_cache_w_ + u) * topk_cache_c_;
-    const int C = std::min<int>(topk_cache_c_, max_sem_);
-    bool any = false;
-    for (int j = 1; j < C; ++j) {
-      const float p = dequantize_prob(topk_cache_probs_[base + j]);
-      if (p > 0.f) {
-        cp[j] = p;
-        any = true;
-      }
-    }
-    return any;
-  }
   void initializeSemanticColors() {
     auto base = scovox::generateSemanticColors(static_cast<size_t>(max_sem_));
     sem_col_.clear();
@@ -1886,27 +1739,11 @@ private:
   // Soft-probability mode: directory of <frame>.topk flat-binary blobs, with
   // file names matching the low 16 bits of header.stamp.nanosec the replay
   // node sets (zero-padded to 6 digits). Empty = legacy hard-label path.
+  // topk_probs_dir_ survives only as the param sink + construction input for
+  // topk_; the per-frame cache + loader telemetry now live in TopkProvider.
   std::string topk_probs_dir_;
   int topk_topk_max_{5};
-  // Cache the most recently loaded frame so we don't read the file twice
-  // (once for the hit lookup, once for the integration loop).
-  uint16_t topk_cache_frame_{0xFFFF};
-  bool     topk_cache_valid_{false};
-  bool     topk_cache_is_image_{false};
-  uint32_t topk_cache_n_{0};
-  uint16_t topk_cache_h_{0}, topk_cache_w_{0};
-  // Number of dense class slots per pixel/point. Slot j IS the SCovox
-  // class id (slot 0 = unknown). Quantized to uint8 (×255) for storage.
-  uint8_t  topk_cache_c_{0};
-  std::vector<uint8_t> topk_cache_probs_;
-  // Soft-prob loader telemetry — guards the silent-fallback footgun the
-  // 5-s-throttled "topk: cannot open" warn alone cannot catch. Counted
-  // per-frame in loadTopkForFrame; logged at shutdown so the smoke gate
-  // can assert "topk dispatched on N frames" (where N matches the integrate
-  // count) rather than guessing from mIoU alone.
-  uint64_t topk_load_success_{0};
-  uint64_t topk_load_failure_{0};
-  bool     topk_first_load_logged_{false};
+  std::unique_ptr<scovox::TopkProvider> topk_;
   bool trace_nr_{false}, pub_pc_, pub_plan_{false}, pub_tsdf_{true};
   double carve_band_{-1.0};
   double min_tsdf_w_{0.5};
