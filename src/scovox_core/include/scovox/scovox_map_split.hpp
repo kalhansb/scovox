@@ -77,14 +77,19 @@ class ScovoxMapSplit {
   // Per-frame integration
   // -------------------------------------------------------------------
 
+  /// `is_dynamic` (default false) routes the endpoint's occupancy + semantics to
+  /// the transient substrate and suppresses the persistent TSDF surface for this
+  /// ray, so moving objects leave no permanent geometry; the free-space carve
+  /// stays persistent. See SemSplitMap::applyHitUpdate / decayTransient.
   void integrateHit(const Eigen::Vector3f&         origin,
                     const Eigen::Vector3f&         endpoint,
                     const std::vector<float>*      sem_probs,
-                    float                          quality) {
+                    float                          quality,
+                    bool                           is_dynamic = false) {
     if (fused_walker_) {
-      integrateHitFused(origin, endpoint, sem_probs, quality);
+      integrateHitFused(origin, endpoint, sem_probs, quality, is_dynamic);
     } else {
-      integrateHitSplit(origin, endpoint, sem_probs, quality);
+      integrateHitSplit(origin, endpoint, sem_probs, quality, is_dynamic);
     }
   }
 
@@ -94,7 +99,8 @@ class ScovoxMapSplit {
   void integrateHitFused(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
-                         float                     quality) {
+                         float                     quality,
+                         bool                      is_dynamic = false) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
 
@@ -153,7 +159,7 @@ class ScovoxMapSplit {
       // applies the hit unconditionally. The TSDF band update below may still
       // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
       if (c == k_hit) {
-        semHit(c, sem_probs, quality);
+        semHit(c, sem_probs, quality, is_dynamic);
       }
 
       if (std::fabs(proj) < 1e-12f) return;
@@ -172,7 +178,11 @@ class ScovoxMapSplit {
       //     applyBandUpdate clamps every in-front voxel (incl. sdf > trunc) to
       //     +trunc, so we drop the upper gate to integrate the full carve front.
       // applyBandUpdate owns the lower gate (`sdf <= -trunc` → drop) for both.
-      if (tsdf_enabled_ && (tparams.space_carving || sdf <= trunc + h)) {
+      // Dynamic rays write NO persistent TSDF: a moving object must not leave a
+      // permanent surface. Its occupancy/semantics live in the transient grids
+      // (semHit above, is_dynamic=true); the free-space carve below stays
+      // persistent (the air the object passed through is genuinely free).
+      if (tsdf_enabled_ && !is_dynamic && (tparams.space_carving || sdf <= trunc + h)) {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
@@ -214,12 +224,15 @@ class ScovoxMapSplit {
   void integrateHitSplit(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
-                         float                     quality) {
+                         float                     quality,
+                         bool                      is_dynamic = false) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
-    tsdf_.integrateRay(origin, endpoint);
+    // Dynamic rays write no persistent TSDF (no ghost surface); the carve inside
+    // semsplit_.integrateHit stays persistent, only the endpoint routes.
+    if (!is_dynamic) tsdf_.integrateRay(origin, endpoint);
     const auto t1 = clk::now();
-    semsplit_.integrateHit(origin, endpoint, sem_probs, quality);
+    semsplit_.integrateHit(origin, endpoint, sem_probs, quality, is_dynamic);
     const auto t2 = clk::now();
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     sem_ns_  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
@@ -235,6 +248,10 @@ class ScovoxMapSplit {
     const auto t1 = clk::now();
     sem_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
+
+  /// Per-frame decay of the transient (dynamic-class) substrate. Call once per
+  /// integrated frame; see SemSplitMap::decayTransient.
+  void decayTransient(float rate) { semsplit_.decayTransient(rate); }
 
   // -------------------------------------------------------------------
   // Per-call timing accumulators
@@ -324,9 +341,11 @@ class ScovoxMapSplit {
   bool semCarve(const CoordT& c, float quality) {
     return semsplit_.applyCarveUpdate(c, quality);
   }
-  /// Per-voxel semantic hit dispatch (SPLIT substrate).
-  void semHit(const CoordT& c, const std::vector<float>* sem_probs, float quality) {
-    semsplit_.applyHitUpdate(c, sem_probs, quality);
+  /// Per-voxel semantic hit dispatch (SPLIT substrate). `is_dynamic` routes the
+  /// endpoint to the transient grids (see SemSplitMap::applyHitUpdate).
+  void semHit(const CoordT& c, const std::vector<float>* sem_probs, float quality,
+              bool is_dynamic) {
+    semsplit_.applyHitUpdate(c, sem_probs, quality, is_dynamic);
   }
 
   TsdfMap     tsdf_;       ///< TSDF surface (band-only)

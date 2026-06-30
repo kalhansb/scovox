@@ -95,6 +95,16 @@ class SemSplitMap {
                     const std::vector<float>* sem_probs,
                     float                     quality);
 
+  /// Dynamic-aware return: free-space carve stays persistent (a moving object
+  /// still proves the air in front of it is free), but the endpoint occupancy +
+  /// semantics route to the transient grids when `is_dynamic`. `is_dynamic ==
+  /// false` is identical to the 4-arg form.
+  void integrateHit(const Eigen::Vector3f&    origin,
+                    const Eigen::Vector3f&    endpoint,
+                    const std::vector<float>* sem_probs,
+                    float                     quality,
+                    bool                      is_dynamic);
+
   /// No-return: carve free (Beta) along [origin, endpoint] inclusive. No hit.
   void integrateMiss(const Eigen::Vector3f& origin,
                      const Eigen::Vector3f& endpoint,

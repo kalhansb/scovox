@@ -147,6 +147,17 @@ void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
   applyHitUpdate(k_hit, sem_probs, quality);
 }
 
+void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
+                               const Eigen::Vector3f&    endpoint,
+                               const std::vector<float>* sem_probs,
+                               float                     quality,
+                               bool                      is_dynamic) {
+  // Free-space carve is always persistent; only the endpoint hit is routed.
+  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false);
+  const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
+  applyHitUpdate(k_hit, sem_probs, quality, is_dynamic);
+}
+
 void SemSplitMap::integrateMiss(const Eigen::Vector3f& origin,
                                 const Eigen::Vector3f& endpoint,
                                 float                  quality) {

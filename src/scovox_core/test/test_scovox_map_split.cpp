@@ -337,3 +337,57 @@ TEST(ScovoxMapSplitSubstrate, DrainTouchedPerGrid) {
   EXPECT_EQ(m.drainTouchedBeta().size(), 0u);
   EXPECT_EQ(m.drainTouchedDir().size(),  0u);
 }
+
+// ===========================================================================
+// Dynamic-class routing (transient substrate) — both walkers
+// ===========================================================================
+
+// A dynamic hit must: (a) write NO persistent TSDF geometry (no ghost surface),
+// (b) commit NO persistent semantics, (c) still carve persistent free space in
+// front, (d) deposit occupancy + semantics into the transient grids.
+static void checkDynamicHitRouting(bool fused) {
+  auto m = makeSplitMap(fused);
+  std::vector<float> probs(14, 0.f); probs[3] = 1.0f;  // class 3
+  const Eigen::Vector3f Hp(0.50f, 0, 0);
+
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Hp, &probs, /*quality=*/1.0f,
+                 /*is_dynamic=*/true);
+
+  EXPECT_EQ(m.tsdfVoxelCount(), 0u) << "dynamic hit must leave NO persistent TSDF";
+  EXPECT_EQ(m.dirVoxelCount(),  0u) << "dynamic hit commits no persistent class";
+  EXPECT_GT(m.betaVoxelCount(), 0u) << "free-space carve stays persistent";
+  // Transient grids carry the endpoint.
+  EXPECT_GT(m.semsplit().transientBetaVoxelCount(), 0u);
+  EXPECT_EQ(m.semsplit().transientDirVoxelCount(),  1u);
+  EXPECT_EQ(m.semsplit().transientDominantClassAt(Hp), 3u);
+  EXPECT_EQ(m.semsplit().dominantClassAt(Hp), 0xFFFFu);  // persistent: none
+}
+
+TEST(ScovoxMapSplitDynamic, FusedHitRoutesToTransient)  { checkDynamicHitRouting(true);  }
+TEST(ScovoxMapSplitDynamic, SplitHitRoutesToTransient)  { checkDynamicHitRouting(false); }
+
+TEST(ScovoxMapSplitDynamic, NonDynamicDefaultUnchanged) {
+  // is_dynamic defaults false → identical to the legacy 4-arg path: all three
+  // persistent grids populate, transient stays empty.
+  auto m = makeSplitMap();
+  std::vector<float> probs(14, 0.f); probs[3] = 1.0f;
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(0.50f, 0, 0),
+                 &probs, /*quality=*/1.0f);  // no is_dynamic arg
+
+  EXPECT_GT(m.tsdfVoxelCount(), 0u);
+  EXPECT_GT(m.dirVoxelCount(),  0u);
+  EXPECT_EQ(m.semsplit().transientBetaVoxelCount(), 0u);
+  EXPECT_EQ(m.semsplit().transientDirVoxelCount(),  0u);
+}
+
+TEST(ScovoxMapSplitDynamic, DecayTransientPassthrough) {
+  auto m = makeSplitMap();
+  std::vector<float> probs(14, 0.f); probs[3] = 1.0f;
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(0.50f, 0, 0),
+                 &probs, 1.0f, /*is_dynamic=*/true);
+  ASSERT_GT(m.semsplit().transientBetaVoxelCount(), 0u);
+
+  m.decayTransient(0.0f);  // collapse to prior → prune via the composer
+  EXPECT_EQ(m.semsplit().transientBetaVoxelCount(), 0u);
+  EXPECT_EQ(m.semsplit().transientDirVoxelCount(),  0u);
+}
