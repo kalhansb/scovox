@@ -218,7 +218,7 @@ private:
     // integrateHit). Empty (default) = every hit is persistent and the
     // per-frame decay pass is skipped.
     for (auto c : dp("dynamic_classes", std::vector<int64_t>{}))
-      if (c >= 0 && c < max_sem_) dyn_cls_.insert((uint8_t)c);
+      if (c >= 0 && c < max_sem_) dyn_cls_.insert((uint16_t)c);
     return P;
   }
   void declareNodeParams() {
@@ -1248,7 +1248,7 @@ private:
       int best = -1; float best_p = 0.f;
       for (size_t i = 0; i < cp->size(); ++i)
         if ((*cp)[i] > best_p) { best_p = (*cp)[i]; best = (int)i; }
-      if (best >= 0 && dyn_cls_.count((uint8_t)best)) is_dynamic = true;
+      if (best >= 0 && dyn_cls_.count((uint16_t)best)) is_dynamic = true;
     }
     split_map_->integrateHit(co, Hp, cp, q, is_dynamic);
     sm_dirty_.store(true, std::memory_order_relaxed);
@@ -1831,7 +1831,7 @@ private:
   // Class ids whose argmax routes a hit to the transient decaying grid rather
   // than the persistent map. Parsed from the `dynamic_classes` launch param;
   // empty disables the transient path (and its per-frame decay) entirely.
-  std::unordered_set<uint8_t> dyn_cls_;
+  std::unordered_set<uint16_t> dyn_cls_;
   // Last observed binary subscriber count. When this transitions from 0 to
   // >0 the next publish ships a full snapshot so a freshly-connected dscovox
   // sees this robot's complete current state, not just deltas since startup.
