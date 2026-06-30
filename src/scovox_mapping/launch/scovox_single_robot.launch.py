@@ -67,15 +67,13 @@ def generate_launch_description():
             # grazing_angle_threshold  double  -1.0   -    cos(t) below which weight ramps down (<=0 disables)
             "grazing_angle_threshold": -1.0,
 
-            # -- Transient / dynamic layer (3) [KEEP 2, REMOVE 1] ---------------------
+            # -- Transient / dynamic layer (2) ----------------------------------------
             # max_semantic_classes is redundant with semantic_top_k and K_TOP
             # in most usage; consider removing in favour of semantic_top_k alone.
             # max_semantic_classes  int            10   -    Total class count (label space)
             # transient_decay_rate  double         0.8  -    Per-frame decay for dynamic voxels
-            # dynamic_classes       int[]          [6]  -    Class IDs routed to transient layer
             "max_semantic_classes": 10,
             "transient_decay_rate": 0.8,
-            "dynamic_classes":      [6],
 
             # -- Input frames & topics (7) [KEEP -- robot-specific] --------------------
             # base_frame          string  "base_link"  -   Robot base frame

@@ -27,7 +27,6 @@
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <deque>
 #include "scovox/map_interface.hpp"   // scovox::Params (launch-param plumbing)
 #include "scovox/scovox_map_split.hpp"
@@ -207,8 +206,6 @@ private:
       else P.semantic_mode = scovox::SemanticMode::DIRICHLET; }
     max_sem_ = dp("max_semantic_classes", 10);
     transient_decay_rate_ = dp("transient_decay_rate", 0.8);
-    for (auto c : dp("dynamic_classes", std::vector<int64_t>{}))
-      if (c >= 0 && c < max_sem_) dyn_cls_.insert((uint8_t)c);
     return P;
   }
   void declareNodeParams() {
@@ -701,9 +698,7 @@ private:
         }
       }
       float q = rw*aw;
-      bool dyn = false;
-      if (vs && !dyn_cls_.empty()) for (size_t i=0;i<cp.size();i++) if (cp[i] > 0.f && dyn_cls_.count((uint8_t)i)) { dyn=true; break; }
-      integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, aw);
+      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q);
     }
     carveNoReturnRays(O, nr_eps);
     auto t_integrate = std::chrono::high_resolution_clock::now();
@@ -750,6 +745,23 @@ private:
     const Eigen::Vector3f ax = phi / th;
     const float s = std::sin(h);
     return Eigen::Quaternionf(std::cos(h), ax.x() * s, ax.y() * s, ax.z() * s);
+  }
+  // Per-point time offset (seconds, relative to scan start) from the cloud's
+  // time field. UINT32 is nanoseconds since scan start; FLOAT32 is already a
+  // relative second offset; FLOAT64 may carry an absolute stamp (tolerated by
+  // subtracting the scan-start time t0_sec when the value looks absolute).
+  static float decodePointTimeOffset(const uint8_t* tp, uint8_t t_type, double t0_sec) {
+    switch (t_type) {
+      case sensor_msgs::msg::PointField::UINT32:
+        return static_cast<float>(*reinterpret_cast<const uint32_t*>(tp) * 1.0e-9);
+      case sensor_msgs::msg::PointField::FLOAT32:
+        return *reinterpret_cast<const float*>(tp);
+      case sensor_msgs::msg::PointField::FLOAT64: {
+        const double td = *reinterpret_cast<const double*>(tp);
+        return static_cast<float>(td > 1.0e6 ? td - t0_sec : td);  // tolerate absolute stamps
+      }
+      default: return 0.f;
+    }
   }
 
   // Buffer the gyro stream. The single-threaded executor serializes this against
@@ -1029,15 +1041,7 @@ private:
         Eigen::Vector3f praw(x, y, z);
         float off_i = 0.f;
         if (do_deskew) {
-          const uint8_t* tp = p + off_t;
-          if (t_type == sensor_msgs::msg::PointField::UINT32)
-            off_i = static_cast<float>(*reinterpret_cast<const uint32_t*>(tp) * 1.0e-9);
-          else if (t_type == sensor_msgs::msg::PointField::FLOAT32)
-            off_i = *reinterpret_cast<const float*>(tp);
-          else if (t_type == sensor_msgs::msg::PointField::FLOAT64) {
-            const double td = *reinterpret_cast<const double*>(tp);
-            off_i = static_cast<float>(td > 1.0e6 ? td - t0_sec : td);
-          }
+          off_i = decodePointTimeOffset(p + off_t, t_type, t0_sec);
           praw = deskewRot(off_i) * praw;
         }
         const int ix = (int)std::floor(praw.x() * inv);
@@ -1057,7 +1061,7 @@ private:
         if (r2 < min_r2 || r2 > max_r2) continue;
         const float rng = need_rng ? std::sqrt(r2) : 0.f;
         const float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
-        integrateHit(O, Hp, rng, false, nullptr, rw, rw, 1.f);
+        integrateHit(O, Hp, rng, nullptr, rw);
       }
     } else {
     std::vector<float> cp(max_sem_, 0.f);
@@ -1074,15 +1078,7 @@ private:
       Eigen::Vector3f praw(x, y, z);
       float off_i = 0.f;
       if (do_deskew) {
-        const uint8_t* tp = p + off_t;
-        if (t_type == sensor_msgs::msg::PointField::UINT32)
-          off_i = static_cast<float>(*reinterpret_cast<const uint32_t*>(tp) * 1.0e-9);
-        else if (t_type == sensor_msgs::msg::PointField::FLOAT32)
-          off_i = *reinterpret_cast<const float*>(tp);
-        else if (t_type == sensor_msgs::msg::PointField::FLOAT64) {
-          const double td = *reinterpret_cast<const double*>(tp);
-          off_i = static_cast<float>(td > 1.0e6 ? td - t0_sec : td);  // tolerate absolute stamps
-        }
+        off_i = decodePointTimeOffset(p + off_t, t_type, t0_sec);
         praw = deskewRot(off_i) * praw;
       }
       Eigen::Vector3f Hp = T_oi * praw;
@@ -1110,9 +1106,7 @@ private:
         if (lbl > 0 && lbl < max_sem_) { std::fill(cp.begin(), cp.end(), 0.f); cp[lbl] = 1.f; vs = true; }
       }
 
-      bool dyn = false;
-      if (vs && !dyn_cls_.empty()) for (size_t j=0;j<cp.size();j++) if (cp[j] > 0.f && dyn_cls_.count((uint8_t)j)) { dyn=true; break; }
-      integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, 1.f);
+      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q);
     }
     }  // end else (per-point path)
 
@@ -1216,16 +1210,15 @@ private:
   }
 
   void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp, float rng,
-                    bool dyn, const std::vector<float>* cp, float q, float rw, float aw) {
+                    const std::vector<float>* cp, float q) {
     // Split-grid path. TsdfMap walks the SDF band, SemSplitMap walks the carve
-    // band leading up to the hit. dyn / rw / aw collapse: q already bakes in
-    // rw*aw; dyn (transient dynamic-class decay) is a retired legacy feature.
+    // band leading up to the hit. `q` already bakes in the range/grazing
+    // weights (rw*aw) at the call site.
     //
     // carve_band: when `carve_band_ > 0` (Replica / KITTI launch default =
     // 0.1), walk the semantic carve along only the last `carve_band` metres
     // before the surface, matching the production mIoU baselines. carve_band
     // <= 0 falls back to full-ray.
-    (void)rng; (void)dyn; (void)rw; (void)aw;  // unused in split mode
     Eigen::Vector3f co = O;
     if (carve_band_ > 0) {
       const float d = rng - static_cast<float>(carve_band_);
@@ -1941,7 +1934,6 @@ private:
   float alpha_0_{scovox::kDefaultDirichletPrior};
   std::string tsdf_dump_path_{};  // audit hook — see [tsdf_dump] memlog branch
   std::vector<std_msgs::msg::ColorRGBA> sem_col_;
-  std::unordered_set<uint8_t> dyn_cls_;
   // Last observed binary subscriber count. When this transitions from 0 to
   // >0 the next publish ships a full snapshot so a freshly-connected dscovox
   // sees this robot's complete current state, not just deltas since startup.
