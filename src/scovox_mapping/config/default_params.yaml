@@ -86,6 +86,12 @@ scovox_node:
     transient_decay_rate:           # float, default 0.8, dimensionless [0,1]
       # Per-frame multiplicative decay applied to transient grid evidence.
 
+    dynamic_classes:                # int[], default [] (empty = feature off)
+      # Class ids treated as dynamic: a hit whose argmax class is one of these
+      # is routed to the transient decaying grid (overlaid on the persistent
+      # map at publish) instead of being written persistently. Ids out of
+      # [0, max_semantic_classes) are ignored.
+
     stride:                         # int, default 1, pixels
       # Pixel stride for depth/segmentation image processing.
 

@@ -1564,10 +1564,23 @@ private:
     // α_0 prior so empty slots read 0).
     const auto& bgrid = ss.betaGrid();
     auto dacc = ss.dirGrid().createConstAccessor();
-    auto project = [&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
+    // Transient (dynamic-class) overlay. Dynamic hits land in a parallel
+    // decaying grid; at publish we overlay them on the persistent cloud so they
+    // appear while live and fade as they decay. A transient voxel with
+    // occupancy evidence overrides its persistent counterpart at the same coord
+    // (faithful to the legacy query-time picker). Empty when no dynamic classes
+    // are configured, in which case the override check + extra walk are skipped.
+    const auto& tbgrid = ss.transientBetaGrid();
+    auto tbacc = ss.transientBetaGrid().createConstAccessor();
+    auto tdacc = ss.transientDirGrid().createConstAccessor();
+    const bool have_transient = ss.transientBetaVoxelCount() > 0;
+    // Project Beta(occupancy) + Dir(semantics) → SemBetaVoxel using the supplied
+    // Dir accessor (persistent or transient). Per-class evidence subtracts the
+    // α_0 prior so empty slots read 0.
+    auto project = [&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co, auto& diracc) {
       scovox::SemBetaVoxel v{};
       v.a_occ = b.a_occ; v.a_free = b.a_free;
-      const scovox::DirVoxel* dv = dacc.value(co);
+      const scovox::DirVoxel* dv = diracc.value(co);
       if (dv) {
         v.a_unk = dv->other;
         for (int i = 0; i < scovox::K_TOP; ++i) {
@@ -1580,15 +1593,30 @@ private:
       }
       return v;
     };
+    // A transient voxel at `co` passes the same publish gate as a persistent one.
+    auto transient_overrides = [&](const Bonxai::CoordT& co) {
+      const scovox::BetaVoxel* tb = tbacc.value(co);
+      return tb && tb->p_occ() >= min_occ_ && has_beta_evidence(*tb);
+    };
 
     // Single grid walk: collect the voxels that pass the publish gate, then size
     // and fill the message from the scratch list (was two full forEachCell walks
     // re-evaluating the same predicate). forEachCell order is deterministic, so
-    // the emitted cloud is byte-identical.
+    // the emitted cloud is byte-identical. Persistent voxels overridden by a
+    // transient voxel at the same coord are dropped; the transient grid walk
+    // then re-emits them with their (decaying) dynamic evidence.
     pc_scratch_.clear();
     bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
-      if (b.p_occ() >= min_occ_ && has_beta_evidence(b)) pc_scratch_.emplace_back(co, b);
+      if (b.p_occ() >= min_occ_ && has_beta_evidence(b) &&
+          !(have_transient && transient_overrides(co)))
+        pc_scratch_.emplace_back(co, b, false);
     });
+    if (have_transient) {
+      tbgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
+        if (b.p_occ() >= min_occ_ && has_beta_evidence(b))
+          pc_scratch_.emplace_back(co, b, true);
+      });
+    }
     if (pc_scratch_.empty()) { pc_pub_->publish(cl); return; }
     mod.resize(pc_scratch_.size());
     sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"), iy(cl,"y"), iz(cl,"z"), ir(cl,"rgb"),
@@ -1599,9 +1627,9 @@ private:
     sensor_msgs::PointCloud2Iterator<uint8_t>  icl(cl,"semantic_class");
     sensor_msgs::PointCloud2Iterator<uint16_t> isc0(cl,"sem_cls0"), isc1(cl,"sem_cls1");
     const float vis_gate = sem_vis_thresh_ >= 0 ? (float)sem_vis_thresh_ : 0.5f;
-    for (const auto& [co, b] : pc_scratch_) {
+    for (const auto& [co, b, is_transient] : pc_scratch_) {
       float pr = b.p_occ();
-      const scovox::SemBetaVoxel v = project(b, co);
+      const scovox::SemBetaVoxel v = project(b, co, is_transient ? tdacc : dacc);
       auto ps = bgrid.coordToPos(co);
       uint8_t bc = 0; float cf = 0, r = 1, gg = 1, bb = 1;
       if (v.a0() > 0 && scovox::K_TOP > 0) {
@@ -1854,7 +1882,9 @@ private:
   // Reused scratch for publishPointCloud's single grid walk (collect matching
   // voxels once, then fill the message from this) so the Beta grid is traversed
   // once per publish, not twice. clear() retains capacity across publishes.
-  std::vector<std::pair<Bonxai::CoordT, scovox::BetaVoxel>> pc_scratch_;
+  // The bool marks a transient (dynamic-class) voxel so the fill step reads its
+  // semantics from the transient Dir grid instead of the persistent one.
+  std::vector<std::tuple<Bonxai::CoordT, scovox::BetaVoxel, bool>> pc_scratch_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tsdf_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr bin_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_pub_;

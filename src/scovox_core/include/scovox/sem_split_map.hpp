@@ -246,6 +246,13 @@ class SemSplitMap {
   const DirGrid&  dirGrid()  const noexcept { return dir_grid_; }
   DirGrid&        dirGrid()        noexcept { return dir_grid_; }
 
+  // Transient (dynamic-class) grids, shared-coord with the persistent ones so
+  // the publisher can overlay them at the same voxel positions.
+  const BetaGrid& transientBetaGrid() const noexcept { return transient_beta_grid_; }
+  BetaGrid&       transientBetaGrid()       noexcept { return transient_beta_grid_; }
+  const DirGrid&  transientDirGrid()  const noexcept { return transient_dir_grid_; }
+  DirGrid&        transientDirGrid()        noexcept { return transient_dir_grid_; }
+
   BetaVoxel defaultBeta() const noexcept {
     return defaultBetaVoxel(beta_occ_prior_, beta_free_prior_);
   }
