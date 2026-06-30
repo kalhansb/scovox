@@ -34,7 +34,10 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 ENV HF_HOME=/root/.cache/huggingface
 
 WORKDIR /seg
-COPY outdoor_palette.py seg_node.py /seg/
+# Bake the Python package; compose also bind-mounts ./ over /seg for live edits.
+# Run as a module so the package-relative import resolves:
+#   python3 -m seg_pipeline.seg_node
+COPY seg_pipeline/ /seg/seg_pipeline/
 
 # Source ROS for every shell.
 RUN echo 'source /opt/ros/jazzy/setup.bash' >> /root/.bashrc

@@ -1,2 +1,0 @@
-# Not a colcon package — this is a standalone GPU container (own Dockerfile/compose).
-# Keeps scovox's `colcon build` from descending into it.

@@ -17,5 +17,5 @@ docker compose up -d --build
 echo "[seg] launching online seg node (use_sim_time:=${SIM})…"
 exec docker compose exec seg bash -lc "
   source /opt/ros/jazzy/setup.bash
-  python3 /seg/seg_node.py --ros-args -p use_sim_time:=${SIM}
+  cd /seg && python3 -m seg_pipeline.seg_node --ros-args -p use_sim_time:=${SIM}
 "

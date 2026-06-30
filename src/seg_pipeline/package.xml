@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>seg_pipeline</name>
+  <version>0.1.0</version>
+  <description>
+    Online RGB-D semantic segmentation node for SCovox. Synchronizes a
+    (depth, color) pair, runs an outdoor segmentation model on the color frame,
+    and republishes a colored segmentation image plus re-framed depth/CameraInfo
+    for SCovox's RGB-D semantic-mapping path. The heavy ML runtime deps (torch,
+    transformers) ship in this package's own GPU container (see Dockerfile /
+    README), not via rosdep, so they are not pulled into the SCovox workspace.
+  </description>
+  <maintainer email="kalhansandaru@gmail.com">kalhansb</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pillow</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

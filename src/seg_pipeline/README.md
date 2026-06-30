@@ -32,7 +32,7 @@ Vistas, 65 outdoor classes) → collapsed to a compact 14-class outdoor set
 matching SCovox params:
 
 ```bash
-docker compose exec seg python3 /seg/outdoor_palette.py
+docker compose exec seg python3 -m seg_pipeline.outdoor_palette
 # prints num_classes / max_semantic_classes / semantic_color_map_keys / _classes
 ```
 

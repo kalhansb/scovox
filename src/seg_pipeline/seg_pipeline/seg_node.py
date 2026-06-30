@@ -25,7 +25,8 @@ Model (default): facebook/mask2former-swin-large-mapillary-vistas-semantic
 outdoor_palette.py. Weights are CC-BY-NC (research use).
 
 Run (inside the GPU container, with a bag playing on /clock):
-  python3 seg_node.py --ros-args -p use_sim_time:=true
+  python3 -m seg_pipeline.seg_node --ros-args -p use_sim_time:=true
+(or, in a sourced colcon workspace: ros2 run seg_pipeline seg_node)
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ import message_filters
 import torch
 import torch.nn.functional as F
 
-from outdoor_palette import build_collapse_lut, COMPACT_COLORS, COMPACT_NAMES, NUM_CLASSES
+from .outdoor_palette import build_collapse_lut, COMPACT_COLORS, COMPACT_NAMES, NUM_CLASSES
 
 
 SENSOR_QOS = QoSProfile(

@@ -12,6 +12,7 @@ src/
   scovox_core/      Voxel types, Beta/Dirichlet semantics, ray casting (C++17, zero ROS deps)
   scovox_mapping/   ROS 2 nodes: scovox_mapping_node (single robot), dscovox_mapping_node (fusion)
   scovox_msgs/      v5 binary-map wire format + query service definitions
+  seg_pipeline/     Online RGB-D segmentation node (feeds SCovox seg_topic; own GPU container)
 
 docker/             Standalone ROS 2 Jazzy build/test image + build_and_test.sh
 compose.yaml        Persistent dev / run container (ROS 2 Jazzy)
@@ -27,8 +28,11 @@ docs/
 
 Target: ROS 2 Jazzy, Ubuntu 24.04, a C++17 compiler (GCC 13). The pinned
 toolchain lives in [`docker/Dockerfile`](docker/Dockerfile)
-(`osrf/ros:jazzy-desktop`). The three packages build standalone — independent of
-the rest of the HMR_Explo workspace they're checked out into.
+(`osrf/ros:jazzy-desktop`). The three C++ packages build standalone — independent
+of the rest of the HMR_Explo workspace they're checked out into. The Python
+`seg_pipeline` package builds here too (`ros2 run seg_pipeline seg_node`), but its
+node needs GPU/ML deps and runs in its own container — see
+[`src/seg_pipeline/README.md`](src/seg_pipeline/README.md).
 
 ### Docker (recommended)
 
