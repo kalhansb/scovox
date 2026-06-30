@@ -6,9 +6,9 @@
 # subscribes to the full-resolution /ouster/points + /imu/data over ROS 2 DDS and
 # builds the occupancy map online. It deskews each scan natively (gyro rotation)
 # and voxel-downsamples it (downsample_voxel_size) to suppress the vertical smear
-# without GLIM's recall-costing cloud downsample -- see config/glim/ + the README.
+# without GLIM's recall-costing cloud downsample -- see config/ + the README.
 #
-# Manual:  docker compose exec scovox bash scripts/glim/launch_scovox.sh raw
+# Manual:  docker compose exec scovox bash scripts/launch_scovox.sh raw
 set -e
 MODE="${1:-raw}"
 
@@ -16,7 +16,7 @@ source /opt/ros/jazzy/setup.bash
 source /scovox/install/setup.bash
 
 ROOT=/scovox
-CFG="$ROOT/config/glim"
+CFG="$ROOT/config"
 
 case "$MODE" in
   raw)

@@ -15,8 +15,8 @@ src/
 
 docker/             Standalone ROS 2 Jazzy build/test image + build_and_test.sh
 compose.yaml        Persistent dev / run container (ROS 2 Jazzy)
-config/glim/        Raw-cloud occupancy config with the smear-suppression cure (see below)
-scripts/glim/       Launch helper for the raw-cloud config (see below)
+config/             Raw-cloud occupancy config with the smear-suppression cure (see below)
+scripts/            Launch helper for the raw-cloud config (see below)
 
 docs/
   design/unified_dirichlet_design_2026_05_13.md   Unified per-voxel Dirichlet design
@@ -91,12 +91,12 @@ in [`scovox_single_robot.launch.py`](src/scovox_mapping/launch/scovox_single_rob
 deskew + downsample so the occupancy map stays surface-thin (no vertical smear)
 without discarding points; an external localizer (e.g. GLIM) supplies the pose:
 
-* **Params:** [`config/glim/scovox_lidar_raw_deskew.yaml`](config/glim/scovox_lidar_raw_deskew.yaml)
+* **Params:** [`config/scovox_lidar_raw_deskew.yaml`](config/scovox_lidar_raw_deskew.yaml)
   — raw `/ouster/points`, `base_frame: os_lidar`, `integration_frame: odom`,
   `deskew_mode: auto`, `downsample_voxel_size: 0.5`. The file's header comments
   carry the full rationale.
 * **Launch helper (in the SCovox container):**
-  [`scripts/glim/launch_scovox.sh raw`](scripts/glim/launch_scovox.sh) starts
+  [`scripts/launch_scovox.sh raw`](scripts/launch_scovox.sh) starts
   `scovox_node` from that config against `/ouster/points`.
 
 See [Raw-cloud occupancy mapping](#raw-cloud-occupancy-mapping-vertical-smear-cure)
@@ -155,8 +155,8 @@ footprint; the default (`0.5`) is the knee — it suppresses the smear while kee
 the surface dense. `0.0` disables downsampling.
 
 Run it as the **Recommended LiDAR setup** under [Running on a robot](#single-robot)
-— [`config/glim/scovox_lidar_raw_deskew.yaml`](config/glim/scovox_lidar_raw_deskew.yaml)
-via [`scripts/glim/launch_scovox.sh raw`](scripts/glim/launch_scovox.sh). The node
+— [`config/scovox_lidar_raw_deskew.yaml`](config/scovox_lidar_raw_deskew.yaml)
+via [`scripts/launch_scovox.sh raw`](scripts/launch_scovox.sh). The node
 logs `ds=out/in` per scan (kept vs raw points) so you can confirm the downsample is
 active.
 
