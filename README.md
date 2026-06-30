@@ -1,7 +1,8 @@
 # SCovox
 
-Semantic Conjugate Voxel mapping with a unified per-voxel Dirichlet
-over `{top-K classes, OTHER, FREE}` — semantic occupancy mapping with
+Semantic Conjugate Voxel mapping on a split per-voxel substrate — a
+Beta–Bernoulli occupancy counter alongside a Dirichlet over
+`{top-K classes, OTHER}` semantic classes — for semantic occupancy mapping with
 calibrated uncertainty, multi-robot fusion, and edge-device runtime.
 
 ## Layout
@@ -110,18 +111,18 @@ Full parameter reference: [`config/default_params.yaml`](src/scovox_mapping/conf
 ## Raw-cloud occupancy mapping (vertical-smear cure)
 
 Beyond the normal use above, this repo carries a config + helper for mapping the
-**raw, full-resolution Ouster cloud** (`/ouster/points`, ~131k pts/scan) while an
+**raw, full-resolution Ouster cloud** (`/ouster/points`) while an
 external localizer (e.g. GLIM LiDAR-IMU SLAM) owns the TF tree
 (`map → odom → imu → os_lidar`) and supplies the per-scan pose. SCovox subscribes
 to `/ouster/points` + `/imu/data` over ROS 2 DDS and builds the occupancy map
 online — no prior map needed.
 
-**The problem.** Integrating the raw full-res cloud accumulates a solid ~7 m
-*vertical smear*: each XY column fills ~17–31 occupied z-cells vs ~2 for a clean
-surface. The surface returns are noisy (σ≈0.3–0.5 m from pose accumulation, range,
-and incidence angle), and dense full-res sampling keeps filling the *tails* of
-each column's z-distribution. Feeding the localizer's own pre-downsampled cloud
-removes the smear but throws away ~90% of the points (a recall loss).
+**The problem.** Integrating the raw full-res cloud accumulates a solid *vertical
+smear*: each XY column fills many occupied z-cells where a clean surface should be
+thin. The surface returns are noisy (pose accumulation, range, and incidence
+angle), and dense full-res sampling keeps filling the *tails* of each column's
+z-distribution. Feeding the localizer's own pre-downsampled cloud removes the
+smear but throws away most of the points (a recall loss).
 
 **The cure** (replicated natively, so we keep the points). SCovox preprocesses
 each scan itself:
@@ -134,26 +135,14 @@ each scan itself:
    LiDAR-SLAM preprocessor does, but *inside* SCovox on the full-res cloud, so the
    map keeps far more density (recall) than consuming the downsampled SLAM cloud.
 
-Sweep (rate 0.5, 120 s, `max_range` 20) of `downsample_voxel_size` — shared-column
-z-cells (smear thickness) / XY footprint / SCovox points:
-
-| `downsample_voxel_size` | z-cells (smear) | XY footprint | SCovox pts |
-|---|---|---|---|
-| 0.05 m | 17 (1.7 m) | 163 k | 3.31 M |
-| 0.10 m | 16 | 164 k | 3.18 M |
-| 0.20 m | 11 | 162 k | 2.48 M |
-| **0.50 m** (default) | **4 (0.4 m)** | **151 k** | **1.05 M** |
-| 1.00 m | 2 (0.2 m) | 125 k | 0.40 M |
-
-**`downsample_voxel_size: 0.5` is the sweet spot:** it cuts the smear 4× (17→4
-cells, ~0.4 m — the same thinness as feeding the SLAM cloud) for only a −7% XY
-footprint hit, while keeping **2.6× more points** (1.05 M vs 0.40 M). Past 0.5 the
-footprint tax accelerates for little extra thinness. `0.0` disables downsampling.
+Larger `downsample_voxel_size` thins the smear further but trims the horizontal
+footprint; the default (`0.5`) is the knee — it suppresses the smear while keeping
+the surface dense. `0.0` disables downsampling.
 
 * **Params:** [`config/glim/scovox_lidar_raw_deskew.yaml`](config/glim/scovox_lidar_raw_deskew.yaml)
   — raw `/ouster/points`, `base_frame: os_lidar`, `integration_frame: odom`,
   `deskew_mode: auto`, `downsample_voxel_size: 0.5`. The file's header comments
-  carry the full rationale and sweep notes.
+  carry the full rationale.
 * **Launch helper (in the SCovox container):**
   [`scripts/glim/launch_scovox.sh raw`](scripts/glim/launch_scovox.sh) starts
   `scovox_node` from that config against `/ouster/points`.
