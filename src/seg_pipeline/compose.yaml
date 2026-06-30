@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Online RGB-D segmentation service. Shares the DDS graph (host net + matching
+# ROS_DOMAIN_ID) with the scovox + localizer containers.
+#
+#   docker compose up -d --build          # build + start
+#   docker compose exec seg bash          # shell (ROS auto-sourced)
+#   ./run_seg.sh                          # build/up + launch the node
+#   docker compose down                   # stop + remove
+# ---------------------------------------------------------------------------
+services:
+  seg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hmr_seg:jazzy
+    container_name: hmr_seg
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      # Keep DDS discovery on loopback (matches the scovox/hmr_localisation note;
+      # do NOT set the deprecated ROS_LOCALHOST_ONLY — it breaks FastDDS here).
+      - ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./:/seg                              # node code (edit on host, no rebuild)
+      - hf_cache:/root/.cache/huggingface    # persist weights (named volume, not in repo)
+    working_dir: /seg
+    stdin_open: true
+    tty: true
+    command: bash
+
+volumes:
+  hf_cache:

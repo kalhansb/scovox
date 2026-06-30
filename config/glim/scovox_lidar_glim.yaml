@@ -54,6 +54,13 @@
     # GLIM's DESKEWED cloud (frame `imu`). scovox does not deskew -- GLIM does.
     input_pointcloud_topic: "/glim_ros/points"
 
+    # --- Deskew (intra-scan) ---------------------------------------------
+    # OFF: GLIM already deskewed this feed. /glim_ros/points still carries a `t`
+    # field, so the "auto" default would otherwise re-deskew it (double-correct).
+    # For the RAW full-res /ouster/points feed (native deskew, no recall loss),
+    # use config/glim/scovox_lidar_raw_deskew.yaml instead.
+    deskew_mode: "off"
+
     # --- Voxel grid ------------------------------------------------------
     # 0.10 m matches GLIM's downsampled deskewed /glim_ros/points feed (~10k pts/scan):
     # resolution sweep (output/res_sweep, scripts/glim/analyze_res.py) showed voxels

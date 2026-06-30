@@ -1,0 +1,118 @@
+# =======================================================================
+# SCovox — LiDAR occupancy mapping on the RAW Ouster cloud, deskewed in-node
+# =======================================================================
+# DESKEW-OFF baseline (control) for the raw-deskew comparison: same raw /ouster/points
+# /ouster/points (frame `os_lidar`, ~131k pts/scan) and lets scovox deskew each
+# scan itself (gyro-integrated per-point rotation), instead of consuming GLIM's
+# already-deskewed but ~11x-DOWNSAMPLED /glim_ros/points (~11.6k pts/scan).
+#
+# WHY: feeding /glim_ros/points fixes the 7.2 m vertical smear (-> 0.40 m) but
+# costs recall because GLIM downsamples to ~10k pts/scan. Native deskew keeps the
+# full-res cloud -> thin surfaces AND full coverage. The smear is intra-scan SKEW
+# (per the feed-cmp in scovox-vertical-overfill.md); rotation dominates it, and
+# gyro integration reproduces GLIM's rotational deskew without GLIM's downsampling.
+#
+# GLIM still runs as the LOCALIZER and owns the TF tree
+#   map -> odom -> imu -> os_lidar
+# We only change WHAT scovox subscribes to (raw cloud + /imu/data) and let scovox
+# rotate each point to scan-start before placing it with odom<-os_lidar @ stamp.
+#
+# Frame wiring:
+#   input_pointcloud_topic = /ouster/points   (RAW, frame os_lidar, has `t` field)
+#   imu_topic              = /imu/data        (gyro source for deskew)
+#   cloud frame_id         = os_lidar
+#   base_frame             = os_lidar         (ray origin = LiDAR optical centre)
+#   integration_frame      = odom             (GLIM smooth odometry frame)
+#
+# The bag must replay /ouster/points RELIABLE (config/ouster_reliable_qos.yaml)
+# for GLIM's sub; scovox's pointcloud sub is also RELIABLE. /imu/data is taken at
+# SensorDataQoS (best-effort) so it connects regardless of the publisher's QoS.
+# =======================================================================
+
+/**:
+  ros__parameters:
+
+    # --- Input -----------------------------------------------------------
+    # RAW Ouster cloud (frame os_lidar). scovox deskews it (see below).
+    input_pointcloud_topic: "/ouster/points"
+
+    # --- Deskew (intra-scan, gyro-based rotation) ------------------------
+    # auto: deskew because /ouster/points carries a per-point `t` field. Falls
+    # back to the single-pose path (with a throttled warn) until the first IMU
+    # msg + the static os_lidar<-imu extrinsic are available.
+    deskew_mode: "off"          # auto | on | off
+    imu_topic: "/imu/data"
+    imu_frame: ""                # "" -> taken from the first /imu msg header
+    deskew_window_sec: 0.2       # per-scan integration window (>= one Ouster scan)
+    imu_retention_sec: 1.0       # rolling gyro buffer depth
+    deskew_min_angle_deg: 0.0    # >0: skip the per-point rotate when a scan turns less than this
+    gyro_bias: [0.0, 0.0, 0.0]   # optional constant gyro bias (rad/s), subtracted before integration
+    # Phase 2: also shift endpoints by sensor velocity (differenced from scan
+    # poses) × per-point time offset. Off by default — rotation dominates the
+    # smear; enable for a small extra correction during fast linear motion.
+    deskew_translation: false
+
+    # --- Voxel grid ------------------------------------------------------
+    resolution: 0.10
+    inner_bits: 2
+    leaf_bits:  1
+
+    # --- Occupancy (Beta) evidence weights -------------------------------
+    w_occ:  8.0
+    w_free: 4.0
+    carve_band: -1.0          # full-ray free-space carving
+
+    # --- TSDF ------------------------------------------------------------
+    enable_tsdf: false        # occupancy only
+    sdf_trunc_voxels: 3
+    tsdf_space_carving: false
+    band_only_integration: false
+
+    # --- Range gating (Ouster OS) ----------------------------------------
+    # Full coverage is the point of feeding the raw cloud, so keep the long range
+    # (deskew removes the smear that previously forced a tight max_range).
+    min_range: 1.0
+    max_range: 50.0
+    range_decay_length: -1.0
+    grazing_angle_threshold: -1.0
+
+    # --- Frames (driven by GLIM SLAM) ------------------------------------
+    base_frame:        "os_lidar"   # ray origin = LiDAR optical centre (raw cloud is in os_lidar)
+    integration_frame: "odom"       # GLIM smooth/jump-free odometry frame
+    map_frame:         "odom"
+
+    # --- TF startup gate -------------------------------------------------
+    startup_tf_stable_sec:     0.5
+    startup_tf_jump_threshold: 10.0
+
+    # --- TF runtime divergence gate --------------------------------------
+    runtime_tf_gate:           false
+    runtime_tf_jump_threshold: 1.0
+
+    # --- Localization reject gate ----------------------------------------
+    reject_gate_enable:               false
+    alignment_status_topic:           "/alignment_status"
+    reject_gate_max_accepted_gap_sec: 0.5
+    reject_gate_min_consecutive:      0
+
+    # --- Mode ------------------------------------------------------------
+    mode: "persistent"
+    dataset_mode: false
+
+    # --- Outputs ---------------------------------------------------------
+    publish_pointcloud:      true
+    occupancy_vis_threshold: 0.6
+    scovox_publish_rate:     0.5
+    pointcloud_topic:        "~/pointcloud"
+    scovox_topic:            "~/scovox"
+
+    # --- 2-D planning grid -----------------------------------------------
+    publish_planning_map:     false
+    planning_map_topic:       "~/planning_map"
+    planning_map_resolution:  0.20
+    planning_map_size_m:      80.0
+    planning_map_origin_x:   -40.0
+    planning_map_origin_y:   -40.0
+    planning_map_min_z:      -0.5
+    planning_map_max_z:       2.0
+    planning_map_inflation_m: 0.0

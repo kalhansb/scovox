@@ -1,0 +1,90 @@
+# =======================================================================
+# SCovox — RGB-D semantic mapping (outdoor, fed by the seg_pipeline node)
+# =======================================================================
+# Builds a Beta-occupancy + Dirichlet-semantic voxel map from a depth image
+# + a colored segmentation image. Inputs come from the online seg node
+# (src/seg_pipeline), which publishes depth/seg/camera_info already:
+#   * stamped with one shared (depth) timestamp  -> robust 0.05 s sync
+#   * re-framed to the BODY frame camera_color_frame -> satisfies the node's
+#     hardcoded optical->body kR rotation
+#
+# Pose: a LiDAR localizer publishes map -> ... -> base_link; the bag's
+# /tf_static chains base_link -> camera_color_frame, so depth integrates in
+# `map` and the result fuses with the LiDAR map.
+#
+# Palette + num_classes MUST match src/seg_pipeline/outdoor_palette.py
+# (regenerate with `python3 outdoor_palette.py`).
+#
+# Load via:
+#   ros2 launch scovox_mapping rgbd_semantic_mapping.launch.py use_sim_time:=true
+# =======================================================================
+
+/**:
+  ros__parameters:
+
+    # --- Input mode -----------------------------------------------------
+    # EMPTY input_pointcloud_topic => RGB-D (depth+seg) path, not LiDAR.
+    input_pointcloud_topic: ""
+    depth_topic:      "/scovox/depth/image_raw"
+    depth_info_topic: "/scovox/depth/camera_info"
+    seg_topic:        "/scovox/segmentation/colored"
+    dataset_mode:     false          # live ApproximateTime sync (not frame-index)
+
+    # --- Frames ---------------------------------------------------------
+    integration_frame: "map"         # integrate + publish in the LiDAR map frame (fusion)
+    base_frame:        "camera_color_frame"   # ray origin = camera; body frame from tf_static
+    map_frame:         "map"
+
+    # --- Voxel grid -----------------------------------------------------
+    resolution: 0.10                 # match the LiDAR map for fusion
+    inner_bits: 2
+    leaf_bits:  2
+
+    # --- Occupancy (Beta) evidence — RGB-D moderate ---------------------
+    w_occ:  2.0
+    w_free: 1.0
+    carve_band: -1.0
+
+    # --- Semantics (Dirichlet) ------------------------------------------
+    semantic_mode:   "dirichlet"
+    kappa0:          2.0
+    semantic_top_k:  2               # clamped to compile-time K_TOP=2
+    num_classes:           14        # 0=other/unknown + 13 outdoor classes
+    max_semantic_classes:  14
+    dirichlet_prior: 0.01
+    semantic_occ_gate: 0.5
+    # Outdoor palette (packed 0xRRGGBB as decimal) <-> compact class id.
+    # MUST equal outdoor_palette.scovox_color_map(). 0 (black) = unknown.
+    semantic_color_map_keys:    [8405120, 15999976, 10025880, 4605510, 7048739, 10066329, 16427550, 14423100, 16711680, 142, 4620980, 12491161, 6710940, 0]
+    semantic_color_map_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0]
+
+    # --- Range gating — RealSense outdoor near-field --------------------
+    min_depth: 0.3
+    max_depth: 6.0
+    min_range: 0.3
+    max_range: 6.0
+    range_decay_length:      -1.0
+    grazing_angle_threshold: -1.0
+    stride: 1
+
+    # --- TSDF surface ---------------------------------------------------
+    enable_tsdf: false               # occupancy + semantics only for the first run
+    sdf_trunc_voxels: 3
+
+    # --- TF gates -------------------------------------------------------
+    # Localizer already tracks; seg is throttled so inter-frame motion can be
+    # large -> disable the runtime jump gate and start integrating immediately.
+    startup_tf_stable_sec:     0.0
+    startup_tf_jump_threshold: 10.0
+    runtime_tf_gate:           false
+
+    # --- Mode -----------------------------------------------------------
+    mode: "persistent"               # single local map, no dscovox binary publish
+
+    # --- Outputs --------------------------------------------------------
+    publish_pointcloud:      true
+    occupancy_vis_threshold: 0.6
+    scovox_publish_rate:     1.0
+    pointcloud_topic:        "~/pointcloud"
+    scovox_topic:            "~/scovox"
+    publish_planning_map:    false
