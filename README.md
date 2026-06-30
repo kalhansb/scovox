@@ -87,6 +87,21 @@ For semantics, give SCovox a class per voxel via a `semantic_label` field on the
 `PointCloud2`, or a colored segmentation image (`seg_topic`) — RGB-D path is wired
 in [`scovox_single_robot.launch.py`](src/scovox_mapping/launch/scovox_single_robot.launch.py).
 
+**Recommended LiDAR setup** — map the full-resolution sensor cloud with native
+deskew + downsample so the occupancy map stays surface-thin (no vertical smear)
+without discarding points; an external localizer (e.g. GLIM) supplies the pose:
+
+* **Params:** [`config/glim/scovox_lidar_raw_deskew.yaml`](config/glim/scovox_lidar_raw_deskew.yaml)
+  — raw `/ouster/points`, `base_frame: os_lidar`, `integration_frame: odom`,
+  `deskew_mode: auto`, `downsample_voxel_size: 0.5`. The file's header comments
+  carry the full rationale.
+* **Launch helper (in the SCovox container):**
+  [`scripts/glim/launch_scovox.sh raw`](scripts/glim/launch_scovox.sh) starts
+  `scovox_node` from that config against `/ouster/points`.
+
+See [Raw-cloud occupancy mapping](#raw-cloud-occupancy-mapping-vertical-smear-cure)
+for the problem this solves.
+
 ### Multi-robot (SCovox + DSCovox)
 
 One `scovox_mapping_node` per robot (`mode:=rolling`, namespaced) publishes
@@ -139,16 +154,11 @@ Larger `downsample_voxel_size` thins the smear further but trims the horizontal
 footprint; the default (`0.5`) is the knee — it suppresses the smear while keeping
 the surface dense. `0.0` disables downsampling.
 
-* **Params:** [`config/glim/scovox_lidar_raw_deskew.yaml`](config/glim/scovox_lidar_raw_deskew.yaml)
-  — raw `/ouster/points`, `base_frame: os_lidar`, `integration_frame: odom`,
-  `deskew_mode: auto`, `downsample_voxel_size: 0.5`. The file's header comments
-  carry the full rationale.
-* **Launch helper (in the SCovox container):**
-  [`scripts/glim/launch_scovox.sh raw`](scripts/glim/launch_scovox.sh) starts
-  `scovox_node` from that config against `/ouster/points`.
-
-The node logs `ds=out/in` per scan (kept vs raw points) so you can confirm the
-downsample is active.
+Run it as the **Recommended LiDAR setup** under [Running on a robot](#single-robot)
+— [`config/glim/scovox_lidar_raw_deskew.yaml`](config/glim/scovox_lidar_raw_deskew.yaml)
+via [`scripts/glim/launch_scovox.sh raw`](scripts/glim/launch_scovox.sh). The node
+logs `ds=out/in` per scan (kept vs raw points) so you can confirm the downsample is
+active.
 
 ## Citation
 
