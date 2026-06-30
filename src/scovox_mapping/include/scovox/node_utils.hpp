@@ -67,11 +67,17 @@ inline TopKSemantics selectTopKSemantics(const Voxel& v, int top_k) {
       pairs[n++] = {v.sem_cls[i], v.sem_cnt[i]};
     }
   }
-  std::sort(pairs.begin(), pairs.begin() + n,
-            [](const std::pair<uint16_t, float>& a,
-               const std::pair<uint16_t, float>& b) {
-              return a.second > b.second;
-            });
+  // Hand-rolled insertion sort (n ≤ K_TOP) instead of std::sort: at -O3 the
+  // inlined std::sort pulls in its 16-element introsort fallback, whose dead
+  // `__first + 16` access trips a -Warray-bounds false positive when this is
+  // inlined into the dscovox refold path. Descending by count; identical output
+  // for this n.
+  for (size_t i = 1; i < n; ++i) {
+    const std::pair<uint16_t, float> key = pairs[i];
+    size_t j = i;
+    while (j > 0 && key.second > pairs[j - 1].second) { pairs[j] = pairs[j - 1]; --j; }
+    pairs[j] = key;
+  }
 
   TopKSemantics out;
   // Clamp the request to [0, K_TOP]. A negative `top_k` is treated as 0 (not 1):

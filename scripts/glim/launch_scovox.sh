@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
-# Launch the SCovox mapping node(s) for a GLIM-driven experiment, IN THE SCOVOX
-# CONTAINER. GLIM SLAM runs in the separate glim_loc container and publishes the
-# TF tree (map->odom->imu->os_lidar) + the deskewed cloud /glim_ros/points; these
-# nodes consume them over ROS 2 DDS (both containers are host-net + ipc host +
-# ROS_DOMAIN_ID=0, so they share one DDS graph).
+# Launch the SCovox mapping node on the RAW Ouster cloud, IN THE SCOVOX CONTAINER.
 #
-# Normally invoked by the host orchestrator ../run_glim_experiment.sh, which
-# backgrounds it (`docker compose exec -d scovox ...`) and tears it down with
-# `docker compose stop scovox` once the GLIM-side driver has captured the map.
-# Manual:  docker compose exec scovox bash scripts/glim/launch_scovox.sh <mode>
+# A localizer (e.g. GLIM LiDAR-IMU SLAM, running in a separate container) owns the
+# TF tree (map -> odom -> imu -> os_lidar) and provides the per-scan pose; SCovox
+# subscribes to the full-resolution /ouster/points + /imu/data over ROS 2 DDS and
+# builds the occupancy map online. It deskews each scan natively (gyro rotation)
+# and voxel-downsamples it (downsample_voxel_size) to suppress the vertical smear
+# without GLIM's recall-costing cloud downsample -- see config/glim/ + the README.
 #
-# Mode (node name must match the salvage calls in the glim-side drivers):
-#   map | odom | viz | verify | smoke   single node `scovox_node` from
-#                                        config/glim/scovox_lidar_glim.yaml, fed /glim_ros/points
+# Manual:  docker compose exec scovox bash scripts/glim/launch_scovox.sh raw
 set -e
-MODE="${1:?usage: launch_scovox.sh <map|odom|viz|verify|smoke>}"
+MODE="${1:-raw}"
 
 source /opt/ros/jazzy/setup.bash
 source /scovox/install/setup.bash
@@ -22,18 +18,12 @@ source /scovox/install/setup.bash
 ROOT=/scovox
 CFG="$ROOT/config/glim"
 
-PIDS=()
-cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
-
-launch_single() {
-  echo "[scovox] single node 'scovox_node' <- /glim_ros/points  (params=$CFG/scovox_lidar_glim.yaml)"
-  ros2 launch scovox_mapping lidar_mapping.launch.py \
-    params_file:="$CFG/scovox_lidar_glim.yaml" \
-    pointcloud_topic:=/glim_ros/points use_sim_time:=true
-}
-
 case "$MODE" in
-  map|odom|viz|verify|smoke) launch_single ;;
-  *) echo "unknown mode: $MODE"; exit 1 ;;
+  raw)
+    echo "[scovox] scovox_node <- /ouster/points (native deskew + downsample)  (params=$CFG/scovox_lidar_raw_deskew.yaml)"
+    exec ros2 launch scovox_mapping lidar_mapping.launch.py \
+      params_file:="$CFG/scovox_lidar_raw_deskew.yaml" \
+      pointcloud_topic:=/ouster/points use_sim_time:=true
+    ;;
+  *) echo "usage: launch_scovox.sh raw"; exit 1 ;;
 esac

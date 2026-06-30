@@ -132,18 +132,30 @@ inline DirVoxel mergeDir(const DirVoxel& a,
   for (int i = 0; i < K_TOP; ++i) if (b.cls[i] != 0xFFFF) upsert(b.cls[i], b.cnt[i]);
 
   // Deterministic, fold-order-invariant ordering: count desc, then class id
-  // asc as a tie-break. std::sort is NOT stable, so without the secondary key
-  // two classes with equal counts at the K_TOP truncation boundary would be
-  // kept-or-dumped depending on source iteration order, making the fused slots
-  // (and dominantClass) nondeterministic across runs/rehashes. NOTE: this makes
-  // the merge DETERMINISTIC but not fully order-INDEPENDENT — a class dumped to
-  // OTHER in one pairwise fold cannot climb back into a slot in a later fold.
-  // True commutativity requires accumulating every source's evidence before a
-  // single truncation; callers needing that must fold in a fixed source order.
-  std::sort(merged, merged + n,
-            [](const Entry& x, const Entry& y) {
-              return x.cnt != y.cnt ? x.cnt > y.cnt : x.cls < y.cls;
-            });
+  // asc as a tie-break. The secondary key is what makes the order independent of
+  // source iteration: without it, two classes with equal counts at the K_TOP
+  // truncation boundary would be kept-or-dumped depending on which source we
+  // folded first, making the fused slots (and dominantClass) nondeterministic
+  // across runs/rehashes. NOTE: this makes the merge DETERMINISTIC but not fully
+  // order-INDEPENDENT — a class dumped to OTHER in one pairwise fold cannot climb
+  // back into a slot in a later fold. True commutativity requires accumulating
+  // every source's evidence before a single truncation; callers needing that
+  // must fold in a fixed source order.
+  //
+  // Hand-rolled insertion sort rather than std::sort: n ≤ 2·K_TOP, and at -O3 an
+  // inlined std::sort drags in its 16-element introsort fallback whose dead
+  // `__first + 16` access trips a -Warray-bounds false positive when mergeDir is
+  // inlined into a hot caller (the dscovox refold path). Output is identical —
+  // the comparator is a strict total order (all cls distinct after upsert).
+  auto orderBefore = [](const Entry& x, const Entry& y) {
+    return x.cnt != y.cnt ? x.cnt > y.cnt : x.cls < y.cls;
+  };
+  for (int i = 1; i < n; ++i) {
+    const Entry key = merged[i];
+    int j = i - 1;
+    while (j >= 0 && orderBefore(key, merged[j])) { merged[j + 1] = merged[j]; --j; }
+    merged[j + 1] = key;
+  }
 
   // Initialise fused slots to prior (matches defaultDirVoxel).
   for (int i = 0; i < K_TOP; ++i) {

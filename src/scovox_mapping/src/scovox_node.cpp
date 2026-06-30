@@ -5,6 +5,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/image_encodings.hpp>
@@ -27,6 +28,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
 #include "scovox/map_interface.hpp"   // scovox::Params (launch-param plumbing)
 #include "scovox/scovox_map_split.hpp"
 #include "scovox/node_utils.hpp"
@@ -279,6 +281,49 @@ private:
     //   (see tools/tsdf_parity_test.py). Empty default → no-op.
     tsdf_dump_path_ = dp("tsdf_dump_path", std::string{});
     pointcloud_mode_ = !input_pc_topic_.empty();
+    // ── Intra-scan deskew (gyro-based rotation correction) ──────────────────
+    // deskew_mode: "auto" (deskew iff the cloud has a per-point time field),
+    // "on"/"gyro" (force; warn if the field is missing), or "off" (never — set
+    // this for already-deskewed feeds like /glim_ros/points, which still carry a
+    // `t` field and would otherwise be double-corrected). Phase 1 is rotation
+    // only: each point is rotated from its capture time back to scan-start using
+    // gyro integrated across the scan, then placed by the single scan-start pose.
+    deskew_mode_ = dp("deskew_mode", std::string("auto"));
+    if (deskew_mode_ == "gyro") deskew_mode_ = "on";
+    if (deskew_mode_ != "off" && deskew_mode_ != "on" && deskew_mode_ != "auto") deskew_mode_ = "auto";
+    imu_topic_ = dp("imu_topic", std::string("/imu/data"));
+    imu_frame_ = dp("imu_frame", std::string(""));   // empty → take from first /imu msg
+    deskew_window_sec_ = dp("deskew_window_sec", 0.2);
+    imu_retention_sec_ = dp("imu_retention_sec", 1.0);
+    deskew_min_angle_deg_ = dp("deskew_min_angle_deg", 0.0);  // skip scans rotating < this
+    // Phase 2: also shift endpoints by the sensor's odom-frame velocity × the
+    // per-point time offset (intra-scan translation). Velocity is differenced
+    // from consecutive scan poses — no IMU accel, no latency. Off by default;
+    // rotation captures the bulk of the smear.
+    deskew_translation_ = dp("deskew_translation", false);
+    // TF placement timing. The raw /ouster/points scan reaches scovox at the same
+    // instant it reaches GLIM, so GLIM has not yet computed/broadcast the
+    // odom<-os_lidar pose for that stamp. With a short timeout the exact-stamp
+    // lookup fails and we fall back to Time(0) (the PREVIOUS scan's pose) →
+    // mis-placed scan → accumulation smear. tf_lookup_timeout_sec lets scovox
+    // WAIT for GLIM's TF (the TransformListener fills the buffer on its own
+    // thread, so this blocks only the main loop, not TF intake). tf_require_exact
+    // drops a scan rather than integrating it at a stale Time(0) pose.
+    tf_lookup_timeout_sec_ = dp("tf_lookup_timeout_sec", 0.2);
+    tf_require_exact_ = dp("tf_require_exact", false);
+    // Uniform voxel-grid downsample, applied per-scan in the SENSOR frame BEFORE
+    // integration (after deskew) — this is what GLIM does in preprocessing
+    // (config_preprocess.json: voxel-grid @ downsample_resolution). The raw
+    // full-res cloud over-samples the noisy surface so every scan fills the tails
+    // of the per-column z-distribution → thick smear; collapsing points to one
+    // centroid per voxel cuts that tail-sampling without throwing away coverage.
+    // 0.0 = off (full per-point path, unchanged). Geometric only: when >0 the
+    // per-point semantic/top-k labels are dropped (fine for the raw LiDAR path).
+    downsample_voxel_size_ = dp("downsample_voxel_size", 0.0);
+    {
+      auto gb = dp("gyro_bias", std::vector<double>{0.0, 0.0, 0.0});
+      if (gb.size() == 3) gyro_bias_ = Eigen::Vector3f((float)gb[0], (float)gb[1], (float)gb[2]);
+    }
     // TF stability gate: skip sensor frames until the TF pose has been
     // stable (no jumps > threshold) for at least this many seconds.
     // Prevents ghost voxels at origin when TF is briefly wrong at startup.
@@ -360,6 +405,16 @@ private:
       input_pc_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(input_pc_topic_, qos,
         std::bind(&SCovoxNode::onPointCloud, this, std::placeholders::_1));
       RCLCPP_INFO(get_logger(), "PointCloud2 input mode: topic=%s", input_pc_topic_.c_str());
+      if (deskew_mode_ != "off") {
+        // Best-effort sensor QoS: connects to BOTH reliable and best-effort IMU
+        // publishers (a reliable sub would refuse a best-effort publisher and we
+        // would silently get no gyro → deskew permanently falls back).
+        imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+          imu_topic_, rclcpp::SensorDataQoS(),
+          std::bind(&SCovoxNode::onImu, this, std::placeholders::_1));
+        RCLCPP_INFO(get_logger(), "deskew=%s: subscribing IMU %s (gyro-only)",
+                    deskew_mode_.c_str(), imu_topic_.c_str());
+      }
     } else {
       di_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(di_topic_, rclcpp::QoS(10),
         [this](sensor_msgs::msg::CameraInfo::SharedPtr m){ di_ = *m; have_di_.store(true, std::memory_order_release); });
@@ -686,6 +741,94 @@ private:
     logTopkSummary(/*throttle_ms=*/10000);
   }
 
+  // ── Intra-scan deskew (gyro-based) ──────────────────────────────────────
+  // Small-angle SO(3) exponential → unit quaternion (rotation vector φ = ω·dt).
+  static Eigen::Quaternionf quatExp(const Eigen::Vector3f& phi) {
+    const float th = phi.norm();
+    if (th < 1.0e-9f) return Eigen::Quaternionf::Identity();
+    const float h = 0.5f * th;
+    const Eigen::Vector3f ax = phi / th;
+    const float s = std::sin(h);
+    return Eigen::Quaternionf(std::cos(h), ax.x() * s, ax.y() * s, ax.z() * s);
+  }
+
+  // Buffer the gyro stream. The single-threaded executor serializes this against
+  // onPointCloud, so no lock is needed (same contract the map_mtx_ comments rely
+  // on). Stores angular velocity only — translation deskew is phase 2.
+  void onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& m) {
+    if (imu_frame_.empty() && !m->header.frame_id.empty()) imu_frame_ = m->header.frame_id;
+    ImuSample s;
+    s.t = rclcpp::Time(m->header.stamp, RCL_ROS_TIME).seconds();
+    s.w = Eigen::Vector3f((float)m->angular_velocity.x, (float)m->angular_velocity.y,
+                          (float)m->angular_velocity.z) - gyro_bias_;
+    imu_buf_.push_back(s);
+    const double cutoff = s.t - imu_retention_sec_;
+    while (!imu_buf_.empty() && imu_buf_.front().t < cutoff) imu_buf_.pop_front();
+  }
+
+  // Resolve + cache R_lidar_imu (rotates gyro from the IMU frame into the
+  // LiDAR/cloud frame). GLIM's static imu→sensor TF supplies it. Returns false
+  // until both the IMU frame id (from the first /imu msg) and the static TF are
+  // available; the caller then falls back to the single-pose path.
+  bool ensureLidarImuExtrinsic(const std::string& lidar_frame) {
+    if (extrinsic_valid_) return true;
+    if (imu_frame_.empty()) return false;
+    try {
+      auto t = tf_buffer_.lookupTransform(lidar_frame, imu_frame_, rclcpp::Time(0),
+                                          rclcpp::Duration::from_seconds(0.05));
+      R_lidar_imu_ = toE(t).linear();
+      extrinsic_valid_ = true;
+      RCLCPP_INFO(get_logger(), "deskew: cached extrinsic R[%s<-%s]",
+                  lidar_frame.c_str(), imu_frame_.c_str());
+      return true;
+    } catch (const std::exception& e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "deskew: extrinsic %s<-%s not in TF yet (%s)",
+                           lidar_frame.c_str(), imu_frame_.c_str(), e.what());
+      return false;
+    }
+  }
+
+  // Build the per-scan cumulative-rotation table over [t0, t0+window] by
+  // strapdown-integrating buffered gyro expressed in the sensor frame:
+  //   ΔR(t0→τ+dτ) = ΔR(t0→τ) · Exp(ω_s·dτ),  ω_s = R_lidar_imu · ω_imu.
+  // Knot k stores (τ_k−t0, ΔR(t0→τ_k)); the point loop slerps between knots and
+  // applies ΔR to map each point back to the scan-start sensor frame. Returns
+  // false (→ no deskew) when the buffer can't cover the scan.
+  bool buildDeskewTable(double t0, double window) {
+    deskew_table_.clear();
+    if (imu_buf_.size() < 2 || !extrinsic_valid_) return false;
+    if (imu_buf_.back().t <= t0) return false;   // whole buffer precedes the scan
+    const double t_end = t0 + window;
+    deskew_table_.push_back({0.f, Eigen::Quaternionf::Identity()});
+    Eigen::Quaternionf cumq = Eigen::Quaternionf::Identity();
+    double last_t = t0;
+    size_t idx = 0;
+    while (idx < imu_buf_.size() && imu_buf_[idx].t <= t0) ++idx;
+    // ω held over [last_t, next sample]: prefer the sample bracketing t0 on the left.
+    Eigen::Vector3f w_prev = (idx > 0) ? imu_buf_[idx - 1].w : imu_buf_[idx].w;
+    for (; idx < imu_buf_.size(); ++idx) {
+      const double ts = imu_buf_[idx].t;
+      if (ts > t_end) break;
+      const double dt = ts - last_t;
+      if (dt <= 0.0) { w_prev = imu_buf_[idx].w; continue; }
+      const Eigen::Vector3f w_mid = 0.5f * (w_prev + imu_buf_[idx].w);   // trapezoidal
+      cumq = cumq * quatExp((R_lidar_imu_ * w_mid) * static_cast<float>(dt));
+      cumq.normalize();
+      deskew_table_.push_back({static_cast<float>(ts - t0), cumq});
+      last_t = ts;
+      w_prev = imu_buf_[idx].w;
+    }
+    // Zero-order-hold extension to the window end so late points still resolve.
+    if (last_t < t_end) {
+      const double dt = t_end - last_t;
+      cumq = cumq * quatExp((R_lidar_imu_ * w_prev) * static_cast<float>(dt));
+      cumq.normalize();
+      deskew_table_.push_back({static_cast<float>(t_end - t0), cumq});
+    }
+    return deskew_table_.size() >= 2;
+  }
+
   // ── PointCloud2 input path (LiDAR) ──────────────────────────────────────
   void onPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud) {
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -696,27 +839,42 @@ private:
     std::unique_lock<std::shared_mutex> lock(map_mtx_);
 
     // Find field offsets
-    int off_x=-1, off_y=-1, off_z=-1, off_lbl=-1;
-    uint8_t lbl_type = 0;
+    int off_x=-1, off_y=-1, off_z=-1, off_lbl=-1, off_t=-1;
+    uint8_t lbl_type = 0, t_type = 0;
     for (auto& f : cloud->fields) {
       if (f.name=="x") off_x=f.offset;
       else if (f.name=="y") off_y=f.offset;
       else if (f.name=="z") off_z=f.offset;
       else if (f.name=="semantic_label") { off_lbl=f.offset; lbl_type=f.datatype; }
+      else if (f.name=="t"||f.name=="time"||f.name=="time_stamp"||f.name=="timestamp") { off_t=f.offset; t_type=f.datatype; }
     }
     if (off_x<0||off_y<0||off_z<0) { RCLCPP_WARN(get_logger(), "PointCloud2 missing xyz fields"); return; }
 
-    // TF: sensor frame -> integration frame (NO kR rotation — LiDAR is already ROS convention)
+    // TF: sensor frame -> integration frame (NO kR rotation — LiDAR is already ROS convention).
+    // Wait up to tf_lookup_timeout_sec_ for the EXACT-stamp pose; only fall back
+    // to Time(0) (the previous scan's pose) if tf_require_exact_ is false. A
+    // Time(0) fallback mis-places the whole scan and is the prime suspect for the
+    // accumulation smear, so it is counted + warned.
+    const auto tf_to = rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_);
     Eigen::Isometry3f T_oi;
-    try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, cloud->header.stamp, rclcpp::Duration::from_seconds(0.2)));
-    } catch (...) { try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.2)));
-    } catch (const std::exception& e) { RCLCPP_WARN(get_logger(), "recv=%zu: TF FAILED: %s", frame_recv_, e.what()); return; } }
+    try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, cloud->header.stamp, tf_to));
+    } catch (...) {
+      ++tf_fallback_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "recv=%zu: no exact-stamp TF for %s after %.2fs (%zu fallbacks) — %s",
+        frame_recv_, cloud->header.frame_id.c_str(), tf_lookup_timeout_sec_,
+        tf_fallback_count_, tf_require_exact_ ? "DROPPING scan" : "using Time(0) (stale pose)");
+      if (tf_require_exact_) return;
+      try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05)));
+      } catch (const std::exception& e) { RCLCPP_WARN(get_logger(), "recv=%zu: TF FAILED: %s", frame_recv_, e.what()); return; } }
 
-    // Sensor origin in integration frame
+    // Sensor origin in integration frame (same exact-stamp-then-fallback policy).
     Eigen::Vector3f O;
-    try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, cloud->header.stamp, rclcpp::Duration::from_seconds(0.2));
+    try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, cloud->header.stamp, tf_to);
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
-    } catch (...) { try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.2));
+    } catch (...) {
+      if (tf_require_exact_) return;
+      try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05));
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
     } catch (...) { return; } }
 
@@ -757,6 +915,10 @@ private:
                        : (lbl_type == sensor_msgs::msg::PointField::UINT16) ? 2 : 1;
       max_field_end = std::max(max_field_end, off_lbl + lbl_sz);
     }
+    if (off_t >= 0) {
+      const int t_sz = (t_type == sensor_msgs::msg::PointField::FLOAT64) ? 8 : 4;
+      max_field_end = std::max(max_field_end, off_t + t_sz);
+    }
     if (max_field_end > step || cloud->data.size() < N * (size_t)step) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "PointCloud2 buffer too small (point_step=%d field_end=%d size=%zu need=%zu); dropping",
@@ -773,6 +935,131 @@ private:
       use_topk = loadTopkForFrame(fid, /*image_mode=*/false);
     }
 
+    // ── Intra-scan deskew decision (gyro-based rotation) ──────────────────
+    // auto/on: deskew iff the cloud carries a per-point time field AND a gyro
+    // table can be built for this scan. off: never (already-deskewed feeds).
+    // Any missing prerequisite → fall back to the legacy single-pose path so we
+    // never integrate a half-built correction.
+    const double t0_sec = last_input_stamp_.seconds();
+    bool do_deskew = false;
+    if (deskew_mode_ != "off" && off_t >= 0) {
+      if (ensureLidarImuExtrinsic(cloud->header.frame_id) &&
+          buildDeskewTable(t0_sec, deskew_window_sec_)) {
+        const float wlast = std::min(1.f, std::abs(deskew_table_.back().q.w()));
+        const float total_deg = 2.f * std::acos(wlast) * 57.29578f;
+        if (deskew_min_angle_deg_ <= 0.0 || total_deg >= deskew_min_angle_deg_) {
+          do_deskew = true;
+          ++deskew_frames_;
+        }
+      } else {
+        ++deskew_fallback_;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "deskew on but IMU/extrinsic not ready (imu_buf=%zu extrinsic=%d frame=%s); "
+          "integrating raw scan", imu_buf_.size(), (int)extrinsic_valid_,
+          cloud->header.frame_id.c_str());
+      }
+    } else if (deskew_mode_ == "on" && off_t < 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "deskew_mode=on but cloud '%s' has no per-point time field; integrating raw scan",
+        cloud->header.frame_id.c_str());
+    }
+
+    // ── Phase 2: intra-scan translation deskew (optional) ─────────────────
+    // Shift each point's endpoint by the sensor's odom-frame velocity × its time
+    // offset, so a point captured at t_i is placed at the sensor position at t_i
+    // (not at scan-start). Velocity is differenced from consecutive scan poses
+    // (no IMU accel, no latency). Endpoints only; the carve origin O stays at
+    // scan-start (a ~0.1 m shift over a scan, negligible for free-space carving).
+    Eigen::Vector3f v_odom = Eigen::Vector3f::Zero();
+    bool apply_trans = false;
+    if (deskew_translation_ && do_deskew) {
+      const Eigen::Vector3f cur_trans = T_oi.translation();
+      if (prev_scan_valid_) {
+        const double dt = t0_sec - prev_scan_t_;
+        if (dt > 1.0e-3 && dt < 1.0) {
+          v_odom = (cur_trans - prev_scan_trans_) / static_cast<float>(dt);
+          apply_trans = true;
+        }
+      }
+      prev_scan_trans_ = cur_trans; prev_scan_t_ = t0_sec; prev_scan_valid_ = true;
+    }
+
+    // Per-point rotation lookup: advance a cursor through the knot table and
+    // slerp between bracketing knots. Ouster points are column-time-ordered (the
+    // 64 beams of a column share one `t`), so the cursor advances monotonically
+    // and the same-offset cache collapses ~one slerp per column, not per point.
+    size_t dk_cursor = 0;
+    float dk_last_off = -1.0e30f;
+    Eigen::Quaternionf dk_last_q = Eigen::Quaternionf::Identity();
+    auto deskewRot = [&](float off) -> Eigen::Quaternionf {
+      if (std::abs(off - dk_last_off) < 1.0e-4f) return dk_last_q;
+      if (off <= deskew_table_.front().dt) { dk_last_off = off; dk_last_q = deskew_table_.front().q; return dk_last_q; }
+      if (off >= deskew_table_.back().dt)  { dk_last_off = off; dk_last_q = deskew_table_.back().q;  return dk_last_q; }
+      if (off < deskew_table_[dk_cursor].dt) dk_cursor = 0;   // non-monotonic guard
+      while (dk_cursor + 1 < deskew_table_.size() && deskew_table_[dk_cursor + 1].dt <= off) ++dk_cursor;
+      const auto& a = deskew_table_[dk_cursor];
+      const auto& b = deskew_table_[dk_cursor + 1];
+      const float denom = b.dt - a.dt;
+      const float fr = denom > 1.0e-9f ? (off - a.dt) / denom : 0.f;
+      dk_last_off = off; dk_last_q = a.q.slerp(fr, b.q);
+      return dk_last_q;
+    };
+
+    // Uniform voxel-grid downsample (sensor frame), then integrate one centroid
+    // per voxel. GLIM does this in preprocessing; on the raw cloud it collapses
+    // the dense over-sampling that fills the per-column z-tails (the smear).
+    // Geometric only (no semantics/top-k) — used for the raw LiDAR path.
+    size_t ds_in = 0, ds_out = 0;
+    if (downsample_voxel_size_ > 0.0) {
+      const float inv = 1.0f / static_cast<float>(downsample_voxel_size_);
+      struct Acc { float sx, sy, sz, soff; uint32_t n; };
+      // pack three voxel indices into one int64 (21 bits each, signed-wrap safe
+      // for |index| < 2^20 ≈ ±10 km at 1 cm — far beyond any LiDAR range here).
+      auto vkey = [](int ix, int iy, int iz) -> int64_t {
+        return (int64_t(ix) & 0x1FFFFF) | ((int64_t(iy) & 0x1FFFFF) << 21) | ((int64_t(iz) & 0x1FFFFF) << 42);
+      };
+      std::unordered_map<int64_t, Acc> grid;
+      grid.reserve(N / 2 + 16);
+      for (size_t i = 0; i < N; ++i) {
+        const uint8_t* p = data + i * step;
+        float x = *reinterpret_cast<const float*>(p + off_x);
+        float y = *reinterpret_cast<const float*>(p + off_y);
+        float z = *reinterpret_cast<const float*>(p + off_z);
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+        Eigen::Vector3f praw(x, y, z);
+        float off_i = 0.f;
+        if (do_deskew) {
+          const uint8_t* tp = p + off_t;
+          if (t_type == sensor_msgs::msg::PointField::UINT32)
+            off_i = static_cast<float>(*reinterpret_cast<const uint32_t*>(tp) * 1.0e-9);
+          else if (t_type == sensor_msgs::msg::PointField::FLOAT32)
+            off_i = *reinterpret_cast<const float*>(tp);
+          else if (t_type == sensor_msgs::msg::PointField::FLOAT64) {
+            const double td = *reinterpret_cast<const double*>(tp);
+            off_i = static_cast<float>(td > 1.0e6 ? td - t0_sec : td);
+          }
+          praw = deskewRot(off_i) * praw;
+        }
+        const int ix = (int)std::floor(praw.x() * inv);
+        const int iy = (int)std::floor(praw.y() * inv);
+        const int iz = (int)std::floor(praw.z() * inv);
+        Acc& a = grid[vkey(ix, iy, iz)];
+        a.sx += praw.x(); a.sy += praw.y(); a.sz += praw.z(); a.soff += off_i; ++a.n;
+      }
+      ds_in = N; ds_out = grid.size();
+      for (const auto& kv : grid) {
+        const Acc& a = kv.second;
+        const float invn = 1.0f / float(a.n);
+        Eigen::Vector3f praw(a.sx * invn, a.sy * invn, a.sz * invn);  // voxel centroid (sensor frame)
+        Eigen::Vector3f Hp = T_oi * praw;
+        if (apply_trans) Hp += v_odom * (a.soff * invn);
+        const float r2 = (Hp - O).squaredNorm();
+        if (r2 < min_r2 || r2 > max_r2) continue;
+        const float rng = need_rng ? std::sqrt(r2) : 0.f;
+        const float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
+        integrateHit(O, Hp, rng, false, nullptr, rw, rw, 1.f);
+      }
+    } else {
     std::vector<float> cp(max_sem_, 0.f);
     for (size_t i = 0; i < N; ++i) {
       const uint8_t* p = data + i * step;
@@ -781,7 +1068,25 @@ private:
       float z = *reinterpret_cast<const float*>(p + off_z);
       if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
 
-      Eigen::Vector3f Hp = T_oi * Eigen::Vector3f(x, y, z);
+      // Intra-scan deskew: rotate each point from its capture-time sensor frame
+      // back to scan-start, then place it with the single scan-start pose. No-op
+      // (byte-identical to the legacy path) when do_deskew is false.
+      Eigen::Vector3f praw(x, y, z);
+      float off_i = 0.f;
+      if (do_deskew) {
+        const uint8_t* tp = p + off_t;
+        if (t_type == sensor_msgs::msg::PointField::UINT32)
+          off_i = static_cast<float>(*reinterpret_cast<const uint32_t*>(tp) * 1.0e-9);
+        else if (t_type == sensor_msgs::msg::PointField::FLOAT32)
+          off_i = *reinterpret_cast<const float*>(tp);
+        else if (t_type == sensor_msgs::msg::PointField::FLOAT64) {
+          const double td = *reinterpret_cast<const double*>(tp);
+          off_i = static_cast<float>(td > 1.0e6 ? td - t0_sec : td);  // tolerate absolute stamps
+        }
+        praw = deskewRot(off_i) * praw;
+      }
+      Eigen::Vector3f Hp = T_oi * praw;
+      if (apply_trans) Hp += v_odom * off_i;
       const float r2 = (Hp - O).squaredNorm();
       if (r2 < min_r2 || r2 > max_r2) continue;
       const float rng = need_rng ? std::sqrt(r2) : 0.f;
@@ -809,6 +1114,7 @@ private:
       if (vs && !dyn_cls_.empty()) for (size_t j=0;j<cp.size();j++) if (cp[j] > 0.f && dyn_cls_.count((uint8_t)j)) { dyn=true; break; }
       integrateHit(O, Hp, rng, dyn, vs ? &cp : nullptr, q, rw, 1.f);
     }
+    }  // end else (per-point path)
 
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
@@ -836,10 +1142,12 @@ private:
       RCLCPP_INFO(get_logger(),
                   "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
                   "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu "
-                  "gated=%zu rearm=%zu reject_gated=%zu",
+                  "gated=%zu rearm=%zu reject_gated=%zu deskew=%d knots=%zu tf_fb=%zu ds=%zu/%zu",
                   frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms,
                   publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_,
-                  frames_gated_, tf_rearm_count_, frames_gated_reject_);
+                  frames_gated_, tf_rearm_count_, frames_gated_reject_,
+                  (int)do_deskew, do_deskew ? deskew_table_.size() : (size_t)0,
+                  tf_fallback_count_, ds_out, ds_in);
     }
     if (frame_recv_ % 10 == 1) scheduleMemUsage();
     logEvictionDelta(frame_recv_);
@@ -1650,6 +1958,31 @@ private:
   mutable std::shared_mutex map_mtx_;  // protects split_map_
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr di_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr input_pc_sub_;
+  // ── Intra-scan deskew (gyro-based rotation correction) ──────────────────
+  std::string deskew_mode_{"auto"}, imu_topic_, imu_frame_;
+  double deskew_window_sec_{0.2}, imu_retention_sec_{1.0}, deskew_min_angle_deg_{0.0};
+  Eigen::Vector3f gyro_bias_{Eigen::Vector3f::Zero()};
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  struct ImuSample { double t; Eigen::Vector3f w; };
+  std::deque<ImuSample> imu_buf_;          // rolling gyro buffer (no lock: single-threaded executor)
+  Eigen::Matrix3f R_lidar_imu_{Eigen::Matrix3f::Identity()};  // rotates gyro from imu frame → cloud frame
+  bool extrinsic_valid_{false};
+  struct DeskewKnot { float dt; Eigen::Quaternionf q; };       // dt since scan-start, ΔR(t0→t0+dt)
+  std::vector<DeskewKnot> deskew_table_;   // per-scan scratch; rebuilt each scan
+  size_t deskew_frames_{0}, deskew_fallback_{0};
+  // Phase 2: intra-scan translation (sensor velocity differenced from scan poses).
+  bool deskew_translation_{false};
+  Eigen::Vector3f prev_scan_trans_{Eigen::Vector3f::Zero()};
+  double prev_scan_t_{0.0};
+  bool prev_scan_valid_{false};
+  // TF placement timing (raw-cloud path): wait for the exact-stamp pose instead
+  // of silently falling back to Time(0) (the previous scan's pose).
+  double tf_lookup_timeout_sec_{0.2};
+  bool tf_require_exact_{false};
+  size_t tf_fallback_count_{0};
+  // Uniform per-scan voxel-grid downsample (sensor frame), 0 = off. See decl in
+  // declareNodeParams. Replicates GLIM's preprocess downsample inside scovox.
+  double downsample_voxel_size_{0.0};
   std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> d_sub_, s_sub_;
   using ISP = message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image,sensor_msgs::msg::Image>;
   std::shared_ptr<message_filters::Synchronizer<ISP>> sync_;
