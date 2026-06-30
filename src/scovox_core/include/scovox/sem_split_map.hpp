@@ -116,6 +116,27 @@ class SemSplitMap {
                       const std::vector<float>* sem_probs,
                       float                     quality);
 
+  /// Dynamic-aware per-voxel hit. When `is_dynamic` is true the endpoint's
+  /// occupancy (Stream A) + semantics (Stream B) are deposited into the parallel
+  /// TRANSIENT Beta/Dir grids — decayed each frame by `decayTransient`, overlaid
+  /// on the persistent map at publish — so moving objects (e.g. people) show
+  /// live but fade fast and never pollute the persistent map. The transient
+  /// path uses the IDENTICAL Stream A/B update; only the target grids differ and
+  /// it records no touched-set (transient is local-only, never drained to the
+  /// fusion wire). `is_dynamic == false` is byte-identical to the 3-arg form.
+  void applyHitUpdate(const CoordT&             c,
+                      const std::vector<float>* sem_probs,
+                      float                     quality,
+                      bool                      is_dynamic);
+
+  /// Per-frame multiplicative decay of the transient grids toward their priors
+  /// (Beta `a → prior`, Dir `cnt → α₀`, `other → (C−K_TOP)·α₀`). Voxels whose
+  /// evidence decays back to within epsilon of prior are pruned (`setCellOff`)
+  /// so the transient grids stay bounded over a long run. `rate ∈ [0,1]`
+  /// (clamped): `rate == 1` is a no-op, `rate == 0` clears all transient
+  /// evidence. Call once per integrated frame.
+  void decayTransient(float rate);
+
   // ----------------------------------------------------------------------
   // Touched-set drains (per grid — Beta is full-ray, Dir is hit-sparse)
   // ----------------------------------------------------------------------
@@ -159,6 +180,41 @@ class SemSplitMap {
   }
 
   // ----------------------------------------------------------------------
+  // Transient (dynamic-class) grid queries — parallel to the persistent ones.
+  // Coords are shared with the persistent grids (same resolution/hierarchy), so
+  // the publisher can overlay a transient voxel directly onto its persistent
+  // counterpart at the same position.
+  // ----------------------------------------------------------------------
+
+  std::optional<BetaVoxel> getTransientBetaVoxel(const Eigen::Vector3f& pos) const;
+  std::optional<DirVoxel>  getTransientDirVoxel(const Eigen::Vector3f& pos) const;
+
+  /// Argmax class in the transient Dir grid at `pos`, or 0xFFFF if none.
+  uint16_t transientDominantClassAt(const Eigen::Vector3f& pos) const;
+
+  template <typename Fn>
+  void forEachTransientBeta(Fn&& fn) const {
+    const float h = 0.5f * static_cast<float>(params_.resolution);
+    transient_beta_grid_.forEachCell([&](const BetaVoxel& v, const CoordT& c) {
+      const auto p = transient_beta_grid_.coordToPos(c);
+      fn(v, Eigen::Vector3f(static_cast<float>(p.x) + h,
+                            static_cast<float>(p.y) + h,
+                            static_cast<float>(p.z) + h));
+    });
+  }
+
+  template <typename Fn>
+  void forEachTransientDir(Fn&& fn) const {
+    const float h = 0.5f * static_cast<float>(params_.resolution);
+    transient_dir_grid_.forEachCell([&](const DirVoxel& v, const CoordT& c) {
+      const auto p = transient_dir_grid_.coordToPos(c);
+      fn(v, Eigen::Vector3f(static_cast<float>(p.x) + h,
+                            static_cast<float>(p.y) + h,
+                            static_cast<float>(p.z) + h));
+    });
+  }
+
+  // ----------------------------------------------------------------------
   // Memory accounting
   // ----------------------------------------------------------------------
 
@@ -166,6 +222,9 @@ class SemSplitMap {
   std::size_t dirVoxelCount()     const;
   std::size_t betaGridMemoryBytes() const { return beta_grid_.memUsage(); }
   std::size_t dirGridMemoryBytes()  const { return dir_grid_.memUsage(); }
+
+  std::size_t transientBetaVoxelCount() const;
+  std::size_t transientDirVoxelCount()  const;
 
   // ----------------------------------------------------------------------
   // Accessors
@@ -188,8 +247,15 @@ class SemSplitMap {
   Params               params_;
   BetaGrid             beta_grid_;
   DirGrid              dir_grid_;
+  // Parallel transient substrate for dynamic-class endpoints. Same resolution /
+  // hierarchy as the persistent grids (coord-identical), decayed each frame and
+  // pruned back to nothing; never drained to the fusion wire.
+  BetaGrid             transient_beta_grid_;
+  DirGrid              transient_dir_grid_;
   BetaGrid::Accessor   beta_acc_;
   DirGrid::Accessor    dir_acc_;
+  BetaGrid::Accessor   transient_beta_acc_;
+  DirGrid::Accessor    transient_dir_acc_;
   std::vector<CoordT>  touched_beta_;
   std::vector<CoordT>  touched_dir_;
 
@@ -205,6 +271,20 @@ class SemSplitMap {
 
   BetaVoxel* getOrAllocateBeta(const CoordT& c);
   DirVoxel*  getOrAllocateDir(const CoordT& c);
+
+  // Accessor-parameterised primitives so the persistent and transient targets
+  // share one implementation of the Stream A/B hit update and the prior-enforcing
+  // first-touch allocation (the persistent grids pass their touched-sets; the
+  // transient grids pass nullptr).
+  BetaVoxel* getOrAllocateBetaOn(BetaGrid::Accessor& acc, const CoordT& c);
+  DirVoxel*  getOrAllocateDirOn(DirGrid::Accessor& acc, const CoordT& c);
+  void       applyHitUpdateOn(const CoordT&             c,
+                              const std::vector<float>* sem_probs,
+                              float                     quality,
+                              BetaGrid::Accessor&       bacc,
+                              DirGrid::Accessor&        dacc,
+                              std::vector<CoordT>*      touched_beta,
+                              std::vector<CoordT>*      touched_dir);
 
   void applyBetaSaturation(BetaVoxel* b) const;
   void applyDirSaturation(DirVoxel* d) const;

@@ -301,3 +301,160 @@ TEST(SemSplitMap, DrainTouchedPerGrid) {
   EXPECT_EQ(m.touchedBetaCount(), 0u);
   EXPECT_EQ(m.touchedDirCount(), 0u);
 }
+
+// ===========================================================================
+// Transient (dynamic-class) substrate
+// ===========================================================================
+
+TEST(SemSplitTransient, DynamicHitRoutesToTransientNotPersistent) {
+  auto m = makeMap();
+  const Eigen::Vector3f pos(1.0f, 0, 0);
+  const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+
+  m.applyHitUpdate(c, &probs, /*quality=*/1.0f, /*is_dynamic=*/true);
+
+  // Nothing in the persistent grids.
+  EXPECT_FALSE(m.getBetaVoxel(pos).has_value());
+  EXPECT_FALSE(m.getDirVoxel(pos).has_value());
+  EXPECT_EQ(m.betaVoxelCount(), 0u);
+  EXPECT_EQ(m.dirVoxelCount(), 0u);
+  // Present in the transient grids.
+  EXPECT_TRUE(m.getTransientBetaVoxel(pos).has_value());
+  EXPECT_TRUE(m.getTransientDirVoxel(pos).has_value());
+  EXPECT_EQ(m.transientBetaVoxelCount(), 1u);
+  EXPECT_EQ(m.transientDirVoxelCount(), 1u);
+  EXPECT_EQ(m.transientDominantClassAt(pos), 3u);
+  EXPECT_EQ(m.dominantClassAt(pos), 0xFFFFu);  // persistent has no class
+}
+
+TEST(SemSplitTransient, DynamicHitRecordsNoTouchedSet) {
+  auto m = makeMap();
+  const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  // Transient is local-only: never enters the fusion-wire touched-sets.
+  EXPECT_EQ(m.touchedBetaCount(), 0u);
+  EXPECT_EQ(m.touchedDirCount(), 0u);
+}
+
+TEST(SemSplitTransient, NonDynamicOverloadMatchesThreeArg) {
+  auto ma = makeMap();
+  auto mb = makeMap();
+  const auto c = ma.betaGrid().posToCoord(1.0f, 0.f, 0.f);
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+
+  ma.applyHitUpdate(c, &probs, 1.0f);                        // 3-arg
+  mb.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/false);  // 4-arg, persistent
+
+  const Eigen::Vector3f pos(1.0f, 0, 0);
+  auto ba = ma.getBetaVoxel(pos); auto bb = mb.getBetaVoxel(pos);
+  ASSERT_TRUE(ba.has_value()); ASSERT_TRUE(bb.has_value());
+  EXPECT_FLOAT_EQ(ba->a_occ, bb->a_occ);
+  EXPECT_FLOAT_EQ(ba->a_free, bb->a_free);
+  EXPECT_EQ(ma.dominantClassAt(pos), mb.dominantClassAt(pos));
+  EXPECT_EQ(ma.touchedBetaCount(), mb.touchedBetaCount());
+  EXPECT_EQ(ma.touchedDirCount(), mb.touchedDirCount());
+}
+
+TEST(SemSplitTransient, TransientHitUsesSameTwoStreamMath) {
+  // A dynamic hit into the transient grid must produce the SAME Beta/Dir state
+  // a persistent hit produces in the persistent grid (only the target differs).
+  auto md = makeMap();
+  auto mp = makeMap();
+  const Eigen::Vector3f pos(1.0f, 0, 0);
+  const auto c = md.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+
+  md.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  mp.applyHitUpdate(c, &probs, 1.0f);
+
+  auto td = md.getTransientBetaVoxel(pos);
+  auto tp = mp.getBetaVoxel(pos);
+  ASSERT_TRUE(td.has_value()); ASSERT_TRUE(tp.has_value());
+  EXPECT_FLOAT_EQ(td->a_occ, tp->a_occ);    // prior 1.0 + w_occ·q = 2.0
+  EXPECT_FLOAT_EQ(td->a_free, tp->a_free);  // prior 1.0 (no carve in applyHitUpdate)
+  EXPECT_NEAR(td->a_occ, 2.0f, 1e-6f);
+  EXPECT_EQ(md.transientDominantClassAt(pos), mp.dominantClassAt(pos));
+}
+
+TEST(SemSplitTransient, DecayMovesEvidenceTowardPrior) {
+  auto m = makeMap();
+  const Eigen::Vector3f pos(1.0f, 0, 0);
+  const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+
+  m.decayTransient(0.5f);
+  auto b = m.getTransientBetaVoxel(pos);
+  ASSERT_TRUE(b.has_value());
+  // a_occ: 1 + (2 - 1)·0.5 = 1.5 ; a_free stays at prior 1.0.
+  EXPECT_NEAR(b->a_occ, 1.5f, 1e-6f);
+  EXPECT_NEAR(b->a_free, 1.0f, 1e-6f);
+  // Persistent untouched by decay.
+  EXPECT_EQ(m.betaVoxelCount(), 0u);
+}
+
+TEST(SemSplitTransient, DecayRateOneIsNoOp) {
+  auto m = makeMap();
+  const Eigen::Vector3f pos(1.0f, 0, 0);
+  const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  const float a_occ_before = m.getTransientBetaVoxel(pos)->a_occ;
+
+  m.decayTransient(1.0f);  // clamp-safe no-op
+  m.decayTransient(2.0f);  // > 1 clamps to 1 → still no-op
+  auto b = m.getTransientBetaVoxel(pos);
+  ASSERT_TRUE(b.has_value());
+  EXPECT_FLOAT_EQ(b->a_occ, a_occ_before);
+  EXPECT_EQ(m.transientBetaVoxelCount(), 1u);
+}
+
+TEST(SemSplitTransient, DecayRateZeroClearsTransient) {
+  auto m = makeMap();
+  const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  ASSERT_EQ(m.transientBetaVoxelCount(), 1u);
+
+  m.decayTransient(0.0f);        // collapse to prior → prune
+  EXPECT_EQ(m.transientBetaVoxelCount(), 0u);
+  EXPECT_EQ(m.transientDirVoxelCount(), 0u);
+  EXPECT_FALSE(m.getTransientBetaVoxel(Eigen::Vector3f(1.0f, 0, 0)).has_value());
+  // Negative rate clamps to 0 as well (no crash, already empty).
+  m.decayTransient(-1.0f);
+  EXPECT_EQ(m.transientBetaVoxelCount(), 0u);
+}
+
+TEST(SemSplitTransient, RepeatedDecayPrunesTransientGrids) {
+  auto m = makeMap();
+  const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+
+  // 0.5^n falls below the 1e-3 prune epsilon after ~11 frames.
+  for (int i = 0; i < 20; ++i) m.decayTransient(0.5f);
+  EXPECT_EQ(m.transientBetaVoxelCount(), 0u);
+  EXPECT_EQ(m.transientDirVoxelCount(), 0u);
+}
+
+TEST(SemSplitTransient, DecayLeavesPersistentUntouched) {
+  auto m = makeMap();
+  const Eigen::Vector3f pos_p(1.0f, 0, 0);
+  const Eigen::Vector3f pos_d(2.0f, 0, 0);
+  const auto cp = m.betaGrid().posToCoord(pos_p.x(), pos_p.y(), pos_p.z());
+  const auto cd = m.betaGrid().posToCoord(pos_d.x(), pos_d.y(), pos_d.z());
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+
+  m.applyHitUpdate(cp, &probs, 1.0f, /*is_dynamic=*/false);
+  m.applyHitUpdate(cd, &probs, 1.0f, /*is_dynamic=*/true);
+  const float persistent_a_occ = m.getBetaVoxel(pos_p)->a_occ;
+
+  for (int i = 0; i < 20; ++i) m.decayTransient(0.5f);
+
+  auto b = m.getBetaVoxel(pos_p);
+  ASSERT_TRUE(b.has_value());
+  EXPECT_FLOAT_EQ(b->a_occ, persistent_a_occ);  // persistent never decays
+  EXPECT_EQ(m.transientBetaVoxelCount(), 0u);   // transient gone
+}

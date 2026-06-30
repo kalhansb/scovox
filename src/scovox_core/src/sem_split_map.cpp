@@ -95,8 +95,12 @@ SemSplitMap::SemSplitMap(const Params& p)
     : params_(sanitise(p))
     , beta_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
     , dir_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
+    , transient_beta_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
+    , transient_dir_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
     , beta_acc_(beta_grid_.createAccessor())
     , dir_acc_(dir_grid_.createAccessor())
+    , transient_beta_acc_(transient_beta_grid_.createAccessor())
+    , transient_dir_acc_(transient_dir_grid_.createAccessor())
     , touched_beta_()
     , touched_dir_()
     // Shipped occupancy prior is symmetric Beta(1,1) → p_occ=0.5, decoupled from
@@ -108,18 +112,26 @@ SemSplitMap::SemSplitMap(const Params& p)
 // Allocation (enforce prior at first touch — Bonxai zero-inits leaf blocks)
 // ===========================================================================
 
-BetaVoxel* SemSplitMap::getOrAllocateBeta(const CoordT& c) {
-  BetaVoxel* v = beta_acc_.value(c, /*create_if_missing=*/false);
+BetaVoxel* SemSplitMap::getOrAllocateBetaOn(BetaGrid::Accessor& acc, const CoordT& c) {
+  BetaVoxel* v = acc.value(c, /*create_if_missing=*/false);
   if (v) return v;
-  beta_acc_.setValue(c, defaultBetaVoxel(beta_occ_prior_, beta_free_prior_));
-  return beta_acc_.value(c, /*create_if_missing=*/false);
+  acc.setValue(c, defaultBetaVoxel(beta_occ_prior_, beta_free_prior_));
+  return acc.value(c, /*create_if_missing=*/false);
+}
+
+DirVoxel* SemSplitMap::getOrAllocateDirOn(DirGrid::Accessor& acc, const CoordT& c) {
+  DirVoxel* v = acc.value(c, /*create_if_missing=*/false);
+  if (v) return v;
+  acc.setValue(c, defaultDirVoxel(params_.num_classes, params_.alpha_0));
+  return acc.value(c, /*create_if_missing=*/false);
+}
+
+BetaVoxel* SemSplitMap::getOrAllocateBeta(const CoordT& c) {
+  return getOrAllocateBetaOn(beta_acc_, c);
 }
 
 DirVoxel* SemSplitMap::getOrAllocateDir(const CoordT& c) {
-  DirVoxel* v = dir_acc_.value(c, /*create_if_missing=*/false);
-  if (v) return v;
-  dir_acc_.setValue(c, defaultDirVoxel(params_.num_classes, params_.alpha_0));
-  return dir_acc_.value(c, /*create_if_missing=*/false);
+  return getOrAllocateDirOn(dir_acc_, c);
 }
 
 // ===========================================================================
@@ -195,12 +207,38 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality) {
 void SemSplitMap::applyHitUpdate(const CoordT&             c,
                                  const std::vector<float>* sem_probs,
                                  float                     quality) {
+  applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
+                   &touched_beta_, &touched_dir_);
+}
+
+void SemSplitMap::applyHitUpdate(const CoordT&             c,
+                                 const std::vector<float>* sem_probs,
+                                 float                     quality,
+                                 bool                      is_dynamic) {
+  if (is_dynamic) {
+    // Route to the transient substrate. No touched-set: transient voxels are
+    // local-only and never drained to the fusion wire.
+    applyHitUpdateOn(c, sem_probs, quality, transient_beta_acc_,
+                     transient_dir_acc_, nullptr, nullptr);
+  } else {
+    applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
+                     &touched_beta_, &touched_dir_);
+  }
+}
+
+void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
+                                   const std::vector<float>* sem_probs,
+                                   float                     quality,
+                                   BetaGrid::Accessor&       bacc,
+                                   DirGrid::Accessor&        dacc,
+                                   std::vector<CoordT>*      touched_beta,
+                                   std::vector<CoordT>*      touched_dir) {
   // ---- Stream A: occupancy (Beta grid), always. ----
-  BetaVoxel* b = getOrAllocateBeta(c);
+  BetaVoxel* b = getOrAllocateBetaOn(bacc, c);
   const float w_occ_share = params_.w_occ * quality;
   if (w_occ_share > 0.f) b->a_occ += w_occ_share;
   applyBetaSaturation(b);
-  touched_beta_.push_back(c);
+  if (touched_beta) touched_beta->push_back(c);
 
   // p_occ_post — read AFTER Stream A lands (matches SemDir/SemBeta timing).
   const float p_occ_post = b->p_occ();
@@ -211,19 +249,19 @@ void SemSplitMap::applyHitUpdate(const CoordT&             c,
   switch (params_.semantic_mode) {
     case SemanticMode::NAIVE:
       if (p_occ_post > 0.5f) {
-        DirVoxel* d = getOrAllocateDir(c);
+        DirVoxel* d = getOrAllocateDirOn(dacc, c);
         naiveUpdate(d, sem_probs, params_.alpha_0);
         applyDirSaturation(d);
-        touched_dir_.push_back(c);
+        if (touched_dir) touched_dir->push_back(c);
       }
       break;
 
     case SemanticMode::MAJORITY_VOTE:
       if (p_occ_post > 0.5f) {
-        DirVoxel* d = getOrAllocateDir(c);
+        DirVoxel* d = getOrAllocateDirOn(dacc, c);
         majorityVoteUpdate(d, sem_probs, params_.alpha_0);
         applyDirSaturation(d);
-        touched_dir_.push_back(c);
+        if (touched_dir) touched_dir->push_back(c);
       }
       break;
 
@@ -232,14 +270,98 @@ void SemSplitMap::applyHitUpdate(const CoordT&             c,
       if (p_occ_post >= params_.dirichlet_min_p_occ) {
         const float class_share = params_.kappa0 * p_occ_post * quality;
         if (class_share > 0.f) {
-          DirVoxel* d = getOrAllocateDir(c);
+          DirVoxel* d = getOrAllocateDirOn(dacc, c);
           dirichletUpdate(d, sem_probs, class_share, params_.alpha_0);
           applyDirSaturation(d);
-          touched_dir_.push_back(c);
+          if (touched_dir) touched_dir->push_back(c);
         }
       }
       break;
   }
+}
+
+// ===========================================================================
+// Transient substrate — per-frame decay + queries
+// ===========================================================================
+
+void SemSplitMap::decayTransient(float rate) {
+  if (rate < 0.f) rate = 0.f;
+  if (rate > 1.f) rate = 1.f;
+  // Voxels whose evidence has decayed to within this much of the prior carry no
+  // meaningful signal; prune them so the transient grids stay bounded.
+  constexpr float kPruneEps = 1e-3f;
+
+  // ---- Beta: decay a_occ / a_free toward their priors, prune at-prior cells.
+  {
+    const float ap = beta_occ_prior_;
+    const float fp = beta_free_prior_;
+    std::vector<CoordT> prune;
+    transient_beta_grid_.forEachCell([&](BetaVoxel& v, const CoordT& c) {
+      v.a_occ  = ap + (v.a_occ  - ap) * rate;
+      v.a_free = fp + (v.a_free - fp) * rate;
+      if (std::fabs(v.a_occ - ap) < kPruneEps && std::fabs(v.a_free - fp) < kPruneEps)
+        prune.push_back(c);
+    });
+    auto acc = transient_beta_grid_.createAccessor();
+    for (const auto& c : prune) acc.setCellOff(c);
+  }
+
+  // ---- Dir: decay cnt toward α₀ and other toward its (C−K_TOP)·α₀ prior; free
+  //      a slot that decays to prior, prune the voxel when nothing is left.
+  {
+    const float a0 = params_.alpha_0;
+    const int   residual = static_cast<int>(params_.num_classes) - K_TOP;
+    const float other_prior = (residual > 0) ? (residual * a0) : 0.f;
+    std::vector<CoordT> prune;
+    transient_dir_grid_.forEachCell([&](DirVoxel& v, const CoordT& c) {
+      v.other = other_prior + (v.other - other_prior) * rate;
+      bool any = std::fabs(v.other - other_prior) >= kPruneEps;
+      for (int i = 0; i < K_TOP; ++i) {
+        if (v.cls[i] == 0xFFFF) continue;
+        v.cnt[i] = a0 + (v.cnt[i] - a0) * rate;
+        if (std::fabs(v.cnt[i] - a0) < kPruneEps) {
+          v.cls[i] = 0xFFFF;   // slot faded to prior → release it
+          v.cnt[i] = a0;
+        } else {
+          any = true;
+        }
+      }
+      if (!any) prune.push_back(c);
+    });
+    auto acc = transient_dir_grid_.createAccessor();
+    for (const auto& c : prune) acc.setCellOff(c);
+  }
+}
+
+std::optional<BetaVoxel> SemSplitMap::getTransientBetaVoxel(const Eigen::Vector3f& pos) const {
+  auto acc = transient_beta_grid_.createConstAccessor();
+  const CoordT c = transient_beta_grid_.posToCoord(pos.x(), pos.y(), pos.z());
+  const BetaVoxel* v = acc.value(c);
+  if (!v) return std::nullopt;
+  return *v;
+}
+
+std::optional<DirVoxel> SemSplitMap::getTransientDirVoxel(const Eigen::Vector3f& pos) const {
+  auto acc = transient_dir_grid_.createConstAccessor();
+  const CoordT c = transient_dir_grid_.posToCoord(pos.x(), pos.y(), pos.z());
+  const DirVoxel* v = acc.value(c);
+  if (!v) return std::nullopt;
+  return *v;
+}
+
+uint16_t SemSplitMap::transientDominantClassAt(const Eigen::Vector3f& pos) const {
+  auto acc = transient_dir_grid_.createConstAccessor();
+  const CoordT c = transient_dir_grid_.posToCoord(pos.x(), pos.y(), pos.z());
+  const DirVoxel* v = acc.value(c);
+  if (!v) return 0xFFFF;
+  return dominantClass(*v, params_.alpha_0, params_.num_classes);
+}
+
+std::size_t SemSplitMap::transientBetaVoxelCount() const {
+  return transient_beta_grid_.activeCellsCount();
+}
+std::size_t SemSplitMap::transientDirVoxelCount() const {
+  return transient_dir_grid_.activeCellsCount();
 }
 
 // ===========================================================================
