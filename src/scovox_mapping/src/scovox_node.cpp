@@ -27,6 +27,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #include "scovox/map_interface.hpp"   // scovox::Params (launch-param plumbing)
 #include "scovox/scovox_map_split.hpp"
@@ -212,6 +213,12 @@ private:
       else P.semantic_mode = scovox::SemanticMode::DIRICHLET; }
     max_sem_ = dp("max_semantic_classes", 10);
     transient_decay_rate_ = dp("transient_decay_rate", 0.8);
+    // Dynamic classes: a hit whose argmax(cp) is one of these is routed to the
+    // transient decaying grid instead of the persistent map (see node
+    // integrateHit). Empty (default) = every hit is persistent and the
+    // per-frame decay pass is skipped.
+    for (auto c : dp("dynamic_classes", std::vector<int64_t>{}))
+      if (c >= 0 && c < max_sem_) dyn_cls_.insert((uint8_t)c);
     return P;
   }
   void declareNodeParams() {
@@ -654,6 +661,7 @@ private:
     } catch (const std::exception& e) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF(o): %s", e.what()); return; } }
     // --- Frame-admission gate: TF stability + runtime divergence + reject ---
     if (!admitFrame(O)) return;
+    decayTransientFrame();
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
     std::vector<Eigen::Vector3f> nr_eps;
@@ -898,6 +906,7 @@ private:
 
     // --- Frame-admission gate (shared with onImages path) ---
     if (!admitFrame(O)) return;
+    decayTransientFrame();
 
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
@@ -1230,7 +1239,27 @@ private:
       const float d = rng - static_cast<float>(carve_band_);
       if (d > 0) co = O + (Hp - O).normalized() * d;
     }
-    split_map_->integrateHit(co, Hp, cp, q);
+    // Dynamic routing: a hit whose winning class is configured dynamic writes
+    // its surface evidence into the transient decaying grid instead of the
+    // persistent map (the free-space carve up to the hit stays persistent).
+    // No cp (geometry-only path) or no configured dynamic classes => persistent.
+    bool is_dynamic = false;
+    if (cp && !dyn_cls_.empty()) {
+      int best = -1; float best_p = 0.f;
+      for (size_t i = 0; i < cp->size(); ++i)
+        if ((*cp)[i] > best_p) { best_p = (*cp)[i]; best = (int)i; }
+      if (best >= 0 && dyn_cls_.count((uint8_t)best)) is_dynamic = true;
+    }
+    split_map_->integrateHit(co, Hp, cp, q, is_dynamic);
+    sm_dirty_.store(true, std::memory_order_relaxed);
+  }
+  // Decay the transient (dynamic-class) grid one step toward the prior. Called
+  // once per admitted frame, before this frame's hits are integrated, so stale
+  // dynamic evidence fades whether or not new dynamic observations arrive.
+  // No-op when no dynamic classes are configured.
+  void decayTransientFrame() {
+    if (dyn_cls_.empty()) return;
+    split_map_->decayTransient(static_cast<float>(transient_decay_rate_));
     sm_dirty_.store(true, std::memory_order_relaxed);
   }
   void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps) {
@@ -1771,6 +1800,10 @@ private:
   float alpha_0_{scovox::kDefaultDirichletPrior};
   std::string tsdf_dump_path_{};  // audit hook — see [tsdf_dump] memlog branch
   std::vector<std_msgs::msg::ColorRGBA> sem_col_;
+  // Class ids whose argmax routes a hit to the transient decaying grid rather
+  // than the persistent map. Parsed from the `dynamic_classes` launch param;
+  // empty disables the transient path (and its per-frame decay) entirely.
+  std::unordered_set<uint8_t> dyn_cls_;
   // Last observed binary subscriber count. When this transitions from 0 to
   // >0 the next publish ships a full snapshot so a freshly-connected dscovox
   // sees this robot's complete current state, not just deltas since startup.
