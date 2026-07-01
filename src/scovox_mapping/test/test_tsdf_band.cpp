@@ -136,13 +136,13 @@ TEST(TSDFBand, BetaUnaffectedByTSDFIntegration) {
   EXPECT_FLOAT_EQ(a.a_unk,  b.a_unk);
 }
 
-// 7. Joint ray-casting attenuation: occluder between origin and hit -------
+// 7. Carving a beam through an occluder — wall stays solid, TSDF still lands ---
 //
-// Under the joint ray-casting likelihood, the wall doesn't "block" carving
-// outright — it attenuates downstream Beta updates by `reach_prob ≈ (1 -
-// p_wall) ≈ 0` per voxel past the wall. The wall stays solid (its
-// accumulated mass dominates), past-wall Beta evidence accumulates very
-// slowly, and TSDF (geometric, not Bayesian) is unweighted by reach_prob.
+// The wall guard is OFF by default (trust the recent scan), so a beam passing
+// through the wall carves the whole segment: front voxels get free evidence,
+// the wall gets one free increment but stays solid (accumulated a_occ
+// dominates), and TSDF (geometric, not Bayesian) lands at full strength at the
+// far surface and its band regardless of occupancy.
 
 TEST(TSDFBand, JointRaycastAttenuation) {
   Map m = makeTsdfMap();
@@ -181,10 +181,8 @@ TEST(TSDFBand, JointRaycastAttenuation) {
   //     by accumulated occupancy mass.
   EXPECT_GT(wall_post.p_occ(), 0.95f);
 
-  // (c) The new surface voxel's Beta-occupied is heavily attenuated
-  //     (reach_prob ≈ 0 through a confident wall — "we don't believe the
-  //     ray actually got there"). TSDF still lands at full strength
-  //     (geometric, not Bayesian).
+  // (c) The new surface voxel's TSDF lands at full strength (geometric, not
+  //     Bayesian, so independent of the guard/occupancy policy).
   EXPECT_GT(beyond_post.tsdf_weight, 0.f);
   EXPECT_LT(std::fabs(beyond_post.tsdf_distance), 0.5f * kRes);
 

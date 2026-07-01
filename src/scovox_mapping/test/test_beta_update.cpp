@@ -206,13 +206,14 @@ TEST(BetaUpdate, MultipleHitsAreAdditive) {
   EXPECT_FLOAT_EQ(v1.a_free, v2.a_free);
 }
 
-// --- 5. Free-space carving is attenuated past occupied voxels ---
+// --- 5. Carving a beam through an occupied voxel leaves it solid ---
 //
-// Under the joint ray-casting likelihood, the wall is not "blocked" — it
-// receives a small free update (weight ≈ w_free * reach_prob), but reach_prob
-// is small at the wall (upstream voxels are carved), and the update is
-// negligible relative to the wall's accumulated occupancy mass. The wall
-// stays solid and its p_occ stays high.
+// The wall guard is OFF by default (we trust the most recent scan). A beam that
+// passes through the wall to a farther return therefore deposits ONE free
+// increment (≤ w_free) on the wall voxel — but the wall stays confidently
+// occupied because its accumulated a_occ (100 rays) dwarfs a single free update.
+// This is the intended dynamic-clearing behaviour: repeated pass-through
+// eventually clears a stale obstacle, one scan does not.
 
 TEST(BetaUpdate, CarvingAttenuatedPastOccupied) {
   Params p;
@@ -234,15 +235,15 @@ TEST(BetaUpdate, CarvingAttenuatedPastOccupied) {
   const float wall_p_occ_pre = wall_pre.p_occ();
   ASSERT_GT(wall_p_occ_pre, 0.9f);
 
-  // Fire a ray through the wall — wall gets a small free update, but stays
-  // confidently occupied because the accumulated a_occ dominates.
+  // Fire one ray through the wall — with the guard off the wall gets a single
+  // free increment, but stays confidently occupied (accumulated a_occ dominates).
   map.integrateRay(origin, beyond);
 
   Voxel wall_post = defaultVoxel();
   ASSERT_TRUE(map.getVoxel(wall, wall_post));
-  // Wall stays confidently occupied — accumulated mass dominates a tiny update.
+  // Wall stays confidently occupied — 100 rays of a_occ dominate one free update.
   EXPECT_GT(wall_post.p_occ(), 0.9f);
-  // The free update is bounded by w_free (would be the unattenuated value).
+  // Exactly one free traversal this scan → bounded by w_free.
   EXPECT_LT(wall_post.a_free - wall_pre.a_free, 1.01f);
 }
 

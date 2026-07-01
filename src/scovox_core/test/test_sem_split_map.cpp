@@ -242,24 +242,126 @@ TEST(SemSplitMap, BelowGateCommitsNoClassAndNoDirVoxel) {
 // Wall blocking, saturation, drains
 // ===========================================================================
 
-TEST(SemSplitMap, WallBlockingStopsCarving) {
-  auto m = makeMap();
-  Eigen::Vector3f wall_pos(0.5f, 0, 0);
-  Eigen::Vector3f beyond(1.0f, 0, 0);
-  {
-    auto acc = m.betaGrid().createAccessor();
-    auto coord = m.betaGrid().posToCoord(wall_pos.x(), wall_pos.y(), wall_pos.z());
-    auto pre = m.defaultBeta();
-    pre.a_occ  = 100.f;  // p_occ ≈ 1 → wall
-    pre.a_free = 1.f;
-    acc.setValue(coord, pre);
-  }
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), beyond, nullptr, 1.0f);
+// Plant a confidently-occupied "wall" voxel at `pos` in map `m`.
+static void plantWall(scovox::SemSplitMap& m, const Eigen::Vector3f& pos) {
+  auto acc   = m.betaGrid().createAccessor();
+  auto coord = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  auto pre   = m.defaultBeta();
+  pre.a_occ  = 100.f;  // p_occ ≈ 1 → wall
+  pre.a_free = 1.f;
+  acc.setValue(coord, pre);
+}
 
+TEST(SemSplitMap, WallGuardOptInStopsCarving) {
+  // The wall guard is OFF by default (trust the recent scan). A positive
+  // carve_skip_occ_threshold re-enables the legacy occupancy-blocked carve, but
+  // only on the IMMEDIATE (unbatched) path — for offline tools / ablations.
+  scovox::SemSplitMap::Params p;
+  p.resolution = kRes; p.w_occ = 1.0f; p.w_free = 0.5f; p.kappa0 = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f; p.num_classes = kC; p.alpha_0 = kAlpha;
+  p.carve_skip_occ_threshold = 0.7f;  // guard ON
+  scovox::SemSplitMap m(p);
+
+  plantWall(m, Eigen::Vector3f(0.5f, 0, 0));
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+
+  EXPECT_FALSE(m.getBetaVoxel(Eigen::Vector3f(0.75f, 0, 0)).has_value())
+      << "guard on: carve stops at the wall — voxels past it are never touched";
+  auto v_before = m.getBetaVoxel(Eigen::Vector3f(0.25f, 0, 0));
+  ASSERT_TRUE(v_before.has_value());
+  EXPECT_GT(v_before->a_free, scovox::kBetaFreePrior)
+      << "voxels before the wall are still carved";
+}
+
+TEST(SemSplitMap, TrustRecentScanCarvesThroughStaleObstacleByDefault) {
+  // Default (guard off): a beam that reached its return proves the whole segment
+  // is free NOW, so a stale/moved obstacle in its path receives free evidence
+  // (clears over time) and voxels past it are carved. Immediate path.
+  auto m = makeMap();  // guard off (default)
+  plantWall(m, Eigen::Vector3f(0.5f, 0, 0));
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+
+  auto obst = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));
+  ASSERT_TRUE(obst.has_value());
+  EXPECT_GT(obst->a_free, 1.0f) << "stale obstacle gets free evidence (no guard)";
   auto v_past = m.getBetaVoxel(Eigen::Vector3f(0.75f, 0, 0));
-  if (v_past.has_value()) {
-    EXPECT_NEAR(v_past->a_free, kAlpha, 1e-5f) << "voxels past the wall must not be carved";
-  }
+  ASSERT_TRUE(v_past.has_value()) << "voxels past the stale obstacle are carved";
+  EXPECT_GT(v_past->a_free, scovox::kBetaFreePrior);
+}
+
+// ===========================================================================
+// Batched per-scan carve (beginCarveFrame / flushCarveFrame)
+// ===========================================================================
+
+TEST(SemSplitMapBatched, WritesOncePerVoxelAcrossRays) {
+  // Full-ray carving crossed by many rays writes each shared voxel ONCE per
+  // scan (max evidence), not once per ray — the fast full-ray carve.
+  auto m = makeMap();  // w_free = 0.5
+  m.beginCarveFrame();
+  for (int i = 0; i < 5; ++i)
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  const std::size_t written = m.flushCarveFrame();
+  EXPECT_GT(written, 0u);
+
+  auto b = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));  // interior, crossed by all 5
+  ASSERT_TRUE(b.has_value());
+  // One w_free*quality (=0.5) applied, not 5× (which would give prior + 2.5).
+  EXPECT_NEAR(b->a_free, scovox::kBetaFreePrior + 0.5f, 1e-5f);
+}
+
+TEST(SemSplitMapBatched, OccupiedWinsSkipsSameScanHitVoxel) {
+  // A voxel that is a surface return in this scan must not be carved free, even
+  // if another ray grazes through it (occupied-wins).
+  auto m = makeMap();
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  m.beginCarveFrame();
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);                      // hit at X
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);  // grazes X
+  m.flushCarveFrame();
+
+  auto b = m.getBetaVoxel(X);
+  ASSERT_TRUE(b.has_value());
+  EXPECT_NEAR(b->a_free, scovox::kBetaFreePrior, 1e-5f)
+      << "same-scan surface voxel is not carved free (occupied-wins)";
+  EXPECT_GT(b->a_occ, scovox::kBetaOccPrior) << "X still accrued its hit occupancy";
+}
+
+TEST(SemSplitMapBatched, ClearsStaleObstacleNoGuard) {
+  // Batched path is guard-free: a stale obstacle a beam passes through receives
+  // free evidence and clears over scans.
+  auto m = makeMap();
+  plantWall(m, Eigen::Vector3f(0.5f, 0, 0));
+  m.beginCarveFrame();
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  m.flushCarveFrame();
+
+  auto b = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));
+  ASSERT_TRUE(b.has_value());
+  EXPECT_GT(b->a_free, 1.0f) << "stale obstacle receives free evidence (guard-free)";
+}
+
+TEST(SemSplitMapBatched, DynamicHitDoesNotSuppressPersistentCarve) {
+  // Occupied-wins is PERSISTENT-only: a dynamic endpoint routes occupancy to the
+  // transient grid, so it must not block another ray's persistent free carve of
+  // that voxel (the is_dynamic contract — persistent grid stays free there).
+  auto m = makeMap();
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
+
+  m.beginCarveFrame();
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, &probs, 1.0f, /*is_dynamic=*/true);       // dynamic hit at X
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f); // persistent carve through X
+  m.flushCarveFrame();
+
+  // Persistent free carve at X is NOT suppressed by the same-scan dynamic hit.
+  auto b = m.getBetaVoxel(X);
+  ASSERT_TRUE(b.has_value())
+      << "persistent free carve must land at a dynamic-endpoint voxel";
+  EXPECT_GT(b->a_free, scovox::kBetaFreePrior);
+  // The dynamic occupancy lives only in the transient grid.
+  auto t = m.getTransientBetaVoxel(X);
+  ASSERT_TRUE(t.has_value());
+  EXPECT_GT(t->a_occ, scovox::kBetaOccPrior);
 }
 
 TEST(SemSplitMap, EvidenceSaturationCapsEachGrid) {

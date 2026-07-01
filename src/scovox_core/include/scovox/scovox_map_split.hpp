@@ -85,11 +85,12 @@ class ScovoxMapSplit {
                     const Eigen::Vector3f&         endpoint,
                     const std::vector<float>*      sem_probs,
                     float                          quality,
-                    bool                           is_dynamic = false) {
+                    bool                           is_dynamic = false,
+                    const HitWeights*              prof = nullptr) {
     if (fused_walker_) {
-      integrateHitFused(origin, endpoint, sem_probs, quality, is_dynamic);
+      integrateHitFused(origin, endpoint, sem_probs, quality, is_dynamic, prof);
     } else {
-      integrateHitSplit(origin, endpoint, sem_probs, quality, is_dynamic);
+      integrateHitSplit(origin, endpoint, sem_probs, quality, is_dynamic, prof);
     }
   }
 
@@ -100,7 +101,13 @@ class ScovoxMapSplit {
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
                          float                     quality,
-                         bool                      is_dynamic = false) {
+                         bool                      is_dynamic = false,
+                         const HitWeights*         prof = nullptr) {
+    // A geometry-off source (RGB-D semantics overlay) writes NO TSDF band this
+    // ray, so its noisy depth never enters the Curless–Levoy surface — geometry
+    // stays 100% LiDAR. Null prof / geometry_off=false keeps TSDF exactly as
+    // before. Combined with the existing is_dynamic suppression below.
+    const bool geometry_off = (prof && prof->geometry_off);
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
 
@@ -159,7 +166,7 @@ class ScovoxMapSplit {
       // applies the hit unconditionally. The TSDF band update below may still
       // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
       if (c == k_hit) {
-        semHit(c, sem_probs, quality, is_dynamic);
+        semHit(c, sem_probs, quality, is_dynamic, prof);
       }
 
       if (std::fabs(proj) < 1e-12f) return;
@@ -182,13 +189,13 @@ class ScovoxMapSplit {
       // permanent surface. Its occupancy/semantics live in the transient grids
       // (semHit above, is_dynamic=true); the free-space carve below stays
       // persistent (the air the object passed through is genuinely free).
-      if (tsdf_enabled_ && !is_dynamic && (tparams.space_carving || sdf <= trunc + h)) {
+      if (tsdf_enabled_ && !is_dynamic && !geometry_off && (tparams.space_carving || sdf <= trunc + h)) {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
       // (2) semantic carve (interior of carve band, not the hit voxel).
       if (c != k_hit && !carve_blocked && sdf > 0.f && sdf <= carve_band) {
-        if (!semCarve(c, quality)) {
+        if (!semCarve(c, quality, prof)) {
           carve_blocked = true;
         }
       }
@@ -225,14 +232,17 @@ class ScovoxMapSplit {
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
                          float                     quality,
-                         bool                      is_dynamic = false) {
+                         bool                      is_dynamic = false,
+                         const HitWeights*         prof = nullptr) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
     // Dynamic rays write no persistent TSDF (no ghost surface); the carve inside
-    // semsplit_.integrateHit stays persistent, only the endpoint routes.
-    if (!is_dynamic) tsdf_.integrateRay(origin, endpoint);
+    // semsplit_.integrateHit stays persistent, only the endpoint routes. A
+    // geometry-off source (RGB-D overlay) also writes no TSDF — geometry stays
+    // LiDAR-only (parity with the fused walker's line-185 gate).
+    if (!is_dynamic && !(prof && prof->geometry_off)) tsdf_.integrateRay(origin, endpoint);
     const auto t1 = clk::now();
-    semsplit_.integrateHit(origin, endpoint, sem_probs, quality, is_dynamic);
+    semsplit_.integrateHit(origin, endpoint, sem_probs, quality, is_dynamic, prof);
     const auto t2 = clk::now();
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     sem_ns_  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
@@ -241,10 +251,11 @@ class ScovoxMapSplit {
   /// No-return: semantic carve only; no TSDF update.
   void integrateMiss(const Eigen::Vector3f& origin,
                      const Eigen::Vector3f& endpoint,
-                     float                  quality) {
+                     float                  quality,
+                     const HitWeights*      prof = nullptr) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
-    semsplit_.integrateMiss(origin, endpoint, quality);
+    semsplit_.integrateMiss(origin, endpoint, quality, prof);
     const auto t1 = clk::now();
     sem_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
@@ -252,6 +263,29 @@ class ScovoxMapSplit {
   /// Per-frame decay of the transient (dynamic-class) substrate. Call once per
   /// integrated frame; see SemSplitMap::decayTransient.
   void decayTransient(float rate) { semsplit_.decayTransient(rate); }
+
+  // -------------------------------------------------------------------
+  // Per-scan carve batching (universal free-space path)
+  // -------------------------------------------------------------------
+
+  /// Open a carve frame on the semantic substrate: every carve (fused walker or
+  /// non-fused integrateHit/Miss) is staged read-free until flushCarveFrame().
+  /// Wrap a whole scan's rays in beginCarveFrame()/flushCarveFrame(). See
+  /// SemSplitMap for the rationale (full-ray free-space, one write per voxel).
+  void beginCarveFrame() { semsplit_.beginCarveFrame(); }
+
+  /// Write all staged carves for the scan (one Beta update per unique voxel,
+  /// block-ordered, occupied-wins). Timed into the same tsdf_ns_ bucket as the
+  /// fused walk, so tsdfTimeUs() reflects total carve cost (walk staging +
+  /// flush). Returns the number of voxels written.
+  std::size_t flushCarveFrame() {
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    const std::size_t n = semsplit_.flushCarveFrame();
+    const auto t1 = clk::now();
+    tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    return n;
+  }
 
   // -------------------------------------------------------------------
   // Per-call timing accumulators
@@ -337,15 +371,17 @@ class ScovoxMapSplit {
   double resolution() const { return resolution_; }
 
  private:
-  /// Per-voxel semantic carve dispatch (SPLIT substrate).
-  bool semCarve(const CoordT& c, float quality) {
-    return semsplit_.applyCarveUpdate(c, quality);
+  /// Per-voxel semantic carve dispatch (SPLIT substrate). `prof` carries the
+  /// per-source w_free (null => global params_).
+  bool semCarve(const CoordT& c, float quality, const HitWeights* prof = nullptr) {
+    return semsplit_.applyCarveUpdate(c, quality, prof);
   }
   /// Per-voxel semantic hit dispatch (SPLIT substrate). `is_dynamic` routes the
-  /// endpoint to the transient grids (see SemSplitMap::applyHitUpdate).
+  /// endpoint to the transient grids (see SemSplitMap::applyHitUpdate). `prof`
+  /// carries the per-source w_occ/kappa0/min_p_occ (null => global params_).
   void semHit(const CoordT& c, const std::vector<float>* sem_probs, float quality,
-              bool is_dynamic) {
-    semsplit_.applyHitUpdate(c, sem_probs, quality, is_dynamic);
+              bool is_dynamic, const HitWeights* prof = nullptr) {
+    semsplit_.applyHitUpdate(c, sem_probs, quality, is_dynamic, prof);
   }
 
   TsdfMap     tsdf_;       ///< TSDF surface (band-only)

@@ -85,7 +85,7 @@ void Map::carve_free(const Eigen::Vector3f& origin, const Eigen::Vector3f& hit,
     if (c == key_end) return false;
 
     Voxel* v = acc_.value(c);
-    if (v && v->p_occ() > skip) return false;  // hit a wall, stop carving
+    if (skip > 0.f && v && v->p_occ() > skip) return false;  // guard opt-in: hit a wall, stop carving
 
     if (!v) {
       Voxel nv = defaultVoxel();
@@ -310,7 +310,7 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
 
     // Wall detection: existing voxel confidently occupied → stop carving
     // through it AND past it. Endpoint and TSDF still update normally.
-    if (!at_hit && !past_hit && !past_wall && !created &&
+    if (skip > 0.f && !at_hit && !past_hit && !past_wall && !created &&
         v->p_occ() > skip) {
       past_wall = true;
     }
@@ -380,7 +380,7 @@ void Map::carve_free(const Eigen::Vector3f& origin, const Eigen::Vector3f& hit,
     if (c == key_end) return false;
 
     Voxel* v = acc_.value(c);
-    if (v && v->p_occ() > skip) return false;  // wall hit, stop
+    if (skip > 0.f && v && v->p_occ() > skip) return false;  // guard opt-in: wall hit, stop
 
     if (!v) {
       Voxel nv = defaultVoxel();

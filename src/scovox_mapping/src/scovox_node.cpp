@@ -56,6 +56,8 @@ public:
     // integration + publish paths read; with the legacy map_ object gone this
     // is their owner.
     map_params_ = P;
+    // Per-source fusion weight profiles (consulted only when fuse_lidar_rgbd_).
+    buildFusionProfiles(P);
     // Soft-probability (.topk) loader. Constructed here, after params, so it
     // captures the configured dir + class count; topk_->enabled() gates the
     // hot path in place of the old `!topk_probs_dir_.empty()` checks.
@@ -200,7 +202,7 @@ private:
     P.tsdf_space_carving = dp("tsdf_space_carving", false);
     P.band_only_integration = dp("band_only_integration", false);
     P.semantic_occ_gate = dp("semantic_occ_gate", 0.5);
-    P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.7);
+    P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.0);  // <=0 = guard off (trust recent scan)
     P.evidence_saturation = static_cast<uint16_t>(dp("evidence_saturation", 1000));
     P.dirichlet_min_p_occ = dp("dirichlet_min_p_occ", 0.5);
     sem_vis_thresh_ = dp("semantic_vis_threshold", -1.0);
@@ -226,6 +228,18 @@ private:
     base_frame_ = dp("base_frame", std::string("base_link"));
     map_frame_ = dp("map_frame", std::string("map"));
     int_frame_ = dp("integration_frame", std::string("odom"));
+    // ── LiDAR + RGB-D fusion (opt-in) ────────────────────────────────────────
+    // Master switch. Default false → today's either/or single-sensor path: every
+    // integrateHit passes prof=nullptr, so the substrate reads the global map
+    // weights and behaviour is byte-identical. true → the node subscribes BOTH
+    // streams and hands each its own HitWeights profile (built in buildFusionProfiles),
+    // so LiDAR and RGB-D write the ONE SemSplitMap with their own sensor models.
+    fuse_lidar_rgbd_ = dp("fuse_lidar_rgbd", false);
+    // Per-stream ray-origin frames (fusion only). LiDAR carve rays originate at
+    // the LiDAR body/optical frame, RGB-D at the camera; both default to
+    // base_frame_ so an unset fused config stays parity with the single path.
+    lidar_base_frame_ = dp("lidar_base_frame", base_frame_);
+    rgbd_base_frame_  = dp("rgbd_base_frame",  base_frame_);
     depth_topic_ = dp("depth_topic", std::string("/atlas/rgbd_camera/depth_image"));
     di_topic_ = dp("depth_info_topic", std::string("/atlas/rgbd_camera/camera_info"));
     seg_topic_ = dp("seg_topic", std::string("/atlas/segmentation/colored"));
@@ -388,6 +402,54 @@ private:
     }
   }
 
+  // Build the per-source HitWeights profiles used when fuse_lidar_rgbd_ is on.
+  // LiDAR defaults fall back to the global map weights (parity with the single-
+  // sensor path when only the master switch is flipped); override lidar_w_occ:=8
+  // etc. for the high-evidence ToF calibration (map_interface.hpp). RGB-D is
+  // "pure LiDAR authority": w_occ=0 (Stream A skipped → occupancy stays LiDAR-
+  // built, Stream B gates on it), w_free=0 (no carve onto the shared Beta grid),
+  // geometry_off=true (no TSDF band). A/B "zero vs small w_occ" is a param flip.
+  void buildFusionProfiles(const scovox::Params& P) {
+    auto dp = [&](auto n, auto d){ return this->declare_parameter<decltype(d)>(n, d); };
+    lidar_prof_.w_occ  = (float)dp("lidar_w_occ",  (double)P.w_occ);
+    lidar_prof_.w_free = (float)dp("lidar_w_free", (double)P.w_free);
+    lidar_prof_.kappa0 = (float)dp("lidar_kappa0", (double)P.kappa0);
+    lidar_prof_.dirichlet_min_p_occ = (float)dp("lidar_dirichlet_min_p_occ", (double)P.dirichlet_min_p_occ);
+    lidar_prof_.geometry_off = false;  // LiDAR owns TSDF geometry
+    lidar_prof_.kernel_radius = 0.0f;  // LiDAR commits geometry+labels at its exact hit voxel — never spreads
+    rgbd_prof_.w_occ  = (float)dp("rgbd_w_occ",  0.0);
+    rgbd_prof_.w_free = (float)dp("rgbd_w_free", 0.0);
+    rgbd_prof_.kappa0 = (float)dp("rgbd_kappa0", (double)P.kappa0);
+    // Gate MUST be strictly above the Beta(1,1) prior (p_occ=0.5): with
+    // rgbd_w_occ=0 an RGB-D hit on a voxel LiDAR never touched allocates a Beta
+    // voxel at prior, and the DIRICHLET gate is `p_occ_post >= min_p_occ`, so a
+    // 0.5 default would commit semantics on prior-only geometry — defeating pure
+    // LiDAR authority. 0.55 rejects the prior AND LiDAR-carved-free voxels while a
+    // single LiDAR hit (p_occ≈0.9, even a weak q≈0.05 hit ≈0.58) admits. Raise
+    // toward 0.6 for stricter authority (worsens leading-edge temporal recall).
+    rgbd_prof_.dirichlet_min_p_occ = (float)dp("rgbd_dirichlet_min_p_occ", 0.55);
+    rgbd_prof_.geometry_off = dp("rgbd_geometry_off", true);
+    // RGB-D→LiDAR BKI spread radius `l` (metres). 0 = classic exact-voxel gate
+    // (RGB-D labels a voxel only if its own endpoint coincides with a LiDAR-
+    // occupied voxel — starved by the LiDAR downsample). >0 spreads each RGB-D
+    // label onto every LiDAR-occupied voxel within `l` via the S-BKI kernel.
+    // Start ~0.4 (LiDAR length-scale from Gan et al.); ~1 voxel at resolution
+    // 0.10. Cost scales as (2·l/res+1)³ persistent-Beta lookups per RGB-D point.
+    rgbd_prof_.kernel_radius = (float)dp("rgbd_kernel_radius", 0.0);
+    if (fuse_lidar_rgbd_) {
+      RCLCPP_INFO(get_logger(),
+        "FUSION on: LiDAR{w_occ=%.2f w_free=%.2f kappa0=%.2f min_p=%.2f} "
+        "RGB-D{w_occ=%.2f w_free=%.2f kappa0=%.2f min_p=%.2f geom_off=%d kernel_l=%.2f}",
+        lidar_prof_.w_occ, lidar_prof_.w_free, lidar_prof_.kappa0, lidar_prof_.dirichlet_min_p_occ,
+        rgbd_prof_.w_occ, rgbd_prof_.w_free, rgbd_prof_.kappa0, rgbd_prof_.dirichlet_min_p_occ,
+        (int)rgbd_prof_.geometry_off, rgbd_prof_.kernel_radius);
+    }
+  }
+  // Per-callback profile selectors. Null when fusion is off → substrate uses its
+  // global params_ (byte-identical single-sensor path).
+  const scovox::HitWeights* lidarProf() const { return fuse_lidar_rgbd_ ? &lidar_prof_ : nullptr; }
+  const scovox::HitWeights* rgbdProf()  const { return fuse_lidar_rgbd_ ? &rgbd_prof_  : nullptr; }
+
   void logEvictionDelta(uint64_t frame_id) {
     if (!evict_csv_.is_open()) return;
     const uint64_t m = scovox::g_sparse_match_count.load(std::memory_order_relaxed);
@@ -410,7 +472,13 @@ private:
           alignment_status_topic_.c_str(), reject_gate_max_accepted_gap_sec_,
           reject_gate_min_consecutive_ > 0 ? " or consec rejects" : "");
     }
-    if (pointcloud_mode_) {
+    // Fusion: subscribe BOTH streams when fuse_lidar_rgbd. Otherwise classic
+    // either/or — LiDAR iff input_pointcloud_topic is set, else RGB-D.
+    const bool want_lidar = pointcloud_mode_;
+    const bool want_rgbd  = fuse_lidar_rgbd_ || !pointcloud_mode_;
+    if (fuse_lidar_rgbd_ && !pointcloud_mode_)
+      RCLCPP_WARN(get_logger(), "fuse_lidar_rgbd=true but input_pointcloud_topic empty — no LiDAR stream; running RGB-D only");
+    if (want_lidar) {
       auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
       input_pc_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(input_pc_topic_, qos,
         std::bind(&SCovoxNode::onPointCloud, this, std::placeholders::_1));
@@ -425,7 +493,8 @@ private:
         RCLCPP_INFO(get_logger(), "deskew=%s: subscribing IMU %s (gyro-only)",
                     deskew_mode_.c_str(), imu_topic_.c_str());
       }
-    } else {
+    }
+    if (want_rgbd) {
       di_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(di_topic_, rclcpp::QoS(10),
         [this](sensor_msgs::msg::CameraInfo::SharedPtr m){ di_ = *m; have_di_.store(true, std::memory_order_release); });
       if (dataset_mode_) {
@@ -642,23 +711,30 @@ private:
     const bool rgba = (seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
     const int sch = rgba ? 4 : 3;
     const bool srgb = (seg->encoding==enc::RGB8||seg->encoding==enc::RGBA8);
+    // RGB-D semantic frames MUST integrate at the EXACT capture-time pose. The old
+    // code fell back to Time(0) (latest pose) on an exact-stamp miss, but seg adds
+    // ~250 ms of inference latency, so the depth stamp is ~250 ms old and "latest"
+    // is ahead by the robot's motion — those semantic points smear into the map
+    // (~5% of frames in testing). Reject instead: drop the frame on any exact-stamp
+    // miss. (LiDAR onPointCloud keeps its own fallback; this policy is RGB-D only.)
     Eigen::Isometry3f T_oo;
-    bool tf_exact = false;
     try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rclcpp::Duration::from_seconds(0.2)));
-      tf_exact = true;
-    } catch (...) { try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.2)));
-      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: TF FALLBACK to Time(0) — pose may be wrong!", frame_recv_, replay_idx);
-    } catch (const std::exception& e) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: TF FAILED: %s", frame_recv_, replay_idx, e.what()); return; } }
-    if (tf_exact) { RCLCPP_DEBUG(get_logger(), "recv=%zu replay=%u: TF exact match", frame_recv_, replay_idx); }
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
+      return;
+    }
+    RCLCPP_DEBUG(get_logger(), "recv=%zu replay=%u: TF exact match", frame_recv_, replay_idx);
     static const Eigen::Matrix3f kR = (Eigen::Matrix3f() << 0,0,1, -1,0,0, 0,-1,0).finished();
     T_oo.linear() = T_oo.linear() * kR;
     Eigen::Vector3f O;
-    try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, depth->header.stamp, rclcpp::Duration::from_seconds(0.2));
+    const std::string& obs_frame = fuse_lidar_rgbd_ ? rgbd_base_frame_ : base_frame_;
+    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, depth->header.stamp, rclcpp::Duration::from_seconds(0.2));
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
-    } catch (...) { try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.2));
-      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
-      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: observer TF FALLBACK to Time(0)", frame_recv_, replay_idx);
-    } catch (const std::exception& e) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF(o): %s", e.what()); return; } }
+    } catch (const std::exception& e) {
+      // Same exact-stamp-or-reject policy for the ray-origin (observer) pose.
+      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: observer TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
+      return;
+    }
     // --- Frame-admission gate: TF stability + runtime divergence + reject ---
     if (!admitFrame(O)) return;
     decayTransientFrame();
@@ -679,6 +755,10 @@ private:
       use_topk = topk_->loadFrame(fid, /*image_mode=*/true);
     }
 
+    // Batched carve frame: stage every ray's free-space read-free, write once
+    // at flush (see SemSplitMap). RGB-D carries w_free=0 so it stages nothing,
+    // but keeping the invariant universal covers any carving image source.
+    split_map_->beginCarveFrame();
     std::vector<float> cp(max_sem_, 0.f);
     for (int v=0; v<H; v+=st) for (int u=0; u<W; u+=st) {
       float z = d16 ? float(reinterpret_cast<const uint16_t*>(depth->data.data()+v*depth->step)[u])*dsc
@@ -712,9 +792,10 @@ private:
         }
       }
       float q = rw*aw;
-      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q);
+      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q, rgbdProf());
     }
-    carveNoReturnRays(O, nr_eps);
+    carveNoReturnRays(O, nr_eps, rgbdProf());
+    split_map_->flushCarveFrame();
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
     if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
@@ -896,17 +977,22 @@ private:
 
     // Sensor origin in integration frame (same exact-stamp-then-fallback policy).
     Eigen::Vector3f O;
-    try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, cloud->header.stamp, tf_to);
+    const std::string& obs_frame = fuse_lidar_rgbd_ ? lidar_base_frame_ : base_frame_;
+    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, cloud->header.stamp, tf_to);
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
     } catch (...) {
       if (tf_require_exact_) return;
-      try { auto t = tf_buffer_.lookupTransform(int_frame_, base_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05));
+      try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05));
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
     } catch (...) { return; } }
 
     // --- Frame-admission gate (shared with onImages path) ---
     if (!admitFrame(O)) return;
-    decayTransientFrame();
+    // In fused mode the RGB-D (onImages) callback owns transient decay — LiDAR
+    // carries no dynamic-class semantics, and decaying here too would fade RGB-D's
+    // person/vehicle evidence ~twice per LiDAR+RGB-D pair. Single-sensor LiDAR
+    // (fusion off) keeps its own decay.
+    if (!fuse_lidar_rgbd_) decayTransientFrame();
 
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
@@ -1037,6 +1123,11 @@ private:
     // the dense over-sampling that fills the per-column z-tails (the smear).
     // Geometric only (no semantics/top-k) — used for the raw LiDAR path.
     size_t ds_in = 0, ds_out = 0;
+    // Batched carve frame: full-ray free-space is staged read-free per ray and
+    // written once per voxel at flush (block-ordered). This is the fast full-ray
+    // carve — the dense near-origin ray fan no longer re-writes the same voxel
+    // thousands of times, and no per-voxel occupancy read stops the walk.
+    split_map_->beginCarveFrame();
     if (downsample_voxel_size_ > 0.0) {
       const float inv = 1.0f / static_cast<float>(downsample_voxel_size_);
       struct Acc { float sx, sy, sz, soff; uint32_t n; };
@@ -1076,7 +1167,7 @@ private:
         if (r2 < min_r2 || r2 > max_r2) continue;
         const float rng = need_rng ? std::sqrt(r2) : 0.f;
         const float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
-        integrateHit(O, Hp, rng, nullptr, rw);
+        integrateHit(O, Hp, rng, nullptr, rw, lidarProf());
       }
     } else {
     std::vector<float> cp(max_sem_, 0.f);
@@ -1121,9 +1212,10 @@ private:
         if (lbl > 0 && lbl < max_sem_) { std::fill(cp.begin(), cp.end(), 0.f); cp[lbl] = 1.f; vs = true; }
       }
 
-      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q);
+      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q, lidarProf());
     }
     }  // end else (per-point path)
+    split_map_->flushCarveFrame();  // one Beta write per carved voxel, block-ordered
 
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
@@ -1225,7 +1317,8 @@ private:
   }
 
   void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp, float rng,
-                    const std::vector<float>* cp, float q) {
+                    const std::vector<float>* cp, float q,
+                    const scovox::HitWeights* prof = nullptr) {
     // Split-grid path. TsdfMap walks the SDF band, SemSplitMap walks the carve
     // band leading up to the hit. `q` already bakes in the range/grazing
     // weights (rw*aw) at the call site.
@@ -1250,7 +1343,7 @@ private:
         if ((*cp)[i] > best_p) { best_p = (*cp)[i]; best = (int)i; }
       if (best >= 0 && dyn_cls_.count((uint16_t)best)) is_dynamic = true;
     }
-    split_map_->integrateHit(co, Hp, cp, q, is_dynamic);
+    split_map_->integrateHit(co, Hp, cp, q, is_dynamic, prof);
     sm_dirty_.store(true, std::memory_order_relaxed);
   }
   // Decay the transient (dynamic-class) grid one step toward the prior. Called
@@ -1262,10 +1355,14 @@ private:
     split_map_->decayTransient(static_cast<float>(transient_decay_rate_));
     sm_dirty_.store(true, std::memory_order_relaxed);
   }
-  void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps) {
+  void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps,
+                         const scovox::HitWeights* prof = nullptr) {
     // Beta-only carve along no-return rays (no TSDF surface to anchor).
-    // q=1.0f matches the legacy carve which doesn't apply rw/aw.
-    for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f);
+    // q=1.0f matches the legacy carve which doesn't apply rw/aw. `prof` carries
+    // the per-source w_free — a semantics-only source (RGB-D, w_free=0) deposits
+    // NO a_free here, so its many no-return (sky/far) rays can't erode LiDAR
+    // occupancy on the shared Beta grid.
+    for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f, prof);
     sm_dirty_.store(true, std::memory_order_relaxed);
   }
   void loadSemanticColorMap() {
@@ -1750,6 +1847,14 @@ private:
   }
   std::string mode_, base_frame_, map_frame_, int_frame_, depth_topic_, di_topic_, seg_topic_, input_pc_topic_, robot_id_;
   bool dataset_mode_{false}, pointcloud_mode_{false};
+  // ── LiDAR + RGB-D fusion (opt-in via fuse_lidar_rgbd) ────────────────────────
+  // When true the node subscribes BOTH streams into the one split_map_ and hands
+  // each callback its own HitWeights profile (lidarProf()/rgbdProf()); when false
+  // the profiles are unused and every integrateHit passes nullptr (global params_).
+  bool fuse_lidar_rgbd_{false};
+  scovox::HitWeights lidar_prof_{};   ///< LiDAR: occupancy+TSDF owner (high w_occ/w_free)
+  scovox::HitWeights rgbd_prof_{};    ///< RGB-D: semantics-only (w_occ=0, geometry_off)
+  std::string lidar_base_frame_, rgbd_base_frame_;  ///< per-stream ray-origin frames
   // Diagnostic-only: periodic per-grid memory/RSS logging. Off by default —
   // when on, scheduleMemUsage spawns a reader thread every ~10 frames and
   // walks the whole grid. Enable via `log_mem_usage:=true`.

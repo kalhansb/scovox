@@ -64,13 +64,15 @@ struct Params {
   float w_free = 1.0f;   ///< Evidence added per free-space traversal
   float w_occ  = 2.0f;   ///< Evidence added per hit observation
 
-  // Wall protection during free-space carving. Stops the DDA Beta-free
-  // sweep at the first voxel whose existing p_occ exceeds this threshold.
-  // Replaces the joint ray-cast `reach_prob` attenuation (reverted because
-  // the cold-start tax cost ~6 mIoU points on indoor RGB-D, with no
-  // benefit on LiDAR — see docs/exp_ablations.md). Per-voxel independence
-  // assumption is the same as OctoMap, log_odds_node, etc.
-  float carve_skip_occ_threshold = 0.7f;
+  // Wall protection during free-space carving — DISABLED by default (<= 0).
+  // We trust the most recent LiDAR scan: a beam that reached its return proves
+  // every voxel it traversed is free NOW, so a previously-occupied (moved/stale)
+  // obstacle in its path should clear, not block the carve. The batched carve
+  // path (the live pipeline) ignores this guard entirely; a positive value only
+  // re-enables it for the immediate (unbatched) path — offline tools/ablations.
+  // (Formerly 0.7; the joint ray-cast reach_prob variant was reverted for a
+  // ~6 mIoU cold-start tax on indoor RGB-D — see docs/exp_ablations.md.)
+  float carve_skip_occ_threshold = 0.0f;
 
   // -- Production knobs (load-bearing on Replica m2f mIoU) --
   // Together these restore OLD-pipeline mIoU within noise (verified by

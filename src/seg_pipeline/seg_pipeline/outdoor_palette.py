@@ -62,29 +62,39 @@ NUM_CLASSES = len(COMPACT_NAMES)  # 14 (0..13)
 # whose any-substring is found in the lowercased model class name wins, so list
 # the more specific groups first (e.g. sidewalk/curb before wall/barrier;
 # rider/bicyclist before vehicle/bicycle). Names that match nothing -> 0 (other).
-# Substrings are matched against Mapillary Vistas v1.2 names, which look like
-# "construction--flat--road", "human--rider--bicyclist", "object--vehicle--car".
+# Substrings are matched against the model's own class names, and this table
+# covers BOTH label sets we test with:
+#   * Mapillary Vistas v1.2 ("construction--flat--road", "object--vehicle--car")
+#   * ADE20K semantic ("tree", "grass", "earth", "path", "streetlight", ...)
+# Ordering note: the POLE group precedes the VEGETATION group on purpose, because
+# ADE's "streetlight" contains the substring "tree" — pole must claim it first so
+# it isn't mis-collapsed to vegetation.
 _KEYWORD_GROUPS = [
     (8,  ["person"]),                                   # person (before rider/bicyclist)
     (9,  ["rider", "bicyclist", "motorcyclist"]),       # rider (before vehicle)
     (7,  ["traffic-sign", "traffic sign", "traffic-light",
-          "traffic light", "sign-frame"]),              # sign / light
+          "traffic light", "sign-frame", "signboard"]), # sign / light (ADE: signboard)
     (2,  ["sidewalk", "curb", "pedestrian"]),           # sidewalk (curb before wall/barrier)
     (1,  ["road", "lane", "crosswalk", "bike-lane", "bike lane",
           "parking", "service-lane", "service lane",
-          "rail-track", "rail track"]),                 # road surface + markings
-    (4,  ["building", "bridge", "tunnel"]),             # building / structure
-    (5,  ["vegetation"]),                               # vegetation / tree
-    (12, ["fence", "guard-rail", "guard rail"]),        # fence
+          "rail-track", "rail track",
+          "path", "runway"]),                           # road/path surface + markings (ADE: path, runway)
+    (4,  ["building", "bridge", "tunnel",
+          "house", "skyscraper"]),                      # building / structure (ADE: house, skyscraper)
+    (6,  ["pole", "street-light", "street light", "streetlight",
+          "banner", "billboard"]),                      # vertical poles / signage posts (before vegetation)
+    (5,  ["vegetation", "tree", "plant", "palm", "flower"]),  # vegetation / tree (ADE: tree, plant, palm, flower)
+    (12, ["fence", "guard-rail", "guard rail", "railing"]),   # fence (ADE: railing)
     (13, ["wall", "barrier"]),                          # wall / generic barrier
-    (6,  ["pole", "street-light", "street light",
-          "banner", "billboard"]),                      # vertical poles / signage posts
     (10, ["car", "truck", "bus", "caravan", "trailer", "van",
           "on-rails", "on rails", "motorcycle", "bicycle",
-          "boat", "vehicle", "wheeled-slow"]),          # vehicles
-    (11, ["sky"]),                                      # sky
-    (3,  ["terrain", "sand", "snow", "mountain"]),      # natural ground (NOT "ground"
-                                                        # -> would catch "Ground Animal")
+          "boat", "vehicle", "wheeled-slow", "minibike"]),   # vehicles (ADE: minibike)
+    (11, ["sky"]),                                      # sky (skyscraper already claimed by building)
+    (3,  ["terrain", "sand", "snow", "mountain",
+          "grass", "earth", "field", "hill", "land",
+          "dirt", "rock"]),                             # natural ground (NOT bare "ground"
+                                                        # -> would catch "Ground Animal";
+                                                        # ADE: grass, earth, field, hill, land, dirt track, rock)
 ]
 
 

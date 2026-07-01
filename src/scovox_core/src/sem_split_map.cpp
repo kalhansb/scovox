@@ -7,7 +7,9 @@
 #include "scovox/sem_split_map.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <utility>
 
 #include "scovox/ray_iterator.hpp"
 
@@ -141,27 +143,30 @@ DirVoxel* SemSplitMap::getOrAllocateDir(const CoordT& c) {
 void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
                                const Eigen::Vector3f&    endpoint,
                                const std::vector<float>* sem_probs,
-                               float                     quality) {
-  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false);
+                               float                     quality,
+                               const HitWeights*         prof) {
+  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false, prof);
   const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
-  applyHitUpdate(k_hit, sem_probs, quality);
+  applyHitUpdate(k_hit, sem_probs, quality, prof);
 }
 
 void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
                                const Eigen::Vector3f&    endpoint,
                                const std::vector<float>* sem_probs,
                                float                     quality,
-                               bool                      is_dynamic) {
+                               bool                      is_dynamic,
+                               const HitWeights*         prof) {
   // Free-space carve is always persistent; only the endpoint hit is routed.
-  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false);
+  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false, prof);
   const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
-  applyHitUpdate(k_hit, sem_probs, quality, is_dynamic);
+  applyHitUpdate(k_hit, sem_probs, quality, is_dynamic, prof);
 }
 
 void SemSplitMap::integrateMiss(const Eigen::Vector3f& origin,
                                 const Eigen::Vector3f& endpoint,
-                                float                  quality) {
-  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/true);
+                                float                  quality,
+                                const HitWeights*      prof) {
+  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/true, prof);
 }
 
 // ===========================================================================
@@ -171,21 +176,27 @@ void SemSplitMap::integrateMiss(const Eigen::Vector3f& origin,
 void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
                            const Eigen::Vector3f& endpoint,
                            float                  quality,
-                           bool                   inclusive_endpoint) {
+                           bool                   inclusive_endpoint,
+                           const HitWeights*      prof) {
   const CoordT k0    = beta_grid_.posToCoord(origin.x(),   origin.y(),   origin.z());
   const CoordT k_end = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
   if (k0 == k_end) return;
 
-  const float w_inc = params_.w_free * quality;
+  // Per-source w_free (prof) overrides the global one for this ray. A semantics-
+  // only source (prof->w_free == 0, e.g. RGB-D "pure LiDAR authority") short-
+  // circuits the whole carve here, so it never deposits a_free onto the shared
+  // Beta grid — matching applyCarveUpdate's own w_inc<=0 no-op per voxel.
+  const float w_free = prof ? prof->w_free : params_.w_free;
+  const float w_inc  = w_free * quality;
   if (w_inc <= 0.f && !inclusive_endpoint) return;
 
   RayIterator(k0, k_end, [&](const CoordT& c) -> bool {
     if (c == k_end) return false;  // hit voxel handled separately for hits
-    return applyCarveUpdate(c, quality);
+    return applyCarveUpdate(c, quality, prof);
   });
 
   if (inclusive_endpoint) {
-    (void)applyCarveUpdate(k_end, quality);
+    (void)applyCarveUpdate(k_end, quality, prof);
   }
 }
 
@@ -193,14 +204,30 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
 // Per-voxel API (for the ScovoxMapSplit fused walker)
 // ===========================================================================
 
-bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality) {
-  const float w_inc = params_.w_free * quality;
+bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
+                                   const HitWeights* prof) {
+  const float w_free = prof ? prof->w_free : params_.w_free;
+  const float w_inc  = w_free * quality;
   if (w_inc <= 0.f) return true;  // no-op; not a wall
 
-  const float skip = params_.carve_skip_occ_threshold;
+  // Batched path (a carve frame is open — the live pipeline): stage the
+  // strongest free vote for this voxel and defer the write to flushCarveFrame.
+  // No grid read, no wall guard: a scan trusts its own beam — every voxel it
+  // traversed to reach a return is free NOW (see class docs). One write per
+  // voxel per scan, block-ordered at flush.
+  if (carve_frame_open_) {
+    auto it = carve_stage_.find(c);
+    if (it == carve_stage_.end()) carve_stage_.emplace(c, w_inc);
+    else if (w_inc > it->second)  it->second = w_inc;
+    return true;
+  }
 
+  // Immediate path (no frame open): write in place. The wall guard is OFF by
+  // default (carve_skip_occ_threshold <= 0); a positive threshold restores the
+  // legacy occupancy-blocked carve for direct callers (offline tools / ablations).
+  const float skip = params_.carve_skip_occ_threshold;
   BetaVoxel* v = beta_acc_.value(c, /*create_if_missing=*/false);
-  if (v && v->p_occ() > skip) return false;  // wall — stop carving
+  if (skip > 0.f && v && v->p_occ() > skip) return false;  // wall — stop carving
 
   if (!v) {
     BetaVoxel nv = defaultBetaVoxel(beta_occ_prior_, beta_free_prior_);
@@ -215,25 +242,80 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality) {
   return true;
 }
 
-void SemSplitMap::applyHitUpdate(const CoordT&             c,
-                                 const std::vector<float>* sem_probs,
-                                 float                     quality) {
-  applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
-                   &touched_beta_, &touched_dir_);
+// ===========================================================================
+// Batched per-scan carve — begin / flush
+// ===========================================================================
+
+void SemSplitMap::beginCarveFrame() {
+  carve_stage_.clear();   // retains bucket capacity → no per-scan realloc churn
+  carve_hits_.clear();
+  carve_frame_open_ = true;
+}
+
+std::size_t SemSplitMap::flushCarveFrame() {
+  if (!carve_frame_open_) return 0;
+
+  // Gather staged voxels, dropping any a same-scan hit claimed as surface
+  // (occupied-wins). Then sort by leaf block so all writes into one 8^3 block
+  // are consecutive and reuse the cached accessor — recovering the locality the
+  // scan-order per-ray scatter throws away.
+  std::vector<std::pair<CoordT, float>> items;
+  items.reserve(carve_stage_.size());
+  for (const auto& kv : carve_stage_) {
+    if (carve_hits_.count(kv.first)) continue;  // occupied-wins
+    items.push_back(kv);
+  }
+  const int lb = static_cast<int>(params_.leaf_bits);
+  std::sort(items.begin(), items.end(),
+            [lb](const std::pair<CoordT, float>& a,
+                 const std::pair<CoordT, float>& b) {
+              const std::array<int32_t, 3> ba{a.first.x >> lb, a.first.y >> lb, a.first.z >> lb};
+              const std::array<int32_t, 3> bb{b.first.x >> lb, b.first.y >> lb, b.first.z >> lb};
+              return ba < bb;
+            });
+
+  for (const auto& item : items) {
+    const CoordT& c   = item.first;
+    const float   inc = item.second;
+    BetaVoxel* v = beta_acc_.value(c, /*create_if_missing=*/false);
+    if (!v) {
+      BetaVoxel nv = defaultBetaVoxel(beta_occ_prior_, beta_free_prior_);
+      nv.a_free += inc;
+      applyBetaSaturation(&nv);
+      beta_acc_.setValue(c, nv);
+    } else {
+      v->a_free += inc;
+      applyBetaSaturation(v);
+    }
+    touched_beta_.push_back(c);
+  }
+
+  const std::size_t n = items.size();
+  carve_frame_open_ = false;
+  return n;
 }
 
 void SemSplitMap::applyHitUpdate(const CoordT&             c,
                                  const std::vector<float>* sem_probs,
                                  float                     quality,
-                                 bool                      is_dynamic) {
+                                 const HitWeights*         prof) {
+  applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
+                   &touched_beta_, &touched_dir_, prof);
+}
+
+void SemSplitMap::applyHitUpdate(const CoordT&             c,
+                                 const std::vector<float>* sem_probs,
+                                 float                     quality,
+                                 bool                      is_dynamic,
+                                 const HitWeights*         prof) {
   if (is_dynamic) {
     // Route to the transient substrate. No touched-set: transient voxels are
     // local-only and never drained to the fusion wire.
     applyHitUpdateOn(c, sem_probs, quality, transient_beta_acc_,
-                     transient_dir_acc_, nullptr, nullptr);
+                     transient_dir_acc_, nullptr, nullptr, prof);
   } else {
     applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
-                     &touched_beta_, &touched_dir_);
+                     &touched_beta_, &touched_dir_, prof);
   }
 }
 
@@ -243,10 +325,41 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
                                    BetaGrid::Accessor&       bacc,
                                    DirGrid::Accessor&        dacc,
                                    std::vector<CoordT>*      touched_beta,
-                                   std::vector<CoordT>*      touched_dir) {
+                                   std::vector<CoordT>*      touched_dir,
+                                   const HitWeights*         prof) {
+  // Occupied-wins: a PERSISTENT surface return in this scan must not be carved
+  // free even if another ray grazes through it. Gate on `touched_beta` — it is
+  // non-null only on the persistent path (the transient/dynamic path passes
+  // nullptr). A dynamic endpoint routes its occupancy to the transient grid and,
+  // by the is_dynamic contract, the persistent grid stays free there, so it must
+  // NOT suppress another ray's legitimate persistent free carve of that voxel.
+  if (carve_frame_open_ && touched_beta) carve_hits_.insert(c);
+
+  // RGB-D→LiDAR BKI spread: a semantics-only source with a kernel radius spreads
+  // its class onto nearby LiDAR-occupied voxels instead of committing at the lone
+  // endpoint voxel `c` (which the LiDAR downsample almost never leaves occupied).
+  // Deposits only into the Dir grid `dacc`; reads LiDAR occupancy from the
+  // PERSISTENT Beta grid inside the helper. A no-label point (sem_probs null)
+  // contributes nothing — a semantics-only source must not touch geometry.
+  if (prof && prof->kernel_radius > 0.f) {
+    if (sem_probs && !sem_probs->empty())
+      applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir, prof);
+    return;
+  }
+
+  // Per-source overrides (fusion). Null prof => the map's global params_ — the
+  // single-sensor path, byte-identical. A semantics-only source passes w_occ=0
+  // (RGB-D "pure LiDAR authority"), so Stream A is skipped by the existing
+  // `w_occ_share > 0` guard and this voxel's occupancy stays 100% LiDAR-built;
+  // Stream B then gates on that LiDAR occupancy. kappa0/min_p_occ are per-source
+  // too; evidence_saturation / alpha_0 remain global (per-grid caps / priors).
+  const float w_occ     = prof ? prof->w_occ              : params_.w_occ;
+  const float kappa0    = prof ? prof->kappa0             : params_.kappa0;
+  const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
+
   // ---- Stream A: occupancy (Beta grid), always. ----
   BetaVoxel* b = getOrAllocateBetaOn(bacc, c);
-  const float w_occ_share = params_.w_occ * quality;
+  const float w_occ_share = w_occ * quality;
   if (w_occ_share > 0.f) b->a_occ += w_occ_share;
   applyBetaSaturation(b);
   if (touched_beta) touched_beta->push_back(c);
@@ -278,8 +391,8 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
 
     case SemanticMode::DIRICHLET:
     default:
-      if (p_occ_post >= params_.dirichlet_min_p_occ) {
-        const float class_share = params_.kappa0 * p_occ_post * quality;
+      if (p_occ_post >= min_p_occ) {
+        const float class_share = kappa0 * p_occ_post * quality;
         if (class_share > 0.f) {
           DirVoxel* d = getOrAllocateDirOn(dacc, c);
           dirichletUpdate(d, sem_probs, class_share, params_.alpha_0);
@@ -289,6 +402,68 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
       }
       break;
   }
+}
+
+// ===========================================================================
+// BKI (S-BKI) semantic spread — RGB-D→LiDAR fusion
+// ===========================================================================
+//
+// For a semantics-only source (RGB-D: w_occ=0, geometry_off) with
+// `prof->kernel_radius = l > 0`, the class is not committed at the single
+// endpoint voxel `c` but spread to its neighborhood, following the Semantic
+// Bayesian Kernel Inference update (Gan et al., RA-L 2020, Eq. 9):
+//
+//     α*ᵏ  +=  k(d) · (κ₀ · p_occ · q)      for every voxel within radius l
+//
+// with the Melkumyan–Ramos compactly-supported sparse kernel (Eq. 10, σ₀=1),
+// which is exactly zero at d ≥ l so the neighborhood is finite:
+//
+//     k(d) = ⅓(2+cos(2π d/l))(1 − d/l) + (1/2π)·sin(2π d/l),   d < l.
+//
+// Pure LiDAR authority is preserved: a neighbor receives a label ONLY if it is
+// occupied in the PERSISTENT Beta grid (`p_occ ≥ dirichlet_min_p_occ`), so
+// RGB-D can never paint a voxel LiDAR hasn't confirmed as surface. `p_occ` also
+// weights the deposit, so weakly-occupied voxels get proportionally less label.
+void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
+                                       const std::vector<float>* sem_probs,
+                                       float                     quality,
+                                       DirGrid::Accessor&        dacc,
+                                       std::vector<CoordT>*      touched_dir,
+                                       const HitWeights*         prof) {
+  const float l         = prof->kernel_radius;                 // > 0 (caller-gated)
+  const float kappa0    = prof->kappa0;
+  const float min_p_occ = prof->dirichlet_min_p_occ;
+  const float res       = static_cast<float>(params_.resolution);
+  if (res <= 0.f) return;
+  const int   R         = std::max(1, static_cast<int>(std::floor(l / res)));
+  const float inv_l     = 1.0f / l;
+  constexpr float kTwoPi = 6.283185307179586f;
+
+  for (int dz = -R; dz <= R; ++dz)
+    for (int dy = -R; dy <= R; ++dy)
+      for (int dx = -R; dx <= R; ++dx) {
+        const float d = res * std::sqrt(static_cast<float>(dx*dx + dy*dy + dz*dz));
+        if (d >= l) continue;                                  // compact support
+
+        const CoordT n{c.x + dx, c.y + dy, c.z + dz};
+        // LiDAR authority: read persistent occupancy; skip voxels LiDAR never
+        // built (nullptr) or that are not confidently occupied. Never allocates.
+        const BetaVoxel* b = beta_acc_.value(n, /*create_if_missing=*/false);
+        if (!b) continue;
+        const float p_occ = b->p_occ();
+        if (p_occ < min_p_occ) continue;
+
+        const float t  = d * inv_l;                            // in [0,1)
+        const float wk = (1.0f/3.0f) * (2.0f + std::cos(kTwoPi * t)) * (1.0f - t)
+                       + (1.0f/kTwoPi) * std::sin(kTwoPi * t);
+        const float class_share = kappa0 * p_occ * quality * wk;
+        if (class_share <= 0.f) continue;
+
+        DirVoxel* dv = getOrAllocateDirOn(dacc, n);
+        dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0);
+        applyDirSaturation(dv);
+        if (touched_dir) touched_dir->push_back(n);
+      }
 }
 
 // ===========================================================================

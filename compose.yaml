@@ -29,11 +29,21 @@ services:
     # Host networking + IPC: trivial DDS discovery and X11 (RViz) on one machine.
     network_mode: host
     ipc: host
+    # NVIDIA GPU passthrough so in-container RViz renders on the discrete GPU
+    # (hardware GL), not Mesa/llvmpipe. Host default-runtime is already nvidia,
+    # but request it explicitly (mirrors glim_localisation/compose.yaml). On this
+    # PRIME/Optimus laptop the RViz launch must also export
+    # __NV_PRIME_RENDER_OFFLOAD=1 + __GLX_VENDOR_LIBRARY_NAME=nvidia (see
+    # run_fused_experiment.sh); DRIVER_CAPABILITIES=all pulls in the GLX libs.
+    runtime: nvidia
+    gpus: all
     environment:
       - DISPLAY=${DISPLAY:-}
       - QT_X11_NO_MITSHM=1
       - RCUTILS_COLORIZED_OUTPUT=1
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
       # Keep DDS discovery on loopback. Do NOT set the deprecated
       # ROS_LOCALHOST_ONLY — under FastDDS here it breaks multicast participant
       # discovery (matches the hmr_localisation compose note).

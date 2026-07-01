@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
                            jitter(rng),                     // Y small
                            1.5f + 0.5f * std::sin(t * 6.28f)); // Z bobbing
     auto dirs = genRayDirs(args.rays_per_frame, rng);
+    map.beginCarveFrame();  // batch this frame's free-space carve (one write/voxel)
     for (const auto& d : dirs) {
       // Surface at random distance in [1, max_range] m for hits.
       // 5% rays exit at max_range as no-returns.
@@ -139,6 +140,7 @@ int main(int argc, char** argv) {
         map.integrateHit(origin, endpoint, &sem_probs, /*quality=*/0.9f);
       }
     }
+    map.flushCarveFrame();
     // Drain touched-set every 10 frames to mimic the per-publish cycle.
     if ((f + 1) % 10 == 0) {
       auto t = map.drainTouchedTsdf();
