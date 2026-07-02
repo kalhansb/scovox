@@ -1,0 +1,113 @@
+# =======================================================================
+# SCovox — FUSED LiDAR-occupancy + RGB-D-semantics into ONE SemSplitMap
+# =======================================================================
+# Param set for the fused experiment (HMR_Explo/ws/src/run_fused_experiment.sh):
+# ONE scovox_mapping_node consumes BOTH the raw Ouster cloud and the seg
+# pipeline's depth+label stream, integrating them into a single SemSplitMap
+# (split Beta/Dirichlet substrate) in the map frame.
+#
+# Fusion policy (pure LiDAR authority — behind the fuse_lidar_rgbd switch):
+#   * LiDAR owns Beta occupancy: lidar_w_occ=8, lidar_w_free=4, full-ray carve.
+#   * RGB-D is semantics-ONLY: rgbd_w_occ=0, rgbd_w_free=0, rgbd_geometry_off —
+#     it deposits ZERO occupancy/carve/TSDF; a bad RGB-D pixel can only misplace
+#     a decayable Dirichlet label, never move geometry.
+#   * Stream-B gate (rgbd_dirichlet_min_p_occ=0.55) reads the LiDAR-only p_occ,
+#     so a semantic label commits ONLY where LiDAR says occupied. >0.5 is
+#     mandatory: at 0.5 an RGB-D hit on a voxel LiDAR never touched (prior
+#     p_occ=0.5) would commit semantics on prior-only geometry.
+#
+# Frames: map --NDT--> odom --EKF--> base_link --STATIC--> {os_lidar, camera_
+# color_frame}; integration_frame=map so LiDAR + semantics land in the same
+# global frame as the NDT/gt map. Per-stream ray origins are lidar_base_frame /
+# rgbd_base_frame.
+#
+# The node runs remapped to `scovox_node` (-r __node:=scovox_node); the /**
+# wildcard below covers it. run_fused_experiment.sh loads this file and then
+# overrides two knobs from env AFTER it (later assignment wins):
+#   KERNEL_L   -> rgbd_kernel_radius   (default 0.4 here)
+#   CARVE_BAND -> carve_band           (default -1.0 = full-ray here)
+# =======================================================================
+
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    # --- Master switch: per-source HitWeights profiles ---------------------
+    fuse_lidar_rgbd: true
+
+    # --- Inputs ------------------------------------------------------------
+    # RGB-D path: seg_node's re-stamped depth+info + colored labels.
+    depth_topic:      "/scovox/depth/image_raw"
+    depth_info_topic: "/scovox/depth/camera_info"
+    seg_topic:        "/scovox/segmentation/colored"
+    # LiDAR path: RAW Ouster cloud (frame os_lidar), deskewed in-node (below).
+    input_pointcloud_topic: "/ouster/points"
+    imu_topic:              "/imu/data"        # gyro source for deskew
+    dataset_mode: false
+
+    # --- Frames --------------------------------------------------------------
+    integration_frame: "map"                   # same global frame as the NDT/gt map
+    map_frame:         "map"
+    base_frame:        "base_link"
+    lidar_base_frame:  "os_lidar"              # LiDAR ray origin
+    rgbd_base_frame:   "camera_color_frame"    # RGB-D ray origin (body frame;
+                                               # SCovox applies its own optical->body kR)
+
+    # --- LiDAR profile: owns Beta occupancy + free-space carve ---------------
+    lidar_w_occ:  8.0
+    lidar_w_free: 4.0
+    carve_band:   -1.0        # full-ray carve — the planner needs complete
+                              # free-space. A positive band (~band/res voxels/ray)
+                              # is far cheaper but only carves near surfaces.
+                              # Overridden by CARVE_BAND env in the run script.
+
+    # --- RGB-D profile: semantics-only (pure LiDAR authority) ----------------
+    rgbd_w_occ:  0.0
+    rgbd_w_free: 0.0
+    rgbd_geometry_off: true
+    rgbd_dirichlet_min_p_occ: 0.55   # strictly > 0.5 (see header)
+    rgbd_kernel_radius: 0.4          # RGB-D->LiDAR S-BKI spread radius l (m);
+                                     # 0 = exact-voxel gate (starved by the LiDAR
+                                     # downsample); ~0.4 = 1 voxel at res 0.10.
+                                     # Overridden by KERNEL_L env in the run script.
+
+    # --- Voxel grid ----------------------------------------------------------
+    resolution: 0.10
+
+    # --- Semantics (Dirichlet, 14-class outdoor palette) ---------------------
+    num_classes:          14
+    max_semantic_classes: 14
+    semantic_top_k:       2
+    semantic_mode:        "dirichlet"
+    dirichlet_prior:      0.01
+    # Outdoor palette: color key (r<<16|g<<8|b) -> compact class id; 0 = void.
+    semantic_color_map_keys:    [8405120, 15999976, 10025880, 4605510, 7048739, 10066329, 16427550, 14423100, 16711680, 142, 4620980, 12491161, 6710940, 0]
+    semantic_color_map_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0]
+
+    # --- Mode / geometry -------------------------------------------------------
+    mode: "persistent"
+    enable_tsdf: false
+
+    # --- Range gating: per-stream by construction -----------------------------
+    # RGB-D gated by min_depth/max_depth; LiDAR by min_range/max_range;
+    # range_decay_length=-1 keeps min_range/max_range off the RGB-D path.
+    min_depth: 0.3
+    max_depth: 6.0
+    min_range: 1.0
+    max_range: 20.0
+    range_decay_length: -1.0
+
+    # --- LiDAR per-scan conditioning ------------------------------------------
+    deskew_mode: "auto"              # /ouster/points carries a per-point `t` field
+    downsample_voxel_size: 0.1       # uniform voxel-grid downsample per scan
+
+    # --- TF placement timing ---------------------------------------------------
+    # Wait for the exact-stamp pose; drop the scan rather than integrate at a
+    # stale Time(0) fallback (the one real corruption path).
+    tf_lookup_timeout_sec: 1.0
+    tf_require_exact: true
+
+    # --- TF gates (off — NDT owns map->odom; no SLAM jump to guard against) ----
+    startup_tf_stable_sec:     0.0
+    startup_tf_jump_threshold: 10.0
+    runtime_tf_gate:           false

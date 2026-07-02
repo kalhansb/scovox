@@ -1,0 +1,39 @@
+# =======================================================================
+# seg_node — RGB-D semantic segmentation for the fused / seg experiments
+# =======================================================================
+# Param set for the bag-driven experiments (HMR_Explo/ws/src/
+# run_fused_experiment.sh and run_seg_experiment.sh): subscribes to the
+# bag's RealSense depth+color, runs Mask2Former, and republishes the
+# colored label image + RE-STAMPED depth+info on the /scovox/* topics so
+# scovox_mapping_node can exact-stamp-sync the pair.
+#
+# output_frame=camera_color_frame: the BODY frame — scovox applies its own
+# optical->body kR to the depth frame_id, and the localizer stack publishes
+# the calibrated base_link->camera_color_frame static.
+#
+# The values below spell out the node defaults the experiments rely on.
+# run_fused_experiment.sh loads this file and appends -p model_name:=$MODEL
+# after it when the MODEL env override is set (later assignment wins).
+# =======================================================================
+
+/**:
+  ros__parameters:
+    use_sim_time: true               # bag-driven (ros2 bag play --clock)
+
+    # --- Inputs (bag topics) ----------------------------------------------
+    depth_topic: "/camera/aligned_depth_to_color/image_raw"
+    color_topic: "/camera/color/image_raw/compressed"
+    info_topic:  "/camera/aligned_depth_to_color/camera_info"
+
+    # --- Outputs (consumed by scovox_mapping_node) -------------------------
+    out_seg_topic:   "/scovox/segmentation/colored"
+    out_depth_topic: "/scovox/depth/image_raw"
+    out_info_topic:  "/scovox/depth/camera_info"
+    output_frame:    "camera_color_frame"
+
+    # --- Model / inference ---------------------------------------------------
+    model_name: "facebook/mask2former-swin-large-mapillary-vistas-semantic"
+    device: "cuda"                   # falls back to CPU (very slow) if no CUDA
+    sync_slop: 0.05                  # depth<->color approximate-sync window (s)
+    infer_short_edge: 720            # bound the resize -> bound VRAM/latency
+    fp16: true
