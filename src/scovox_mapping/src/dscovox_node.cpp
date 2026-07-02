@@ -188,9 +188,14 @@ public:
 
     initSemanticColors();
 
+    // Explicit reliable + depth 1, mirroring scovox_node's pc_pub_: the fused
+    // cloud is tens of MB (one point per fused voxel) and SystemDefaultsQoS
+    // resolved to BEST_EFFORT on this build — every fragmented sample dropped
+    // and RViz never received a single cloud. Depth 1 caps publisher-side
+    // buffering (see scovox_node's OOM note).
     pc_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       declare_parameter<std::string>("pointcloud_topic", "~/pointcloud"),
-      rclcpp::SystemDefaultsQoS());
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
 
     // Fused-map topic for downstream consumers (planner, visualisation). Topic
     // form of the on-demand GetRegion service: a full snapshot of the fused
