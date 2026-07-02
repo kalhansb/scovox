@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -298,6 +299,22 @@ private:
     plan_zmin_ = dp("planning_map_min_z", -1.0);
     plan_zmax_ = dp("planning_map_max_z", 2.0);
     plan_infl_ = dp("planning_map_inflation_m", 0.0);
+    // Terrain-relative projection (3D/hilly sites). When true the absolute
+    // [planning_map_min_z, planning_map_max_z] band is IGNORED; instead each
+    // XY column is classified against a band RELATIVE to that column's own
+    // ground elevation (lowest occupied voxel + contiguous stack walk capped
+    // at planning_map_ground_stack_m, absorbing residual vertical smear).
+    // A column whose relative band [rel_min_z, rel_max_z] above the ground
+    // top contains an occupied voxel is blocked (100); a column with
+    // observed ground and a clear band is free (0); columns with no occupied
+    // voxel (free-only / unobserved) stay unknown (-1). Obstacles shorter
+    // than ~ground_stack_m above the detected ground merge into the ground
+    // stack and read traversable. NB: rel_min_z must stay > 0 or the ground
+    // itself blocks every cell.
+    plan_terrain_rel_ = dp("planning_map_terrain_relative", false);
+    plan_rel_zmin_ = dp("planning_map_rel_min_z", 0.4);
+    plan_rel_zmax_ = dp("planning_map_rel_max_z", 2.0);
+    plan_ground_stack_m_ = dp("planning_map_ground_stack_m", 0.6);
     // Side length of the robot-centered planning_map crop window in
     // mode=rolling. Ignored in mode=persistent (which uses the fixed
     // (plan_ox_, plan_oy_, plan_sz_) envelope).
@@ -1771,16 +1788,69 @@ private:
     g.info.origin.orientation.w = 1.0;
     g.data.assign(w * h, -1);
     const auto& bgrid = split_map_->semsplit().betaGrid();
-    bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
-      auto p = bgrid.coordToPos(c);
-      if (p.z < plan_zmin_ || p.z > plan_zmax_) return;
-      int gx = int(std::floor((p.x - ox) / plan_res_));
-      int gy = int(std::floor((p.y - oy) / plan_res_));
-      if (gx < 0 || gy < 0 || gx >= w || gy >= h) return;
-      int i = gy * w + gx;
-      if (v.p_occ() >= float(min_occ_)) g.data[i] = 100;
-      else if (g.data[i] != 100) g.data[i] = 0;
-    });
+    if (plan_terrain_rel_) {
+      // Terrain-relative projection: per-column ground elevation, then a
+      // band relative to it (see the param comment). One forEachCell pass
+      // collects the occupied voxels per beta-grid XY column; the column map
+      // is then classified without further grid access. Free voxels are not
+      // consulted: an observed ground with a clear band IS the free
+      // evidence (occupied still wins across beta columns sharing a plan
+      // cell). coordToPos returns voxel CORNERS; the ground surface is the
+      // top face (corner + one voxel) of the ground stack.
+      struct Col { double x = 0.0, y = 0.0; std::vector<float> occ_z; };
+      std::unordered_map<uint64_t, Col> cols;
+      const float vres = float(bgrid.voxelSize());
+      bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+        if (v.p_occ() < float(min_occ_)) return;
+        const uint64_t key =
+            (uint64_t(uint32_t(c.x)) << 32) | uint64_t(uint32_t(c.y));
+        auto& col = cols[key];
+        auto p = bgrid.coordToPos(c);
+        col.x = p.x; col.y = p.y;
+        col.occ_z.push_back(float(p.z));
+      });
+      for (auto& [key, col] : cols) {
+        (void)key;
+        const int gx = int(std::floor((col.x - ox) / plan_res_));
+        const int gy = int(std::floor((col.y - oy) / plan_res_));
+        if (gx < 0 || gy < 0 || gx >= w || gy >= h) continue;
+        std::sort(col.occ_z.begin(), col.occ_z.end());
+        // Ground anchor = lowest occupied voxel (robust to canopy, which
+        // sits higher); walk the contiguous stack upward, capped so a
+        // wall/trunk doesn't lift the ground to its own top.
+        const float ground = col.occ_z.front();
+        float top = ground;
+        for (size_t k = 1; k < col.occ_z.size(); ++k) {
+          const float z = col.occ_z[k];
+          if (z - top <= vres * 1.5f &&
+              z - ground <= float(plan_ground_stack_m_)) top = z;
+          else break;
+        }
+        const float ground_top = top + vres;  // top FACE of the ground stack
+        bool blocked = false;
+        for (const float z : col.occ_z) {
+          const float rel = z - ground_top;
+          if (rel >= float(plan_rel_zmin_) && rel <= float(plan_rel_zmax_)) {
+            blocked = true;
+            break;
+          }
+        }
+        const int i = gy * w + gx;
+        if (blocked) g.data[i] = 100;
+        else if (g.data[i] != 100) g.data[i] = 0;
+      }
+    } else {
+      bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+        auto p = bgrid.coordToPos(c);
+        if (p.z < plan_zmin_ || p.z > plan_zmax_) return;
+        int gx = int(std::floor((p.x - ox) / plan_res_));
+        int gy = int(std::floor((p.y - oy) / plan_res_));
+        if (gx < 0 || gy < 0 || gx >= w || gy >= h) return;
+        int i = gy * w + gx;
+        if (v.p_occ() >= float(min_occ_)) g.data[i] = 100;
+        else if (g.data[i] != 100) g.data[i] = 0;
+      });
+    }
     int ic=int(std::ceil(plan_infl_/plan_res_)); int ic2=ic*ic;
     if (ic>0) { auto inf=g.data; for (int y=0;y<h;++y) for (int x=0;x<w;++x) { if (g.data[y*w+x]!=100) continue;
       for (int dy=-ic;dy<=ic;++dy) for (int dx=-ic;dx<=ic;++dx) { if (dx*dx+dy*dy>ic2) continue;
@@ -2080,6 +2150,9 @@ private:
   double min_tsdf_w_{0.5};
   double plan_res_{0.2}, plan_sz_{80}, plan_ox_{-40}, plan_oy_{-40}, plan_zmin_{-1}, plan_zmax_{2}, plan_infl_{0};
   double plan_window_size_m_{20.0};
+  // Terrain-relative planning_map projection (see param comment).
+  bool plan_terrain_rel_{false};
+  double plan_rel_zmin_{0.4}, plan_rel_zmax_{2.0}, plan_ground_stack_m_{0.6};
   std::atomic<bool> sm_dirty_{false};
   std::unordered_map<uint32_t,uint16_t> color_map_;
   // Launch param block (scovox::Params). Carries the node-level sensor filters
