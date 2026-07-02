@@ -116,6 +116,10 @@ for the problem this solves.
 
 ### Multi-robot mapping (SCovox + DSCovox)
 
+> Start-to-finish real-robot runbook (single robot and two robots, incl.
+> localizer bring-up, verification, and troubleshooting):
+> [`docs/distributed_mapping.md`](docs/distributed_mapping.md).
+
 One `scovox_mapping_node` per robot (`mode: rolling`, namespaced) publishes an
 LZ4 `ScovoxMapBinary` delta stream on `/<robot>/scovox_node/scovox_bin`; every
 robot also runs its own `dscovox_mapping_node` fusing ALL peers' streams —
