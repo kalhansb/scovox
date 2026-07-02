@@ -23,6 +23,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <cmath>
+#include <limits>
 #include <scovox/uncertainty.hpp>
 #include <shared_mutex>
 #include <thread>
@@ -98,6 +99,7 @@ public:
     SP.semsplit.w_occ                   = P.w_occ;
     SP.semsplit.kappa0                  = P.kappa0;
     SP.semsplit.carve_skip_occ_threshold = P.carve_skip_occ_threshold;
+    SP.semsplit.batch_free_carve        = P.batch_free_carve;
     SP.semsplit.evidence_saturation     = static_cast<float>(P.evidence_saturation);
     SP.semsplit.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
     SP.semsplit.range_decay_length      = static_cast<float>(P.range_decay_length);
@@ -203,6 +205,7 @@ private:
     P.band_only_integration = dp("band_only_integration", false);
     P.semantic_occ_gate = dp("semantic_occ_gate", 0.5);
     P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.0);  // <=0 = guard off (trust recent scan)
+    P.batch_free_carve = dp("batch_free_carve", true);
     P.evidence_saturation = static_cast<uint16_t>(dp("evidence_saturation", 1000));
     P.dirichlet_min_p_occ = dp("dirichlet_min_p_occ", 0.5);
     sem_vis_thresh_ = dp("semantic_vis_threshold", -1.0);
@@ -1118,10 +1121,12 @@ private:
       return dk_last_q;
     };
 
-    // Uniform voxel-grid downsample (sensor frame), then integrate one centroid
-    // per voxel. GLIM does this in preprocessing; on the raw cloud it collapses
-    // the dense over-sampling that fills the per-column z-tails (the smear).
-    // Geometric only (no semantics/top-k) — used for the raw LiDAR path.
+    // Uniform voxel-grid downsample (sensor frame): integrate one *real* return
+    // per voxel — the measured point nearest the voxel centroid (a medoid, not the
+    // synthetic centroid, which drifts off-surface into free space). GLIM does this
+    // in preprocessing; on the raw cloud it collapses the dense over-sampling that
+    // fills the per-column z-tails (the smear). Geometric only (no semantics/top-k)
+    // — used for the raw LiDAR path.
     size_t ds_in = 0, ds_out = 0;
     // Batched carve frame: full-ray free-space is staged read-free per ray and
     // written once per voxel at flush (block-ordered). This is the fast full-ray
@@ -1130,14 +1135,28 @@ private:
     split_map_->beginCarveFrame();
     if (downsample_voxel_size_ > 0.0) {
       const float inv = 1.0f / static_cast<float>(downsample_voxel_size_);
-      struct Acc { float sx, sy, sz, soff; uint32_t n; };
+      struct Acc {
+        float sx = 0.f, sy = 0.f, sz = 0.f;              // centroid accumulator
+        uint32_t n = 0;
+        float best_d2 = std::numeric_limits<float>::infinity();
+        Eigen::Vector3f best_p{0.f, 0.f, 0.f};           // measured return nearest centroid
+        float best_off = 0.f;
+      };
       // pack three voxel indices into one int64 (21 bits each, signed-wrap safe
       // for |index| < 2^20 ≈ ±10 km at 1 cm — far beyond any LiDAR range here).
       auto vkey = [](int ix, int iy, int iz) -> int64_t {
         return (int64_t(ix) & 0x1FFFFF) | ((int64_t(iy) & 0x1FFFFF) << 21) | ((int64_t(iz) & 0x1FFFFF) << 42);
       };
-      std::unordered_map<int64_t, Acc> grid;
+      // Single deskew pass: cache each deskewed return + its voxel slot and
+      // accumulate the per-voxel centroid. Slots index a flat vector, so the
+      // nearest-point pass below needs neither a map lookup nor a second deskew.
+      struct DPoint { Eigen::Vector3f p; float off; uint32_t slot; };
+      std::unordered_map<int64_t, uint32_t> grid;
       grid.reserve(N / 2 + 16);
+      std::vector<Acc> accs;
+      accs.reserve(N / 2 + 16);
+      std::vector<DPoint> pts;
+      pts.reserve(N);
       for (size_t i = 0; i < N; ++i) {
         const uint8_t* p = data + i * step;
         float x = *reinterpret_cast<const float*>(p + off_x);
@@ -1153,16 +1172,27 @@ private:
         const int ix = (int)std::floor(praw.x() * inv);
         const int iy = (int)std::floor(praw.y() * inv);
         const int iz = (int)std::floor(praw.z() * inv);
-        Acc& a = grid[vkey(ix, iy, iz)];
-        a.sx += praw.x(); a.sy += praw.y(); a.sz += praw.z(); a.soff += off_i; ++a.n;
+        auto [it, inserted] = grid.try_emplace(vkey(ix, iy, iz), (uint32_t)accs.size());
+        if (inserted) accs.emplace_back();
+        Acc& a = accs[it->second];
+        a.sx += praw.x(); a.sy += praw.y(); a.sz += praw.z(); ++a.n;
+        pts.push_back({praw, off_i, it->second});
       }
-      ds_in = N; ds_out = grid.size();
-      for (const auto& kv : grid) {
-        const Acc& a = kv.second;
+      // Keep one ORIGINAL return per voxel: the cached point nearest the voxel
+      // centroid (a medoid). No deskew here — every point is already cached, and
+      // each voxel has ≥1 point, so best_p is always a real measurement.
+      for (const DPoint& d : pts) {
+        Acc& a = accs[d.slot];
         const float invn = 1.0f / float(a.n);
-        Eigen::Vector3f praw(a.sx * invn, a.sy * invn, a.sz * invn);  // voxel centroid (sensor frame)
-        Eigen::Vector3f Hp = T_oi * praw;
-        if (apply_trans) Hp += v_odom * (a.soff * invn);
+        const Eigen::Vector3f c(a.sx * invn, a.sy * invn, a.sz * invn);
+        const float d2 = (d.p - c).squaredNorm();
+        if (d2 < a.best_d2) { a.best_d2 = d2; a.best_p = d.p; a.best_off = d.off; }
+      }
+
+      ds_in = N; ds_out = accs.size();
+      for (const Acc& a : accs) {
+        Eigen::Vector3f Hp = T_oi * a.best_p;
+        if (apply_trans) Hp += v_odom * a.best_off;
         const float r2 = (Hp - O).squaredNorm();
         if (r2 < min_r2 || r2 > max_r2) continue;
         const float rng = need_rng ? std::sqrt(r2) : 0.f;

@@ -340,6 +340,27 @@ TEST(SemSplitMapBatched, ClearsStaleObstacleNoGuard) {
   EXPECT_GT(b->a_free, 1.0f) << "stale obstacle receives free evidence (guard-free)";
 }
 
+TEST(SemSplitMapBatched, CanDisableFreeSpaceCarve) {
+  // Turning off batched free-space carve suppresses staging entirely while
+  // leaving hit updates intact.
+  scovox::SemSplitMap::Params p;
+  p.resolution = kRes; p.w_occ = 1.0f; p.w_free = 0.5f; p.kappa0 = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f; p.num_classes = kC; p.alpha_0 = kAlpha;
+  p.batch_free_carve = false;
+  scovox::SemSplitMap m(p);
+
+  const Eigen::Vector3f X(1.0f, 0, 0);
+  m.beginCarveFrame();
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  EXPECT_EQ(m.flushCarveFrame(), 0u) << "batch-free carve disabled: nothing stages";
+
+  EXPECT_FALSE(m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0)).has_value())
+      << "mid-ray free-space voxel stays untouched";
+  auto hit = m.getBetaVoxel(X);
+  ASSERT_TRUE(hit.has_value()) << "hit voxel still updates";
+  EXPECT_GT(hit->a_occ, scovox::kBetaOccPrior);
+}
+
 TEST(SemSplitMapBatched, DynamicHitDoesNotSuppressPersistentCarve) {
   // Occupied-wins is PERSISTENT-only: a dynamic endpoint routes occupancy to the
   // transient grid, so it must not block another ray's persistent free carve of

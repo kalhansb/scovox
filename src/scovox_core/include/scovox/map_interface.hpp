@@ -74,6 +74,11 @@ struct Params {
   // ~6 mIoU cold-start tax on indoor RGB-D — see docs/exp_ablations.md.)
   float carve_skip_occ_threshold = 0.0f;
 
+  // Batched free-space carve toggle. When false, the live batch path still
+  // accepts hit updates but stages no free-space evidence; immediate carve
+  // calls are unchanged.
+  bool batch_free_carve = true;
+
   // -- Production knobs (load-bearing on Replica m2f mIoU) --
   // Together these restore OLD-pipeline mIoU within noise (verified by
   // res_step_bayesian: 0.3488 vs OLD baseline_newgate_05 0.3481). The four

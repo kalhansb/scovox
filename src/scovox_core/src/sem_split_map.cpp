@@ -216,6 +216,7 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
   // traversed to reach a return is free NOW (see class docs). One write per
   // voxel per scan, block-ordered at flush.
   if (carve_frame_open_) {
+    if (!params_.batch_free_carve) return true;
     auto it = carve_stage_.find(c);
     if (it == carve_stage_.end()) carve_stage_.emplace(c, w_inc);
     else if (w_inc > it->second)  it->second = w_inc;

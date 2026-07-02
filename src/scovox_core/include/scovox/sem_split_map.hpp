@@ -108,6 +108,11 @@ class SemSplitMap {
     /// per scan. A positive value re-enables the guard only for direct
     /// applyCarveUpdate callers (offline tools / ablations).
     float   carve_skip_occ_threshold   = 0.0f;   ///< wall-blocking guard (immediate path; <=0 = off)
+    /// Batched free-space carving toggle. When false, beginCarveFrame() still
+    /// allows hit updates, but carve rays stage nothing and flushCarveFrame()
+    /// writes no free-space evidence. Immediate applyCarveUpdate calls remain
+    /// unchanged.
+    bool    batch_free_carve           = true;
     float   range_decay_length         = 50.0f;  ///< exp(-r/L); 0 disables (caller-applied)
 
     /// Dataset class count `C`. Sets the semantic OTHER prior `(C − K_TOP)·α₀`.
