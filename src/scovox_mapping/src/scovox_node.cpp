@@ -24,6 +24,7 @@
 #include <Eigen/Geometry>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <scovox/uncertainty.hpp>
 #include <shared_mutex>
 #include <thread>
@@ -116,6 +117,15 @@ public:
     // parity testing against the two-DDA split path.
     SP.fused_walker = fused_walker_;
     split_map_ = std::make_unique<scovox::ScovoxMapSplit>(SP);
+    // Change-gate shadow grids: the last-EMITTED wire state per voxel, same
+    // geometry as the live grids. Only the wire path reads/writes these, and
+    // only in mode=rolling (no bin_pub_ otherwise).
+    if (share_change_gate_ && mode_ == "rolling") {
+      gate_beta_ = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
+          P.resolution, P.inner_bits, P.leaf_bits);
+      gate_dir_ = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
+          P.resolution, P.inner_bits, P.leaf_bits);
+    }
     loadSemanticColorMap();  initializeSemanticColors();
     setupSubscribers();
     setupPublishers();
@@ -145,6 +155,25 @@ public:
         if (pub_pc_) publishPointCloud();
         if (tsdf_pub_) publishTSDFPointCloud();
       });
+    if (bin_pub_ && share_rate_hz_ > 0.0) {
+      // Timer-owned binary publish (share_rate_hz > 0): the sensor callbacks
+      // skip their inline publishBinaryMap and touched coords accumulate until
+      // this tick. Unique lock — publishBinaryMap drains the touched-sets and
+      // writes the change-gate shadow grids, both mutations. Under the
+      // SingleThreadedExecutor this also serializes us against integration.
+      bin_timer_ = rclcpp::create_timer(this, get_clock(),
+        std::chrono::duration<double>(1.0 / share_rate_hz_),
+        [this]{
+          std::unique_lock<std::shared_mutex> lock(map_mtx_);
+          publishBinaryMap();
+        });
+      RCLCPP_INFO(get_logger(),
+        "share timer: ScovoxMapBinary coalesced at %.2f Hz (change_gate=%d "
+        "z_band=[%.2f, %.2f]%s)",
+        share_rate_hz_, (int)share_change_gate_, share_roi_z_min_,
+        share_roi_z_max_,
+        share_roi_z_max_ > share_roi_z_min_ ? "" : " off");
+    }
     RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s share_tsdf=%d fused_walker=%d",
       P.resolution, mode_.c_str(), int_frame_.c_str(), (int)share_tsdf_, (int)fused_walker_);
     {
@@ -286,6 +315,40 @@ private:
     //   share_tsdf=true: also emit the TSDF stream (opt-in for fused-geometry
     //     consensus). Maps to BinarySerializer::Options.share_tsdf.
     share_tsdf_ = dp("share_tsdf", false);
+    // ── Low-bandwidth share controls (ScovoxMapBinary wire path, mode=rolling) ──
+    // share_rate_hz: cadence of the binary delta publish. <=0 (default) keeps
+    // the legacy per-scan publish inline in the sensor callbacks. >0 moves the
+    // publish onto a wall timer at this rate; touched coords accumulate
+    // between ticks and drainTouched* sort+uniques them, so slower rates
+    // coalesce repeated writes of the same voxel into ONE wire record. The
+    // receiver merge is snapshot-replace per (source, coord), so coalescing is
+    // lossless — the merger converges to the same state either way.
+    share_rate_hz_ = dp("share_rate_hz", 0.0);
+    // share_change_gate: per-voxel change gate against the LAST-EMITTED wire
+    // state. A touched voxel is re-emitted only when its posterior actually
+    // moved: |Δp_occ| > share_gate_p_eps, relative total-evidence growth >
+    // share_gate_evidence_rel, or (Dir) a top-K class slot changed. This kills
+    // the dominant waste stream — saturated / effectively-unchanged free-space
+    // carve voxels re-shipped every scan forever. A voxel's FIRST observation
+    // always emits (it has no gate entry), so planner frontiers are never
+    // delayed, and full snapshots (new-subscriber path) bypass the gate.
+    // Costs a shadow copy of the emitted Beta/Dir state (~8/16 B per emitted
+    // voxel). false = legacy wire, byte-identical to before this gate existed.
+    share_change_gate_ = dp("share_change_gate", true);
+    share_gate_p_eps_ = dp("share_gate_p_eps", 0.02);
+    share_gate_evidence_rel_ = dp("share_gate_evidence_rel", 0.10);
+    // share_roi_z_min/max: vertical band (integration frame, metres) outside
+    // which voxels stay OFF the wire (both Beta and Dir streams). The LOCAL
+    // map is untouched — this filters only what is shared, so out-of-band
+    // structure survives in each robot's own map. min >= max (the 0/0
+    // default) disables the band.
+    // KEEP IN SYNC with dscovox_node share_roi_z_min/share_roi_z_max (the
+    // receiver-side defensive clip) and with explo_planner
+    // exploration_params.yaml roi_min_z/roi_max_z: the shared band must be a
+    // SUPERSET of the planner band, or free voxels at the band edge arrive
+    // clipped and read as unknown to the planner.
+    share_roi_z_min_ = dp("share_roi_z_min", 0.0);
+    share_roi_z_max_ = dp("share_roi_z_max", 0.0);
     // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default true.
     // Set false to fall back to the two-DDA split path for A/B parity testing.
     fused_walker_ = dp("fused_walker", true);
@@ -801,7 +864,14 @@ private:
     split_map_->flushCarveFrame();
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
-    if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
+    if (bin_pub_) {
+      // share_rate_hz > 0: the share timer owns the publish. Touched coords
+      // just accumulate here and coalesce at the next tick (drainTouched*
+      // sort+uniques, so N same-voxel writes become one wire record).
+      if (share_rate_hz_ <= 0.0) {
+        auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm;
+      }
+    }
     else {
       // No bin_pub_ in persistent mode → publishBinaryMap is never
       // called → TsdfMap/SemSplitMap touched buffers grow unbounded
@@ -1249,7 +1319,14 @@ private:
 
     auto t_integrate = std::chrono::high_resolution_clock::now();
     size_t bin_bytes_ = 0;
-    if (bin_pub_) { auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm; }
+    if (bin_pub_) {
+      // share_rate_hz > 0: the share timer owns the publish. Touched coords
+      // just accumulate here and coalesce at the next tick (drainTouched*
+      // sort+uniques, so N same-voxel writes become one wire record).
+      if (share_rate_hz_ <= 0.0) {
+        auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm;
+      }
+    }
     else {
       // No bin_pub_ in persistent mode → publishBinaryMap is never
       // called → TsdfMap/SemSplitMap touched buffers grow unbounded
@@ -1472,6 +1549,29 @@ private:
   //
   // Snapshot-on-resub + at-prior elision are applied per grid. This is the
   // node's only wire path; the SPLIT substrate (semsplit()) is always valid.
+  // Change-gate predicates: has this voxel moved enough since its LAST-EMITTED
+  // wire state to justify re-shipping? (share_change_gate, declareNodeParams.)
+  // Evidence growth is measured RELATIVE to the emitted state, so a voxel that
+  // keeps accumulating same-p carve evidence re-emits at a geometric (not
+  // per-scan) cadence, and a saturated voxel (evidence cap reached, value
+  // frozen) never re-emits at all.
+  bool betaChangedSinceEmit(const scovox::BetaVoxel& last,
+                            const scovox::BetaVoxel& now) const {
+    if (std::abs(now.p_occ() - last.p_occ()) > (float)share_gate_p_eps_)
+      return true;
+    const float s0 = last.s_total();
+    return (now.s_total() - s0) > (float)share_gate_evidence_rel_ * s0;
+  }
+  bool dirChangedSinceEmit(const scovox::DirVoxel& last,
+                           const scovox::DirVoxel& now) const {
+    // Any top-K slot change (new class, eviction, reorder) is semantically
+    // meaningful downstream — always ship it.
+    for (int i = 0; i < scovox::K_TOP; ++i)
+      if (now.cls[i] != last.cls[i]) return true;
+    const float s0 = last.s_class();
+    return (now.s_class() - s0) > (float)share_gate_evidence_rel_ * s0;
+  }
+
   std::pair<size_t,double> publishBinaryMap() {
     if (!bin_pub_) return {0, 0};
     auto& ss = split_map_->semsplit();
@@ -1494,6 +1594,12 @@ private:
     const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
     const float dir_other_prior =
         static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
+
+    // Shared-ROI z-band (see share_roi_z_min/max in declareNodeParams). Applied
+    // to Beta AND Dir identically — semantics are a first-class planner input,
+    // never decimated below occupancy.
+    const bool zband = share_roi_z_max_ > share_roi_z_min_;
+    const double zhalf = 0.5 * split_map_->resolution();
 
     // ----- TSDF section (elided when share_tsdf_=false) -----
     if (share_tsdf_) {
@@ -1518,11 +1624,30 @@ private:
     {
       auto& bgrid = ss.betaGrid();
       auto bacc = bgrid.createAccessor();
+      std::optional<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor> gacc;
+      if (gate_beta_) gacc.emplace(gate_beta_->createAccessor());
       auto emit_beta = [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         // At prior → no posterior information; keep off the wire.
         const bool at_prior = (v.a_occ  <= beta_occ_prior        + 1e-4f) &&
                               (v.a_free <= scovox::kBetaFreePrior + 1e-4f);
         if (at_prior) return;
+        if (zband) {
+          const double zc = bgrid.coordToPos(c).z + zhalf;
+          if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
+        }
+        if (gacc) {
+          // Change gate vs the last-EMITTED state. Snapshots bypass the check
+          // (a fresh subscriber needs full state) but still refresh the gate.
+          if (!snapshot) {
+            if (auto* g = gacc->value(c, false); g && !betaChangedSinceEmit(*g, v))
+              return;
+          }
+          // MUST be setValue, not `*value(c, true) = v`: the miss above caches
+          // prev_leaf_ptr_ = nullptr for this inner key, and value(c, true)
+          // skips the refresh on a same-key hit → returns nullptr even with
+          // create_if_missing. setValue re-fetches on a null cached leaf.
+          gacc->setValue(c, v);
+        }
         frame.beta_deltas.push_back({c, v});
       };
       if (snapshot) {
@@ -1538,12 +1663,26 @@ private:
     {
       auto& dgrid = ss.dirGrid();
       auto dacc = dgrid.createAccessor();
+      std::optional<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> gacc;
+      if (gate_dir_) gacc.emplace(gate_dir_->createAccessor());
       auto emit_dir = [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
         bool any_sem = false;
         for (int i = 0; i < scovox::K_TOP; ++i)
           if (v.cls[i] != 0xFFFF) { any_sem = true; break; }
         const bool at_prior = !any_sem && (v.other <= dir_other_prior + 1e-4f);
         if (at_prior) return;
+        if (zband) {
+          const double zc = dgrid.coordToPos(c).z + zhalf;
+          if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
+        }
+        if (gacc) {
+          if (!snapshot) {
+            if (auto* g = gacc->value(c, false); g && !dirChangedSinceEmit(*g, v))
+              return;
+          }
+          // setValue, not `*value(c, true)` — see the Beta gate note above.
+          gacc->setValue(c, v);
+        }
         frame.dir_deltas.push_back({c, v});
       };
       if (snapshot) {
@@ -1956,6 +2095,18 @@ private:
   // (BetaVoxel ∥ DirVoxel). Always allocated — the node has one path.
   std::unique_ptr<scovox::ScovoxMapSplit> split_map_;
   bool share_tsdf_{false};        // TSDF stream toggle (wire opts.share_tsdf)
+  // ── Low-bandwidth share controls (see declareNodeParams) ────────────────
+  double share_rate_hz_{0.0};            // <=0 = legacy per-scan inline publish
+  bool   share_change_gate_{true};       // emit only changed-since-last-emit voxels
+  double share_gate_p_eps_{0.02};        // |Δp_occ| emit threshold
+  double share_gate_evidence_rel_{0.10}; // relative evidence-growth emit threshold
+  double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
+  // Last-EMITTED wire state per voxel (the change gate's memory). Shadow
+  // Bonxai grids with the live grids' geometry; allocated only when
+  // share_change_gate is on in mode=rolling.
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> gate_beta_;
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  gate_dir_;
+  rclcpp::TimerBase::SharedPtr bin_timer_;  // share_rate_hz publish timer
   bool fused_walker_{true};       // Step 12.10 — single-DDA hit-ray walker
   // Semantic dataset priors. Defaults match SemSplitMap::Params; KITTI launches
   // override via num_classes:=20.

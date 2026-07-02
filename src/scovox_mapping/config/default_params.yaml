@@ -119,6 +119,35 @@ scovox_node:
     scovox_publish_rate:            # float, default 1.0, Hz
       # Rate of full ScovoxMap publication (uncertainty visualization).
 
+    # === Low-bandwidth share params [T] (ScovoxMapBinary wire, mode=rolling) ===
+
+    share_rate_hz:                  # double, default 0.0 (= per-scan), Hz
+      # Binary delta publish cadence. <=0 keeps the legacy per-scan publish
+      # inline in the sensor callbacks; >0 publishes from a wall timer,
+      # coalescing every voxel touched between ticks into ONE wire record
+      # (receiver merge is snapshot-replace per (source, coord) — lossless).
+
+    share_change_gate:              # bool, default true
+      # Per-voxel change gate against the last-EMITTED wire state: a touched
+      # voxel is re-sent only if |Δp_occ| > share_gate_p_eps, relative
+      # evidence growth > share_gate_evidence_rel, or a semantic top-K slot
+      # changed. First observation always emits; new-subscriber snapshots
+      # bypass the gate. false = legacy wire (every touched voxel re-sent).
+
+    share_gate_p_eps:               # double, default 0.02, dimensionless
+      # |Δ p_occ| since last emit that forces a re-send.
+
+    share_gate_evidence_rel:        # double, default 0.10, dimensionless
+      # Relative total-evidence growth since last emit that forces a re-send.
+
+    share_roi_z_min:                # double, default 0.0, meters
+    share_roi_z_max:                # double, default 0.0, meters
+      # Vertical band kept ON the wire (integration frame); the LOCAL map is
+      # unaffected. min >= max disables. KEEP IN SYNC with dscovox_node
+      # share_roi_z_min/share_roi_z_max (receiver ingest clip) and with
+      # explo_planner exploration_params.yaml roi_min_z/roi_max_z — the
+      # shared band must be a SUPERSET of the planner band.
+
     publish_pointcloud:             # bool, default true
       # Whether to publish the colored occupancy point cloud.
 
@@ -202,6 +231,15 @@ dscovox_node:
 
     publish_rate_hz:                # float, default 5.0, Hz
       # Rate of point cloud and planning map publication.
+
+    share_roi_z_min:                # double, default 0.0, meters
+    share_roi_z_max:                # double, default 0.0, meters
+      # Receive-side defensive mirror of the sender's shared-ROI z-band:
+      # records whose MAP-frame voxel centre is outside the band are dropped
+      # at ingest. min >= max disables. KEEP IN SYNC with scovox_node
+      # share_roi_z_min/share_roi_z_max and explo_planner
+      # exploration_params.yaml roi_min_z/roi_max_z (shared band must be a
+      # SUPERSET of the planner band).
 
     publish_planning_map:           # bool, default false
       # Whether to publish the 2D OccupancyGrid.

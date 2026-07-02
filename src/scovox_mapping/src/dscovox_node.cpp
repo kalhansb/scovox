@@ -175,6 +175,17 @@ public:
     pc_min_interval_s_ = declare_parameter<double>("pointcloud_min_interval_s", 0.1);
     last_pc_pub_ns_.store(get_clock()->now().nanoseconds(), std::memory_order_relaxed);
 
+    // Shared-ROI z-band — receive-side defensive mirror of the sender's wire
+    // filter. Records whose MAP-frame voxel centre falls outside
+    // [share_roi_z_min, share_roi_z_max] are dropped at ingest, so the fused
+    // map honours the band even if one sender was launched without it.
+    // KEEP IN SYNC with scovox_node share_roi_z_min/share_roi_z_max (sender
+    // wire filter, applied in its integration frame) and with explo_planner
+    // exploration_params.yaml roi_min_z/roi_max_z: the shared band must be a
+    // SUPERSET of the planner band. min >= max (default 0/0) disables.
+    share_z_min_ = declare_parameter<double>("share_roi_z_min", 0.0);
+    share_z_max_ = declare_parameter<double>("share_roi_z_max", 0.0);
+
     initSemanticColors();
 
     pc_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -432,19 +443,23 @@ private:
       touched_dir.reserve(frame.dir_deltas.size());
       const Eigen::Isometry3d Te = src.T_map_source;
       const double half_src_res = 0.5 * double(src_res);
-      auto toMapCoord = [&](const Bonxai::CoordT& sc, auto& grid_ptr) {
+      auto toMapPos = [&](const Bonxai::CoordT& sc) {
         Eigen::Vector3d sp(
           double(sc.x) * double(src_res) + half_src_res,
           double(sc.y) * double(src_res) + half_src_res,
           double(sc.z) * double(src_res) + half_src_res);
-        Eigen::Vector3d mp = Te * sp;
-        return grid_ptr->posToCoord(mp.x(), mp.y(), mp.z());
+        return Eigen::Vector3d(Te * sp);
       };
+      // Shared-ROI z-band clip (see share_roi_z_min/max in the constructor).
+      // Applied to Beta AND Dir identically, in the MAP frame (post-TF).
+      const bool zband = share_z_max_ > share_z_min_;
 
       {
         auto ba = src.beta_grid->createAccessor();
         for (auto& d : frame.beta_deltas) {
-          auto mc = toMapCoord(d.coord, src.beta_grid);
+          const Eigen::Vector3d mp = toMapPos(d.coord);
+          if (zband && (mp.z() < share_z_min_ || mp.z() > share_z_max_)) continue;
+          auto mc = src.beta_grid->posToCoord(mp.x(), mp.y(), mp.z());
           auto* v = ba.value(mc, true);
           if (!v) continue;
           *v = d.data;     // snapshot-replace
@@ -454,7 +469,9 @@ private:
       {
         auto da = src.dir_grid->createAccessor();
         for (auto& d : frame.dir_deltas) {
-          auto mc = toMapCoord(d.coord, src.dir_grid);
+          const Eigen::Vector3d mp = toMapPos(d.coord);
+          if (zband && (mp.z() < share_z_min_ || mp.z() > share_z_max_)) continue;
+          auto mc = src.dir_grid->posToCoord(mp.x(), mp.y(), mp.z());
           auto* v = da.value(mc, true);
           if (!v) continue;
           *v = d.data;     // snapshot-replace
@@ -818,6 +835,9 @@ private:
   std::string map_frame_;
   double min_occ_, sem_gate_;
   double pub_hz_;
+  // Shared-ROI z-band ingest clip (map frame; min >= max = off). KEEP IN SYNC
+  // with scovox_node share_roi_z_min/max + explo_planner roi_min_z/roi_max_z.
+  double share_z_min_{0.0}, share_z_max_{0.0};
   double pc_min_interval_s_;
   // Rate-limiter timestamp for the visualisation pointcloud, stored as raw
   // nanoseconds in a std::atomic. maybePublishPointCloud() runs under only a
