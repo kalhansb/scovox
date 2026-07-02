@@ -1,0 +1,120 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Candidates1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Color: 160; 160; 164
+      Cell Size: 5
+      Plane Cell Count: 40
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Marker Scale: 3
+      Show Names: true
+      Value: true
+    # No Planning Map display: the experiment runs the planner in its
+    # straight-line fallback (require_planning_map: false) and scovox has
+    # publish_planning_map:=false — there is no 2D grid to draw.
+    # The SCovox semantic-occupancy cloud. Color Transformer = RGB8 shows the
+    # semantic CLASS colors (the outdoor palette). Switch to AxisColor (Z) in RViz
+    # if you'd rather read height. resolution 0.1 m -> Boxes sized 0.1.
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Name: Semantic Map
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /scovox_node/pointcloud
+      Color Transformer: RGB8
+      Style: Boxes
+      Size (m): 0.1
+      Use Fixed Frame: true
+      Value: true
+    # Planner candidate viewpoints: one arrow per candidate, colored red->green
+    # by normalized EIG utility, plus a cyan sphere ("selected" namespace)
+    # hovering 0.5 m above the selected waypoint. Republished every PLAN cycle
+    # (DELETEALL first, so only the latest set is shown).
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Candidates
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /explo_planner/candidates
+      Value: true
+    # The selected NBV goal pose itself (nothing navigates to it in the bag
+    # replay — this is the "selected waypoint" the planner would drive to).
+    - Alpha: 1
+      Class: rviz_default_plugins/Pose
+      Name: Selected Goal
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
+      Shape: Arrow
+      Color: 0; 255; 255
+      Shaft Length: 1
+      Shaft Radius: 0.08
+      Head Length: 0.4
+      Head Radius: 0.2
+      Value: true
+    # Live LiDAR scan for spatial context (off by default). Bag plays /ouster/points
+    # as RELIABLE (ouster_reliable_qos.yaml), so match Reliable here.
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Name: Live Scan
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ouster/points
+      Color Transformer: FlatColor
+      Color: 120; 120; 120
+      Style: Points
+      Size (Pixels): 2
+      Value: false
+  Global Options:
+    Background Color: 25; 25; 30
+    # map = NDT's global frame (same frame the gt_map_us050 localizer map lives in).
+    # SCovox integrates into map (integration_frame:=map), so the semantic cloud,
+    # the planner markers and the TF tree all line up here.
+    Fixed Frame: map
+    Frame Rate: 20
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 40
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 1.0
+      Yaw: 0.785
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Displays:
+    collapsed: false

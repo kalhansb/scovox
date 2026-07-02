@@ -16,7 +16,8 @@ src/
 
 docker/             Standalone ROS 2 Jazzy build/test image + build_and_test.sh
 compose.yaml        Persistent dev / run container (ROS 2 Jazzy)
-config/             Raw-cloud occupancy config with the smear-suppression cure (see below)
+config/             Param sets: raw-cloud smear cure, fused LiDAR+RGB-D, robot-share
+                    overlay, and the HMR_Explo exploration experiment (planner + RViz)
 scripts/            Launch helper for the raw-cloud config (see below)
 
 docs/
@@ -72,9 +73,16 @@ Runtime dependencies: Eigen 3.4+, lz4, standard ROS 2 stack.
 Both nodes consume live sensor topics + TF — no datasets needed. Use
 `use_sim_time:=false` on hardware.
 
+**Docker:** run everything below inside the compose container on the robot
+(`docker compose up -d`, then `docker compose exec scovox bash`). It uses host
+networking, but [`compose.yaml`](compose.yaml) pins DDS discovery to loopback —
+add `-e ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET` to `exec` when sensors or
+teammate robots publish from other machines.
+
 **TF required** (from your odometry/SLAM): `integration_frame → sensor_frame`
 (the cloud/depth `frame_id`) and `integration_frame → base_frame` (robot pose).
-Multi-robot fusion also needs `map_frame → <robot>/odom` per robot.
+Multi-robot fusion also needs `map_frame → <bin frame_id>` per peer (identity
+in the recommended setup below).
 
 ### Single robot
 
@@ -106,16 +114,75 @@ without discarding points; an external localizer (e.g. GLIM) supplies the pose:
 See [Raw-cloud occupancy mapping](#raw-cloud-occupancy-mapping-vertical-smear-cure)
 for the problem this solves.
 
-### Multi-robot (SCovox + DSCovox)
+### Multi-robot mapping (SCovox + DSCovox)
 
-One `scovox_mapping_node` per robot (`mode:=rolling`, namespaced) publishes
-`/<robot>/scovox_node/scovox_bin`; one `dscovox_mapping_node` fuses them:
+One `scovox_mapping_node` per robot (`mode: rolling`, namespaced) publishes an
+LZ4 `ScovoxMapBinary` delta stream on `/<robot>/scovox_node/scovox_bin`; every
+robot also runs its own `dscovox_mapping_node` fusing ALL peers' streams —
+there is no central merger.
+
+**TF contract:** each robot runs the sibling `hmr_localisation` NDT localizer
+(in the HMR_Explo workspace) against the same ground-truth map, giving it
+`map → odom → base_link` locally — the fleet shares one global `map` frame.
+Each robot's mapper then integrates in a **per-robot frame** (`r1_map`,
+`r2_map`, …) bridged to `map` by an identity static TF. The unique frame is
+**mandatory**: the bin stream's `header.frame_id` is the `integration_frame`,
+and the merger keys its per-source grids by that frame_id — two robots sharing
+one frame_id collapse into a single source grid and overwrite each other where
+their maps overlap. The static TF is one latched `/tf_static` sample that
+peers' mergers cache on first sight; there is no per-scan cross-robot `/tf`.
+
+Per robot, inside the container (shown for robot 1 — substitute the
+namespace, frame, and log names; **start the merger before the mapper**: the
+bin publish is subscriber-gated, deltas are drained while nobody listens):
 
 ```bash
-ros2 launch scovox_mapping scovox_multi_robot.launch.py
+# Identity bridge map -> r1_map (see TF contract above).
+ros2 run tf2_ros static_transform_publisher \
+  --frame-id map --child-frame-id r1_map &
+
+# Merger — fleet-wide bin-topic list lives in dscovox_params.yaml input_topics.
+ros2 run scovox_mapping dscovox_mapping_node --ros-args -r __ns:=/robot1 \
+  --params-file /scovox/src/scovox_mapping/config/dscovox_params.yaml &
+
+# Mapper — base sensor config + the real-robot share overlay (later file
+# wins): rolling mode, use_sim_time=false, and the low-bandwidth share
+# controls (change gate + 2 Hz coalescing + z-band; measured 32.8 -> 4.9 Mbps
+# per robot). integration_frame is the one per-robot param (see above).
+ros2 run scovox_mapping scovox_mapping_node --ros-args \
+  -r __ns:=/robot1 -r __node:=scovox_node \
+  --params-file /scovox/config/scovox_fused_lidar_rgbd.yaml \
+  --params-file /scovox/config/scovox_robot_share.yaml \
+  -p integration_frame:=r1_map
 ```
 
-Edit the `robots` list / `input_topics` in [`scovox_multi_robot.launch.py`](src/scovox_mapping/launch/scovox_multi_robot.launch.py).
+The fused latched map comes out on `/<robot>/dscovox_node/scovox` — the
+planner input consumed by
+[explo_planner](https://github.com/kalhansb/explo_planner). Keep the share
+z-band in sync across [`scovox_robot_share.yaml`](config/scovox_robot_share.yaml),
+[`dscovox_params.yaml`](src/scovox_mapping/config/dscovox_params.yaml), and
+explo_planner's `exploration_params.yaml` (shared band ⊇ planner band) — each
+file's comments cross-reference the others.
+
+For simulation/bag use,
+[`scovox_multi_robot.launch.py`](src/scovox_mapping/launch/scovox_multi_robot.launch.py)
+wires the same topology (edit its `robots` list / `input_topics`).
+
+### Exploration experiment (HMR_Explo)
+
+The bag-driven exploration experiment in the parent
+[HMR_Explo](https://github.com/kalhansb/hmr_explo) workspace
+(`ws/src/run_explo_experiment.sh`) runs explo_planner and RViz inside this
+repo's container, so both of its config files live here and are read live
+through the `/scovox` bind mount — host edits apply on the next run, no
+rebuild or copy:
+
+* [`config/exploration_fused_bag.yaml`](config/exploration_fused_bag.yaml) —
+  explo_planner param set: terrain-relative 3D mode, straight-line candidate
+  costs (`require_planning_map: false`, no 2D planning_map — the file header
+  carries the rationale).
+* [`config/explo_experiment.rviz`](config/explo_experiment.rviz) — RViz
+  layout for the run (semantic cloud, candidate arrows, selected goal).
 
 ### Interfaces
 
@@ -123,7 +190,8 @@ Edit the `robots` list / `input_topics` in [`scovox_multi_robot.launch.py`](src/
   **out:** `~/pointcloud`, `~/scovox`, `~/scovox_bin` (rolling mode), `~/tsdf_pointcloud` (if `enable_tsdf`), `~/planning_map` (if `publish_planning_map`);
   **service:** `~/extract_mesh` (`ExtractMesh`).
 * `dscovox_mapping_node` (node name `dscovox_node`) — **in:** each robot's `~/scovox_bin` (`input_topics`);
-  **out:** fused `~/pointcloud`; **services:** `~/get_region` (`GetRegion`), `~/get_occupancy_grid` (`GetOccupancyGrid`).
+  **out:** fused `~/pointcloud`, latched fused `~/scovox` (planner input);
+  **services:** `~/get_region` (`GetRegion`), `~/get_occupancy_grid` (`GetOccupancyGrid`).
 
 Full parameter reference: [`config/default_params.yaml`](src/scovox_mapping/config/default_params.yaml).
 

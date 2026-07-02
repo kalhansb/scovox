@@ -4,9 +4,12 @@
 # still win when passed explicitly. Full per-param reference:
 # default_params.yaml (DSCovoxNode section).
 #
-# Usage: ros2 run scovox_mapping dscovox_mapping_node --ros-args \
-#          --params-file <share>/scovox_mapping/config/dscovox_params.yaml
-dscovox_node:
+# Usage (namespace per robot — every robot runs its own merger):
+#   ros2 run scovox_mapping dscovox_mapping_node --ros-args -r __ns:=/atlas \
+#     --params-file <share>/scovox_mapping/config/dscovox_params.yaml
+# The /** key matches the node in any robot namespace (a bare node-name key
+# only matches the root namespace).
+/**:
   ros__parameters:
     # ScovoxMapBinary delta streams to fuse (one per robot). Every robot runs
     # its own dscovox subscribing to ALL peers, so this list is fleet-wide.
@@ -23,9 +26,10 @@ dscovox_node:
 
     # Shared-ROI z-band (map frame, metres) — receive-side defensive clip of
     # the multi-robot share band; records outside it are dropped at ingest.
-    # min >= max disables (default). KEEP IN SYNC with the sender band
-    # (scovox_node share_roi_z_min/share_roi_z_max) and with the planner band
+    # min >= max disables. KEEP IN SYNC with the sender band
+    # (scovox_node share_roi_z_min/share_roi_z_max — set for real robots in
+    # config/scovox_robot_share.yaml) and with the planner band
     # (explo_planner exploration_params.yaml roi_min_z/roi_max_z): the shared
     # band must be a SUPERSET of the planner band.
-    share_roi_z_min: 0.0
-    share_roi_z_max: 0.0
+    share_roi_z_min: -0.5
+    share_roi_z_max: 2.0

@@ -1,0 +1,58 @@
+# =======================================================================
+# SCovox — REAL-ROBOT multi-robot share overlay
+# =======================================================================
+# Load AFTER a base sensor config (later --params-file wins), plus the two
+# per-robot values that cannot live in a shared file — the namespace and the
+# UNIQUE integration frame. E.g. robot 1:
+#
+#   ros2 run scovox_mapping scovox_mapping_node --ros-args \
+#     -r __ns:=/robot1 -r __node:=scovox_node \
+#     --params-file /scovox/config/scovox_fused_lidar_rgbd.yaml \
+#     --params-file /scovox/config/scovox_robot_share.yaml \
+#     -p integration_frame:=r1_map
+#
+# It flips the base config from bag-replay/persistent to a live rolling-mode
+# sharer: rolling mode creates the ~/scovox_bin LZ4 delta stream that every
+# peer's dscovox_mapping_node fuses (see config/dscovox_params.yaml in
+# src/scovox_mapping).
+#
+# TF assumptions:
+#  * Each robot runs the hmr_localisation NDT tree (map -> odom -> base_link)
+#    against the SAME ground-truth map, so the fleet shares one global `map`
+#    frame.
+#  * integration_frame MUST BE UNIQUE PER ROBOT (r1_map, r2_map, ...). The
+#    bin stream's header.frame_id IS the integration_frame, and the dscovox
+#    merger keys its per-source grids by that frame_id — two robots sharing
+#    one frame_id collapse into a single source grid and snapshot-overwrite
+#    each other's evidence wherever their maps overlap. Bridge the frame with
+#    an identity static TF on each robot (one latched /tf_static sample that
+#    peers' mergers cache on first sight — NOT per-scan cross-robot /tf):
+#
+#      ros2 run tf2_ros static_transform_publisher \
+#        --frame-id map --child-frame-id r1_map
+# =======================================================================
+/**:
+  ros__parameters:
+    use_sim_time: false          # live sensors, wall clock
+
+    mode: "rolling"              # creates the ~/scovox_bin share publisher
+    map_frame: "map"
+    # integration_frame: set PER ROBOT on the command line (see header) — the
+    # unique frame_id keys this robot's stream in every peer's merger.
+
+    # --- Low-bandwidth share controls (Tier 1) -----------------------------
+    # Measured on the map-test-2 stream: legacy 32.8 Mbps -> gate 20.7 ->
+    # gate + 2 Hz coalescing + z-band 4.9 Mbps per robot.
+    share_change_gate: true      # re-send a voxel only when it changed vs its
+                                 # last-emitted state (p_occ eps / relative
+                                 # evidence growth / top-K class change)
+    share_rate_hz: 2.0           # coalesce deltas into a timer publish
+                                 # (0.0 = legacy per-scan publish)
+
+    # Shared-ROI z-band (map frame, metres); min >= max disables.
+    # KEEP IN SYNC with the receive-side clip (dscovox_params.yaml
+    # share_roi_z_min/max) and with the planner band (explo_planner
+    # exploration_params.yaml roi_min_z/roi_max_z): the shared band must be a
+    # SUPERSET of the planner band.
+    share_roi_z_min: -0.5
+    share_roi_z_max: 2.0
