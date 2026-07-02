@@ -562,7 +562,11 @@ private:
     if (fuse_lidar_rgbd_ && !pointcloud_mode_)
       RCLCPP_WARN(get_logger(), "fuse_lidar_rgbd=true but input_pointcloud_topic empty — no LiDAR stream; running RGB-D only");
     if (want_lidar) {
-      auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+      // Best-effort to match the real robot's LiDAR driver, which publishes
+      // best-effort. A reliable sub would refuse a best-effort publisher and we
+      // would silently get no cloud. Best-effort still connects to reliable
+      // publishers too (e.g. a bag replay), so this is safe in both cases.
+      auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
       input_pc_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(input_pc_topic_, qos,
         std::bind(&SCovoxNode::onPointCloud, this, std::placeholders::_1));
       RCLCPP_INFO(get_logger(), "PointCloud2 input mode: topic=%s", input_pc_topic_.c_str());
