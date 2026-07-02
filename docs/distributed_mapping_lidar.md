@@ -79,53 +79,11 @@ Everything runs inside the repos' Docker containers; nothing is installed on the
   config. `input_topics` lists the fleet's bin topics; **extend it on every robot
   as the fleet grows**.
 
-## Single robot
-
-One robot is just a fleet of one: the merger fuses its own stream and its output
-is the (trivially global) planner map. Run these in three terminals / background jobs.
-
-```bash
-# ── 1. Localization tree (hmr_localisation container) ─────────────────────────
-cd ws/src/hmr_localisation
-docker compose exec -e ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET ros \
-  bash /ws/scripts/run_localization_live.sh
-# wait for "active. TF tree: map -> odom -> base_link -> {os_lidar, imu}"
-
-# ── 2. Mapping (scovox container; run each command in its own exec) ───────────
-cd ../scovox
-E="docker compose exec -e ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET scovox"
-S="source /opt/ros/jazzy/setup.bash && source /scovox/install/setup.bash"
-
-# identity bridge  map -> r1_map  (rule 1 above)
-$E bash -lc "$S && ros2 run tf2_ros static_transform_publisher \
-  --frame-id map --child-frame-id r1_map"
-
-# merger FIRST (rule 2)
-$E bash -lc "$S && ros2 run scovox_mapping dscovox_mapping_node --ros-args \
-  -r __ns:=/robot1 \
-  --params-file /scovox/src/scovox_mapping/config/dscovox_params.yaml"
-
-# mapper: LiDAR-only base config + share overlay + the one per-robot frame
-$E bash -lc "$S && ros2 run scovox_mapping scovox_mapping_node --ros-args \
-  -r __ns:=/robot1 -r __node:=scovox_node \
-  --params-file /scovox/config/scovox_lidar_geometric.yaml \
-  --params-file /scovox/config/scovox_robot_share.yaml \
-  -p integration_frame:=r1_map"
-```
-
-**Verify** (any scovox exec):
-
-```bash
-# merger logs "dscovox_diag: sources=1 ... fused_voxels=…" every ~5 s
-$E bash -lc "$S && ros2 topic hz /robot1/scovox_node/scovox_bin"   # ~2 Hz share cadence
-```
-
-The fused map for the planner is `/robot1/dscovox_node/scovox`; the viewable cloud
-is `/robot1/dscovox_node/pointcloud`.
-
 ## Two robots
 
-Run the **same three programs on each robot**, changing only the robot index:
+Set up **each** robot exactly as in
+[single_robot_lidar.md](single_robot_lidar.md) — localizer → identity static TF →
+merger → mapper — changing only the robot index:
 
 | per-robot value       | robot 1     | robot 2     |
 |-----------------------|-------------|-------------|
@@ -137,11 +95,11 @@ Everything else comes from the committed config files above, unchanged. On each
 robot, extend `input_topics` in `dscovox_params.yaml` so it lists **all** robots'
 bin topics (`/robot1/scovox_node/scovox_bin` + `/robot2/scovox_node/scovox_bin`).
 
-Start order per robot: **localizer → static TF → merger → mapper.** Robots do not
-need to start at the same time (a late merger gets a fresh snapshot; a late mapper
-just starts contributing when it comes up).
+Robots do not need to start at the same time: a late merger gets a fresh snapshot,
+and a late mapper just starts contributing when it comes up.
 
-**Verify the exchange** (on *either* robot):
+**Verify the exchange** (on *either* robot; `$E`/`$S` are the exec shorthands
+defined in [single_robot_lidar.md](single_robot_lidar.md)):
 
 ```bash
 $E bash -lc "$S && ros2 topic hz /robot1/scovox_node/scovox_bin /robot2/scovox_node/scovox_bin"
