@@ -170,7 +170,11 @@ file's comments cross-reference the others.
 
 For simulation/bag use,
 [`scovox_multi_robot.launch.py`](src/scovox_mapping/launch/scovox_multi_robot.launch.py)
-wires the same topology (edit its `robots` list / `input_topics`).
+wires the same topology (edit its `robots` list / `input_topics`). To drive the
+`~/scovox_bin` delta stream straight from a recorded rosbag's LiDAR (and why it
+stays silent by default — persistent mode, subscriber-gating, and the bag having
+no `map`/`odom` TF), see
+[`docs/publish_scovox_bin_from_bag.md`](docs/publish_scovox_bin_from_bag.md).
 
 ### Exploration experiment (HMR_Explo)
 
