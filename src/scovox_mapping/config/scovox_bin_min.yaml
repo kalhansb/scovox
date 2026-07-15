@@ -1,0 +1,78 @@
+# =======================================================================
+# SCovox — MINIMAL config that GUARANTEES the ~/scovox_bin delta stream
+# =======================================================================
+# Purpose: a stripped, copy-paste starting point for anyone whose mapper is
+# NOT publishing `.../scovox_node/scovox_bin`. It sets the three things the bin
+# stream actually depends on and nothing else, so there is little to get wrong.
+#
+# Run it (one robot, LiDAR-only) — note the namespace + node name pin the topic
+# path the merger subscribes to (`/robot1/scovox_node/scovox_bin`):
+#
+#   ros2 run scovox_mapping scovox_mapping_node --ros-args \
+#     -r __ns:=/robot1 -r __node:=scovox_node \
+#     --params-file <this file> \
+#     -p use_sim_time:=true            # bag replay; drop for a live robot
+#
+# Then open the subscriber gate (gate 2 below) with the merger, OR just:
+#   ros2 topic echo /robot1/scovox_node/scovox_bin --field header
+#
+# The three gates on ~/scovox_bin (see docs/scovox_bin_manual_bringup.md):
+#   GATE 1  publisher exists ONLY in mode:=rolling      → `mode` below
+#   GATE 2  publish is subscriber-gated (0 subs = drop) → run a merger / echo
+#   GATE 3  no TF at scan stamp ⇒ scan dropped ⇒ empty map ⇒ nothing to emit
+#           → your localizer must supply map->odom->base_link and the bag/robot
+#             the base_link->sensor static (this file can't provide those).
+#
+# The `/**` key matches this node in ANY namespace (a bare node-name key only
+# matches the root namespace, so it would silently NOT apply under /robot1).
+# =======================================================================
+/**:
+  ros__parameters:
+    # ---- GATE 1: the ONLY line that creates the bin publisher --------------
+    mode: "rolling"                 # "persistent" (the shipped LiDAR base
+                                    #  configs' default) creates NO bin_pub_.
+
+    # ---- Sensor path: LiDAR-only ------------------------------------------
+    fuse_lidar_rgbd: false          # classic single-stream LiDAR path
+    input_pointcloud_topic: "/ouster/points"   # <<< EDIT: your cloud topic.
+                                    #  EMPTY string here = RGB-D mode (no LiDAR
+                                    #  subscription) — a common silent trap.
+    imu_topic: "/imu/data"          # <<< EDIT: gyro source for deskew
+    dataset_mode: false
+
+    # ---- Frames (GATE 3 lives here) ---------------------------------------
+    # The node looks up base_frame's pose in integration_frame at each scan's
+    # exact stamp; a missing TF drops the scan (map never fills, bin stays empty).
+    integration_frame: "map"        # <<< per-robot UNIQUE frame in a real fleet
+                                    #  (r1_map, r2_map, ...); "map" is fine for a
+                                    #  single-robot smoke test. header.frame_id of
+                                    #  the bin stream == this; the merger keys by it.
+    map_frame:  "map"
+    base_frame: "os_lidar"          # <<< EDIT: LiDAR ray origin frame
+
+    # ---- Low-bandwidth share controls (safe defaults) ---------------------
+    share_change_gate: true         # re-send a voxel only when it changed
+    share_rate_hz: 2.0              # coalesce deltas into a 2 Hz publish
+                                    #  (0.0 = legacy per-scan publish; still works)
+    share_roi_z_min: -0.5           # shared vertical band (map frame, m);
+    share_roi_z_max:  2.0           #  min >= max disables. KEEP IN SYNC with the
+                                    #  merger's dscovox_params.yaml share_roi_z_*.
+
+    # ---- Occupancy + grid (LiDAR physics; same as the geometric base) -----
+    resolution: 0.10
+    w_occ:  8.0
+    w_free: 4.0
+    carve_band: -1.0                # full-ray free-space carve
+    enable_tsdf: false
+    min_range: 1.0
+    max_range: 20.0
+    range_decay_length:      -1.0
+    grazing_angle_threshold: -1.0
+    deskew_mode: "auto"             # set "off" to silence the IMU-not-ready note
+    downsample_voxel_size: 0.1
+
+    # ---- TF placement: exact stamp, no stale fallback ---------------------
+    tf_lookup_timeout_sec: 1.0
+    tf_require_exact: true          # do NOT relax — the Time(0) fallback
+                                    #  mis-places whole scans (accumulation smear).
+    runtime_tf_gate: false          # NDT owns map->odom; no SLAM jump to guard.

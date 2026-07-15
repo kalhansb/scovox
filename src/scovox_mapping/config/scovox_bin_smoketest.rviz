@@ -1,0 +1,89 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Fused map (dscovox)1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Color: 160; 160; 164
+      Cell Size: 1
+      Plane: XY
+      Plane Cell Count: 40
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 1
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+      Value: true
+    # The FUSED global map every robot's merger holds — this is the payload
+    # carried by the scovox_bin stream, reconstructed by dscovox_node.
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Fused map (dscovox)
+      Enabled: true
+      Topic:
+        Value: /robot1/dscovox_node/pointcloud
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Style: Boxes
+      Size (m): 0.1
+      Color Transformer: RGB8
+      Decay Time: 0
+      Position Transformer: XYZ
+      Value: true
+    # robot1's OWN local map (before fusion). Disabled by default to keep the
+    # fused map uncluttered; tick it on to compare source vs fused.
+    - Class: rviz_default_plugins/PointCloud2
+      Name: robot1 local (scovox)
+      Enabled: false
+      Topic:
+        Value: /robot1/scovox_node/pointcloud
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 255; 170; 0
+      Decay Time: 0
+      Position Transformer: XYZ
+      Value: false
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 30
+      Pitch: 0.6
+      Yaw: 0.8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+    Saved: ~
+Window Geometry:
+  Height: 800
+  Width: 1200
+  Displays:
+    collapsed: false
