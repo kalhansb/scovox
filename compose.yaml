@@ -35,8 +35,12 @@ services:
     # PRIME/Optimus laptop the RViz launch must also export
     # __NV_PRIME_RENDER_OFFLOAD=1 + __GLX_VENDOR_LIBRARY_NAME=nvidia (see
     # run_fused_experiment.sh); DRIVER_CAPABILITIES=all pulls in the GLX libs.
+    # GPU passthrough: `runtime: nvidia` + NVIDIA_VISIBLE_DEVICES/DRIVER_CAPABILITIES
+    # (in environment below) is the portable mechanism. The `gpus: all` short syntax
+    # needs Compose >= v2.30; this host runs v2.26, which rejects it as an unknown
+    # property. runtime+env gives the same full-GPU access (verified: nvidia-smi -L
+    # lists the Quadro P2000 inside the container).
     runtime: nvidia
-    gpus: all
     environment:
       - DISPLAY=${DISPLAY:-}
       - QT_X11_NO_MITSHM=1
