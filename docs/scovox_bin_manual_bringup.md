@@ -46,7 +46,7 @@ sourced (`source /opt/ros/jazzy/setup.bash; source /scovox/install/setup.bash`).
 ```bash
 colcon build --packages-select scovox_mapping   # pick up the new launch/config
 source install/setup.bash
-ros2 launch scovox_mapping dscovox.launch.py \
+ros2 launch scovox_mapping dscovox_single_robot.launch.py \
     robot:=robot1 cloud_topic:=/ouster/points base_frame:=os_lidar
 ```
 
@@ -218,6 +218,6 @@ scovox_bin present, `topic hz` silent
 ## See also
 
 - [scovox_bin_min.yaml](../src/scovox_mapping/config/scovox_bin_min.yaml) — minimal params that guarantee the stream
-- [dscovox.launch.py](../src/scovox_mapping/launch/dscovox.launch.py) — one-shot known-good bring-up
+- [dscovox_single_robot.launch.py](../src/scovox_mapping/launch/dscovox_single_robot.launch.py) — one-shot single-robot dscovox map (rolling mapper + merger)
 - [publish_scovox_bin_from_bag.md](publish_scovox_bin_from_bag.md) — bag-driven variant
 - [distributed_mapping_lidar.md](distributed_mapping_lidar.md) — full multi-robot runbook

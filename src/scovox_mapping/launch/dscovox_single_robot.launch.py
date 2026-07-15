@@ -1,10 +1,12 @@
 # =======================================================================
-# scovox_bin smoke test — minimal KNOWN-GOOD bring-up of the delta stream.
+# dscovox — SINGLE-ROBOT dscovox map bring-up (rolling mapper + merger).
 # =======================================================================
-# One rolling-mode mapper + one merger, correctly namespaced so the topic path
-# is exactly `/<robot>/scovox_node/scovox_bin` (what dscovox subscribes to).
-# Use it as a reference when a mapper is NOT publishing scovox_bin: if the topic
-# flows HERE but not in your setup, the difference is your config (almost always
+# One rolling-mode mapper feeds one merger, which reconstructs the fused
+# `dscovox` map on `/<robot>/dscovox_node/pointcloud`. Correctly namespaced so
+# the delta topic is exactly `/<robot>/scovox_node/scovox_bin` (what the merger
+# subscribes to). Doubles as the KNOWN-GOOD reference when a mapper is NOT
+# publishing scovox_bin: if the topic flows HERE but not in your setup, the
+# difference is your config (almost always
 # mode != rolling, or a namespace/node-name mismatch). See
 # docs/scovox_bin_manual_bringup.md for the full step-by-step diagnosis.
 #
@@ -16,10 +18,10 @@
 #     and the map — hence the bin stream — stays empty (GATE 3).
 #
 # Examples (run inside the scovox container after `colcon build`):
-#   ros2 launch scovox_mapping dscovox.launch.py
-#   ros2 launch scovox_mapping dscovox.launch.py \
+#   ros2 launch scovox_mapping dscovox_single_robot.launch.py
+#   ros2 launch scovox_mapping dscovox_single_robot.launch.py \
 #       robot:=robot1 cloud_topic:=/ouster/points base_frame:=os_lidar
-#   ros2 launch scovox_mapping dscovox.launch.py with_merger:=false
+#   ros2 launch scovox_mapping dscovox_single_robot.launch.py with_merger:=false
 #
 # Verify (another shell in the container):
 #   ros2 topic list | grep scovox_bin
@@ -32,8 +34,10 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-# Deployment-specific knobs. Defaults reproduce the LiDAR-only distributed
-# experiment (Ouster cloud + os_lidar origin, sim time for bag replay).
+# Deployment-specific knobs. Defaults target single-robot viz: Ouster cloud +
+# os_lidar origin, sim time for bag replay, and the map-extent knobs OPENED UP
+# (z-band off, max_range 40 m) so the fused map isn't clipped. Tighten the
+# share_roi_z_*/max_range args to match the low-bandwidth distributed experiment.
 _ARGS = {
     "robot": ("robot1", "Namespace + node-name pin: topic becomes /<robot>/scovox_node/scovox_bin"),
     "cloud_topic": ("/ouster/points", "Input LiDAR PointCloud2 topic (EMPTY = RGB-D mode — no bin)"),
@@ -43,6 +47,11 @@ _ARGS = {
     "map_frame": ("map", "Global/world frame"),
     "use_sim_time": ("true", "Use /clock (true for bag replay, false for a live robot)"),
     "deskew_mode": ("auto", "auto|on|off — 'off' silences the IMU-not-ready note"),
+    # ---- Map-extent knobs (how far/tall the FUSED dscovox map reaches) ------
+    "min_range": ("1.0", "Per-scan min integration range (m)"),
+    "max_range": ("40.0", "Per-scan max integration range (m) — RAISE to widen the map's radial footprint"),
+    "share_roi_z_min": ("0.0", "Vertical share-band lower bound (m, map frame); wired to BOTH mapper+merger"),
+    "share_roi_z_max": ("0.0", "Vertical share-band upper bound (m). min>=max (0/0) = band OFF → full vertical extent. Set e.g. -0.5/2.0 to clip"),
     "with_merger": ("true", "Also start a dscovox merger so the subscriber gate (GATE 2) opens"),
 }
 
@@ -78,12 +87,12 @@ def launch_setup(context, *args, **kwargs):
             # LiDAR occupancy defaults (mirror config/scovox_lidar_geometric.yaml)
             "resolution": 0.10,
             "w_occ": 8.0, "w_free": 4.0, "carve_band": -1.0,
-            "min_range": 1.0, "max_range": 20.0,
+            "min_range": float(g["min_range"]), "max_range": float(g["max_range"]),
             "enable_tsdf": False,
             # Low-bandwidth share controls
             "share_change_gate": True,
             "share_rate_hz": 2.0,
-            "share_roi_z_min": -0.5, "share_roi_z_max": 2.0,
+            "share_roi_z_min": float(g["share_roi_z_min"]), "share_roi_z_max": float(g["share_roi_z_max"]),
             # Exact-stamp TF; never fall back to a stale Time(0) pose (GATE 3)
             "tf_require_exact": True,
             "tf_lookup_timeout_sec": 1.0,
@@ -104,7 +113,8 @@ def launch_setup(context, *args, **kwargs):
             "use_sim_time": use_sim_time,
             "input_topics": [bin_topic],
             "map_frame": g["map_frame"],
-            "share_roi_z_min": -0.5, "share_roi_z_max": 2.0,  # keep in sync with the sender
+            "share_roi_z_min": float(g["share_roi_z_min"]),   # keep in sync with the sender
+            "share_roi_z_max": float(g["share_roi_z_max"]),
             "pointcloud_min_interval_s": 0.5,
         }],
     )
