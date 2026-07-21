@@ -776,54 +776,45 @@ private:
     return true;
   }
 
-  void onImages(const sensor_msgs::msg::Image::ConstSharedPtr& depth, const sensor_msgs::msg::Image::ConstSharedPtr& seg) {
-    auto t_start = std::chrono::high_resolution_clock::now();
-    split_map_->resetTiming();
-    ++frame_recv_;
-    uint16_t replay_idx = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
-    last_input_stamp_ = rclcpp::Time(depth->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
-    if (!have_di_.load(std::memory_order_acquire)) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: waiting for CameraInfo", frame_recv_, replay_idx); return; }
-    std::unique_lock<std::shared_mutex> lock(map_mtx_);
-    if (depth->width != seg->width || depth->height != seg->height) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: size mismatch", frame_recv_, replay_idx); return; }
-    if (std::abs(rclcpp::Time(seg->header.stamp).seconds() - rclcpp::Time(depth->header.stamp).seconds()) > 0.05) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: timestamp mismatch dt=%.3f", frame_recv_, replay_idx, std::abs(rclcpp::Time(seg->header.stamp).seconds() - rclcpp::Time(depth->header.stamp).seconds())); return; }
-    const int W = (int)depth->width, H = (int)depth->height;
-    const double fx = di_.k[0], fy = di_.k[4], cx = di_.k[2], cy = di_.k[5];
-    const bool d16 = (depth->encoding == enc::TYPE_16UC1 || depth->encoding == enc::MONO16);
-    const bool d32 = (depth->encoding == enc::TYPE_32FC1);
-    if (!d16 && !d32) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Bad depth enc"); return; }
-    const bool srgb8 = (seg->encoding==enc::RGB8||seg->encoding==enc::BGR8||seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
-    if (!srgb8) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Bad seg enc"); return; }
-    const float dsc = d16 ? 0.001f : 1.0f;
-    const int st = stride_;
-    const bool rgba = (seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
-    const int sch = rgba ? 4 : 3;
-    const bool srgb = (seg->encoding==enc::RGB8||seg->encoding==enc::RGBA8);
-    // RGB-D semantic frames MUST integrate at the EXACT capture-time pose. The old
-    // code fell back to Time(0) (latest pose) on an exact-stamp miss, but seg adds
-    // ~250 ms of inference latency, so the depth stamp is ~250 ms old and "latest"
-    // is ahead by the robot's motion — those semantic points smear into the map
-    // (~5% of frames in testing). Reject instead: drop the frame on any exact-stamp
-    // miss. (LiDAR onPointCloud keeps its own fallback; this policy is RGB-D only.)
-    Eigen::Isometry3f T_oo;
-    try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rclcpp::Duration::from_seconds(0.2)));
-    } catch (const std::exception& e) {
-      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
-      return;
-    }
-    RCLCPP_DEBUG(get_logger(), "recv=%zu replay=%u: TF exact match", frame_recv_, replay_idx);
-    static const Eigen::Matrix3f kR = (Eigen::Matrix3f() << 0,0,1, -1,0,0, 0,-1,0).finished();
-    T_oo.linear() = T_oo.linear() * kR;
-    Eigen::Vector3f O;
-    const std::string& obs_frame = fuse_lidar_rgbd_ ? rgbd_base_frame_ : base_frame_;
-    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, depth->header.stamp, rclcpp::Duration::from_seconds(0.2));
-      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
-    } catch (const std::exception& e) {
-      // Same exact-stamp-or-reject policy for the ray-origin (observer) pose.
-      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: observer TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
-      return;
-    }
+  // ── Snapshot/integrate seam (RGB-D) ─────────────────────────────────────
+  // The sensor callback captures the frame and the capture-time pose into a
+  // DepthSnapshot, then hands it to integrateDepthSnapshot below. Integration
+  // reads pose from the snapshot only — no TF touch — so the map update depends
+  // solely on the bundled pose, mirroring dscovox's pose-rides-with-the-data.
+  struct DepthSnapshot {
+    sensor_msgs::msg::Image::ConstSharedPtr depth;
+    sensor_msgs::msg::Image::ConstSharedPtr seg;
+    Eigen::Isometry3f T_oo;   // int_frame_ <- optical, kR already applied
+    Eigen::Vector3f   O;      // observer (ray origin) in int_frame_
+    int W{0}, H{0};
+    double fx{0}, fy{0}, cx{0}, cy{0};
+    bool d16{false};
+    float dsc{1.0f};
+    int st{1}, sch{3};
+    bool srgb{false};
+  };
+  struct DepthIntegrateResult {
+    bool admitted{false};   // false => frame-admission gate rejected the pose
+    std::chrono::high_resolution_clock::time_point t_tf{};
+    std::chrono::high_resolution_clock::time_point t_integrate{};
+  };
+
+  // Integrate a snapshotted RGB-D frame. Body is the former onImages integrate
+  // block verbatim; pose/frame inputs are now read from `s` (const aliases
+  // below) instead of captured live. No tf_buffer_ call inside this function.
+  DepthIntegrateResult integrateDepthSnapshot(const DepthSnapshot& s) {
+    const auto& depth = s.depth;
+    const auto& seg = s.seg;
+    const Eigen::Isometry3f& T_oo = s.T_oo;
+    const Eigen::Vector3f& O = s.O;
+    const int W = s.W, H = s.H;
+    const double fx = s.fx, fy = s.fy, cx = s.cx, cy = s.cy;
+    const bool d16 = s.d16;
+    const float dsc = s.dsc;
+    const int st = s.st, sch = s.sch;
+    const bool srgb = s.srgb;
     // --- Frame-admission gate: TF stability + runtime divergence + reject ---
-    if (!admitFrame(O)) return;
+    if (!admitFrame(O)) return {};
     decayTransientFrame();
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
@@ -884,6 +875,69 @@ private:
     carveNoReturnRays(O, nr_eps, rgbdProf());
     split_map_->flushCarveFrame();
     auto t_integrate = std::chrono::high_resolution_clock::now();
+    return {true, t_tf, t_integrate};
+  }
+
+  void onImages(const sensor_msgs::msg::Image::ConstSharedPtr& depth, const sensor_msgs::msg::Image::ConstSharedPtr& seg) {
+    auto t_start = std::chrono::high_resolution_clock::now();
+    split_map_->resetTiming();
+    ++frame_recv_;
+    uint16_t replay_idx = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
+    last_input_stamp_ = rclcpp::Time(depth->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
+    if (!have_di_.load(std::memory_order_acquire)) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: waiting for CameraInfo", frame_recv_, replay_idx); return; }
+    std::unique_lock<std::shared_mutex> lock(map_mtx_);
+    if (depth->width != seg->width || depth->height != seg->height) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: size mismatch", frame_recv_, replay_idx); return; }
+    if (std::abs(rclcpp::Time(seg->header.stamp).seconds() - rclcpp::Time(depth->header.stamp).seconds()) > 0.05) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: timestamp mismatch dt=%.3f", frame_recv_, replay_idx, std::abs(rclcpp::Time(seg->header.stamp).seconds() - rclcpp::Time(depth->header.stamp).seconds())); return; }
+    const int W = (int)depth->width, H = (int)depth->height;
+    const double fx = di_.k[0], fy = di_.k[4], cx = di_.k[2], cy = di_.k[5];
+    const bool d16 = (depth->encoding == enc::TYPE_16UC1 || depth->encoding == enc::MONO16);
+    const bool d32 = (depth->encoding == enc::TYPE_32FC1);
+    if (!d16 && !d32) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Bad depth enc"); return; }
+    const bool srgb8 = (seg->encoding==enc::RGB8||seg->encoding==enc::BGR8||seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
+    if (!srgb8) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Bad seg enc"); return; }
+    const float dsc = d16 ? 0.001f : 1.0f;
+    const int st = stride_;
+    const bool rgba = (seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
+    const int sch = rgba ? 4 : 3;
+    const bool srgb = (seg->encoding==enc::RGB8||seg->encoding==enc::RGBA8);
+    // RGB-D semantic frames MUST integrate at the EXACT capture-time pose. The old
+    // code fell back to Time(0) (latest pose) on an exact-stamp miss, but seg adds
+    // ~250 ms of inference latency, so the depth stamp is ~250 ms old and "latest"
+    // is ahead by the robot's motion — those semantic points smear into the map
+    // (~5% of frames in testing). Reject instead: drop the frame on any exact-stamp
+    // miss. (LiDAR onPointCloud keeps its own fallback; this policy is RGB-D only.)
+    Eigen::Isometry3f T_oo;
+    try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rclcpp::Duration::from_seconds(0.2)));
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
+      return;
+    }
+    RCLCPP_DEBUG(get_logger(), "recv=%zu replay=%u: TF exact match", frame_recv_, replay_idx);
+    static const Eigen::Matrix3f kR = (Eigen::Matrix3f() << 0,0,1, -1,0,0, 0,-1,0).finished();
+    T_oo.linear() = T_oo.linear() * kR;
+    Eigen::Vector3f O;
+    const std::string& obs_frame = fuse_lidar_rgbd_ ? rgbd_base_frame_ : base_frame_;
+    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, depth->header.stamp, rclcpp::Duration::from_seconds(0.2));
+      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
+    } catch (const std::exception& e) {
+      // Same exact-stamp-or-reject policy for the ray-origin (observer) pose.
+      RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: observer TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
+      return;
+    }
+    // --- Snapshot complete: bundle the parsed frame + capture-time pose, then
+    // integrate. integrateDepthSnapshot reads pose ONLY from the snapshot — it
+    // performs no live TF lookup (snapshot/integrate seam). ---
+    DepthSnapshot snap;
+    snap.depth = depth; snap.seg = seg;
+    snap.T_oo = T_oo;   snap.O = O;
+    snap.W = W;   snap.H = H;
+    snap.fx = fx; snap.fy = fy; snap.cx = cx; snap.cy = cy;
+    snap.d16 = d16; snap.dsc = dsc;
+    snap.st = st; snap.sch = sch; snap.srgb = srgb;
+    const DepthIntegrateResult res = integrateDepthSnapshot(snap);
+    if (!res.admitted) return;   // frame-admission gate rejected the pose
+    const auto t_tf = res.t_tf;
+    const auto t_integrate = res.t_integrate;
     size_t bin_bytes_ = 0;
     if (bin_pub_) {
       // share_rate_hz > 0: the share timer owns the publish. Touched coords
@@ -1030,58 +1084,38 @@ private:
     return deskew_table_.size() >= 2;
   }
 
-  // ── PointCloud2 input path (LiDAR) ──────────────────────────────────────
-  void onPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud) {
-    auto t_start = std::chrono::high_resolution_clock::now();
-    split_map_->resetTiming();
-    ++frame_recv_;
-    uint16_t replay_idx = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
-    last_input_stamp_ = rclcpp::Time(cloud->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
-    std::unique_lock<std::shared_mutex> lock(map_mtx_);
+  // ── Snapshot/integrate seam (LiDAR) ─────────────────────────────────
+  // onPointCloud snapshots the cloud + capture-time pose into a LidarSnapshot,
+  // then hands it here. Integration reads pose from the snapshot only. The one
+  // TF touch left inside is ensureLidarImuExtrinsic — a static sensor<-imu
+  // calibration (not a robot pose), the documented carve-out from the seam.
+  struct LidarSnapshot {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
+    Eigen::Isometry3f T_oi;   // int_frame_ <- sensor (no kR; LiDAR is ROS convention)
+    Eigen::Vector3f   O;      // observer (ray origin) in int_frame_
+    int off_x{-1}, off_y{-1}, off_z{-1}, off_lbl{-1}, off_t{-1};
+    uint8_t lbl_type{0}, t_type{0};
+  };
+  struct LidarIntegrateResult {
+    bool admitted{false};   // false => early-out (gate reject / malformed cloud)
+    std::chrono::high_resolution_clock::time_point t_tf{};
+    std::chrono::high_resolution_clock::time_point t_integrate{};
+    bool do_deskew{false};
+    size_t ds_in{0}, ds_out{0};
+  };
 
-    // Find field offsets
-    int off_x=-1, off_y=-1, off_z=-1, off_lbl=-1, off_t=-1;
-    uint8_t lbl_type = 0, t_type = 0;
-    for (auto& f : cloud->fields) {
-      if (f.name=="x") off_x=f.offset;
-      else if (f.name=="y") off_y=f.offset;
-      else if (f.name=="z") off_z=f.offset;
-      else if (f.name=="semantic_label") { off_lbl=f.offset; lbl_type=f.datatype; }
-      else if (f.name=="t"||f.name=="time"||f.name=="time_stamp"||f.name=="timestamp") { off_t=f.offset; t_type=f.datatype; }
-    }
-    if (off_x<0||off_y<0||off_z<0) { RCLCPP_WARN(get_logger(), "PointCloud2 missing xyz fields"); return; }
-
-    // TF: sensor frame -> integration frame (NO kR rotation — LiDAR is already ROS convention).
-    // Wait up to tf_lookup_timeout_sec_ for the EXACT-stamp pose; only fall back
-    // to Time(0) (the previous scan's pose) if tf_require_exact_ is false. A
-    // Time(0) fallback mis-places the whole scan and is the prime suspect for the
-    // accumulation smear, so it is counted + warned.
-    const auto tf_to = rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_);
-    Eigen::Isometry3f T_oi;
-    try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, cloud->header.stamp, tf_to));
-    } catch (...) {
-      ++tf_fallback_count_;
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "recv=%zu: no exact-stamp TF for %s after %.2fs (%zu fallbacks) — %s",
-        frame_recv_, cloud->header.frame_id.c_str(), tf_lookup_timeout_sec_,
-        tf_fallback_count_, tf_require_exact_ ? "DROPPING scan" : "using Time(0) (stale pose)");
-      if (tf_require_exact_) return;
-      try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05)));
-      } catch (const std::exception& e) { RCLCPP_WARN(get_logger(), "recv=%zu: TF FAILED: %s", frame_recv_, e.what()); return; } }
-
-    // Sensor origin in integration frame (same exact-stamp-then-fallback policy).
-    Eigen::Vector3f O;
-    const std::string& obs_frame = fuse_lidar_rgbd_ ? lidar_base_frame_ : base_frame_;
-    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, cloud->header.stamp, tf_to);
-      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
-    } catch (...) {
-      if (tf_require_exact_) return;
-      try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05));
-      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
-    } catch (...) { return; } }
-
+  // Integrate a snapshotted LiDAR scan. Body is the former onPointCloud
+  // integrate block verbatim; pose/field inputs are read from `s`. The only TF
+  // call is the static lidar<-imu extrinsic (ensureLidarImuExtrinsic), out of
+  // scope for the no-TF-in-integrate rule.
+  LidarIntegrateResult integrateLidarSnapshot(const LidarSnapshot& s) {
+    const auto& cloud = s.cloud;
+    const Eigen::Isometry3f& T_oi = s.T_oi;
+    const Eigen::Vector3f& O = s.O;
+    const int off_x = s.off_x, off_y = s.off_y, off_z = s.off_z, off_lbl = s.off_lbl, off_t = s.off_t;
+    const uint8_t lbl_type = s.lbl_type, t_type = s.t_type;
     // --- Frame-admission gate (shared with onImages path) ---
-    if (!admitFrame(O)) return;
+    if (!admitFrame(O)) return {};
     // In fused mode the RGB-D (onImages) callback owns transient decay — LiDAR
     // carries no dynamic-class semantics, and decaying here too would fade RGB-D's
     // person/vehicle evidence ~twice per LiDAR+RGB-D pair. Single-sensor LiDAR
@@ -1115,7 +1149,7 @@ private:
     // clouds always satisfy these (data.size() == height*row_step >=
     // width*height*point_step, and every field offset+size <= point_step).
     if (step <= 0) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "PointCloud2 has point_step=%d; dropping", step); return; }
+        "PointCloud2 has point_step=%d; dropping", step); return {}; }
     int max_field_end = std::max({off_x, off_y, off_z}) + (int)sizeof(float);
     if (off_lbl >= 0) {
       const int lbl_sz = (lbl_type == sensor_msgs::msg::PointField::UINT32) ? 4
@@ -1130,7 +1164,7 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "PointCloud2 buffer too small (point_step=%d field_end=%d size=%zu need=%zu); dropping",
         step, max_field_end, cloud->data.size(), N * (size_t)step);
-      return;
+      return {};
     }
 
     // Soft-prob: load the per-frame top-K table once. The replay node sets
@@ -1339,6 +1373,73 @@ private:
     split_map_->flushCarveFrame();  // one Beta write per carved voxel, block-ordered
 
     auto t_integrate = std::chrono::high_resolution_clock::now();
+    return {true, t_tf, t_integrate, do_deskew, ds_in, ds_out};
+  }
+
+  // ── PointCloud2 input path (LiDAR) ──────────────────────────────────────
+  void onPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud) {
+    auto t_start = std::chrono::high_resolution_clock::now();
+    split_map_->resetTiming();
+    ++frame_recv_;
+    uint16_t replay_idx = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
+    last_input_stamp_ = rclcpp::Time(cloud->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
+    std::unique_lock<std::shared_mutex> lock(map_mtx_);
+
+    // Find field offsets
+    int off_x=-1, off_y=-1, off_z=-1, off_lbl=-1, off_t=-1;
+    uint8_t lbl_type = 0, t_type = 0;
+    for (auto& f : cloud->fields) {
+      if (f.name=="x") off_x=f.offset;
+      else if (f.name=="y") off_y=f.offset;
+      else if (f.name=="z") off_z=f.offset;
+      else if (f.name=="semantic_label") { off_lbl=f.offset; lbl_type=f.datatype; }
+      else if (f.name=="t"||f.name=="time"||f.name=="time_stamp"||f.name=="timestamp") { off_t=f.offset; t_type=f.datatype; }
+    }
+    if (off_x<0||off_y<0||off_z<0) { RCLCPP_WARN(get_logger(), "PointCloud2 missing xyz fields"); return; }
+
+    // TF: sensor frame -> integration frame (NO kR rotation — LiDAR is already ROS convention).
+    // Wait up to tf_lookup_timeout_sec_ for the EXACT-stamp pose; only fall back
+    // to Time(0) (the previous scan's pose) if tf_require_exact_ is false. A
+    // Time(0) fallback mis-places the whole scan and is the prime suspect for the
+    // accumulation smear, so it is counted + warned.
+    const auto tf_to = rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_);
+    Eigen::Isometry3f T_oi;
+    try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, cloud->header.stamp, tf_to));
+    } catch (...) {
+      ++tf_fallback_count_;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "recv=%zu: no exact-stamp TF for %s after %.2fs (%zu fallbacks) — %s",
+        frame_recv_, cloud->header.frame_id.c_str(), tf_lookup_timeout_sec_,
+        tf_fallback_count_, tf_require_exact_ ? "DROPPING scan" : "using Time(0) (stale pose)");
+      if (tf_require_exact_) return;
+      try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05)));
+      } catch (const std::exception& e) { RCLCPP_WARN(get_logger(), "recv=%zu: TF FAILED: %s", frame_recv_, e.what()); return; } }
+
+    // Sensor origin in integration frame (same exact-stamp-then-fallback policy).
+    Eigen::Vector3f O;
+    const std::string& obs_frame = fuse_lidar_rgbd_ ? lidar_base_frame_ : base_frame_;
+    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, cloud->header.stamp, tf_to);
+      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
+    } catch (...) {
+      if (tf_require_exact_) return;
+      try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.05));
+      O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
+    } catch (...) { return; } }
+
+    // --- Snapshot complete: bundle the parsed cloud + capture-time pose, then
+    // integrate. integrateLidarSnapshot reads pose from the snapshot only. ---
+    LidarSnapshot snap;
+    snap.cloud = cloud;
+    snap.T_oi = T_oi; snap.O = O;
+    snap.off_x = off_x; snap.off_y = off_y; snap.off_z = off_z;
+    snap.off_lbl = off_lbl; snap.off_t = off_t;
+    snap.lbl_type = lbl_type; snap.t_type = t_type;
+    const LidarIntegrateResult res = integrateLidarSnapshot(snap);
+    if (!res.admitted) return;   // gate reject or malformed cloud
+    const auto t_tf = res.t_tf;
+    const auto t_integrate = res.t_integrate;
+    const bool do_deskew = res.do_deskew;
+    const size_t ds_in = res.ds_in, ds_out = res.ds_out;
     size_t bin_bytes_ = 0;
     if (bin_pub_) {
       // share_rate_hz > 0: the share timer owns the publish. Touched coords
@@ -1564,7 +1665,7 @@ private:
   // coords from the SemSplitMap substrate, reads each voxel's current state,
   // builds a BinarySerializer::Frame (three streams), optionally elides the
   // TSDF section per share_tsdf_, LZ4-compresses, and publishes with
-  // msg->version=4. Beta (occupancy) and Dir (semantics) cross the wire as
+  // msg->version=5. Beta (occupancy) and Dir (semantics) cross the wire as
   // SEPARATE streams — the receiver merges each with its own conjugate rule
   // (consensus_merge.hpp), losslessly.
   //
@@ -1598,14 +1699,41 @@ private:
     auto& ss = split_map_->semsplit();
 
     const size_t cur_sub = bin_pub_->get_subscription_count();
-    bool snapshot = (cur_sub > prev_sub_count_);
-    prev_sub_count_ = cur_sub;
     if (cur_sub == 0) {
+      prev_sub_count_ = cur_sub;
       (void)split_map_->drainTouchedTsdf();
       (void)split_map_->drainTouchedBeta();
       (void)split_map_->drainTouchedDir();
       return {0, 0};
     }
+
+    // Snapshot the source->map pose from TF and carry it with this update so the
+    // merger (dscovox) integrates against the bundled pose and never needs the
+    // source->map transform from its own TF tree. Capture it BEFORE advancing
+    // prev_sub_count_ or draining any touched-set: on a failed lookup we bail
+    // without consuming state, so the snapshot re-trigger and the pending deltas
+    // survive to the next tick — guaranteeing the first delta a merger ever sees
+    // pins a valid pose. (map_frame_ <- int_frame_ is identity under the
+    // integration_frame:"map" presets.)
+    geometry_msgs::msg::Transform map_from_source;
+    try {
+      // Zero timeout: under the SingleThreadedExecutor the TF listener callback
+      // runs on this same thread, so blocking here can never let a new transform
+      // arrive — the pose can only be found if it is already cached. A nonzero
+      // timeout would just burn dead wait while holding map_mtx_. On a miss we
+      // defer and retry next tick (see the catch below).
+      map_from_source = tf_buffer_.lookupTransform(
+          map_frame_, int_frame_, rclcpp::Time(0),
+          rclcpp::Duration(0, 0)).transform;
+    } catch (const tf2::TransformException& e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "publishBinaryMap: no %s <- %s transform yet (%s); deferring publish",
+        map_frame_.c_str(), int_frame_.c_str(), e.what());
+      return {0, 0};
+    }
+
+    bool snapshot = (cur_sub > prev_sub_count_);
+    prev_sub_count_ = cur_sub;
 
     scovox::BinarySerializer::Frame frame;
     frame.resolution  = static_cast<float>(split_map_->resolution());
@@ -1727,8 +1855,9 @@ private:
 
     scovox_msgs::msg::ScovoxMapBinary bin;
     bin.header.stamp    = get_clock()->now();
-    bin.header.frame_id = int_frame_;
-    bin.version         = 4;   // envelope version — dscovox onBinaryMap routes on it
+    bin.header.frame_id  = int_frame_;
+    bin.map_from_source  = map_from_source;
+    bin.version          = 5;   // envelope version — dscovox onBinaryMap routes on it
 #if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
     bin.little_endian = true;
 #else

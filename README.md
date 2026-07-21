@@ -133,8 +133,10 @@ Each robot's mapper then integrates in a **per-robot frame** (`r1_map`,
 **mandatory**: the bin stream's `header.frame_id` is the `integration_frame`,
 and the merger keys its per-source grids by that frame_id — two robots sharing
 one frame_id collapse into a single source grid and overwrite each other where
-their maps overlap. The static TF is one latched `/tf_static` sample that
-peers' mergers cache on first sight; there is no per-scan cross-robot `/tf`.
+their maps overlap. Each mapper resolves that `map ← rK_map` bridge from its own
+`/tf_static` and stamps the pose into every delta (`ScovoxMapBinary.map_from_source`);
+peers' mergers read the pose from the message and hold **no TF listener**, so no
+cross-robot `/tf` is needed.
 
 Per robot, inside the container (shown for robot 1 — substitute the
 namespace, frame, and log names; **start the merger before the mapper**: the
