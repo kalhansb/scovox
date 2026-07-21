@@ -19,17 +19,19 @@
 // The merger keeps one source grid per robot keyed by the binary's
 // header.frame_id (e.g. "atlas/odom"). Source grids are stored directly in
 // MAP-FRAME coordinates: at receive time we transform each delta voxel once
-// using the source->map TF, which is cached the first time we see that source.
+// using the source->map pose the producer captured and CARRIED in the message
+// (ScovoxMapBinary.map_from_source), cached the first time we see that source.
+// This node holds NO TF listener — the pose rides with the data.
 //
 // !! REQUIRES c-slam DISABLED !!
-// The cached source->map TF is never refreshed. This is correct only while
-// TFs are static. Re-enabling c-slam (loop closures / pose-graph
-// optimization) is a CORRECTNESS BUG: the first TF jump leaves every voxel
-// in the source grid at its old map-frame coord, producing ghost voxels at
-// pre-loop-closure positions and missing voxels at the new positions. Before
-// turning c-slam back on, refactor SourceGrid to store evidence in
-// source-frame coords + project on demand at the current TF, with a
-// per-source "TF changed → reproject" handler. See ablation entry C5 in
+// The cached source->map pose is never refreshed (first carried pose wins).
+// This is correct only while TFs are static. Re-enabling c-slam (loop closures
+// / pose-graph optimization) is a CORRECTNESS BUG: the first pose jump leaves
+// every voxel in the source grid at its old map-frame coord, producing ghost
+// voxels at pre-loop-closure positions and missing voxels at the new positions.
+// Before turning c-slam back on, refactor SourceGrid to store evidence in
+// source-frame coords + reproject on each carried-pose change, with a
+// per-source "pose changed → reproject" handler. See ablation entry C5 in
 // docs/issues/ablations_punch_list.md for the design.
 //
 // On every binary we incrementally update the fused grid by, for each touched
@@ -63,10 +65,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
-#include <tf2/time.h>
-#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/transform.hpp>
 #include <scovox/uncertainty.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -95,23 +94,24 @@ struct SourceGrid {
   // wire to dscovox in the production path.
   std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> beta_grid;
   std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  dir_grid;
-  // Cached static source->map transform. Looked up once on first sight and
-  // never refreshed — this assumes TFs are static (c-slam disabled). Under
-  // c-slam, loop closures change this TF and the cache becomes a correctness
-  // bug. See the file-header banner and C5 in ablations_punch_list.md.
+  // Cached static source->map transform. Taken from the first update's carried
+  // map_from_source pose and never refreshed — this assumes TFs are static
+  // (c-slam disabled). Under c-slam, loop closures change this transform and the
+  // cache becomes a correctness bug. See the file-header banner and C5 in
+  // ablations_punch_list.md.
   Eigen::Isometry3d T_map_source{Eigen::Isometry3d::Identity()};
-  bool tf_cached{false};
+  bool pose_cached{false};
 };
 
-inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::TransformStamped& tf) {
+inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::Transform& tf) {
   Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
-  T.translation() = Eigen::Vector3d(tf.transform.translation.x,
-                                    tf.transform.translation.y,
-                                    tf.transform.translation.z);
-  T.linear() = Eigen::Quaterniond(tf.transform.rotation.w,
-                                  tf.transform.rotation.x,
-                                  tf.transform.rotation.y,
-                                  tf.transform.rotation.z).toRotationMatrix();
+  T.translation() = Eigen::Vector3d(tf.translation.x,
+                                    tf.translation.y,
+                                    tf.translation.z);
+  T.linear() = Eigen::Quaterniond(tf.rotation.w,
+                                  tf.rotation.x,
+                                  tf.rotation.y,
+                                  tf.rotation.z).toRotationMatrix();
   return T;
 }
 
@@ -126,9 +126,7 @@ inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::TransformStamped
 class DSCovoxNode : public rclcpp::Node {
 public:
   DSCovoxNode()
-  : rclcpp::Node("dscovox_node"),
-    tf_buffer_(this->get_clock()),
-    tf_listener_(tf_buffer_)
+  : rclcpp::Node("dscovox_node")
   {
     input_topics_ = declare_parameter<std::vector<std::string>>(
         "input_topics", std::vector<std::string>{});
@@ -272,14 +270,6 @@ public:
   }
 
 private:
-  bool lookupTF(const std::string& frame, Eigen::Isometry3d& T) {
-    try {
-      T = tfToIsometry(tf_buffer_.lookupTransform(
-        map_frame_, frame, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)));
-      return true;
-    } catch (...) { return false; }
-  }
-
   // Hash/equality for Bonxai::CoordT so we can dedupe touched coords in a set.
   struct CoordTHash {
     std::size_t operator()(const Bonxai::CoordT& c) const noexcept {
@@ -311,9 +301,9 @@ private:
   // GetRegion joins the Dir grid for per-class evidence.
   // ==================================================================
   void onBinaryMap(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
-    if (msg->version != 4) {
+    if (msg->version != 5) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "wire receiver expects envelope version 4, got %d (dropping)",
+        "wire receiver expects envelope version 5, got %d (dropping)",
         msg->version);
       return;
     }
@@ -353,21 +343,12 @@ private:
     }
     if (frame.beta_deltas.empty() && frame.dir_deltas.empty()) return;
 
-    // Resolve / cache the source->map TF (static; cached on first sight).
-    Eigen::Isometry3d Tmo;
-    {
-      std::shared_lock<std::shared_mutex> rlk(mu_);
-      auto it = sources_.find(sf);
-      if (it != sources_.end() && it->second.tf_cached) {
-        Tmo = it->second.T_map_source;
-      } else {
-        rlk.unlock();
-        if (!lookupTF(sf, Tmo)) {
-          RCLCPP_WARN(get_logger(), "No TF for '%s'", sf.c_str());
-          return;
-        }
-      }
-    }
+    // The producer captured its source->map pose at publish time and carried it
+    // in the message, so the merger never touches TF. First-pose-wins: the first
+    // frame from a source pins T_map_source (below); later frames' carried poses
+    // are ignored. The static-TF / c-slam-off assumption is unchanged — only its
+    // mechanism moved from a TF lookup to the message's map_from_source.
+    const Eigen::Isometry3d Tmo = tfToIsometry(msg->map_from_source);
 
     float src_res = frame.resolution > 0.f ? frame.resolution : 0.f;
 
@@ -420,16 +401,16 @@ private:
         SourceGrid sg;
         sg.source_frame = sf;
         sg.T_map_source = Tmo;
-        sg.tf_cached = true;
+        sg.pose_cached = true;
         scovox::Params P; P.resolution = res_;
         sg.beta_grid = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
             P.resolution, P.inner_bits, P.leaf_bits);
         sg.dir_grid  = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
             P.resolution, P.inner_bits, P.leaf_bits);
         it = sources_.emplace(sf, std::move(sg)).first;
-      } else if (!it->second.tf_cached) {
+      } else if (!it->second.pose_cached) {
         it->second.T_map_source = Tmo;
-        it->second.tf_cached = true;
+        it->second.pose_cached = true;
       }
       auto& src = it->second;
       if (!src.beta_grid) {
@@ -442,7 +423,7 @@ private:
 
       // Step 1 — ingest both deltas into this source's MAP-FRAME grids.
       // Centre-sample posToCoord (floor() picks whichever map voxel contains
-      // the bulk of the source voxel's volume even when the TF is unaligned).
+      // the bulk of the source voxel's volume even when the pose is unaligned).
       std::unordered_set<Bonxai::CoordT, CoordTHash, CoordTEqual> touched_beta, touched_dir;
       touched_beta.reserve(frame.beta_deltas.size());
       touched_dir.reserve(frame.dir_deltas.size());
@@ -456,7 +437,7 @@ private:
         return Eigen::Vector3d(Te * sp);
       };
       // Shared-ROI z-band clip (see share_roi_z_min/max in the constructor).
-      // Applied to Beta AND Dir identically, in the MAP frame (post-TF).
+      // Applied to Beta AND Dir identically, in the MAP frame (post-transform).
       const bool zband = share_z_max_ > share_z_min_;
 
       {
@@ -859,8 +840,6 @@ private:
   int top_k_;
   float res_{0.f};
   std::vector<std::array<float, 3>> sem_col_;
-  tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
   // One source grid per robot, keyed by header.frame_id of incoming binaries.
   std::unordered_map<std::string, SourceGrid> sources_;
   // Split Beta/Dirichlet fused grids. Allocated lazily on the first wire

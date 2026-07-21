@@ -122,8 +122,10 @@ revision (`BinarySerializer::FORMAT_VERSION`) was bumped **4 → 5** with this
 change: the wire *layout* is byte-identical, but a revision-4 (calibrated-prior)
 node and a revision-5 (`Beta(1,1)`) node now reject each other's frames at
 `deserialize` (the frame is dropped with a warning) instead of merging under
-mismatched priors. The ROS envelope `version` stays `4` (it routes to this
-codec).
+mismatched priors. The ROS envelope `version` is a **separate** number (it routes
+the message, not the blob) and must not be conflated with this codec revision: it
+was independently bumped **4 → 5** when `map_from_source` was added to
+`ScovoxMapBinary` (so the merger carries the source→map pose instead of reading TF).
 
 ## 10. Entropy / EIG / SSMI
 

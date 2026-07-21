@@ -62,8 +62,12 @@ merger keys its per-source grids by that frame_id. **Each robot must therefore m
 in a unique frame** (`r1_map`, `r2_map`, …) bridged to `map` by an identity static
 TF. If two robots both integrate directly in `map`, their streams collapse into one
 source grid inside every merger and overwrite each other wherever their maps
-overlap. The identity TF is a single latched `/tf_static` sample that peers' mergers
-cache on first sight — there is no per-scan cross-robot `/tf`.
+overlap. Each robot's **mapper** resolves that `map ← rK_map` bridge from its own
+local `/tf_static` at publish time and stamps the resulting pose into every delta
+(`ScovoxMapBinary.map_from_source`). Mergers read that pose straight from the message
+and run **no TF listener at all**, so no robot's localization TF ever has to reach
+another robot's merger; each merger pins the **first** pose it sees per source (the
+static-bridge assumption — c-SLAM re-alignment is out of scope).
 
 Also: **start the merger before the mapper.** The bin publish is subscriber-gated —
 deltas are drained (discarded) while nobody listens, and the mapper only re-sends a
