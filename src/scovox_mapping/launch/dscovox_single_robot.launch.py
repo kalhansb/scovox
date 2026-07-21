@@ -89,6 +89,11 @@ def launch_setup(context, *args, **kwargs):
             "w_occ": 8.0, "w_free": 4.0, "carve_band": -1.0,
             "min_range": float(g["min_range"]), "max_range": float(g["max_range"]),
             "enable_tsdf": False,
+            # Per-scan sensor-frame voxel downsample BEFORE integration: collapses
+            # the dense Hesai over-sampling (~115k pts) to one return per 0.10 m
+            # voxel = the map resolution, so it's near-lossless for occupancy but
+            # cuts the full-ray carve cost (frame_ms ~700ms -> keeps up at 0.5x).
+            "downsample_voxel_size": 0.10,
             # Low-bandwidth share controls
             "share_change_gate": True,
             "share_rate_hz": 2.0,
