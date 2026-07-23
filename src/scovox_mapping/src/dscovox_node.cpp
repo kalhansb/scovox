@@ -352,6 +352,16 @@ private:
 
     float src_res = frame.resolution > 0.f ? frame.resolution : 0.f;
 
+    // Captured inside the lock, logged after release (keeps the info log out of
+    // the critical section). Report the integration of this source's update into
+    // the fused map: how much arrived, how much it touched, and the fleet size.
+    bool   new_source      = false;   // first frame ever seen from this source
+    size_t n_beta_deltas   = frame.beta_deltas.size();
+    size_t n_dir_deltas    = frame.dir_deltas.size();
+    size_t n_touched_beta  = 0;       // fused occupancy cells this frame changed
+    size_t n_touched_dir   = 0;       // fused semantic  cells this frame changed
+    size_t n_sources       = 0;       // robots currently contributing to the fusion
+
     {
       std::unique_lock<std::shared_mutex> lk(mu_);
       // Reject num_classes==0 outright (invalid Dirichlet dimension): pinning it
@@ -408,6 +418,7 @@ private:
         sg.dir_grid  = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
             P.resolution, P.inner_bits, P.leaf_bits);
         it = sources_.emplace(sf, std::move(sg)).first;
+        new_source = true;
       } else if (!it->second.pose_cached) {
         it->second.T_map_source = Tmo;
         it->second.pose_cached = true;
@@ -495,7 +506,26 @@ private:
           source_accs.emplace_back(sources_.at(*k).dir_grid->createAccessor());
         for (const auto& mc : touched_dir) refoldCellDir(mc, fa, source_accs);
       }
+
+      // Snapshot the counts for the post-lock info log below.
+      n_touched_beta = touched_beta.size();
+      n_touched_dir  = touched_dir.size();
+      n_sources      = sources_.size();
     }  // unique_lock released
+
+    // Announce the integration of this source's map update into the fused map.
+    // A brand-new robot joining the fusion is a distinct, notable event, so it
+    // gets its own line before the per-update detail.
+    if (new_source) {
+      RCLCPP_INFO(get_logger(),
+        "dscovox: new robot source '%s' joined the fused map (now %zu source%s)",
+        sf.c_str(), n_sources, n_sources == 1 ? "" : "s");
+    }
+    RCLCPP_INFO(get_logger(),
+      "dscovox: integrated update from '%s' — occupancy %zu deltas / %zu fused cells, "
+      "semantics %zu deltas / %zu fused cells (%zu source%s fused)",
+      sf.c_str(), n_beta_deltas, n_touched_beta, n_dir_deltas, n_touched_dir,
+      n_sources, n_sources == 1 ? "" : "s");
 
     // The fused grid changed; mark it so the publish timer re-publishes the
     // fused-map topic on its next tick (and only then). Reaching here implies
