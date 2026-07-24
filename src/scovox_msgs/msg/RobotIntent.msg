@@ -35,3 +35,22 @@ float32 ttl_sec
 # Diagnostic: which planner produced this claim.
 # 0 = eig, 1 = entropy, 2 = frontier, 3 = random
 uint8 planner_type
+
+# --- Exploitation coupling (team-quota vantage sharing) ---
+# When exploit is true this claim is an exploit hop (vantage or approach) on
+# tree target `target_id`, and goal_pos is the claimed vantage — peers doing
+# the same target use MinPos with a small per-vantage radius to take a
+# different angle. exploit=false (exploration claims) leaves target_id and
+# dwelled_mask zero; target_id alone is not a discriminator because a
+# detector may legitimately emit id 0.
+bool exploit
+uint32 target_id
+
+# Bitmask of vantage indices on target_id that the producer has dwelled at
+# with a clear line of sight. The vantage ring is deterministic from the
+# trunk (center, radius), so index k names the same pose on every robot.
+# Peers OR this into their local target state: the team's union of clear-LoS
+# dwells counts toward min_vantages_required (team quota), so the ring is
+# captured once, cooperatively. Cumulative-state (not per-event) so a lost
+# message never loses credit. Supports n_vantages <= 32.
+uint32 dwelled_mask
