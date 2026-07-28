@@ -189,7 +189,7 @@ rebuild or copy:
 
 * [`config/exploration_fused_bag.yaml`](config/exploration_fused_bag.yaml) —
   explo_planner param set: terrain-relative 3D mode, straight-line candidate
-  costs (`require_planning_map: false`, no 2D planning_map — the file header
+  costs (`use_planning_map: false`, no 2D planning_map — the file header
   carries the rationale).
 * [`config/explo_experiment.rviz`](config/explo_experiment.rviz) — RViz
   layout for the run (semantic cloud, candidate arrows, selected goal).
