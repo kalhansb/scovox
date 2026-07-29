@@ -40,18 +40,10 @@
 #   ros2 topic hz /dscovox_mapping/pointcloud
 #   # the merger console (output=screen) should reach: dscovox_diag: sources=2 ...
 # =======================================================================
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-
-# Shaper tuning (burst/chunk/tick/history) comes from the yaml so editing it
-# affects a launch bring-up; the inline dict overrides only topics + rate.
-_SHAPER_YAML = os.path.join(
-    get_package_share_directory("scovox_mapping"), "config", "share_shaper.yaml")
 
 
 # ---- Per-robot deployment table --------------------------------------------
@@ -93,42 +85,19 @@ _ARGS = {
     "share_roi_z_min": ("0.0", "Vertical share-band lower bound (m, map frame); wired to mapper+merger"),
     "share_roi_z_max": ("0.0", "Vertical share-band upper bound (m). min>=max (0/0) = band OFF"),
     "resolution": ("0.10", "Voxel size (m)"),
-    "with_shaper": ("false", "Insert a share_shaper egress pacer per robot; the merger then reads "
-                             "the SHAPED topics (on-one-host analog of the radio deployment)"),
-    "shaper_rate_mbps": ("5.0", "share_shaper token-bucket rate (Mbps on the wire, per robot)"),
 }
 
 
 def launch_setup(context, *args, **kwargs):
     g = {k: LaunchConfiguration(k).perform(context) for k in _ARGS}
     use_sim_time = str(g["use_sim_time"]).lower() in ("1", "true", "yes", "on")
-    with_shaper = str(g["with_shaper"]).lower() in ("1", "true", "yes", "on")
     map_frame = g["map_frame"]
 
     nodes = []
-    merger_inputs = []
+    bin_topics = []
     for r in _ROBOTS:
         bin_topic = f"/{r['name']}/scovox_node/scovox_bin"
-        # with_shaper:=true routes each robot's stream through its shaper, and
-        # the merger reads the shaped topics — the on-one-host analog of a peer
-        # over the radio. (In the real fleet each robot's OWN merger stays on
-        # its raw loopback topic; see dscovox_params.yaml.)
-        merger_inputs.append(
-            f"/{r['name']}/share_shaper/scovox_bin_shaped" if with_shaper
-            else bin_topic)
-        if with_shaper:
-            nodes.append(Node(
-                package="scovox_mapping",
-                executable="share_shaper_node",
-                namespace=r["name"],
-                name="share_shaper",
-                output="screen",
-                parameters=[_SHAPER_YAML, {
-                    "use_sim_time": use_sim_time,
-                    "input_topic": bin_topic,
-                    "target_rate_mbps": float(g["shaper_rate_mbps"]),
-                }],
-            ))
+        bin_topics.append(bin_topic)
 
         # Rolling-mode mapper: builds this robot's occupancy map in its UNIQUE
         # integration_frame and publishes the LZ4 delta stream (~/scovox_bin).
@@ -191,7 +160,7 @@ def launch_setup(context, *args, **kwargs):
         output="screen",
         parameters=[{
             "use_sim_time": use_sim_time,
-            "input_topics": merger_inputs,
+            "input_topics": bin_topics,
             "map_frame": map_frame,
             "pointcloud_topic": "/dscovox_mapping/pointcloud",
             "share_roi_z_min": float(g["share_roi_z_min"]),   # keep in sync with senders

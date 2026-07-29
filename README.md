@@ -176,8 +176,13 @@ full-map snapshot in ONE message, landing on the WiFi at the moment the link
 is weakest. Running one shaper per robot repacks that robot's stream into
 token-bucket-paced chunks (default 5 Mbps / 128 KB per message) on
 `~/scovox_bin_shaped`; peer mergers subscribe to the shaped topic, while each
-robot's own merger stays on the raw loopback topic (see the `input_topics`
-note in `dscovox_params.yaml`). Reconnects are detected via publisher matched
+robot's own merger stays on the raw loopback topic — so `input_topics` becomes
+per-robot (own stream raw, peers shaped) rather than the fleet-wide raw list
+that [`dscovox_params.yaml`](src/scovox_mapping/config/dscovox_params.yaml)
+ships; override it on the command line. Subscribing to a peer's *raw* stream
+over the radio defeats the shaper (the one-message snapshot dump comes back).
+No launch file or shipped merger config wires the shaper yet — run it by hand
+as below. Reconnects are detected via publisher matched
 events and answered with a paced full resync instead of the burst. Pacing is
 lossless — the merger ingest is snapshot-replace per source voxel, so the
 shaper's latest-value store coalesces without corruption and the rate knob only

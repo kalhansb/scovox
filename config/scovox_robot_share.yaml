@@ -30,18 +30,6 @@
 #
 #      ros2 run tf2_ros static_transform_publisher \
 #        --frame-id map --child-frame-id r1_map
-#
-# Radio deployments — egress shaping (Tier 2):
-#   Also run one share_shaper_node per robot (see
-#   src/scovox_mapping/config/share_shaper.yaml). It repacks this robot's
-#   ~/scovox_bin into token-bucket-paced chunks on ~/scovox_bin_shaped, so the
-#   radio never sees the one-message full-map snapshot burst a (re)connecting
-#   peer otherwise triggers. Peers' mergers then subscribe to the SHAPED
-#   topic; each robot's own merger stays on the raw loopback topic (see the
-#   input_topics note in dscovox_params.yaml).
-#
-#   ros2 run scovox_mapping share_shaper_node --ros-args -r __ns:=/robot1 \
-#     --params-file /scovox/src/scovox_mapping/config/share_shaper.yaml
 # =======================================================================
 /**:
   ros__parameters:
