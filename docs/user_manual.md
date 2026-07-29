@@ -16,7 +16,7 @@ runbooks rather than repeating them.
 6. [Configuration reference](#6-configuration-reference)
 7. [Verifying a healthy map](#7-verifying-a-healthy-map)
 8. [Troubleshooting](#8-troubleshooting)
-9. [Bandwidth tuning & radio pacing](#9-bandwidth-tuning--radio-pacing)
+9. [Bandwidth tuning](#9-bandwidth-tuning)
 10. [Where to go deeper](#10-where-to-go-deeper)
 
 ---
@@ -76,12 +76,6 @@ Each robot runs the **same three programs**:
    scan into a local voxel map and publishes the `~/scovox_bin` delta stream.
 3. **DScovox merger** (`dscovox_mapping_node`) — subscribes to all robots' delta
    streams and fuses them. Its output is that robot's copy of the global map.
-
-On a **radio** fleet there is an optional fourth program per robot, the
-**share shaper** (`share_shaper_node`): it sits between that robot's mapper and
-the air, and hands peers a rate-paced copy of the delta stream
-(`~/scovox_bin_shaped`) instead of the raw bursts. On wired/single-host setups
-you don't need it. See [§9](#9-bandwidth-tuning--radio-pacing).
 
 ### Two rules that make fusion work
 
@@ -164,10 +158,6 @@ auto-publishes the identity `map → integration_frame` static TF when needed. I
 doubles as the **known-good reference**: if the bin stream flows here but not in
 your setup, the difference is your config.
 
-Add `with_shaper:=true` (optionally `shaper_rate_mbps:=…`) to route the stream
-through the egress pacer and have the merger read the **shaped** topic — a
-single-host rehearsal of the radio chain ([§9](#9-bandwidth-tuning--radio-pacing)).
-
 ### 4b. Multi-robot from bags (single-host fusion demo)
 
 Two independently-recorded robots (`bunker`, `curt`) each localize against the
@@ -177,10 +167,6 @@ both. Full walkthrough: [dscovox_multi_robot_run.md](dscovox_multi_robot_run.md)
 ```bash
 # SCovox mappers (one per robot, unique frames) + one merger:
 ros2 launch scovox_mapping dscovox_multi_robot.launch.py use_sim_time:=true
-
-# …or with a per-robot egress pacer in front of the merger (radio rehearsal):
-ros2 launch scovox_mapping dscovox_multi_robot.launch.py use_sim_time:=true \
-    with_shaper:=true shaper_rate_mbps:=5.0
 ```
 
 Then bring up both localizers, and **play the bags sequentially** (earlier
@@ -194,13 +180,11 @@ The production topology — per-robot localizer → identity static TF → merge
 mapper, no central server. Set each robot up identically, changing only the
 per-robot index:
 
-| per-robot value        | robot 1                                  | robot 2                                  |
-|------------------------|------------------------------------------|------------------------------------------|
-| namespace (`__ns`)     | `/robot1`                                | `/robot2`                                |
-| `integration_frame`    | `r1_map`                                 | `r2_map`                                 |
-| static-TF child frame  | `r1_map`                                 | `r2_map`                                 |
-| raw stream (loopback)  | `/robot1/scovox_node/scovox_bin`         | `/robot2/scovox_node/scovox_bin`         |
-| shaped stream (radio)  | `/robot1/share_shaper/scovox_bin_shaped` | `/robot2/share_shaper/scovox_bin_shaped` |
+| per-robot value       | robot 1     | robot 2     |
+|-----------------------|-------------|-------------|
+| namespace (`__ns`)    | `/robot1`   | `/robot2`   |
+| `integration_frame`   | `r1_map`    | `r2_map`    |
+| static-TF child frame | `r1_map`    | `r2_map`    |
 
 Mapper bring-up (LiDAR-only) = base config + share overlay + the one per-robot
 frame:
@@ -219,29 +203,12 @@ ros2 run scovox_mapping scovox_mapping_node --ros-args \
     --params-file /scovox/config/scovox_lidar_geometric.yaml \
     --params-file /scovox/config/scovox_robot_share.yaml \
     -p integration_frame:=r1_map
-
-# on a radio link, also the egress pacer (what the PEERS subscribe to)
-ros2 run scovox_mapping share_shaper_node --ros-args -r __ns:=/robot1 \
-    --params-file /scovox/src/scovox_mapping/config/share_shaper.yaml
 ```
 
 For the fused (semantic) path, swap the base config to
 `scovox_fused_lidar_rgbd.yaml` and feed the seg pipeline's RGB-D/segmentation
-topics.
-
-On **every** robot, extend `input_topics` in `dscovox_params.yaml` to list the
-whole fleet's streams. Without a shaper that's every robot's raw
-`~/scovox_bin`. With shapers, each merger takes **its own robot raw + every peer
-shaped**:
-
-```yaml
-# robot 1's dscovox_params.yaml
-input_topics:
-  - /robot1/scovox_node/scovox_bin            # own map, loopback, unpaced
-  - /robot2/share_shaper/scovox_bin_shaped    # peer, over the radio, paced
-```
-
-Full runbooks:
+topics. On **every** robot, extend `input_topics` in `dscovox_params.yaml` to list
+all robots' bin topics. Full runbooks:
 [distributed_mapping_lidar.md](distributed_mapping_lidar.md) (LiDAR-only) and
 [distributed_mapping.md](distributed_mapping.md) (fused/semantic).
 
@@ -271,13 +238,6 @@ and name. With `-r __ns:=/robot1 -r __node:=scovox_node` the mapper's
 | srv | `~/get_region` | `GetRegion` | per-voxel occupancy + class evidence in an AABB |
 | srv | `~/get_occupancy_grid` | `GetOccupancyGrid` | 2D/3D occupancy grid projection |
 
-### Share shaper (`share_shaper_node`, optional — radio links)
-
-| Direction | Topic (param) | Type | Notes |
-|-----------|---------------|------|-------|
-| in  | `input_topic` | `ScovoxMapBinary` | **this robot's own** `~/scovox_bin` (default `scovox_node/scovox_bin`, relative → resolves in the robot's namespace). Never a peer's stream, never a merger output. |
-| out | `~/scovox_bin_shaped` (`output_topic`) | `ScovoxMapBinary` | the same evidence, repacked into rate-paced chunks — **what peers' mergers subscribe to.** |
-
 Concrete defaults from the two launch files:
 
 - **Single-robot** (`dscovox_single_robot.launch.py`, merger under `/<robot>`):
@@ -298,7 +258,6 @@ Concrete defaults from the two launch files:
 | [`scovox_robot_share.yaml`](../config/scovox_robot_share.yaml) | **Share overlay** — flips to `mode: rolling` (creates the bin stream) + low-bandwidth controls + z-band. Load **on top of** a base. |
 | [`dscovox_params.yaml`](../src/scovox_mapping/config/dscovox_params.yaml) | Merger config. `input_topics` lists the fleet's bin topics — **extend it as the fleet grows.** |
 | [`scovox_bin_min.yaml`](../src/scovox_mapping/config/scovox_bin_min.yaml) | Minimal params that **guarantee** the bin stream — a copy-paste starting point for debugging. |
-| [`share_shaper.yaml`](../src/scovox_mapping/config/share_shaper.yaml) | Egress pacer config (radio fleets): rate, burst, chunk size, retransmit window. Uses a `/**` key, so one file serves every robot namespace. |
 
 > **Run the identical base config on every robot.** The merger pins the map's
 > `num_classes` / Dirichlet prior from the first stream it sees and drops any
@@ -333,18 +292,6 @@ Concrete defaults from the two launch files:
 | `publish_rate_hz` | `1.0` | Fused `~/scovox` (planner) + viz cadence. |
 | `share_roi_z_min/max` | `-0.5 / 2.0` | Receive-side clip; **keep in sync with the sender band.** |
 
-### Key shaper parameters ([`share_shaper.yaml`](../src/scovox_mapping/config/share_shaper.yaml))
-
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `input_topic` | `scovox_node/scovox_bin` | This robot's own raw stream (relative → resolves under `__ns`). |
-| `output_topic` | `~/scovox_bin_shaped` | Paced stream the peers read. |
-| `target_rate_mbps` | `5.0` | Token-bucket rate in **on-the-wire (compressed)** Mbps. Set it to the share you can afford on the link; below the input rate the backlog simply coalesces. |
-| `burst_kb` | `256` | Bucket depth. Worst-case instantaneous burst = `burst_kb` + one chunk. |
-| `max_chunk_kb` | `128` | **Uncompressed** payload budget per shaped message — keeps DDS samples below the size that triggers IP-fragmentation storms on WiFi. |
-| `tick_hz` | `10.0` | Emission granularity. `burst_kb × tick_hz` is a hard throughput ceiling; the node warns if the rate exceeds it. |
-| `out_history_depth` | `300` | Shaped publisher's KEEP_LAST depth = the **retransmit window** (~30 s at defaults). See the sizing note in [§9](#9-bandwidth-tuning--radio-pacing). |
-
 > **Z-band coherence.** The share band must be a **superset** of the planner band
 > (`roi_min_z`/`roi_max_z` in explo_planner's `exploration_params.yaml`) and in
 > sync across the mapper (`scovox_robot_share.yaml`) and merger
@@ -373,19 +320,6 @@ dscovox_diag: sources=N src_voxels=… fused_voxels=…
 - `fused_voxels > 0` = data arrived and fused.
 - In a genuine multi-robot merge, `src_voxels > fused_voxels` (the maps overlap =
   co-registered), and the robots' `fused_voxels` counts converge toward each other.
-
-If a shaper is in the chain, it prints its own line on the same 5 s cadence:
-
-```text
-shaper_diag: in_frames=… out_chunks=… out=5.01 Mbps backlog=… store=…/… (beta/dir) resyncs=…
-```
-
-- `out` should hover at `target_rate_mbps` while there's work, and drop below it
-  when the mapper is quiet — it is a ceiling, not a floor.
-- `backlog` = voxels queued but not yet sent. Non-zero is normal during a burst;
-  **permanently** climbing means the rate is below the sustained input rate.
-- `store` = the resync mirror (grows with mapped volume, never prunes).
-- `resyncs` increments once per peer rejoin, not per message.
 
 Cross-robot spot check — query one robot's merger for a region only a *peer* has
 visited; a populated response can only have crossed the wire:
@@ -425,12 +359,6 @@ Other common issues:
 | `prior mismatch … dropping frame` | A robot runs a different config → use the **identical** base config fleet-wide. |
 | Empty map despite a cloud | `input_pointcloud_topic` is empty → node is in RGB-D mode; set your cloud topic. |
 | NDT sits at "Configuring end" (never "Activating end") | Lifecycle handoff missed → `ros2 lifecycle set /lidar_localization activate`. |
-| Shaper runs, but the radio still sees bursts | A peer's merger is still subscribed to the **raw** `~/scovox_bin` → point its `input_topics` entry at `…/share_shaper/scovox_bin_shaped` ([§4c](#4c-live-robot--real-fleet)). The raw topic keeps publishing for the robot's own merger, so nothing errors — it just isn't paced. |
-| `shaper_diag: backlog=…` climbs without bound | `target_rate_mbps` is below the sustained input rate → raise it, or cut the input first (change gate / `share_rate_hz` / z-band, [§9](#9-bandwidth-tuning--radio-pacing)). Also check the `burst_kb × tick_hz` ceiling warning at startup. |
-| Peer map has stale holes after a link outage | The outage outlasted the retransmit window but not DDS's liveliness lease, so chunks were dropped without an unmatch (hence no resync) → raise `out_history_depth`. |
-| `new epoch from '…'` / `map_from_source changed` WARN | The sender restarted with a different `resolution`, or its pose bridge jumped. The shaper drops its mirror and re-pins deliberately (old coords can't be placed at a peer). Expected after a mapper restart; **unexpected** mid-run means a flapping static TF. |
-| `shaper_diag` goes silent mid-replay | With `use_sim_time:=true` the pacer's timer is driven by `/clock` — when the bag ends, the clock stops and so does emission (nothing is lost, it resumes on the next `/clock`). Expected at end-of-bag; for a wall-clock measurement run the shaper with `use_sim_time:=false`. |
-| Shaper RSS as large as the merger's | Working as designed — the resync mirror holds the sender's whole grid (measured 968 MB at 12.6M voxels). Budget a second map-sized process per robot. |
 
 > **Rig-specific gotcha.** Do not trust a LiDAR-embedded IMU blind. On the Unitree
 > Go1 bag, `/hesai/imu`'s gyro was corrupt and fed garbage rotation into the
@@ -439,14 +367,7 @@ Other common issues:
 
 ---
 
-## 9. Bandwidth tuning & radio pacing
-
-Two separate questions. **How much** goes on the wire is set on the mapper (the
-three share knobs below). **How it is shaped in time** — smooth trickle vs
-multi-megabyte spikes — is the shaper's job. On a wired or single-host setup only
-the first matters; on a radio, the second is usually what actually breaks.
-
-### 9a. How much: the mapper's share knobs
+## 9. Bandwidth tuning
 
 The share is a strict subset of the fused pipeline, so it's cheap. Measured
 per-robot on the map-test-2 stream (0.1 m voxels, 14 classes, top-2 evidence):
@@ -463,65 +384,6 @@ delta ≈ `28 + 20·N_beta` bytes). The three knobs live in
 `share_rate_hz`, and the z-band `share_roi_z_min/max` — kept in sync with the
 merger and a superset of the planner band (see [§6](#6-configuration-reference)).
 Full measurements: `map_share_bandwidth_experiment.md` in the hmr_explo workspace.
-
-### 9b. How it's shaped: `share_shaper_node`
-
-Those knobs flatten the *average*, not the peaks. The raw stream is bursty by
-construction: whenever a new subscriber appears, the mapper answers with a **full
-map snapshot in one message**. On a radio that lands exactly when the link is
-weakest — a peer just came back — and a multi-megabyte DDS sample fragments into
-thousands of UDP packets that the reassembly window usually loses wholesale.
-
-`share_shaper_node` runs **on each robot**, subscribes to that robot's own raw
-`~/scovox_bin`, and republishes the same evidence on `~/scovox_bin_shaped` as
-token-bucket-paced chunks (default 5 Mbps, ≤128 KB per message). Peers subscribe
-to the shaped topic; the robot's **own** merger stays on the raw loopback topic,
-so the planner's fused map keeps zero added latency and can never be starved
-behind a peer's resync.
-
-```
-  robot 1's mapper ──raw───────────────────────► robot 1's merger   own map, loopback, unpaced
-  robot 1's mapper ──► robot 1's shaper ─radio─► robot 2's merger   peer map, over the air, paced
-  robot 2's mapper ──raw───────────────────────► robot 2's merger   own map, loopback, unpaced
-  robot 2's mapper ──► robot 2's shaper ─radio─► robot 1's merger   peer map, over the air, paced
-```
-
-Read the wiring as: **own stream raw, every peer's stream shaped.** That is
-exactly what `input_topics` must say on each robot ([§4c](#4c-live-robot--real-fleet)).
-
-```bash
-# one per robot, alongside its mapper and merger
-ros2 run scovox_mapping share_shaper_node --ros-args -r __ns:=/robot1 \
-    --params-file /scovox/src/scovox_mapping/config/share_shaper.yaml
-```
-
-To rehearse the whole chain on one host, both dscovox launch files take
-`with_shaper:=true` ([§4a](#4a-single-robot-from-a-bag-fastest-end-to-end-check),
-[§4b](#4b-multi-robot-from-bags-single-host-fusion-demo)) and rewire the merger
-onto the shaped topic for you.
-
-**Pacing does not lose information.** The merger applies each incoming voxel by
-*replacement*, not accumulation, so only the newest value per voxel can affect
-the fused map. The shaper therefore keeps a latest-value store: a voxel that
-changes ten times while queued is sent once, with its final value. Turning the
-rate down trades **staleness** (peers converge later) for bandwidth — it never
-corrupts the map, and it never double-counts evidence.
-
-**Reconnects.** A returning peer is detected through DDS publisher matched
-events, and answered by re-queueing the store and trickling it out under the same
-bucket instead of one snapshot burst. Measured on a 12.6M-voxel map: a flat
-~5 Mbps for the whole resync, converging to exactly the sender's voxel count.
-
-Two things to size before a deployment:
-
-| Concern | What to do |
-|---------|-----------|
-| **Retransmit window** — RELIABLE + KEEP_LAST recycles the oldest sample once the writer cache wraps, acked or not. An outage longer than the window but shorter than DDS's ~10–20 s liveliness lease drops chunks *without* an unmatch event, so no resync fires and the peer keeps stale voxels wherever the robot has since driven away. | Set `out_history_depth` (default 300 ≈ 30 s at 5 Mbps) above your worst expected micro-outage. Costs ~20–40 MB of writer cache. |
-| **Memory** — the resync store mirrors the sender's never-pruned grid: 968 MB RSS at 12.6M voxels, the same order as the merger holding that same map (1.16 GB). | Budget a second map-sized process per robot, not a small one. Watch `store=` in `shaper_diag`. |
-
-An epoch change — the sender restarting with a different `resolution`, or its
-`map_from_source` pose jumping — drops the store and re-pins, logged loudly,
-because those old coordinates can no longer be placed correctly at a peer.
 
 ---
 
