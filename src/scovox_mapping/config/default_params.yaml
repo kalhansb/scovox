@@ -8,12 +8,10 @@
 #   [N] = Node-level param (ROS wrapper only)
 #   [T] = Topic / frame / transport config
 #
-# Counts:
-#   SCovoxNode:   17 [M] + 14 [N] + 8 [T] = 39 total  (17 algorithmic)
-#   DSCovoxNode:  4  [M] + 11 [N] + 5 [T] = 20 total  (4  algorithmic)
-#
-# The plan target was <=20 algorithmic for SCovoxNode, <=14 for DSCovoxNode.
-# Current: 17 [M] and 4 [M] respectively. Both within target.
+# This file documents the KEY parameters with their code defaults — the
+# authoritative list is the declare_parameter calls in
+# src/scovox_node.cpp and src/dscovox_node.cpp. A key absent there is NOT
+# a parameter: undeclared keys in a params-file are silently ignored.
 # =======================================================================
 
 # -----------------------------------------------------------------------
@@ -52,8 +50,10 @@ scovox_node:
     kappa0:                        # float, default 2.0, pseudo-counts
       # Base Dirichlet evidence weight per semantic observation.
 
-    semantic_top_k:                # int, default 2 (=K_TOP), classes
+    semantic_top_k:                # LEGACY — do not set. int, default = K_TOP
       # Number of top semantic classes stored per voxel (sparse Dirichlet).
+      # The width is the compile-time K_TOP in scovox_core voxel.hpp; any
+      # value set here is clamped to K_TOP with a warning.
 
     semantic_occ_gate:             # float, default 0.5, dimensionless [0,1]
       # Publish/visualization threshold: voxels with p_occ > this are emitted
@@ -209,28 +209,22 @@ dscovox_node:
     semantic_occ_gate:              # float, default 0.5, dimensionless [0,1]
       # (Forwarded from SCovoxNode) p_occ hard threshold for semantic merging.
 
-    semantic_top_k:                 # int, default 2 (=K_TOP), classes
-      # Active top-K classes per voxel for deserialization.
+    semantic_top_k:                 # LEGACY — do not set. int, default = K_TOP
+      # Active top-K classes per voxel for deserialization. The width is the
+      # compile-time K_TOP in scovox_core voxel.hpp (sender and receiver must
+      # be built alike); any value set here is clamped to K_TOP with a warning.
 
     # === Node behaviour params [N] ===
 
     occupancy_vis_threshold:             # float, default 0.7, dimensionless [0,1]
       # Minimum p_occ for visualization / planning output.
 
-    pose_source:                    # string, default "tf"
-      # How submap poses are obtained: "tf" or "pose_graph".
-
-    correction_check_hz:            # float, default 1.0, Hz
-      # Rate at which TF corrections are checked for map rebuilds.
-
-    correction_pos_threshold:       # float, default 0.05, meters
-      # Translation change that triggers a fused map rebuild.
-
-    correction_rot_threshold:       # float, default 0.05, radians
-      # Rotation change that triggers a fused map rebuild.
-
     publish_rate_hz:                # float, default 1.0, Hz
-      # Rate of point cloud and planning map publication.
+      # Rate of point cloud and fused-map publication.
+
+    pointcloud_min_interval_s:      # double, default 0.1, seconds
+      # Minimum interval between visualization-pointcloud publishes when
+      # triggered by binary callbacks (10 Hz cap by default).
 
     share_roi_z_min:                # double, default 0.0, meters
     share_roi_z_max:                # double, default 0.0, meters
@@ -241,18 +235,11 @@ dscovox_node:
       # exploration_params.yaml roi_min_z/roi_max_z (shared band must be a
       # SUPERSET of the planner band).
 
-    publish_planning_map:           # bool, default false
-      # Whether to publish the 2D OccupancyGrid.
-
-    # === Planning map params [N] ===
-
-    planning_map_resolution:        # float, default 0.20, meters
-    planning_map_size_m:            # float, default 80.0, meters
-    planning_map_origin_x:          # float, default -40.0, meters
-    planning_map_origin_y:          # float, default -40.0, meters
-    planning_map_min_z:             # float, default -1.0, meters
-    planning_map_max_z:             # float, default 2.0, meters
-    planning_map_inflation_m:       # float, default 0.0, meters
+    # NOTE: dscovox_mapping_node declares NO planning-map, pose-correction
+    # (pose_source/correction_*) or consensus-tuning (epsilon_w/Lsat/
+    # k_conflict/epsilon_sem/lambda_sem) parameters — the planning map is the
+    # mapper's (SCovoxNode), and consensus constants are compile-time in
+    # scovox_core. Any such keys in a params-file are silently ignored.
 
     # === Topic / frame config [T] ===
 
@@ -263,13 +250,15 @@ dscovox_node:
     input_topic_2:                  # string, default "/robot2/scovox_node/scovox_bin"
     map_frame:                      # string, default "map"
     pointcloud_topic:               # string, default "~/pointcloud"
-    planning_map_topic:             # string, default "~/planning_map"
+    scovox_topic:                   # string, default "~/scovox"
+      # Latched fused ScovoxMap — the exploration planner's input.
 
 
 # -----------------------------------------------------------------------
 # scovox::Params struct (scovox_core library)
 # -----------------------------------------------------------------------
-# These are the 17 framework-agnostic parameters in the Params struct.
+# Key framework-agnostic parameters in the Params struct (authoritative
+# list and defaults: scovox_core/include/scovox/map_interface.hpp).
 # They control the Beta-conjugate occupancy model, Dirichlet semantics,
 # occupancy gate, evidence saturation, range/angle weighting, and
 # consensus fusion. All have sensible defaults. No ROS dependency.
