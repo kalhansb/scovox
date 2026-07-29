@@ -168,7 +168,7 @@ def generate_launch_description():
             # pointcloud_topic   string  ~/pointcloud  -    Fused pointcloud output
             # map_frame          string  "map"         -    Frame for fused map
             # occupancy_vis_threshold double  0.7           -    Min P(occ) for outputs
-            # publish_rate_hz    double  5.0           Hz   Fused map publish rate
+            # publish_rate_hz    double  1.0           Hz   Fused map publish rate (= code default)
             # publish_planning_map      bool    false  -    Publish merged planning grid
             # planning_map_topic        string  ~/pm   -
             # planning_map_resolution   double  0.20   m
@@ -182,7 +182,7 @@ def generate_launch_description():
             "map_frame":                "map",
             "occupancy_vis_threshold":       0.7,
             "semantic_occ_gate":     0.6,
-            "publish_rate_hz":          5.0,
+            "publish_rate_hz":          1.0,
             "publish_planning_map":     False,
             "planning_map_topic":       "~/planning_map",
             "planning_map_resolution":  0.20,
