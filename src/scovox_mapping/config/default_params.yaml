@@ -229,7 +229,7 @@ dscovox_node:
     correction_rot_threshold:       # float, default 0.05, radians
       # Rotation change that triggers a fused map rebuild.
 
-    publish_rate_hz:                # float, default 5.0, Hz
+    publish_rate_hz:                # float, default 1.0, Hz
       # Rate of point cloud and planning map publication.
 
     share_roi_z_min:                # double, default 0.0, meters
