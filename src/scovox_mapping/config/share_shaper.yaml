@@ -1,0 +1,58 @@
+# share_shaper_node — per-robot scovox_bin egress pacer.
+#
+# Runs ON each robot, between its own scovox_node and the radio. Peers'
+# dscovox mergers subscribe to /<robot>/share_shaper/scovox_bin_shaped
+# instead of the raw /<robot>/scovox_node/scovox_bin; the robot's OWN merger
+# stays on the raw loopback topic (zero added latency for the planner's fused
+# map, and a peer resync can never starve the local map behind the bucket).
+#
+# Usage (namespace per robot, alongside the mapper + merger):
+#   ros2 run scovox_mapping share_shaper_node --ros-args -r __ns:=/robot1 \
+#     --params-file <share>/scovox_mapping/config/share_shaper.yaml
+#
+# The /** key matches the node in any robot namespace.
+/**:
+  ros__parameters:
+    # Relative → resolves under the robot namespace to
+    # /<robot>/scovox_node/scovox_bin (the same raw stream the local merger
+    # reads). MUST be this robot's OWN local stream — never a fused/dscovox
+    # output (evidence-echo; see the dscovox_node.cpp header banner) and never
+    # another robot's stream (one shaper per robot).
+    input_topic: "scovox_node/scovox_bin"
+    output_topic: "~/scovox_bin_shaped"
+
+    # Token-bucket rate for the shaped stream, in Mbps of on-the-wire
+    # (compressed) bytes. Purely a staleness/bandwidth trade — below the
+    # steady-state input rate (~4.9 Mbps/robot measured on map-test-2 with
+    # gate + 2 Hz coalescing + z-band) the backlog coalesces losslessly and
+    # the peer map just converges later; it never corrupts. Default sits just
+    # above steady state so only bursts (reconnect resyncs, big deltas) are
+    # smoothed.
+    target_rate_mbps: 5.0
+
+    # Bucket depth (KB). Worst-case instantaneous burst is
+    # burst_kb + one compressed chunk.
+    burst_kb: 256
+
+    # UNCOMPRESSED payload budget per shaped message (KB). Keeps DDS samples
+    # small enough to avoid the IP-fragmentation storms a multi-MB snapshot
+    # sample causes on WiFi.
+    max_chunk_kb: 128
+
+    # Pacer tick rate (Hz). Granularity of emission, not a rate limit.
+    # NOTE burst_kb * tick_hz is a hard ceiling on sustained throughput
+    # (each tick spends at most one bucketful); the node warns if
+    # target_rate_mbps is set above it.
+    tick_hz: 10.0
+
+    # History depth of the SHAPED publisher = the retransmit window on the
+    # radio. RELIABLE + KEEP_LAST recycles the oldest sample once the writer
+    # cache wraps, acknowledged or not, so this must outlast the time DDS
+    # needs to NOTICE a dead peer (liveliness lease, ~10-20 s). An outage
+    # longer than the window but shorter than the lease drops chunks WITHOUT
+    # an unmatch event, hence without a resync, leaving holes in the peer's
+    # map for any voxel the robot has since driven away from. At 5 Mbps and
+    # ~64 KB compressed chunks the stream is ~10 chunks/s, so 300 buys ~30 s
+    # of history and costs ~20-40 MB of writer cache. Raise it for a link
+    # with longer outages; the memory is per shaper.
+    out_history_depth: 300

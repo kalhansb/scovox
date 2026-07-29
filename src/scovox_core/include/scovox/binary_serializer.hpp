@@ -87,6 +87,18 @@ class BinarySerializer {
   struct BetaDelta { Bonxai::CoordT coord; BetaVoxel data; };
   struct DirDelta  { Bonxai::CoordT coord; DirVoxel  data; };
 
+  // ---- Wire sizes (bytes, uncompressed) ------------------------------------
+  // serialize() below reserves from these, so anything that budgets a frame
+  // WITHOUT serializing it first (share_shaper's per-chunk budget) can share
+  // the layout instead of re-deriving it and silently drifting.
+  static constexpr std::size_t kPerTsdf = 12 /*coord*/ + 4 + 4 /*distance + weight*/;
+  static constexpr std::size_t kPerBeta = 12 /*coord*/ + 4 + 4 /*a_occ + a_free*/;
+  static constexpr std::size_t kPerDir  = 12 /*coord*/ + 4 /*other*/
+                                        + 4 * K_TOP /*cnt*/ + 2 * K_TOP /*cls*/;
+  /// MAGIC(4) VERSION(1) resolution(4) num_classes(2) K_TOP(1) alpha_0(4) plus
+  /// the three stream count fields (3x4) — the fixed cost of any frame.
+  static constexpr std::size_t kFrameOverhead = 4 + 1 + 4 + 2 + 1 + 4 + 3 * 4;
+
   struct Frame {
     float    resolution  = 0.0f;
     uint16_t num_classes = 14;            ///< NYU13 default
@@ -111,13 +123,10 @@ class BinarySerializer {
     const std::size_t tsdf_n = opts.share_tsdf ? frame.tsdf_deltas.size() : 0;
     const std::size_t beta_n = frame.beta_deltas.size();
     const std::size_t dir_n  = frame.dir_deltas.size();
-    const std::size_t per_beta = 12 /*coord*/ + 4 + 4 /*a_occ + a_free*/;
-    const std::size_t per_dir  = 12 /*coord*/ + 4 /*other*/
-                               + 4 * K_TOP /*cnt*/ + 2 * K_TOP /*cls*/;
-    out.reserve(4 + 1 + 4 + 2 + 1 + 4              // header
-                + 4 + tsdf_n * 20
-                + 4 + beta_n * per_beta
-                + 4 + dir_n  * per_dir);
+    out.reserve(kFrameOverhead                     // header + the 3 count fields
+                + tsdf_n * kPerTsdf
+                + beta_n * kPerBeta
+                + dir_n  * kPerDir);
 
     appendBytes(out, &MAGIC, sizeof(MAGIC));
     appendBytes(out, &FORMAT_VERSION, sizeof(FORMAT_VERSION));

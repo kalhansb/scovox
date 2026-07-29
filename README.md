@@ -170,6 +170,38 @@ z-band in sync across [`scovox_robot_share.yaml`](config/scovox_robot_share.yaml
 explo_planner's `exploration_params.yaml` (shared band ⊇ planner band) — each
 file's comments cross-reference the others.
 
+**Radio deployments — smooth the bin stream with `share_shaper_node`.** The
+raw `~/scovox_bin` stream is bursty: a (re)connecting peer triggers a
+full-map snapshot in ONE message, landing on the WiFi at the moment the link
+is weakest. Running one shaper per robot repacks that robot's stream into
+token-bucket-paced chunks (default 5 Mbps / 128 KB per message) on
+`~/scovox_bin_shaped`; peer mergers subscribe to the shaped topic, while each
+robot's own merger stays on the raw loopback topic (see the `input_topics`
+note in `dscovox_params.yaml`). Reconnects are detected via publisher matched
+events and answered with a paced full resync instead of the burst. Pacing is
+lossless — the merger ingest is snapshot-replace per source voxel, so the
+shaper's latest-value store coalesces without corruption and the rate knob only
+trades staleness for bandwidth
+([`share_shaper.yaml`](src/scovox_mapping/config/share_shaper.yaml)):
+
+```bash
+ros2 run scovox_mapping share_shaper_node --ros-args -r __ns:=/robot1 \
+  --params-file /scovox/src/scovox_mapping/config/share_shaper.yaml &
+```
+
+Two properties to size before a deployment. First, `out_history_depth` (default
+300 ≈ 30 s) is the retransmit window: RELIABLE + KEEP_LAST recycles the oldest
+sample once the writer cache wraps, so an outage longer than the window but
+shorter than DDS's ~10–20 s liveliness lease drops chunks *without* an unmatch
+event and therefore without a resync. Second, the store mirrors the sender's
+(never-pruned) grid, so it grows with mapped volume: measured 968 MB RSS at
+12.6M voxels mid-resync — the same order as the merger holding that same map
+(1.16 GB), so budget for a second map-sized process, not a small one. Both are
+printed live: `shaper_diag: … backlog=… store=…`. A sender restart that changes
+`resolution`, or a `map_from_source` jump, starts a new epoch (the store is
+dropped and re-pinned, logged loudly) because those old coords can no longer be
+placed correctly at a peer.
+
 For simulation/bag use,
 [`scovox_multi_robot.launch.py`](src/scovox_mapping/launch/scovox_multi_robot.launch.py)
 wires the same topology (edit its `robots` list / `input_topics`). To drive the
@@ -202,6 +234,9 @@ rebuild or copy:
 * `dscovox_mapping_node` (node name `dscovox_node`) — **in:** each robot's `~/scovox_bin` (`input_topics`);
   **out:** fused `~/pointcloud`, latched fused `~/scovox` (planner input);
   **services:** `~/get_region` (`GetRegion`), `~/get_occupancy_grid` (`GetOccupancyGrid`).
+* `share_shaper_node` (node name `share_shaper`) — **in:** this robot's own `~/scovox_bin` (`input_topic`);
+  **out:** `~/scovox_bin_shaped`, the same stream repacked into token-bucket-paced chunks
+  (radio egress smoothing; peers' mergers subscribe to this instead of the raw topic).
 
 Full parameter reference: [`config/default_params.yaml`](src/scovox_mapping/config/default_params.yaml).
 

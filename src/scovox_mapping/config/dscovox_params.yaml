@@ -12,7 +12,20 @@
 /**:
   ros__parameters:
     # ScovoxMapBinary delta streams to fuse (one per robot). Every robot runs
-    # its own dscovox subscribing to ALL peers, so this list is fleet-wide.
+    # its own dscovox subscribing to ALL peers.
+    #
+    # WITHOUT the share_shaper (single host / wired bench): this fleet-wide
+    # list of raw streams works for every robot, as before.
+    #
+    # WITH the per-robot share_shaper (radio deployments — see
+    # config/share_shaper.yaml): the list becomes PER ROBOT — own stream RAW
+    # (loopback, zero latency), peers SHAPED (paced over the radio). E.g. on
+    # robot1, override on the command line (CLI/launch overrides win over this
+    # file):
+    #   -p input_topics:="['/robot1/scovox_node/scovox_bin',
+    #                      '/robot2/share_shaper/scovox_bin_shaped']"
+    # Subscribing to a peer's RAW stream over the radio defeats the shaper
+    # (the sender's one-message snapshot dump comes back).
     input_topics: ["/robot1/scovox_node/scovox_bin",
                    "/robot2/scovox_node/scovox_bin"]
     map_frame: "map"

@@ -66,6 +66,14 @@ ament_target_dependencies(scovox_mapping_node
 target_link_libraries(scovox_mapping_node scovoxmap ${LZ4_LIBRARIES})
 target_include_directories(scovox_mapping_node PRIVATE ${LZ4_INCLUDE_DIRS})
 
+# ShareShaperNode — per-robot scovox_bin egress pacer (radio-side bandwidth
+# smoothing between a robot's own scovox_node and its peers' mergers).
+add_executable(share_shaper_node src/share_shaper_node.cpp)
+ament_target_dependencies(share_shaper_node
+  rclcpp geometry_msgs scovox_msgs scovox_core)
+target_link_libraries(share_shaper_node ${LZ4_LIBRARIES})
+target_include_directories(share_shaper_node PRIVATE ${LZ4_INCLUDE_DIRS})
+
 # ==================================================================
 # Tests
 # ==================================================================
@@ -79,6 +87,7 @@ set(SCOVOX_TEST_SOURCES
   test/test_semantic_audit.cpp
   test/test_tsdf_band.cpp
   test/test_marching_cubes.cpp
+  test/test_share_shaper.cpp
 )
 
 foreach(TEST_SRC ${SCOVOX_TEST_SOURCES})
@@ -108,7 +117,7 @@ install(TARGETS scovoxmap
   RUNTIME DESTINATION bin
 )
 
-install(TARGETS dscovox_mapping_node scovox_mapping_node
+install(TARGETS dscovox_mapping_node scovox_mapping_node share_shaper_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/scovox
