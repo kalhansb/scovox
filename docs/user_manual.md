@@ -283,26 +283,40 @@ is exactly what this table makes visible.
 | `carve_band` | `-1.0` | `-1.0` | Full-ray free-space carve (planner needs complete free space); positive = carve only near surfaces (cheaper). |
 | `min_range` / `max_range` | `0.3` / `10.0` | `1.0` / `20.0` (launch files: `40.0`) | Per-scan integration range; **raise `max_range` to widen the map's radial footprint.** |
 | `deskew_mode` | `auto` | `auto` | `auto\|on\|off`; `off` silences the harmless IMU-not-ready note. |
-| `downsample_voxel_size` | `0.0` (off) | `0.1` | Per-scan sensor-frame downsample before integration; set it to the map resolution — near-lossless for occupancy and it keeps dense LiDAR real-time. |
+| `downsample_voxel_size` | `0.0` (off) | `0.1` | Per-scan sensor-frame voxel downsample before integration — near-lossless for occupancy and it keeps dense LiDAR real-time. Use `0.1`; **off unless something sets it**, see the warning below. |
 | `tf_require_exact` | `false` | `true` | Require TF at the scan's exact stamp; **do not relax** — the stale-pose fallback mis-places whole scans. |
 | `share_change_gate` | `true` | `true` | Re-send a voxel only when it changed (bandwidth). |
 | `share_rate_hz` | `0.0` (per-scan) | `2.0` (overlay) | Coalesce deltas into a timer publish (`0.0` = legacy per-scan). |
 | `share_roi_z_min/max` | `0.0 / 0.0` (off) | `-0.5 / 2.0` (overlay) | Vertical share band (map frame); `min ≥ max` disables. |
+
+> **`downsample_voxel_size` defaults to OFF — check that yours is set.** The
+> node's own default is `0.0` (no downsample). `0.1` is what the shipped base
+> configs ([`scovox_lidar_geometric.yaml`](../config/scovox_lidar_geometric.yaml),
+> [`scovox_fused_lidar_rgbd.yaml`](../config/scovox_fused_lidar_rgbd.yaml))
+> load — so a run that loads a base config is fine, but a bare `ros2 run` or a
+> launch file that inlines its parameters instead of loading a config gets **no
+> downsample at all**. With a dense LiDAR (a 128-beam Hesai/Ouster scan is
+> ~115k points) the full-ray carve then misses real time by a wide margin
+> (~700 ms/frame observed) and the map falls behind the robot. Confirm with
+> `ros2 param get /<robot>/scovox_node downsample_voxel_size` before a run.
 
 ### Key merger parameters
 
 | Parameter | Code default | Shipped config | Meaning |
 | --------- | ------------ | -------------- | ------- |
 | `input_topics` | `[]` → falls back to `/robot{1,2}/scovox_node/scovox_bin` | robots 1+2 listed | Fleet-wide list of bin streams to fuse — **extend it as the fleet grows.** |
-| `publish_rate_hz` | `1.0` | `1.0` | Fused `~/scovox` (planner) + viz cadence. |
+| `publish_rate_hz` | `1.0` | `1.0` | Fused `~/scovox` (planner input) publish cadence. The **mapper's** own full-map rate is a different parameter, `scovox_publish_rate` (also `1.0`). |
+| `pointcloud_min_interval_s` | `0.1` | `0.1` (launch files: `0.5`) | Floor on the spacing of the fused viz cloud — throttles independently of `publish_rate_hz`. |
 | `share_roi_z_min/max` | `0.0 / 0.0` (off) | `-0.5 / 2.0` | Receive-side clip; **keep in sync with the sender band.** |
 
 > **Semantic width is compile-time, not a parameter.** The number of top classes
-> stored per voxel is the constant `K_TOP` in scovox_core's `voxel.hpp`
-> (currently `2`). Every sender and receiver in a fleet must be **built** with
-> the same value — to change it, edit `K_TOP` and rebuild everywhere. The nodes
-> still accept a legacy `semantic_top_k` parameter for compatibility, but they
-> clamp it to `K_TOP` with a warning; do not set it.
+> stored per voxel is the constant `K_TOP` in scovox_core's
+> [`voxel.hpp`](../src/scovox_core/include/scovox/voxel.hpp) (currently `2`) — it
+> sizes the fixed-width per-voxel arrays and the binary wire format, so every
+> sender and receiver in a fleet must be **built** with the same value. To change
+> it, edit `K_TOP` and rebuild everywhere. Both nodes still accept a legacy
+> `semantic_top_k` parameter for compatibility, but they clamp it to `K_TOP` and
+> log a warning; **do not set it** — a config asking for `10` silently gets `2`.
 >
 > **Z-band coherence.** The share band must be a **superset** of the planner band
 > (`roi_min_z`/`roi_max_z` in explo_planner's `exploration_params.yaml`) and in
