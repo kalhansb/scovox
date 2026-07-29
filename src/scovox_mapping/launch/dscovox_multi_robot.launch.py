@@ -153,6 +153,10 @@ def launch_setup(context, *args, **kwargs):
                 "w_occ": 8.0, "w_free": 4.0, "carve_band": -1.0,
                 "min_range": float(g["min_range"]), "max_range": float(g["max_range"]),
                 "enable_tsdf": False,
+                # Per-scan sensor-frame voxel downsample BEFORE integration, at
+                # the map resolution: near-lossless for occupancy but keeps the
+                # full-ray carve real-time (mirror dscovox_single_robot.launch.py).
+                "downsample_voxel_size": float(g["resolution"]),
                 # Low-bandwidth share controls
                 "share_change_gate": True,
                 "share_rate_hz": 2.0,

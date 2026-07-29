@@ -40,10 +40,11 @@ def generate_launch_description():
 
             # -- Semantics (4) [KEEP] -------------------------------------------------
             # kappa0                   double  2.0   -     Dirichlet base pseudo-count per hit
-            # semantic_top_k           int     10    -     Max named classes stored per voxel
+            # semantic_top_k           int     2     -     Top classes stored per voxel; hard-capped
+            #                                              at compile-time K_TOP (scovox_core voxel.hpp)
             # semantic_occ_gate        double  0.5   -     Hard p_occ threshold for semantic updates
             "kappa0":                   2.0,
-            "semantic_top_k":           10,
+            "semantic_top_k":           2,
             "semantic_occ_gate":        0.5,
 
             # -- Evidence weights (3) --------------------------------------------------
