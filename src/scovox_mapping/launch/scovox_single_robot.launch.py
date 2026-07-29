@@ -3,9 +3,9 @@
 Launch with:
   ros2 launch scovox_mapping scovox_single_robot.launch.py robot_name:=atlas
 
-Current param counts (post Phase-0 tasks 0.1-0.7):
-  SCovoxNode  : 54  (target <= 20)
-  DSCovoxNode : 26  (target <= 14)
+Only parameters the nodes actually declare are set here (see
+declare_parameter calls in scovox_node.cpp / dscovox_node.cpp — undeclared
+keys in a launch dict are silently ignored by ROS 2).
 """
 
 from launch import LaunchDescription
@@ -40,10 +40,10 @@ def generate_launch_description():
 
             # -- Semantics (4) [KEEP] -------------------------------------------------
             # kappa0                   double  2.0   -     Dirichlet base pseudo-count per hit
-            # semantic_top_k           int     10    -     Max named classes stored per voxel
             # semantic_occ_gate        double  0.5   -     Hard p_occ threshold for semantic updates
+            # (top-K width per voxel is the compile-time K_TOP in scovox_core
+            #  voxel.hpp — not a parameter)
             "kappa0":                   2.0,
-            "semantic_top_k":           10,
             "semantic_occ_gate":        0.5,
 
             # -- Evidence weights (3) --------------------------------------------------
@@ -68,8 +68,8 @@ def generate_launch_description():
             "grazing_angle_threshold": -1.0,
 
             # -- Transient / dynamic layer (3) ----------------------------------------
-            # max_semantic_classes is redundant with semantic_top_k and K_TOP
-            # in most usage; consider removing in favour of semantic_top_k alone.
+            # max_semantic_classes is the total label space; the per-voxel
+            # top-K width is the compile-time K_TOP (scovox_core voxel.hpp).
             # max_semantic_classes  int            10   -    Total class count (label space)
             # transient_decay_rate  double         0.8  -    Per-frame decay for dynamic voxels
             # dynamic_classes       int[]          []   -    Class ids routed to the transient
@@ -148,8 +148,12 @@ def generate_launch_description():
     )
 
     # -- DSCovoxNode ---------------------------------------------------------------
-    # AUDIT NOTE: 26 params total.
-    # Target <= 14.
+    # Only parameters dscovox_mapping_node actually declares are set here. The
+    # planning-map, pose-correction (pose_source/correction_*) and
+    # consensus-tuning (epsilon_w/Lsat/k_conflict/epsilon_sem/lambda_sem) keys
+    # formerly listed were never declared by the node and were silently
+    # ignored; consensus constants live in scovox_core, and the per-voxel
+    # top-K width is the compile-time K_TOP (scovox_core voxel.hpp).
     dscovox_node = Node(
         package="scovox_mapping",
         executable="dscovox_mapping_node",
@@ -158,68 +162,21 @@ def generate_launch_description():
         parameters=[{
             "use_sim_time": use_sim_time,
 
-            # -- Input (1) [KEEP] ------------------------------------------------------
+            # -- Input -----------------------------------------------------------------
             # input_topics  string[]  []  -  Binary scovox topics from each robot
             "input_topics": [["", robot_name, "/scovox_node/scovox_bin"]],
 
-            # -- Output (5) [KEEP 2, CANDIDATE: planning map -> separate node] ---------
-            # Same 8-param planning_map block as SCovoxNode -- prime candidate for
-            # extraction to a shared planning-map server.
+            # -- Output ----------------------------------------------------------------
             # pointcloud_topic   string  ~/pointcloud  -    Fused pointcloud output
             # map_frame          string  "map"         -    Frame for fused map
-            # occupancy_vis_threshold double  0.7           -    Min P(occ) for outputs
+            # occupancy_vis_threshold double  0.7      -    Min P(occ) for outputs
+            # semantic_occ_gate  double  0.5           -    p_occ gate for semantic merge
             # publish_rate_hz    double  1.0           Hz   Fused map publish rate (= code default)
-            # publish_planning_map      bool    false  -    Publish merged planning grid
-            # planning_map_topic        string  ~/pm   -
-            # planning_map_resolution   double  0.20   m
-            # planning_map_size_m       double  80.0   m
-            # planning_map_origin_x     double  -40.0  m
-            # planning_map_origin_y     double  -40.0  m
-            # planning_map_min_z        double  -1.0   m
-            # planning_map_max_z        double   2.0   m
-            # planning_map_inflation_m  double  0.0    m
             "pointcloud_topic":         "/dscovox_mapping/pointcloud",
             "map_frame":                "map",
-            "occupancy_vis_threshold":       0.7,
-            "semantic_occ_gate":     0.6,
+            "occupancy_vis_threshold":  0.7,
+            "semantic_occ_gate":        0.6,
             "publish_rate_hz":          1.0,
-            "publish_planning_map":     False,
-            "planning_map_topic":       "~/planning_map",
-            "planning_map_resolution":  0.20,
-            "planning_map_size_m":      80.0,
-            "planning_map_origin_x":   -40.0,
-            "planning_map_origin_y":   -40.0,
-            "planning_map_min_z":      -1.0,
-            "planning_map_max_z":       2.0,
-            "planning_map_inflation_m": 0.0,
-
-            # -- Pose correction (3) [CANDIDATE FOR REMOVAL] ---------------------------
-            # pose_source = "tf" means these are never used; remove until the
-            # pose-correction path is actually implemented.
-            # pose_source              string  "tf"   -    "tf" | "topic"
-            # correction_check_hz      double  1.0    Hz   Rate to check for pose corrections
-            # correction_pos_threshold double  0.05   m    Min position delta to trigger correction
-            # correction_rot_threshold double  0.05   rad  Min rotation delta to trigger correction
-            "pose_source":              "tf",
-            "correction_check_hz":      1.0,
-            "correction_pos_threshold": 0.05,
-            "correction_rot_threshold": 0.05,
-
-            # -- Consensus fusion (6) [KEEP -- core algorithm] -------------------------
-            # epsilon_w   double  1e-3  -    Evidence floor (prevents divide-by-zero)
-            # Lsat        double  3.0   -    Evidence saturation level for fusion
-            # k_conflict  double  2.0   -    Conflict penalty scale factor
-            # epsilon_sem double  1e-3  -    Semantic evidence floor
-            # lambda_sem  double  5.0   -    Semantic consensus weight
-            "epsilon_w":   1e-3,
-            "Lsat":        3.0,
-            "k_conflict":  2.0,
-            "epsilon_sem": 1e-3,
-            "lambda_sem":  5.0,
-
-            # -- Semantics (1) [KEEP] -------------------------------------------------
-            # semantic_top_k  int  10  -  Max named classes per fused voxel
-            "semantic_top_k": 10,
         }],
     )
 

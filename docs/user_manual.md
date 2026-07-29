@@ -266,32 +266,44 @@ Concrete defaults from the two launch files:
 
 ### Key mapper parameters
 
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `mode` | `persistent` | `rolling` creates the `~/scovox_bin` publisher — **required to share.** |
-| `fuse_lidar_rgbd` | `false` | `true` adds the RGB-D semantic path. |
-| `integration_frame` | `map` | Frame the map is built in; **must be unique per robot** in a fleet. |
-| `base_frame` | `os_lidar` | LiDAR ray-origin (sensor) frame. |
-| `resolution` | `0.10` | Voxel size (m). |
-| `w_occ` / `w_free` | `8.0` / `4.0` | Beta occupancy evidence weights (hit / clear-air). |
-| `carve_band` | `-1.0` | Full-ray free-space carve (planner needs complete free space); positive = carve only near surfaces (cheaper). |
-| `min_range` / `max_range` | `1.0` / `20–40` | Per-scan integration range; **raise `max_range` to widen the map's radial footprint.** |
-| `deskew_mode` | `auto` | `auto\|on\|off`; `off` silences the harmless IMU-not-ready note. |
-| `downsample_voxel_size` | `0.10` | Per-scan sensor-frame downsample before integration (keeps dense LiDAR real-time). |
-| `tf_require_exact` | `true` | Require TF at the scan's exact stamp; **do not relax** — the stale-pose fallback mis-places whole scans. |
-| `share_change_gate` | `true` | Re-send a voxel only when it changed (bandwidth). |
-| `share_rate_hz` | `2.0` | Coalesce deltas into a timer publish (`0.0` = legacy per-scan). |
-| `share_roi_z_min/max` | `-0.5 / 2.0` | Vertical share band (map frame); `min ≥ max` disables. |
+**Code default** = what an *unset* parameter falls back to (a launch file or
+params-file that omits the key gets this). **Shipped config** = the value the
+base configs / share overlay actually load. Where the two differ, setting up a
+robot without the shipped configs silently changes behaviour — that difference
+is exactly what this table makes visible.
+
+| Parameter | Code default | Shipped config | Meaning |
+| --------- | ------------ | -------------- | ------- |
+| `mode` | `rolling` | base: `persistent`; overlay: `rolling` | `rolling` creates the `~/scovox_bin` publisher — **required to share.** |
+| `fuse_lidar_rgbd` | `false` | geometric: `false`; fused: `true` | `true` adds the RGB-D semantic path. |
+| `integration_frame` | `odom` | `map` | Frame the map is built in; **must be unique per robot** in a fleet (override per robot). |
+| `base_frame` | `base_link` | `os_lidar` | LiDAR ray-origin (sensor) frame. |
+| `resolution` | `0.10` | `0.10` | Voxel size (m). |
+| `w_occ` / `w_free` | `2.0` / `1.0` | `8.0` / `4.0` | Beta occupancy evidence weights (hit / clear-air). The fused base sets them per sensor instead: `lidar_w_occ`/`lidar_w_free` = 8/4, `rgbd_w_occ`/`rgbd_w_free` = 0/0 (RGB-D adds no occupancy). |
+| `carve_band` | `-1.0` | `-1.0` | Full-ray free-space carve (planner needs complete free space); positive = carve only near surfaces (cheaper). |
+| `min_range` / `max_range` | `0.3` / `10.0` | `1.0` / `20.0` (launch files: `40.0`) | Per-scan integration range; **raise `max_range` to widen the map's radial footprint.** |
+| `deskew_mode` | `auto` | `auto` | `auto\|on\|off`; `off` silences the harmless IMU-not-ready note. |
+| `downsample_voxel_size` | `0.0` (off) | `0.1` | Per-scan sensor-frame downsample before integration; set it to the map resolution — near-lossless for occupancy and it keeps dense LiDAR real-time. |
+| `tf_require_exact` | `false` | `true` | Require TF at the scan's exact stamp; **do not relax** — the stale-pose fallback mis-places whole scans. |
+| `share_change_gate` | `true` | `true` | Re-send a voxel only when it changed (bandwidth). |
+| `share_rate_hz` | `0.0` (per-scan) | `2.0` (overlay) | Coalesce deltas into a timer publish (`0.0` = legacy per-scan). |
+| `share_roi_z_min/max` | `0.0 / 0.0` (off) | `-0.5 / 2.0` (overlay) | Vertical share band (map frame); `min ≥ max` disables. |
 
 ### Key merger parameters
 
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `input_topics` | `[…scovox_bin]` | Fleet-wide list of bin streams to fuse. |
-| `semantic_top_k` | `2` | Must match the senders' compile-time `K_TOP`. |
-| `publish_rate_hz` | `1.0` | Fused `~/scovox` (planner) + viz cadence. |
-| `share_roi_z_min/max` | `-0.5 / 2.0` | Receive-side clip; **keep in sync with the sender band.** |
+| Parameter | Code default | Shipped config | Meaning |
+| --------- | ------------ | -------------- | ------- |
+| `input_topics` | `[]` → falls back to `/robot{1,2}/scovox_node/scovox_bin` | robots 1+2 listed | Fleet-wide list of bin streams to fuse — **extend it as the fleet grows.** |
+| `publish_rate_hz` | `1.0` | `1.0` | Fused `~/scovox` (planner) + viz cadence. |
+| `share_roi_z_min/max` | `0.0 / 0.0` (off) | `-0.5 / 2.0` | Receive-side clip; **keep in sync with the sender band.** |
 
+> **Semantic width is compile-time, not a parameter.** The number of top classes
+> stored per voxel is the constant `K_TOP` in scovox_core's `voxel.hpp`
+> (currently `2`). Every sender and receiver in a fleet must be **built** with
+> the same value — to change it, edit `K_TOP` and rebuild everywhere. The nodes
+> still accept a legacy `semantic_top_k` parameter for compatibility, but they
+> clamp it to `K_TOP` with a warning; do not set it.
+>
 > **Z-band coherence.** The share band must be a **superset** of the planner band
 > (`roi_min_z`/`roi_max_z` in explo_planner's `exploration_params.yaml`) and in
 > sync across the mapper (`scovox_robot_share.yaml`) and merger

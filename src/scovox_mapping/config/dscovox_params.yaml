@@ -19,7 +19,9 @@
 
     occupancy_vis_threshold: 0.7
     semantic_occ_gate: 0.5
-    semantic_top_k: 2            # must match the senders' compile-time K_TOP
+    # Semantic width (top-K classes per voxel) is the compile-time K_TOP in
+    # scovox_core/include/scovox/voxel.hpp — NOT a parameter. Build every
+    # sender and receiver with the same K_TOP.
 
     publish_rate_hz: 1.0         # fused ScovoxMap topic (planner input) + viz
     pointcloud_min_interval_s: 0.1
