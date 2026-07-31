@@ -384,12 +384,47 @@ Jetson Nano: sustained Hz, p95 latency, RSS, payload, stage breakdown on ARM;
 full-state cross-platform determinism check. 🚫 **hardware-gated** (no Nano attached).
 
 ### A — Supporting ablations · P2  *(anchors, n=1, descriptive)*
-κ₀/α₀ · S_max∈{250,1000,∞} · quality-weighting on/off · carve band · gate sweeps ·
-A6 Hutter floor on/off (✅ done) · **A7 OTHER ablation** — re-score K_top=2
-snapshots with p_OTHER dropped and the top-2 renormalised (offline, no runs):
-the expected collapse of out-of-top-K AUROC shows OTHER, not the top-2 alone,
-buys the uncertainty leg (feeds S1). Mostly run-level via existing params — ⬜
-compute, not code.
+κ₀/α₀ · S_max sweep (**A8** below) · quality-weighting on/off · carve band ·
+gate sweeps · A6 Hutter floor on/off (✅ done) · **A7 OTHER ablation** —
+re-score K_top=2 snapshots with p_OTHER dropped and the top-2 renormalised
+(offline, no runs): the expected collapse of out-of-top-K AUROC shows OTHER,
+not the top-2 alone, buys the uncertainty leg (feeds S1). Mostly run-level via
+existing params — ⬜ compute, not code.
+
+**A8 evidence-saturation sweep** ⬜ — `evidence_saturation` (S_max, node default
+1000) caps per-voxel total pseudo-counts; the proportional rescale preserves
+p_occ / class ratios, so above the cap every update degrades gracefully into an
+exponential moving average with rate λ = w/(S_max+w). This is the Beta-analogue
+of OctoMap's log-odds clamping (defaults p ∈ [0.12, 0.97]) but ratio-preserving
+rather than truncating. **There is no closed-form optimum — theory fixes the
+scaling and two bounds; the value itself is empirical.** Three anchors:
+
+1. **Precision ceiling (calibration)** — Var[p_occ] = p(1−p)/(N+1) ≥
+   p(1−p)/(S_max+1). Statistical error shrinks as 1/√N but the sensor stack's
+   *systematic* error ε_sys (miscalibration, pose drift, deskew residue) does
+   not, so counts beyond N\* ≈ p(1−p)/ε_sys² claim precision the pipeline
+   cannot deliver — visible as overconfidence in the E3.1 extreme-confidence
+   ECE/NLL bins. The default 1000 corresponds to ε_sys ≈ 1.5–3 %.
+2. **Adaptation time (dynamics)** — flipping a saturated voxel across 0.5
+   under contradicting evidence takes ≈ ln2·S_max/w scans (batched carve =
+   one write per voxel per scan): ~690 scans ≈ 69 s at 10 Hz with w_free = 1.
+   The tracking-optimal cap matches the environment's change rate h (flips per
+   scan): S_max ≈ w/h — environment-dependent, hence no universal value.
+3. **Gate coupling (E6.6, lower bound)** — at saturation, p_occ jitters with
+   stationary std ≈ √(λ/2 · p(1−p)); once that nears τ, *stable* saturated
+   voxels re-trip the |Δp| > τ arm indefinitely — a pure bandwidth leak.
+   Requiring jitter ≪ τ gives S_max ≳ w·p(1−p)/(2τ²) ≈ 300–600 at the
+   τ = 0.02 / w ∈ {1, 2} defaults — so the low arm below is *predicted* to
+   leak, a falsifiable coupling between the mapping cap and the comms gate.
+
+Sweep S_max ∈ {100, 250, 1000, 4000, 0 = off} on one static and one
+dynamic-obstacle sequence; measure (a) E3.1 occupancy calibration —
+overconfidence should appear only above N\*, (b) stale-obstacle clearing
+latency — linear in S_max/w per anchor ②, (c) E6.6 gate bytes at fixed τ —
+leak below the anchor-③ bound, (d) static-map accuracy — expected flat for
+S_max ≳ a few hundred, the insensitivity claim that justifies shipping one
+default rather than tuning per scene. Rides the E3.1 harness and E6.2/E6.6
+byte counters — runs only, no new code.
 
 ---
 
