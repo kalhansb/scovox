@@ -19,7 +19,7 @@
 #  - candidates snap to local ground + candidate_z_clearance (frontier
 #    candidates to the ground under their own centroid), so goals and
 #    markers carry a real 3D z,
-#  - NO 2D planning_map: require_planning_map: false runs the planner in
+#  - NO 2D planning_map: use_planning_map: false runs the planner in
 #    its straight-line fallback — Euclidean candidate costs, no 2D
 #    reachability/free-cell filter. The live scovox projection covers only
 #    the walked corridor and a static GT prior came out ~90% unknown at
@@ -49,11 +49,10 @@ explo_planner:
     # Live fused map from the fused scovox_node (run_fused_experiment.sh
     # node, remapped __node:=scovox_node). No 2D planning grid: scovox runs
     # publish_planning_map:=false, so the planner starts in its
-    # straight-line fallback (see header) after the zeroed grace wait.
+    # straight-line fallback (see header) as soon as map + pose are ready.
     dscovox_topic: "/scovox_node/scovox"
-    planning_map_topic: "/scovox_node/planning_map"   # nothing publishes this
-    require_planning_map: false      # straight-line mode (see header)
-    planning_map_wait_sec: 0.0       # don't stall startup waiting for one
+    planning_map_topic: "/scovox_node/planning_map"   # unused while disabled
+    use_planning_map: false          # straight-line mode (see header)
 
     # Selected NBV goal. Nothing subscribes (no nav stack in the bag replay);
     # RViz displays it as the selected-waypoint arrow.

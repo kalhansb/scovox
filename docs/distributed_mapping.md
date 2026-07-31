@@ -62,8 +62,12 @@ merger keys its per-source grids by that frame_id. **Each robot must therefore m
 in a unique frame** (`r1_map`, `r2_map`, …) bridged to `map` by an identity static
 TF. If two robots both integrate directly in `map`, their streams collapse into one
 source grid inside every merger and overwrite each other wherever their maps
-overlap. The identity TF is a single latched `/tf_static` sample that peers' mergers
-cache on first sight — there is no per-scan cross-robot `/tf`.
+overlap. Each robot's **mapper** resolves that `map ← rK_map` bridge from its own
+local `/tf_static` at publish time and stamps the resulting pose into every delta
+(`ScovoxMapBinary.map_from_source`). Mergers read that pose straight from the message
+and run **no TF listener at all**, so no robot's localization TF ever has to reach
+another robot's merger; each merger pins the **first** pose it sees per source (the
+static-bridge assumption — c-SLAM re-alignment is out of scope).
 
 Also: **start the merger before the mapper.** The bin publish is subscriber-gated —
 deltas are drained (discarded) while nobody listens, and the mapper only re-sends a
@@ -172,7 +176,7 @@ top-2 evidence: legacy per-scan publish 32.8 Mbps → change gate 20.7 Mbps → 
 [scovox_robot_share.yaml](../config/scovox_robot_share.yaml)
 (`share_change_gate`, `share_rate_hz`, `share_roi_z_min/max`). Keep the z-band a
 **superset** of the planner band (`roi_min_z`/`roi_max_z` in explo_planner's
-`exploration_params.yaml`) and in sync with the merger's receive-side clip — the
+`shared_params.yaml`) and in sync with the merger's receive-side clip — the
 three files cross-reference each other. Full measurements:
 [map_share_bandwidth_experiment.md](https://github.com/kalhansb/hmr_explo/blob/main/ws/src/map_share_bandwidth_experiment.md)
 in the hmr_explo workspace.

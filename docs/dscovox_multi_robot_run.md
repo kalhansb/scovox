@@ -95,13 +95,19 @@ docker compose -f scovox/compose.yaml exec scovox bash -lc '
 '
 ```
 
-Map-extent knobs (same as single-robot; defaults opened up — z-band off,
-`max_range 40`):
+Map-extent knobs (z-band off so the fused map isn't clipped vertically;
+`max_range 20`, matching `scovox_lidar_geometric.yaml` — the single-robot launch
+still defaults to 40):
 
 ```bash
 ... dscovox_multi_robot.launch.py ... max_range:=60.0
 ... dscovox_multi_robot.launch.py ... share_roi_z_min:=-0.5 share_roi_z_max:=3.0
 ```
+
+Raising `max_range` widens the footprint but costs carve time on **every** mapper:
+`carve_band` is `-1.0` (full-ray free-space carve), so at 0.10 m a 40 m ray
+traverses ~400 voxels vs ~200 at 20 m, and two mappers run concurrently on this
+one host. Keep `downsample_voxel_size` on (the launch pins `0.1`) when you widen.
 
 ## 3. Play the bags LAST — SEQUENTIALLY (bunker, then curt)
 
