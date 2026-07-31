@@ -122,9 +122,9 @@ public:
     // geometry as the live grids. Only the wire path reads/writes these, and
     // only in mode=rolling (no bin_pub_ otherwise).
     if (share_change_gate_ && mode_ == "rolling") {
-      gate_beta_ = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
+      gate_beta_ = std::make_unique<Bonxai::VoxelGrid<GateBeta>>(
           P.resolution, P.inner_bits, P.leaf_bits);
-      gate_dir_ = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
+      gate_dir_ = std::make_unique<Bonxai::VoxelGrid<GateDir>>(
           P.resolution, P.inner_bits, P.leaf_bits);
     }
     loadSemanticColorMap();  initializeSemanticColors();
@@ -170,8 +170,9 @@ public:
         });
       RCLCPP_INFO(get_logger(),
         "share timer: ScovoxMapBinary coalesced at %.2f Hz (change_gate=%d "
-        "z_band=[%.2f, %.2f]%s)",
-        share_rate_hz_, (int)share_change_gate_, share_roi_z_min_,
+        "mode=%s heartbeat=%.1fs chunk=%d z_band=[%.2f, %.2f]%s)",
+        share_rate_hz_, (int)share_change_gate_, share_gate_mode_.c_str(),
+        share_heartbeat_sec_, share_max_voxels_per_msg_, share_roi_z_min_,
         share_roi_z_max_,
         share_roi_z_max_ > share_roi_z_min_ ? "" : " off");
     }
@@ -354,6 +355,66 @@ private:
     share_change_gate_ = dp("share_change_gate", true);
     share_gate_p_eps_ = dp("share_gate_p_eps", 0.02);
     share_gate_evidence_rel_ = dp("share_gate_evidence_rel", 0.10);
+    // ── E6.6 gate-policy experiment knobs (experiment_plan.md §E6.6) ──
+    // share_gate_mode selects the emit TRIGGER when share_change_gate is on:
+    //   "significance"      (default) — |Δp_occ| > τ OR relative evidence
+    //                       growth > share_gate_evidence_rel (κ = 1 + rel).
+    //                       This is the OR-form significance gate; the wire
+    //                       carries the full posterior either way.
+    //   "state_flip"        — OctoMap-equivalent baseline: emit only when the
+    //                       thresholded state flips (Beta: p_occ crosses
+    //                       share_stateflip_p_occ; Dir: dominantClass changes).
+    //                       Payload unchanged (full posterior).
+    //   "state_flip_binary" — MARBLE-equivalent baseline: state_flip trigger
+    //                       AND the payload is binarized — Beta collapsed to
+    //                       prior + share_binarize_evidence on the winning
+    //                       side, Dir to a one-hot argmax slot; a voxel with
+    //                       no dominant class ships no Dir record at all (the
+    //                       baseline cannot express "uncertain"). Wire FORMAT
+    //                       is unchanged, so the byte advantage a purpose-built
+    //                       binary codec would add must be credited
+    //                       analytically in E6.6's equal-bandwidth comparison.
+    // The any-change baseline row is share_change_gate:=false, not a mode.
+    share_gate_mode_ = dp("share_gate_mode", std::string("significance"));
+    if (share_gate_mode_ != "significance" && share_gate_mode_ != "state_flip" &&
+        share_gate_mode_ != "state_flip_binary") {
+      RCLCPP_WARN(get_logger(),
+        "share_gate_mode '%s' unknown; falling back to 'significance'",
+        share_gate_mode_.c_str());
+      share_gate_mode_ = "significance";
+    }
+    gate_state_flip_ = share_gate_mode_.rfind("state_flip", 0) == 0;
+    gate_binarize_   = share_gate_mode_ == "state_flip_binary";
+    // τ(n) ablation (E6.6 req. ④): with tau_ref_n > 0 the mean-arm threshold
+    // shrinks once last-sent evidence n exceeds it:
+    //   τ_eff = τ · (tau_ref_n / n)^tau_n_pow.
+    // pow = 1 is the design doc's 1/n; pow = 0.5 is the constant-KL rate in
+    // the quadratic regime (KL ≈ n·Δp²/2p(1−p) ⇒ Δp* ∝ n^-1/2). 0 = fixed τ.
+    share_gate_tau_ref_n_ = dp("share_gate_tau_ref_n", 0.0);
+    share_gate_tau_n_pow_ = dp("share_gate_tau_n_pow", 0.5);
+    // share_heartbeat_sec: per-voxel re-emit period. Loss healing plus the
+    // liveness half of the negative-information contract — a receiver that
+    // heard nothing about an emitted voxel for longer than this may treat the
+    // silence as "unchanged within τ", not "unheard". Needs the gate's
+    // last-emit state, so it requires share_change_gate:=true. 0 = off.
+    share_heartbeat_sec_ = dp("share_heartbeat_sec", 0.0);
+    if (share_heartbeat_sec_ > 0.0 && !share_change_gate_) {
+      RCLCPP_WARN(get_logger(),
+        "share_heartbeat_sec needs share_change_gate (no last-emit state "
+        "without it); heartbeat disabled");
+      share_heartbeat_sec_ = 0.0;
+    }
+    share_stateflip_p_occ_   = dp("share_stateflip_p_occ", 0.5);
+    share_binarize_evidence_ = dp("share_binarize_evidence", 20.0);
+    // ── E6.7 message-size knob ──
+    // share_max_voxels_per_msg: >0 splits one publish tick's deltas across
+    // ceil(total/N) self-contained ScovoxMapBinary messages (each carries the
+    // full envelope + pose; each LZ4-compressed separately). The receiver merge
+    // is snapshot-replace per (source, coord), so chunk boundaries cannot
+    // change the converged state — only delivery dynamics (loss blast radius
+    // vs per-message overhead and LZ4 ratio). 0 (default) = one message per
+    // tick, the legacy wire behaviour.
+    share_max_voxels_per_msg_ = static_cast<int>(dp("share_max_voxels_per_msg", 0));
     // share_roi_z_min/max: vertical band (integration frame, metres) outside
     // which voxels stay OFF the wire (both Beta and Dir streams). The LOCAL
     // map is untouched — this filters only what is shared, so out-of-band
@@ -1521,6 +1582,18 @@ private:
                   "semdir_voxels=%zu semdir_grid_mb=%.3f",
                   split_map_->tsdfVoxelCount(), tsdf_mb,
                   split_map_->semdirVoxelCount(), sembeta_mb);
+      // Gate-state cost (E6.6 prerequisite: "state cost is unmeasured").
+      // Shared lock suffices: the publish path writes these under the unique
+      // lock, so this read never races it.
+      if (gate_beta_ && gate_dir_) {
+        RCLCPP_INFO(get_logger(),
+                    "[memGate] beta_voxels=%zu beta_mb=%.3f "
+                    "dir_voxels=%zu dir_mb=%.3f",
+                    gate_beta_->activeCellsCount(),
+                    static_cast<double>(gate_beta_->memUsage()) / (1024.0 * 1024.0),
+                    gate_dir_->activeCellsCount(),
+                    static_cast<double>(gate_dir_->memUsage()) / (1024.0 * 1024.0));
+      }
       if (!tsdf_dump_path_.empty()) {
         // Overwrite snapshot of TsdfMap on every memlog tick — last
         // write before kill -9 is what the parity tool consumes.
@@ -1684,15 +1757,37 @@ private:
   // keeps accumulating same-p carve evidence re-emits at a geometric (not
   // per-scan) cadence, and a saturated voxel (evidence cap reached, value
   // frozen) never re-emits at all.
+  // τ(n) ablation: effective mean-arm threshold given the LAST-SENT evidence
+  // (the receiver's belief mass — that is what the trigger's KL is against).
+  double gateTauEff(float n_last) const {
+    double tau = share_gate_p_eps_;
+    if (share_gate_tau_ref_n_ > 0.0 && n_last > share_gate_tau_ref_n_)
+      tau *= std::pow(share_gate_tau_ref_n_ / (double)n_last,
+                      share_gate_tau_n_pow_);
+    return tau;
+  }
   bool betaChangedSinceEmit(const scovox::BetaVoxel& last,
                             const scovox::BetaVoxel& now) const {
-    if (std::abs(now.p_occ() - last.p_occ()) > (float)share_gate_p_eps_)
+    if (gate_state_flip_) {
+      // OctoMap/MARBLE-equivalent baseline trigger: emit only when the
+      // thresholded occupancy state flips. No evidence arm — accumulating
+      // confidence in an unchanged state is exactly what these systems
+      // cannot ship, which is the point of the baseline.
+      const auto th = (float)share_stateflip_p_occ_;
+      return (last.p_occ() >= th) != (now.p_occ() >= th);
+    }
+    if (std::abs(now.p_occ() - last.p_occ()) > (float)gateTauEff(last.s_total()))
       return true;
     const float s0 = last.s_total();
     return (now.s_total() - s0) > (float)share_gate_evidence_rel_ * s0;
   }
   bool dirChangedSinceEmit(const scovox::DirVoxel& last,
                            const scovox::DirVoxel& now) const {
+    if (gate_state_flip_) {
+      // Baseline trigger, semantic layer: argmax label flip only.
+      return scovox::dominantClass(last, alpha_0_, (uint16_t)num_classes_) !=
+             scovox::dominantClass(now,  alpha_0_, (uint16_t)num_classes_);
+    }
     // Any top-K slot change (new class, eviction, reorder) is semantically
     // meaningful downstream — always ship it.
     for (int i = 0; i < scovox::K_TOP; ++i)
@@ -1757,6 +1852,37 @@ private:
     const bool zband = share_roi_z_max_ > share_roi_z_min_;
     const double zhalf = 0.5 * split_map_->resolution();
 
+    // Emit timestamp for the gate's heartbeat arm. One stamp per tick — the
+    // heartbeat period (seconds) is far coarser than a tick.
+    const double t_now = get_clock()->now().seconds();
+
+    // state_flip_binary payload transforms (identity in every other mode).
+    // The gate grids always store the LIVE posterior — flip detection needs
+    // it — and only the wire copy is collapsed.
+    auto wireBeta = [&](const scovox::BetaVoxel& v) {
+      if (!gate_binarize_) return v;
+      const bool occ = v.p_occ() >= (float)share_stateflip_p_occ_;
+      scovox::BetaVoxel w;
+      w.a_occ  = beta_occ_prior +
+                 (occ ? (float)share_binarize_evidence_ : 0.f);
+      w.a_free = scovox::kBetaFreePrior +
+                 (occ ? 0.f : (float)share_binarize_evidence_);
+      return w;
+    };
+    auto wireDir = [&](const scovox::DirVoxel& v) {
+      if (!gate_binarize_) return v;
+      // One-hot argmax: the binarized baseline ships a label, never a
+      // distribution. Callers skip emission entirely when there is no
+      // dominant class (checked before calling — see emit_dir).
+      scovox::DirVoxel w =
+          scovox::defaultDirVoxel((uint16_t)num_classes_, alpha_0_);
+      const uint16_t d =
+          scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_);
+      w.cls[0] = d;
+      w.cnt[0] = alpha_0_ + (float)share_binarize_evidence_;
+      return w;
+    };
+
     // ----- TSDF section (elided when share_tsdf_=false) -----
     if (share_tsdf_) {
       auto& tsdf_grid = split_map_->tsdf().grid();
@@ -1780,7 +1906,7 @@ private:
     {
       auto& bgrid = ss.betaGrid();
       auto bacc = bgrid.createAccessor();
-      std::optional<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor> gacc;
+      std::optional<Bonxai::VoxelGrid<GateBeta>::Accessor> gacc;
       if (gate_beta_) gacc.emplace(gate_beta_->createAccessor());
       auto emit_beta = [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         // At prior → no posterior information; keep off the wire.
@@ -1795,16 +1921,16 @@ private:
           // Change gate vs the last-EMITTED state. Snapshots bypass the check
           // (a fresh subscriber needs full state) but still refresh the gate.
           if (!snapshot) {
-            if (auto* g = gacc->value(c, false); g && !betaChangedSinceEmit(*g, v))
+            if (auto* g = gacc->value(c, false); g && !betaChangedSinceEmit(g->v, v))
               return;
           }
           // MUST be setValue, not `*value(c, true) = v`: the miss above caches
           // prev_leaf_ptr_ = nullptr for this inner key, and value(c, true)
           // skips the refresh on a same-key hit → returns nullptr even with
           // create_if_missing. setValue re-fetches on a null cached leaf.
-          gacc->setValue(c, v);
+          gacc->setValue(c, GateBeta{v, t_now});
         }
-        frame.beta_deltas.push_back({c, v});
+        frame.beta_deltas.push_back({c, wireBeta(v)});
       };
       if (snapshot) {
         bgrid.forEachCell(emit_beta);
@@ -1819,7 +1945,7 @@ private:
     {
       auto& dgrid = ss.dirGrid();
       auto dacc = dgrid.createAccessor();
-      std::optional<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> gacc;
+      std::optional<Bonxai::VoxelGrid<GateDir>::Accessor> gacc;
       if (gate_dir_) gacc.emplace(gate_dir_->createAccessor());
       auto emit_dir = [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
         bool any_sem = false;
@@ -1831,15 +1957,23 @@ private:
           const double zc = dgrid.coordToPos(c).z + zhalf;
           if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
         }
+        // Binarized baseline: a voxel with no dominant class (OTHER veto or
+        // nothing observed) has nothing an argmax-only payload can say — no
+        // record, and the gate entry keeps its previous emitted state. A
+        // receiver that heard class k earlier keeps class k; the baseline has
+        // no retraction, faithfully. (E6.6 measures exactly this blindness.)
+        if (gate_binarize_ &&
+            scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) == 0xFFFF)
+          return;
         if (gacc) {
           if (!snapshot) {
-            if (auto* g = gacc->value(c, false); g && !dirChangedSinceEmit(*g, v))
+            if (auto* g = gacc->value(c, false); g && !dirChangedSinceEmit(g->v, v))
               return;
           }
           // setValue, not `*value(c, true)` — see the Beta gate note above.
-          gacc->setValue(c, v);
+          gacc->setValue(c, GateDir{v, t_now});
         }
-        frame.dir_deltas.push_back({c, v});
+        frame.dir_deltas.push_back({c, wireDir(v)});
       };
       if (snapshot) {
         dgrid.forEachCell(emit_dir);
@@ -1850,6 +1984,36 @@ private:
       }
     }
 
+    // ----- Heartbeat arm (share_heartbeat_sec > 0; E6.6) -----
+    // Re-pin every emitted voxel at least once per period: heals a lost delta
+    // (reliable QoS notwithstanding, the E6.4 relay drops whole messages) and
+    // makes silence mean "unchanged within τ" rather than "unheard". Walks the
+    // gate grids — exactly the ever-emitted set, never the whole map. The
+    // touched-path emits above already stamped t_emit = t_now, so a voxel
+    // never rides both paths in one tick. Snapshot ticks skip this: the
+    // snapshot itself re-pins everything.
+    if (!snapshot && share_heartbeat_sec_ > 0.0 && gate_beta_ && gate_dir_) {
+      auto bacc = ss.betaGrid().createAccessor();
+      auto dacc = ss.dirGrid().createAccessor();
+      gate_beta_->forEachCell([&](GateBeta& g, const Bonxai::CoordT& c) {
+        if (t_now - g.t_emit < share_heartbeat_sec_) return;
+        if (const auto* v = bacc.value(c, false)) {
+          g.v = *v; g.t_emit = t_now;
+          frame.beta_deltas.push_back({c, wireBeta(*v)});
+        }
+      });
+      gate_dir_->forEachCell([&](GateDir& g, const Bonxai::CoordT& c) {
+        if (t_now - g.t_emit < share_heartbeat_sec_) return;
+        if (const auto* v = dacc.value(c, false)) {
+          if (gate_binarize_ &&
+              scovox::dominantClass(*v, alpha_0_, (uint16_t)num_classes_) == 0xFFFF)
+            return;
+          g.v = *v; g.t_emit = t_now;
+          frame.dir_deltas.push_back({c, wireDir(*v)});
+        }
+      });
+    }
+
     if (frame.tsdf_deltas.empty() && frame.beta_deltas.empty() &&
         frame.dir_deltas.empty()) {
       return {0, 0};
@@ -1857,33 +2021,77 @@ private:
 
     scovox::BinarySerializer::Options opts;
     opts.share_tsdf = share_tsdf_;
-    auto data = scovox::BinarySerializer::serialize(frame, opts);
-    auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
 
-    scovox_msgs::msg::ScovoxMapBinary bin;
-    bin.header.stamp    = get_clock()->now();
-    bin.header.frame_id  = int_frame_;
-    bin.map_from_source  = map_from_source;
-    bin.version          = 5;   // envelope version — dscovox onBinaryMap routes on it
+    // Serialize + LZ4 + publish one frame. Returns the deltas it shipped
+    // (0 on an LZ4 error — the consumer always expects the LZ4 framing, so
+    // shipping a raw blob would be undecodable; drop the frame instead).
+    size_t bytes_total = 0;
+    auto publish_frame = [&](const scovox::BinarySerializer::Frame& f) -> size_t {
+      auto data = scovox::BinarySerializer::serialize(f, opts);
+      auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
+      if (comp.empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "publishBinaryMap: LZ4 compression failed; dropping frame");
+        return 0;
+      }
+      scovox_msgs::msg::ScovoxMapBinary bin;
+      bin.header.stamp    = get_clock()->now();
+      bin.header.frame_id  = int_frame_;
+      bin.map_from_source  = map_from_source;
+      bin.version          = 5;   // envelope version — dscovox onBinaryMap routes on it
 #if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
-    bin.little_endian = true;
+      bin.little_endian = true;
 #else
-    bin.little_endian = false;
+      bin.little_endian = false;
 #endif
-    if (comp.empty()) {
-      // data is non-empty by the guard above, so compressLZ4 only returns empty
-      // on a genuine LZ4 error. The consumer always expects the LZ4 framing, so
-      // shipping the raw blob would be undecodable — drop the frame instead.
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "publishBinaryMap: LZ4 compression failed; dropping frame");
-      return {0, 0};
+      bin.data = std::move(comp);
+      bytes_total += bin.data.size();
+      const size_t n = f.tsdf_deltas.size() + f.beta_deltas.size()
+                     + f.dir_deltas.size();
+      bin_pub_->publish(std::move(bin));
+      return n;
+    };
+
+    size_t emitted = 0;
+    const size_t total = frame.tsdf_deltas.size() + frame.beta_deltas.size()
+                       + frame.dir_deltas.size();
+    const size_t chunk = share_max_voxels_per_msg_ > 0
+                       ? (size_t)share_max_voxels_per_msg_ : total;
+    if (chunk >= total) {
+      emitted = publish_frame(frame);
+    } else {
+      // E6.7 chunking: greedy split preserving section order. Every chunk is a
+      // complete, independently decodable ScovoxMapBinary (own envelope, pose,
+      // LZ4 stream) — the receiver merge is per-(source, coord) replace, so
+      // chunk boundaries change delivery dynamics only, never the converged
+      // state. Costs: per-message envelope overhead + smaller LZ4 windows.
+      scovox::BinarySerializer::Frame part;
+      part.resolution  = frame.resolution;
+      part.num_classes = frame.num_classes;
+      part.alpha_0     = frame.alpha_0;
+      size_t in_part = 0;
+      auto flush = [&] {
+        if (in_part == 0) return;
+        emitted += publish_frame(part);
+        part.tsdf_deltas.clear(); part.beta_deltas.clear();
+        part.dir_deltas.clear();
+        in_part = 0;
+      };
+      for (const auto& d : frame.tsdf_deltas) {
+        part.tsdf_deltas.push_back(d);
+        if (++in_part >= chunk) flush();
+      }
+      for (const auto& d : frame.beta_deltas) {
+        part.beta_deltas.push_back(d);
+        if (++in_part >= chunk) flush();
+      }
+      for (const auto& d : frame.dir_deltas) {
+        part.dir_deltas.push_back(d);
+        if (++in_part >= chunk) flush();
+      }
+      flush();
     }
-    bin.data = std::move(comp);
-    const size_t emitted = frame.tsdf_deltas.size() + frame.beta_deltas.size()
-                         + frame.dir_deltas.size();
-    double mb = double(bin.data.size()) / (1024.0 * 1024.0);
-    bin_pub_->publish(std::move(bin));
-    return {emitted, mb};
+    return {emitted, double(bytes_total) / (1024.0 * 1024.0)};
   }
 
   // Publish planning_map as a 2D projection of the persistent voxel grid.
@@ -2311,14 +2519,28 @@ private:
   // ── Low-bandwidth share controls (see declareNodeParams) ────────────────
   double share_rate_hz_{0.0};            // <=0 = legacy per-scan inline publish
   bool   share_change_gate_{true};       // emit only changed-since-last-emit voxels
-  double share_gate_p_eps_{0.02};        // |Δp_occ| emit threshold
-  double share_gate_evidence_rel_{0.10}; // relative evidence-growth emit threshold
+  double share_gate_p_eps_{0.02};        // |Δp_occ| emit threshold (τ)
+  double share_gate_evidence_rel_{0.10}; // relative evidence-growth emit threshold (κ−1)
+  // ── E6.6 gate-policy knobs (see declareNodeParams for semantics) ──
+  std::string share_gate_mode_{"significance"};
+  bool   gate_state_flip_{false};        // cached: mode starts with "state_flip"
+  bool   gate_binarize_{false};          // cached: mode == "state_flip_binary"
+  double share_gate_tau_ref_n_{0.0};     // >0 enables τ(n) shrink above this evidence
+  double share_gate_tau_n_pow_{0.5};     // τ(n) exponent: 1 = 1/n, 0.5 = const-KL rate
+  double share_heartbeat_sec_{0.0};      // >0 = per-voxel re-emit period (loss healing)
+  double share_stateflip_p_occ_{0.5};    // occ/free threshold, state_flip modes
+  double share_binarize_evidence_{20.0}; // pseudo-count mass of a binarized payload
+  int    share_max_voxels_per_msg_{0};   // E6.7: >0 chunks one tick into N-delta msgs
   double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
-  // Last-EMITTED wire state per voxel (the change gate's memory). Shadow
-  // Bonxai grids with the live grids' geometry; allocated only when
-  // share_change_gate is on in mode=rolling.
-  std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> gate_beta_;
-  std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  gate_dir_;
+  // Last-EMITTED wire state per voxel (the change gate's memory) plus its emit
+  // time — node-clock seconds, double not float: wall-clock epoch seconds are
+  // outside float's exact-integer range, and the heartbeat compares differences
+  // of these. Shadow Bonxai grids with the live grids' geometry; allocated only
+  // when share_change_gate is on in mode=rolling.
+  struct GateBeta { scovox::BetaVoxel v; double t_emit; };
+  struct GateDir  { scovox::DirVoxel  v; double t_emit; };
+  std::unique_ptr<Bonxai::VoxelGrid<GateBeta>> gate_beta_;
+  std::unique_ptr<Bonxai::VoxelGrid<GateDir>>  gate_dir_;
   rclcpp::TimerBase::SharedPtr bin_timer_;  // share_rate_hz publish timer
   bool fused_walker_{true};       // Step 12.10 — single-DDA hit-ray walker
   // Semantic dataset priors. Defaults match SemSplitMap::Params; KITTI launches

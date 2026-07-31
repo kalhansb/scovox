@@ -285,7 +285,11 @@ is exactly what this table makes visible.
 | `deskew_mode` | `auto` | `auto` | `auto\|on\|off`; `off` silences the harmless IMU-not-ready note. |
 | `downsample_voxel_size` | `0.0` (off) | `0.1` | Per-scan sensor-frame voxel downsample before integration — near-lossless for occupancy and it keeps dense LiDAR real-time. Use `0.1`; **off unless something sets it**, see the warning below. |
 | `tf_require_exact` | `false` | `true` | Require TF at the scan's exact stamp; **do not relax** — the stale-pose fallback mis-places whole scans. |
-| `share_change_gate` | `true` | `true` | Re-send a voxel only when it changed (bandwidth). |
+| `share_change_gate` | `true` | `true` | Re-send a voxel only when it changed (bandwidth). `false` = the any-change baseline: every touched voxel re-ships. |
+| `share_gate_mode` | `significance` | `significance` | Emit trigger when the gate is on: `significance` (\|Δp\| > `share_gate_p_eps` OR evidence growth > `share_gate_evidence_rel`); `state_flip` (OctoMap-style: occ/free crossing of `share_stateflip_p_occ` / argmax label change); `state_flip_binary` (state_flip + payload collapsed to `share_binarize_evidence` pseudo-counts on the winning side; experiment baseline, MARBLE-equivalent). |
+| `share_gate_tau_ref_n` / `share_gate_tau_n_pow` | `0.0` (off) / `0.5` | — | τ(n) ablation: above `ref_n` evidence, the \|Δp\| threshold shrinks as `(ref_n/n)^pow`. |
+| `share_heartbeat_sec` | `0.0` (off) | — | Re-send every emitted voxel at least this often (loss healing; makes silence mean "unchanged within τ"). Needs `share_change_gate`. |
+| `share_max_voxels_per_msg` | `0` (one msg/tick) | — | Split a publish tick into self-contained chunks of ≤ N deltas (message-size experiment; converged state unaffected). |
 | `share_rate_hz` | `0.0` (per-scan) | `2.0` (overlay) | Coalesce deltas into a timer publish (`0.0` = legacy per-scan). |
 | `share_roi_z_min/max` | `0.0 / 0.0` (off) | `-0.5 / 2.0` (overlay) | Vertical share band (map frame); `min ≥ max` disables. |
 
