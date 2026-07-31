@@ -176,7 +176,7 @@ top-2 evidence: legacy per-scan publish 32.8 Mbps → change gate 20.7 Mbps → 
 [scovox_robot_share.yaml](../config/scovox_robot_share.yaml)
 (`share_change_gate`, `share_rate_hz`, `share_roi_z_min/max`). Keep the z-band a
 **superset** of the planner band (`roi_min_z`/`roi_max_z` in explo_planner's
-`exploration_params.yaml`) and in sync with the merger's receive-side clip — the
+`shared_params.yaml`) and in sync with the merger's receive-side clip — the
 three files cross-reference each other. Full measurements:
 [map_share_bandwidth_experiment.md](https://github.com/kalhansb/hmr_explo/blob/main/ws/src/map_share_bandwidth_experiment.md)
 in the hmr_explo workspace.

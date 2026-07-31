@@ -361,7 +361,7 @@ private:
     // default) disables the band.
     // KEEP IN SYNC with dscovox_node share_roi_z_min/share_roi_z_max (the
     // receiver-side defensive clip) and with explo_planner
-    // exploration_params.yaml roi_min_z/roi_max_z: the shared band must be a
+    // shared_params.yaml roi_min_z/roi_max_z: the shared band must be a
     // SUPERSET of the planner band, or free voxels at the band edge arrive
     // clipped and read as unknown to the planner.
     share_roi_z_min_ = dp("share_roi_z_min", 0.0);

@@ -52,7 +52,7 @@
     # Shared-ROI z-band (map frame, metres); min >= max disables.
     # KEEP IN SYNC with the receive-side clip (dscovox_params.yaml
     # share_roi_z_min/max) and with the planner band (explo_planner
-    # exploration_params.yaml roi_min_z/roi_max_z): the shared band must be a
+    # shared_params.yaml roi_min_z/roi_max_z): the shared band must be a
     # SUPERSET of the planner band.
     share_roi_z_min: -0.5
     share_roi_z_max: 2.0
