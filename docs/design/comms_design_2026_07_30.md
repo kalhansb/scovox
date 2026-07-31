@@ -225,6 +225,12 @@ occupancy mapping; value-of-information and distributed fusion; deployed systems
 and patents) converged on one answer: **the mechanism is not novel, the
 application is.**
 
+The citation set, closest-work table, threat register and baseline list derived
+from this section now live in
+[docs/papers/lit_review_2026_07_31.md](../papers/lit_review_2026_07_31.md), which
+supersedes this section for anything paper-facing. Its appendix records which
+citations from the two agent surveys failed verification — several did.
+
 ### Not novel — do not claim these
 
 | Claim | Prior art |
@@ -249,6 +255,11 @@ the posterior on the receiving side**:
   *"has the downside, that the probabilistic framework is lost on the remote
   side."*
 - **US 11,312,379** (octree map sync) quantizes child nodes to a single bit.
+- **Łuczyński et al.** (OCEANS 2017) gate per voxel against the last transmitted
+  map state under a hard link budget, and state the consequence themselves: the
+  wire carries lists of newly-occupied / newly-unoccupied voxels, while *"the log
+  odds in the OctoMap are constantly updated on board of the vehicle"* (§VI.A).
+  The posterior evolves and is never transmitted. See below.
 - **Where2comm** (NeurIPS 2022) gates per BEV cell, but on absolute current-frame
   detection confidence with no temporal reference at all, and ships learned
   features that cannot be Bayes-fused.
@@ -324,23 +335,76 @@ arithmetic in this document does not carry over directly either.
 Cite it as the closest conceptual ancestor for "don't send map information that
 does not reduce teammates' uncertainty enough", and distinguish on (1) and (2).
 
+### Resolved: Łuczyński et al. 2017 is a state-flip gate, and it supports the claim
+
+Flagged in the first survey as the likeliest place an aggressive per-cell gate
+already exists. **Obtained and read 2026-07-31. It is not a threat — it is the
+best single piece of evidence for the contribution.**
+
+Their operation scheme (§VI.A) gates per voxel against the last transmitted map
+state, exactly as we do, but on the discrete classification:
+
+> "When integrating the point cloud into the map, it is checked if any voxel has
+> changed its state, i.e., if a previously unknown region is now identified as
+> free/occupied, a voxel that was occupied is now free or the free voxel is now
+> occupied."
+
+Four lists go on the wire — newly-occupied and newly-unoccupied, each at coarse
+or fine resolution. The receiver gets a classification. And the paper says what
+happens to the rest, in the next sentence:
+
+> "At the same time the log odds in the OctoMap are constantly updated on board
+> of the vehicle."
+
+That is this document's thesis, stated by the prior art about itself: under a hard
+link budget, the continuous belief keeps evolving locally and is structurally
+excluded from the wire. Cite it in the differentiator cluster alongside MARBLE and
+`vdb_mapping`.
+
+Three corrections to how it was described here before, all of which would have
+been caught in review:
+
+- **It is a satellite link, not acoustic.** Ku-band VSAT for ROV teleoperation
+  (the DexROV project): 768 kb/s uplink, 256 kb/s downlink, 620 ms nominal RTT
+  (§II). The "~100 kbps acoustic" characterization was wrong.
+- **It is single-vehicle telemetry, not multi-robot map sharing.** ROV → vessel →
+  onshore mission control, for an operator's visualization. There is no peer fleet
+  and no fusion.
+- **The bounding box is not the gate.** It is an operator-specified region of
+  interest selecting *resolution and color*; the gate is the per-voxel state-flip
+  test above. (Evaluation is simulation-only, §VII: Docker plus `netem`.)
+
+Reported bandwidth, for the baseline comparison: retransmitting the full OctoMap
+per scan climbs to ~700 KB/s at 10 cm and ~330 KB/s at 15 cm (Figs. 5, 7); their
+incremental scheme sits in the low single-digit KB/s (Fig. 6).
+
 ### Remaining novelty risk
 
-Unread: underwater 3D-grid map transmission over ~100 kbps acoustic links
-(Łuczyński & Birk, OCEANS 2017 and follow-ons) — the most bandwidth-hostile
-setting in the field, and the likeliest place an aggressive per-cell gate already
-exists.
+Resolving Łuczyński did **not** sweep the underwater acoustic literature — it
+removed the only entry we had from it, since that paper turned out to be
+satellite. True acoustic links (~1–10 kbps, not the ~100 kbps assumed here
+earlier) remain the most bandwidth-hostile regime in robotics and the most
+plausible home for an undiscovered per-cell continuous gate. One targeted sweep of
+OCEANS / IEEE JOE / AUV proceedings would close it. Until that search is actually
+run, do not write "no such system exists" — write nothing.
 
-Patent posture, stated factually and with no infringement or validity assessment:
-the closest granted-and-active claim is **US 12,236,779 B2** (Intel, collective
-perception service), whose transmission-selection granularity is the *layer*, not
-the cell, with a fraction-of-cells-changed threshold. The closest cell-granularity
-disclosure is **US 2023/0110467 A1** (Intel, abandoned — prior art, not an
-enforceable claim), which discloses differential cost-map transmission of cells
-whose cost or confidence changed by more than a threshold versus previously
-transmitted messages. Google Patents and USPTO were rate-limiting during the
-survey; both should be re-verified before being relied on, and non-English
-filings were not searched.
+Patent posture, stated factually and with no infringement or validity assessment.
+The closest granted-and-active claim is **US 12,236,779 B2** (Intel, "Collective
+perception service enhancements in intelligent transport systems") — **re-verified
+2026-07-31** against the Google Patents record: granted 2025-02-25, status active,
+expires 2041-10-15, and claim 1 selects layered cost-map data at the *layer*, not
+the cell. The prior reading holds. (The specific "fraction-of-cells-changed"
+threshold wording was *not* re-confirmed and should not be repeated as a quote.)
+
+The closest cell-granularity disclosure is **US 2023/0110467 A1** (Intel,
+believed abandoned — prior art, not an enforceable claim), believed to disclose
+differential cost-map transmission of cells whose cost or confidence changed by
+more than a threshold versus previously transmitted messages. **Still unread.**
+This is now the highest-severity open item in the prior-art picture: it is the
+only known disclosure combining cell granularity with a versus-last-transmitted
+threshold. Pull the primary claim text and file wrapper before relying on any
+novelty statement at mechanism level. Non-English filings (JP/CN/KR/DE) remain
+unsearched.
 
 ## Design sketch
 
@@ -488,8 +552,42 @@ gate reduces how many records exist.
    constraint, Part 1 alone does not reach it and Part 2 is required.
 5. ~~Obtain Rocha et al. 2005.~~ **Resolved 2026-07-31** — obtained, read, and
    distinguished; see *Resolved: Rocha et al. 2005 is not prior art for the
-   gate*. The remaining unread item is the underwater acoustic map-transmission
-   line.
+   gate*.
+6. ~~Obtain the underwater map-transmission line (Łuczyński).~~ **Resolved
+   2026-07-31** — obtained, read; it is a state-flip gate over a *satellite* link
+   and it supports the claim rather than threatening it. See *Resolved: Łuczyński
+   et al. 2017 is a state-flip gate*. Two unread items remain, both narrowed:
+   US 2023/0110467 A1 (primary claim text), and a genuine acoustic-link sweep.
+7. ~~The merge operator across robots is not pinned down in this document.~~
+   **Resolved 2026-07-31** — settled by reading the code; both of this document's
+   descriptions were true, at different layers. The merger keeps one replica grid
+   pair *per source robot* (`sources_`,
+   [dscovox_node.cpp:416](src/scovox_mapping/src/dscovox_node.cpp#L416));
+   snapshot-replace
+   ([dscovox_node.cpp:462](src/scovox_mapping/src/dscovox_node.cpp#L462)) only
+   ever overwrites a robot's *own* previous value inside that robot's layer.
+   Each touched fused cell is then rebuilt from scratch — reset to prior, fold
+   every source's current value via `mergeBeta`/`mergeDir` (`refoldBeta`,
+   [dscovox_consensus.hpp:163](src/scovox_mapping/include/scovox/dscovox_consensus.hpp#L163)).
+   Prior-subtraction never runs against an accumulating fused value, and the
+   header states the property this buys: the result "depends only on the current
+   *set* of source values, never on how many times a snapshot was received."
+   Since no carve posterior ever ingests fused output (`scovox_node` publishes
+   `ScovoxMapBinary` and never subscribes to it; `dscovox_node` publishes only
+   `ScovoxMap`), the topology is acyclic and no evidence path returns to its
+   origin. **The data-incest objection does not apply, and the scope argument is
+   provable rather than asserted:** fused = F(current source values), so the
+   gate changes *when* a replica attains a value, never what the fold produces
+   from it — exact per cell at every instant with respect to fusion, while
+   "exact in the limit" remains the claim for the individual link. One caveat,
+   which belongs to the full paper rather than this one: `mergeDir` re-truncates
+   the union of the sources' top-K slots back to K_TOP at every fold (a class
+   dumped to OTHER cannot climb back; fold order is pinned by sorted source
+   keys, so the result is deterministic). That is not collateral damage — the
+   split Dir substrate exists precisely to test the hypothesis that K_TOP = 2 +
+   OTHER retains approximately all the information needed for uncertainty,
+   memory, and wire bandwidth, and the cross-robot fold is where that hypothesis
+   is stressed hardest. Measure the truncation loss there; do not hedge it.
 
 ## Reproducing the measurement
 
@@ -560,6 +658,12 @@ Ordered by how load-bearing they are for Part 2.
   `github.com/dan-riley/marble_mapping`. Deployed diff-map sharing; binarized.
 - FZI `vdb_mapping` / `vdb_mapping_ros2`. The direct architectural analogue, and
   the explicit statement that its low-bandwidth mode loses the posterior.
+- T. Łuczyński, T. Fromm, S. Govindaraj, C. A. Mueller & A. Birk, "3D Grid Map
+  Transmission for Underwater Mapping and Visualization under Bandwidth
+  Constraints", *OCEANS 2017 – Anchorage*, 2017 (IEEE Xplore 8232281). Per-voxel
+  state-flip gate against last-transmitted map state under a hard satellite link
+  budget; §VI.A is the quotable admission that the log-odds stay on the vehicle.
+  Note: satellite, not acoustic; single-vehicle; simulation-only evaluation.
 - V. Reijgwart, C. Cadena, R. Siegwart & L. Ott, "Efficient volumetric mapping of
   multi-scale environments using wavelet-based compression", *RSS*, 2023.
   Saturated-region skipping; coefficient thresholding.
