@@ -145,7 +145,7 @@ scovox_node:
       # Vertical band kept ON the wire (integration frame); the LOCAL map is
       # unaffected. min >= max disables. KEEP IN SYNC with dscovox_node
       # share_roi_z_min/share_roi_z_max (receiver ingest clip) and with
-      # explo_planner exploration_params.yaml roi_min_z/roi_max_z — the
+      # explo_planner shared_params.yaml roi_min_z/roi_max_z — the
       # shared band must be a SUPERSET of the planner band.
 
     publish_pointcloud:             # bool, default true
@@ -232,7 +232,7 @@ dscovox_node:
       # records whose MAP-frame voxel centre is outside the band are dropped
       # at ingest. min >= max disables. KEEP IN SYNC with scovox_node
       # share_roi_z_min/share_roi_z_max and explo_planner
-      # exploration_params.yaml roi_min_z/roi_max_z (shared band must be a
+      # shared_params.yaml roi_min_z/roi_max_z (shared band must be a
       # SUPERSET of the planner band).
 
     # NOTE: dscovox_mapping_node declares NO planning-map, pose-correction

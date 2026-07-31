@@ -319,7 +319,7 @@ is exactly what this table makes visible.
 > log a warning; **do not set it** — a config asking for `10` silently gets `2`.
 >
 > **Z-band coherence.** The share band must be a **superset** of the planner band
-> (`roi_min_z`/`roi_max_z` in explo_planner's `exploration_params.yaml`) and in
+> (`roi_min_z`/`roi_max_z` in explo_planner's `shared_params.yaml`) and in
 > sync across the mapper (`scovox_robot_share.yaml`) and merger
 > (`dscovox_params.yaml`).
 

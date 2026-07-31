@@ -167,7 +167,7 @@ planner input consumed by
 [explo_planner](https://github.com/kalhansb/explo_planner). Keep the share
 z-band in sync across [`scovox_robot_share.yaml`](config/scovox_robot_share.yaml),
 [`dscovox_params.yaml`](src/scovox_mapping/config/dscovox_params.yaml), and
-explo_planner's `exploration_params.yaml` (shared band ⊇ planner band) — each
+explo_planner's `shared_params.yaml` (shared band ⊇ planner band) — each
 file's comments cross-reference the others.
 
 For simulation/bag use,

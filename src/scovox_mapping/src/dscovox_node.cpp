@@ -179,7 +179,7 @@ public:
     // map honours the band even if one sender was launched without it.
     // KEEP IN SYNC with scovox_node share_roi_z_min/share_roi_z_max (sender
     // wire filter, applied in its integration frame) and with explo_planner
-    // exploration_params.yaml roi_min_z/roi_max_z: the shared band must be a
+    // shared_params.yaml roi_min_z/roi_max_z: the shared band must be a
     // SUPERSET of the planner band. min >= max (default 0/0) disables.
     share_z_min_ = declare_parameter<double>("share_roi_z_min", 0.0);
     share_z_max_ = declare_parameter<double>("share_roi_z_max", 0.0);

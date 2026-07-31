@@ -120,7 +120,7 @@ per robot). Wire cost per delta ≈ `28 + 20·N_beta` bytes. The knobs live in
 [scovox_robot_share.yaml](../config/scovox_robot_share.yaml): `share_change_gate`
 (re-send a voxel only when it changed), `share_rate_hz` (coalesce deltas), and the
 z-band `share_roi_z_min/max`. Keep the z-band a **superset** of the planner band
-(`roi_min_z`/`roi_max_z` in explo_planner's `exploration_params.yaml`) and in sync
+(`roi_min_z`/`roi_max_z` in explo_planner's `shared_params.yaml`) and in sync
 with the merger's receive-side clip (`share_roi_z_min/max` in `dscovox_params.yaml`).
 
 ## Validating without robots
