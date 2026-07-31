@@ -22,6 +22,8 @@ scripts/            Launch helper for the raw-cloud config (see below)
 
 docs/
   design/unified_dirichlet_design_2026_05_13.md   Unified per-voxel Dirichlet design
+  design/fine_tsdf_band_dbh_2026_07_30.md         Fine-resolution TSDF band near trees for DBH
+  design/comms_design_2026_07_30.md               Wire compaction and the significance gate
   occupancy_prior.md                              Why the symmetric Beta(1,1) occupancy prior
 ```
 
