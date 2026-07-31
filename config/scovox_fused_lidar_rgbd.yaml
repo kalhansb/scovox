@@ -77,7 +77,8 @@
     # --- Semantics (Dirichlet, 14-class outdoor palette) ---------------------
     num_classes:          14
     max_semantic_classes: 14
-    semantic_top_k:       2
+    # top-K width per voxel is the compile-time K_TOP (scovox_core voxel.hpp),
+    # not a parameter — build every robot with the same K_TOP
     semantic_mode:        "dirichlet"
     dirichlet_prior:      0.01
     # Outdoor palette: color key (r<<16|g<<8|b) -> compact class id; 0 = void.
