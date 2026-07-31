@@ -293,9 +293,8 @@ Two qualifications, both of which should be stated rather than glossed:
 vision-based 3-D mapping using information theory", *Robotics and Autonomous
 Systems* 53(3–4):282–311, 2005** was flagged as the main novelty risk — an
 entropy-based *information utility* deciding what map information is worth
-sending teammates. Full text now in [docs/papers/rocha2005.md](docs/papers/rocha2005.md).
-It is close, and it is not the same thing. Three separations, in order of
-importance:
+sending teammates. It is close, and it is not the same thing. Three separations,
+in order of importance:
 
 1. **It gates per measurement, not per voxel.** Eq. 64 defines
    `I_{k,i} = Σ_{l∈Z_{k,i}} I^l_{k,i}` — per-voxel mutual-information terms
@@ -566,9 +565,8 @@ Ordered by how load-bearing they are for Part 2.
   Saturated-region skipping; coefficient thresholding.
 - R. Rocha, J. Dias & A. Carvalho, "Cooperative multi-robot systems: A study of
   vision-based 3-D mapping using information theory", *Robotics and Autonomous
-  Systems* 53(3–4):282–311, 2005. Full text at
-  [docs/papers/rocha2005.md](docs/papers/rocha2005.md). The closest conceptual
-  ancestor; per-measurement, peer-memoryless, shares measurements not map state.
+  Systems* 53(3–4):282–311, 2005. The closest conceptual ancestor;
+  per-measurement, peer-memoryless, shares measurements not map state.
   Eq. 64 (utility), Eq. 65 (`log σ/σ'` closed form), Eq. 68 (the gate).
 
 **Bandwidth-aware sharing elsewhere**
