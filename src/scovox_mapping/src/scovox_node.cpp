@@ -237,7 +237,19 @@ private:
     P.semantic_occ_gate = dp("semantic_occ_gate", 0.5);
     P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.0);  // <=0 = guard off (trust recent scan)
     P.batch_free_carve = dp("batch_free_carve", true);
-    P.evidence_saturation = static_cast<uint16_t>(dp("evidence_saturation", 1000));
+    {
+      // uint16_t storage: an out-of-range request would otherwise wrap silently
+      // (70000 → 4464, a far TIGHTER cap than asked for; -1 → 65535). Clamp to
+      // the storable range and warn; 0 disables the cap, so negatives land there.
+      const int requested_sat = (int)dp("evidence_saturation", 1000);
+      const int sat = std::clamp(requested_sat, 0, 65535);
+      if (requested_sat != sat) {
+        RCLCPP_WARN(get_logger(),
+          "evidence_saturation=%d outside the uint16 storage range [0, 65535]; "
+          "clamped to %d (0 disables the cap).", requested_sat, sat);
+      }
+      P.evidence_saturation = static_cast<uint16_t>(sat);
+    }
     P.dirichlet_min_p_occ = dp("dirichlet_min_p_occ", 0.5);
     sem_vis_thresh_ = dp("semantic_vis_threshold", -1.0);
     P.range_decay_length = dp("range_decay_length", -1.0);

@@ -87,9 +87,13 @@ inline BetaVoxel mergeBeta(const BetaVoxel& a,
   const float occ_prior  = kBetaOccPrior;
   const float free_prior = kBetaFreePrior;
   BetaVoxel f{};
-  // Floor each fused α at its prior. For valid inputs (each source at-or-above
-  // prior) a+b−prior ≥ prior already, so this is a no-op; it only guards a
-  // corrupt/below-prior source from producing a negative α and an out-of-[0,1]
+  // Floor each fused α at its prior. Below-prior inputs are NORMAL, not just
+  // corruption: the split-path evidence saturation (SemSplitMap::
+  // applyBetaSaturation) rescales BOTH α by cap/s_total, which pushes the
+  // minority bucket below its prior on any saturated lopsided voxel (e.g.
+  // cap=1000, a_occ≈999 ⇒ a_free≈0.999 < 1). The floor then binds with a fused
+  // p_occ error bounded by the prior itself (~1e-4 at cap 1000). It also still
+  // guards a corrupt source from producing a negative α and an out-of-[0,1]
   // p_occ that would poison downstream entropy/EIG.
   f.a_occ  = std::max(occ_prior,  a.a_occ  + b.a_occ  - occ_prior);
   f.a_free = std::max(free_prior, a.a_free + b.a_free - free_prior);
