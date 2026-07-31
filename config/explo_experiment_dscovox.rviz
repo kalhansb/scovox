@@ -23,7 +23,7 @@ Visualization Manager:
       Show Names: true
       Value: true
     # No Planning Map display: the experiment runs the planner in its
-    # straight-line fallback (require_planning_map: false) and scovox has
+    # straight-line fallback (use_planning_map: false) and scovox has
     # publish_planning_map:=false — there is no 2D grid to draw.
     # The fused dscovox map. This variant of explo_experiment.rviz points the
     # cloud at the single-robot MERGER (/robot1/dscovox_node/pointcloud) instead

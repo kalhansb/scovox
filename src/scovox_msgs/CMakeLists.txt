@@ -13,8 +13,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ScovoxVoxel.msg"
   "msg/ScovoxMap.msg"
   "msg/ScovoxMapBinary.msg"
-  "msg/RobotIntent.msg"
-  "msg/TreeTarget.msg"
   "srv/GetRegion.srv"
   "srv/GetOccupancyGrid.srv"
   "srv/ExtractMesh.srv"
