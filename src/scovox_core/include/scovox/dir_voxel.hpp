@@ -32,6 +32,14 @@
 /// discipline as `sparse_add_unified` in semdir_map.cpp, ported to the
 /// occupancy-free Dirichlet; it is *not* the legacy `voxel.hpp::sparse_add`
 /// with its `≥ 0` slack.
+///
+/// One bounded exception, from evidence saturation
+/// (`SemSplitMap::applyDirSaturation`): the rescale multiplies an EMPTY slot's
+/// α₀ placeholder down to k·α₀ (only FILLED slots are floored back to α₀ —
+/// flooring empty ones would re-inflate `s_class` past the cap). The next
+/// empty-slot fill overwrites that placeholder with `α₀ + inc`, so the fill's
+/// Δ exceeds `inc` by α₀·(1−k) ≤ α₀. This merely restores the eroded prior,
+/// is bounded by α₀ per fill, and needs no downstream guard.
 
 #include <cstddef>
 #include <cstdint>

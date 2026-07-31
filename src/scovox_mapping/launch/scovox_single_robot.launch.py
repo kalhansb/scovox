@@ -51,7 +51,11 @@ def generate_launch_description():
             "w_occ":                    2.0,
             "w_free":                   1.0,
 
-            # -- Evidence saturation ---------------------------------------------------
+            # -- Evidence saturation (1) -----------------------------------------------
+            # evidence_saturation  int  1000  counts  Per-voxel cap on pseudo-count
+            # totals (Beta a_occ+a_free, Dir other+sum(cnt)); the proportional
+            # rescale preserves p_occ / class ratios. 0 disables.
+            "evidence_saturation": 1000,
 
             # -- Range weighting (3) ---------------------------------------------------
             # range_decay_length <= 0 disables range weighting.
