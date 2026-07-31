@@ -22,6 +22,8 @@ scripts/            Launch helper for the raw-cloud config (see below)
 
 docs/
   design/unified_dirichlet_design_2026_05_13.md   Unified per-voxel Dirichlet design
+  design/fine_tsdf_band_dbh_2026_07_30.md         Fine-resolution TSDF band near trees for DBH
+  design/comms_design_2026_07_30.md               Wire compaction and the significance gate
   occupancy_prior.md                              Why the symmetric Beta(1,1) occupancy prior
 ```
 
@@ -133,8 +135,10 @@ Each robot's mapper then integrates in a **per-robot frame** (`r1_map`,
 **mandatory**: the bin stream's `header.frame_id` is the `integration_frame`,
 and the merger keys its per-source grids by that frame_id — two robots sharing
 one frame_id collapse into a single source grid and overwrite each other where
-their maps overlap. The static TF is one latched `/tf_static` sample that
-peers' mergers cache on first sight; there is no per-scan cross-robot `/tf`.
+their maps overlap. Each mapper resolves that `map ← rK_map` bridge from its own
+`/tf_static` and stamps the pose into every delta (`ScovoxMapBinary.map_from_source`);
+peers' mergers read the pose from the message and hold **no TF listener**, so no
+cross-robot `/tf` is needed.
 
 Per robot, inside the container (shown for robot 1 — substitute the
 namespace, frame, and log names; **start the merger before the mapper**: the
@@ -165,7 +169,7 @@ planner input consumed by
 [explo_planner](https://github.com/kalhansb/explo_planner). Keep the share
 z-band in sync across [`scovox_robot_share.yaml`](config/scovox_robot_share.yaml),
 [`dscovox_params.yaml`](src/scovox_mapping/config/dscovox_params.yaml), and
-explo_planner's `exploration_params.yaml` (shared band ⊇ planner band) — each
+explo_planner's `shared_params.yaml` (shared band ⊇ planner band) — each
 file's comments cross-reference the others.
 
 For simulation/bag use,
@@ -187,7 +191,7 @@ rebuild or copy:
 
 * [`config/exploration_fused_bag.yaml`](config/exploration_fused_bag.yaml) —
   explo_planner param set: terrain-relative 3D mode, straight-line candidate
-  costs (`require_planning_map: false`, no 2D planning_map — the file header
+  costs (`use_planning_map: false`, no 2D planning_map — the file header
   carries the rationale).
 * [`config/explo_experiment.rviz`](config/explo_experiment.rviz) — RViz
   layout for the run (semantic cloud, candidate arrows, selected goal).

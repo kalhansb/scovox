@@ -120,7 +120,7 @@ per robot). Wire cost per delta ≈ `28 + 20·N_beta` bytes. The knobs live in
 [scovox_robot_share.yaml](../config/scovox_robot_share.yaml): `share_change_gate`
 (re-send a voxel only when it changed), `share_rate_hz` (coalesce deltas), and the
 z-band `share_roi_z_min/max`. Keep the z-band a **superset** of the planner band
-(`roi_min_z`/`roi_max_z` in explo_planner's `exploration_params.yaml`) and in sync
+(`roi_min_z`/`roi_max_z` in explo_planner's `shared_params.yaml`) and in sync
 with the merger's receive-side clip (`share_roi_z_min/max` in `dscovox_params.yaml`).
 
 ## Validating without robots
@@ -154,8 +154,11 @@ only have arrived over the wire.
   switch it to RELIABLE.
 - **Both robots' maps flicker/overwrite each other** — they share one
   `integration_frame`; give each its own `rK_map` + identity static TF (rule 1).
-- **Merger logs `No TF for 'rK_map'`** — that robot's identity static TF isn't
-  running or isn't reaching this machine; the merger waits until it appears.
+- **Mapper logs `no map <- rK_map transform yet … deferring publish`** — that
+  robot's own identity static TF (`map → rK_map`) isn't up yet, so the mapper can't
+  stamp the delta's pose; it holds the pending deltas and retries next tick. Start
+  the static TF. (The merger itself runs **no** TF listener — the pose rides in the
+  message, so `No TF for 'rK_map'` on the merger is a thing of the past.)
 - **Merger logs `prior mismatch … dropping frame`** — a robot is running a
   different config. Every robot must use the identical
   [scovox_lidar_geometric.yaml](../config/scovox_lidar_geometric.yaml).

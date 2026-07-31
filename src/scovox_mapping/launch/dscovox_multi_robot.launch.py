@@ -73,15 +73,25 @@ _ROBOTS = [
 ]
 
 
-# Shared knobs (mirror dscovox_single_robot.launch.py). Map-extent defaults are
-# opened up (z-band off, max_range 40) so the fused map isn't clipped; tighten
-# share_roi_z_*/max_range to match the low-bandwidth distributed experiment.
+# Shared knobs (mirror dscovox_single_robot.launch.py, EXCEPT max_range — see
+# below). The z-band is off by default so the fused map isn't clipped
+# vertically; tighten share_roi_z_* to match the low-bandwidth distributed
+# experiment.
+#
+# max_range is 20 m, matching scovox_lidar_geometric.yaml (the single-robot
+# launch still defaults to 40). carve_band is -1.0 = FULL-RAY free-space carve,
+# so carve cost scales linearly with max_range: at 0.10 m resolution a 40 m ray
+# traverses ~400 voxels vs ~200 at 20 m. Two mappers run concurrently on one
+# host here, and a 128-beam scan is already near the real-time budget (see the
+# downsample_voxel_size note below) — so raising max_range to widen the
+# footprint costs carve time on EVERY mapper. Keep downsample_voxel_size on
+# when you do, or bound the carve with a positive carve_band instead.
 _ARGS = {
     "map_frame": ("map", "Global/world frame shared by every robot (NDT vs the same gt_map)"),
     "use_sim_time": ("true", "Use /clock (true for bag replay)"),
     "deskew_mode": ("auto", "auto|on|off — 'off' silences the IMU-not-ready note"),
     "min_range": ("1.0", "Per-scan min integration range (m)"),
-    "max_range": ("40.0", "Per-scan max integration range (m) — RAISE to widen the footprint"),
+    "max_range": ("20.0", "Per-scan max integration range (m) — RAISE to widen the footprint (full-ray carve cost scales with it)"),
     "share_roi_z_min": ("0.0", "Vertical share-band lower bound (m, map frame); wired to mapper+merger"),
     "share_roi_z_max": ("0.0", "Vertical share-band upper bound (m). min>=max (0/0) = band OFF"),
     "resolution": ("0.10", "Voxel size (m)"),
@@ -117,11 +127,21 @@ def launch_setup(context, *args, **kwargs):
                 "integration_frame": r["integration_frame"],
                 "map_frame": map_frame,
                 "deskew_mode": g["deskew_mode"],
-                # LiDAR occupancy defaults (mirror scovox_lidar_geometric.yaml)
+                # LiDAR occupancy defaults (mirror scovox_lidar_geometric.yaml;
+                # its TF-gate block is deliberately NOT mirrored — see the
+                # tf_* note at the end of this dict)
                 "resolution": float(g["resolution"]),
                 "w_occ": 8.0, "w_free": 4.0, "carve_band": -1.0,
                 "min_range": float(g["min_range"]), "max_range": float(g["max_range"]),
                 "enable_tsdf": False,
+                # Per-scan sensor-frame voxel downsample BEFORE integration:
+                # near-lossless for occupancy but keeps the full-ray carve
+                # real-time. The node's own default is 0.0 (OFF) and this launch
+                # loads no params file, so it MUST be set here — without it a
+                # 128-beam scan (~115k points) misses real time by ~700 ms/frame.
+                # 0.1 fleet-wide, matching every shipped config and
+                # dscovox_single_robot.launch.py.
+                "downsample_voxel_size": 0.1,
                 # Low-bandwidth share controls
                 "share_change_gate": True,
                 "share_rate_hz": 2.0,
@@ -130,6 +150,20 @@ def launch_setup(context, *args, **kwargs):
                 # Exact-stamp TF; never integrate at a stale pose (GATE 3)
                 "tf_require_exact": True,
                 "tf_lookup_timeout_sec": 1.0,
+                # TF STABILITY GATES: left at the NODE DEFAULTS on purpose
+                # (startup_tf_stable_sec 2.0, startup_tf_jump_threshold 0.5,
+                # runtime_tf_gate true, runtime_tf_jump_threshold 1.0).
+                # scovox_lidar_geometric.yaml disables all three ("NDT owns
+                # map->odom, no SLAM jump to guard against") — do NOT copy that
+                # here. Both robots' NDT self-localizes from a near-origin seed
+                # (docs/dscovox_multi_robot_run.md), so the first convergence is
+                # a LARGE pose jump that the startup gate should absorb rather
+                # than integrate; and 1.0 m frame-to-frame sits well above real
+                # ground-robot motion (~0.1-0.15 m at 10 Hz), so the runtime
+                # gate only trips on genuine NDT divergence. Cost of leaving
+                # them on: ~2 s of scans gated per robot at startup, and a 2 s
+                # re-settle after any real divergence — both visible in the
+                # mapper console ("Waiting for TF stabilization").
             }],
         ))
 
@@ -161,6 +195,11 @@ def launch_setup(context, *args, **kwargs):
             "pointcloud_topic": "/dscovox_mapping/pointcloud",
             "share_roi_z_min": float(g["share_roi_z_min"]),   # keep in sync with senders
             "share_roi_z_max": float(g["share_roi_z_max"]),
+            # Fused ~/scovox (planner input) cadence — pinned to the code default
+            # so it matches docs/user_manual.md ch.6 rather than relying on it.
+            # (semantic_top_k is deliberately NOT set: the per-voxel top-K width
+            #  is the compile-time K_TOP in scovox_core/voxel.hpp.)
+            "publish_rate_hz": 1.0,
             "pointcloud_min_interval_s": 0.5,
         }],
     ))
