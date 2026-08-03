@@ -211,11 +211,23 @@ inline BinarySerializer::Frame mergeFrames(
         "mergeFrames: resolution mismatch ("
         + std::to_string(a.resolution) + " vs " + std::to_string(b.resolution) + ")");
   }
+  // Same lattice rule for the FINE stream: fine coords index res/2^k, so two
+  // different k must never union-by-coord. A side with no fine grid (k=0,
+  // empty stream) is compatible with anything — the other side carries.
+  if (a.fine_ratio_log2 > 0 && b.fine_ratio_log2 > 0 &&
+      a.fine_ratio_log2 != b.fine_ratio_log2) {
+    throw std::runtime_error(
+        "mergeFrames: fine_ratio_log2 mismatch ("
+        + std::to_string(a.fine_ratio_log2) + " vs "
+        + std::to_string(b.fine_ratio_log2) + ")");
+  }
 
   BinarySerializer::Frame fused;
   fused.resolution  = (a.resolution > 0.f) ? a.resolution : b.resolution;
   fused.num_classes = a.num_classes;
   fused.alpha_0     = a.alpha_0;
+  fused.fine_ratio_log2 =
+      (a.fine_ratio_log2 > 0) ? a.fine_ratio_log2 : b.fine_ratio_log2;
 
   // TSDF — Curless–Levoy merge.
   std::unordered_map<Bonxai::CoordT, TsdfVoxel,
@@ -254,6 +266,19 @@ inline BinarySerializer::Frame mergeFrames(
   }
   fused.dir_deltas.reserve(dir_map.size());
   for (auto& kv : dir_map) fused.dir_deltas.push_back({kv.first, kv.second});
+
+  // Fine TSDF — Curless–Levoy merge on the (lattice-checked) fine coords,
+  // exactly like the coarse TSDF stream.
+  std::unordered_map<Bonxai::CoordT, TsdfVoxel,
+                     detail::CoordHash, detail::CoordEq> fine_map;
+  for (const auto& d : a.fine_tsdf_deltas) fine_map[d.coord] = d.data;
+  for (const auto& d : b.fine_tsdf_deltas) {
+    auto it = fine_map.find(d.coord);
+    if (it == fine_map.end()) fine_map[d.coord] = d.data;
+    else                      it->second = mergeTsdf(it->second, d.data);
+  }
+  fused.fine_tsdf_deltas.reserve(fine_map.size());
+  for (auto& kv : fine_map) fused.fine_tsdf_deltas.push_back({kv.first, kv.second});
 
   return fused;
 }

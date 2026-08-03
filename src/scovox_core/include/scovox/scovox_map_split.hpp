@@ -17,11 +17,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "scovox/marching_cubes.hpp"
 #include "scovox/mesh_labelling.hpp"
 #include "scovox/ray_iterator.hpp"
+#include "scovox/refinement_regions.hpp"
 #include "scovox/sem_split_map.hpp"
 #include "scovox/tsdf_map.hpp"
 #include "scovox/tsdf_voxel.hpp"
@@ -56,6 +58,24 @@ class ScovoxMapSplit {
     /// is never read. Default true → TSDF integrates exactly as before. The
     /// occupancy (Beta) and semantic (Dir) substrates are unaffected either way.
     bool tsdf_enabled = true;
+
+    // ---- Fine TSDF band (localized two-lattice refinement) ----
+    // docs/design/fine_tsdf_band_dbh_2026_07_30.md. 0 = off (default —
+    // byte-identical behaviour, no fine grid allocated). k > 0 adds a second
+    // sparse TSDF-only lattice at res_fine = resolution / 2^k, written only
+    // inside registered refinement cylinders (addRefinementRegion), in a
+    // ±fine_sdf_trunc_voxels fine-voxel band around gated hits. Independent
+    // of tsdf_enabled: the fine band can run with the coarse TSDF off
+    // (e.g. the occupancy-only LiDAR config).
+    uint8_t fine_ratio_log2       = 0;
+    int     fine_sdf_trunc_voxels = 3;      ///< fine trunc = this · res_fine
+    float   fine_region_margin    = 0.15f;  ///< gate radius = model r + margin
+    /// Per-scan anchor re-registration (drift absorption). When true, each
+    /// scan's staged in-region hits are rigidly shifted by the 2-DoF fit
+    /// against the region's canonical cylinder before fusing — see
+    /// fitCylinderAnchorShift. When false, hits fuse at their odometry pose.
+    bool            fine_anchor_enable = true;
+    AnchorFitParams fine_anchor;
   };
 
   explicit ScovoxMapSplit(const Params& p)
@@ -71,7 +91,26 @@ class ScovoxMapSplit {
                        return s; }())
       , resolution_(p.resolution)
       , fused_walker_(p.fused_walker)
-      , tsdf_enabled_(p.tsdf_enabled) {}
+      , tsdf_enabled_(p.tsdf_enabled)
+      , fine_ratio_log2_(p.fine_ratio_log2)
+      , fine_region_margin_(p.fine_region_margin)
+      , fine_anchor_enable_(p.fine_anchor_enable)
+      , fine_anchor_params_(p.fine_anchor) {
+    if (fine_ratio_log2_ > 0) {
+      // Second, independent TSDF lattice at res_fine. Band-only by
+      // construction (space_carving=false → integrateRay walks exactly
+      // [hit − trunc·û, hit + trunc·û]); trunc derives from the FINE voxel
+      // count so it works with the coarse TSDF disabled (sdf_trunc = 0).
+      TsdfMap::Params fp;
+      fp.resolution    = p.resolution / static_cast<double>(1u << fine_ratio_log2_);
+      fp.inner_bits    = p.inner_bits;
+      fp.leaf_bits     = p.leaf_bits;
+      fp.sdf_trunc     = static_cast<float>(
+          std::max(1, p.fine_sdf_trunc_voxels) * fp.resolution);
+      fp.space_carving = false;
+      fine_tsdf_ = std::make_unique<TsdfMap>(fp);
+    }
+  }
 
   // -------------------------------------------------------------------
   // Per-frame integration
@@ -87,6 +126,13 @@ class ScovoxMapSplit {
                     float                          quality,
                     bool                           is_dynamic = false,
                     const HitWeights*              prof = nullptr) {
+    // Fine TSDF band routing — walker-independent, so the fused and split
+    // paths stay in parity. Dynamic rays leave no fine surface (same rule
+    // as the coarse TSDF); geometry-off sources (RGB-D overlay) never
+    // touch geometry. One null-check when the fine band is off.
+    if (fine_tsdf_ && !is_dynamic && !(prof && prof->geometry_off)) {
+      stageFineHit(origin, endpoint);
+    }
     if (fused_walker_) {
       integrateHitFused(origin, endpoint, sem_probs, quality, is_dynamic, prof);
     } else {
@@ -272,20 +318,94 @@ class ScovoxMapSplit {
   /// non-fused integrateHit/Miss) is staged read-free until flushCarveFrame().
   /// Wrap a whole scan's rays in beginCarveFrame()/flushCarveFrame(). See
   /// SemSplitMap for the rationale (full-ray free-space, one write per voxel).
-  void beginCarveFrame() { semsplit_.beginCarveFrame(); }
+  /// Also opens the fine-band scan frame: gated hits are staged per region
+  /// so flushCarveFrame can anchor-correct the whole scan before fusing.
+  void beginCarveFrame() {
+    semsplit_.beginCarveFrame();
+    beginFineFrame();
+  }
 
   /// Write all staged carves for the scan (one Beta update per unique voxel,
   /// block-ordered, occupied-wins). Timed into the same tsdf_ns_ bucket as the
   /// fused walk, so tsdfTimeUs() reflects total carve cost (walk staging +
-  /// flush). Returns the number of voxels written.
+  /// flush). Returns the number of voxels written (carve only — fine-band ray
+  /// count is reported via fineLastFrameRays()).
   std::size_t flushCarveFrame() {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
     const std::size_t n = semsplit_.flushCarveFrame();
+    flushFineFrame();
     const auto t1 = clk::now();
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     return n;
   }
+
+  // -------------------------------------------------------------------
+  // Fine TSDF band — localized two-lattice refinement
+  // (docs/design/fine_tsdf_band_dbh_2026_07_30.md)
+  // -------------------------------------------------------------------
+
+  bool fineEnabled() const noexcept { return fine_tsdf_ != nullptr; }
+  uint8_t fineRatioLog2() const noexcept { return fine_ratio_log2_; }
+  double fineResolution() const {
+    return fine_tsdf_ ? fine_tsdf_->params().resolution : 0.0;
+  }
+
+  /// Register (or replace, keyed on id) a refinement cylinder. Hits inside
+  /// `radius + fine_region_margin` (and the z band) start routing to the
+  /// fine lattice immediately. No-op returning -1 when the fine band is off.
+  int addRefinementRegion(const RefinementCylinder& cyl) {
+    if (!fine_tsdf_) return -1;
+    const int idx = fine_regions_.add(cyl, fine_region_margin_);
+    if (static_cast<std::size_t>(idx) >= fine_staged_.size())
+      fine_staged_.resize(fine_regions_.slotCount());
+    return idx;
+  }
+
+  /// Unregister a region. Already-fused fine voxels stay in the lattice
+  /// (the region gate is an integration-time policy, not storage).
+  bool removeRefinementRegion(uint32_t id) {
+    return fine_tsdf_ ? fine_regions_.remove(id) : false;
+  }
+
+  const RefinementRegions& refinementRegions() const { return fine_regions_; }
+
+  /// Feed one raw sensor return to the fine band ONLY — no coarse-map write.
+  /// This is the full-density path: nodes typically voxel-grid-downsample
+  /// each scan before `integrateHit`, which caps what the fine lattice can
+  /// see at one return per downsample cell. Routing every raw (deskewed)
+  /// return here instead gives refinement regions the sensor's native point
+  /// density while the coarse map keeps its downsampled diet. Same gate,
+  /// staging, and per-scan anchor treatment as dispatcher-staged hits;
+  /// out-of-region endpoints are a no-op after one O(1) hash lookup.
+  void refineHit(const Eigen::Vector3f& origin, const Eigen::Vector3f& endpoint) {
+    if (fine_tsdf_) stageFineHit(origin, endpoint);
+  }
+
+  TsdfMap&       fineTsdf()       { return *fine_tsdf_; }
+  const TsdfMap& fineTsdf() const { return *fine_tsdf_; }
+
+  std::vector<CoordT> drainTouchedFine() {
+    return fine_tsdf_ ? fine_tsdf_->drainTouched() : std::vector<CoordT>{};
+  }
+  void clearTouchedFine() noexcept {
+    if (fine_tsdf_) fine_tsdf_->clearTouched();
+  }
+  std::size_t fineVoxelCount() const {
+    return fine_tsdf_ ? fine_tsdf_->voxelCount() : 0;
+  }
+  std::size_t fineGridBytes() const {
+    return fine_tsdf_ ? fine_tsdf_->gridMemoryBytes() : 0;
+  }
+
+  /// Fine-band rays fused in the last flushed scan frame.
+  std::size_t fineLastFrameRays() const noexcept { return fine_last_rays_; }
+  /// Anchor shift magnitude applied in the last flushed frame (max over
+  /// regions; 0 when no region had enough points or the anchor is off).
+  float fineLastFrameShift() const noexcept { return fine_last_shift_; }
+  /// Cumulative scans-with-region where the anchor fit fell back to
+  /// odometry (too few points / rejected shift).
+  std::size_t fineAnchorFallbacks() const noexcept { return fine_anchor_fallbacks_; }
 
   // -------------------------------------------------------------------
   // Per-call timing accumulators
@@ -371,6 +491,85 @@ class ScovoxMapSplit {
   double resolution() const { return resolution_; }
 
  private:
+  // -------------------------------------------------------------------
+  // Fine-band internals
+  // -------------------------------------------------------------------
+
+  struct FineStagedHit {
+    Eigen::Vector3f origin;
+    Eigen::Vector3f endpoint;
+  };
+
+  void beginFineFrame() {
+    if (!fine_tsdf_) return;
+    fine_frame_open_ = true;
+    if (fine_staged_.size() < fine_regions_.slotCount())
+      fine_staged_.resize(fine_regions_.slotCount());
+    for (auto& v : fine_staged_) v.clear();
+  }
+
+  /// Gate + stage one hit for the fine band. Inside an open scan frame the
+  /// hit is buffered per region for the anchor-corrected flush; outside a
+  /// frame (direct integrateHit callers, e.g. unit tests without the carve
+  /// bracket) it fuses immediately, uncorrected — mirroring SemSplitMap's
+  /// immediate-vs-batched carve semantics.
+  void stageFineHit(const Eigen::Vector3f& origin,
+                    const Eigen::Vector3f& endpoint) {
+    const int idx =
+        fine_regions_.lookup(endpoint.x(), endpoint.y(), endpoint.z());
+    if (idx < 0) return;
+    if (fine_frame_open_ && static_cast<std::size_t>(idx) < fine_staged_.size()) {
+      fine_staged_[static_cast<std::size_t>(idx)].push_back({origin, endpoint});
+    } else {
+      fine_tsdf_->integrateRay(origin, endpoint);
+    }
+  }
+
+  /// Per-region anchor fit + band fusion of all staged hits. The whole
+  /// scan's in-region rays are translated by the fitted Δ (a rigid shift of
+  /// the sensor pose in the horizontal plane) so the fusion input aligns
+  /// with the region's canonical cylinder — drift is absorbed at the door,
+  /// before the irreversible Curless–Levoy average. Fit failure → Δ = 0.
+  std::size_t flushFineFrame() {
+    fine_frame_open_ = false;
+    if (!fine_tsdf_) return 0;
+    fine_last_rays_  = 0;
+    fine_last_shift_ = 0.f;
+    for (std::size_t slot = 0; slot < fine_staged_.size(); ++slot) {
+      auto& hits = fine_staged_[slot];
+      if (hits.empty()) continue;
+      if (!fine_regions_.slotActive(static_cast<int>(slot))) {
+        hits.clear();  // region removed mid-frame
+        continue;
+      }
+      Eigen::Vector3f shift = Eigen::Vector3f::Zero();
+      if (fine_anchor_enable_) {
+        const auto& cyl = fine_regions_.cylinder(static_cast<int>(slot));
+        std::vector<Eigen::Vector2f> xy;
+        xy.reserve(hits.size());
+        for (const auto& hh : hits)
+          xy.emplace_back(hh.endpoint.x(), hh.endpoint.y());
+        // Align the scan TO the model: points sit at p + Δ, so the fitted
+        // Δ is applied directly to the staged rays.
+        const auto d = fitCylinderAnchorShift(
+            xy, Eigen::Vector2f(cyl.cx, cyl.cy), cyl.radius,
+            fine_anchor_params_);
+        if (d) {
+          shift.x() = d->x();
+          shift.y() = d->y();
+          fine_last_shift_ = std::max(fine_last_shift_, d->norm());
+        } else {
+          ++fine_anchor_fallbacks_;
+        }
+      }
+      for (const auto& hh : hits)
+        fine_tsdf_->integrateRay(hh.origin + shift, hh.endpoint + shift);
+      fine_last_rays_ += hits.size();
+      hits.clear();
+    }
+    return fine_last_rays_;
+  }
+
   /// Per-voxel semantic carve dispatch (SPLIT substrate). `prof` carries the
   /// per-source w_free (null => global params_).
   bool semCarve(const CoordT& c, float quality, const HitWeights* prof = nullptr) {
@@ -389,6 +588,19 @@ class ScovoxMapSplit {
   double      resolution_;
   bool        fused_walker_;
   bool        tsdf_enabled_;
+
+  // Fine TSDF band state (null / empty when fine_ratio_log2 == 0).
+  std::unique_ptr<TsdfMap>    fine_tsdf_;
+  RefinementRegions           fine_regions_;
+  std::vector<std::vector<FineStagedHit>> fine_staged_;  ///< per region slot
+  uint8_t         fine_ratio_log2_;
+  float           fine_region_margin_;
+  bool            fine_anchor_enable_;
+  AnchorFitParams fine_anchor_params_;
+  bool            fine_frame_open_       = false;
+  std::size_t     fine_last_rays_        = 0;
+  float           fine_last_shift_       = 0.f;
+  std::size_t     fine_anchor_fallbacks_ = 0;
 
   std::int64_t tsdf_ns_ = 0;
   std::int64_t sem_ns_  = 0;

@@ -40,6 +40,7 @@
 #include "scovox_msgs/msg/scovox_voxel.hpp"
 #include "scovox_msgs/msg/scovox_semantic_evidence.hpp"
 #include "scovox_msgs/msg/scovox_map_binary.hpp"
+#include "scovox_msgs/msg/refinement_region.hpp"
 #include "scovox/binary_serializer.hpp"
 #include "scovox/lz4_codec.hpp"
 #include "scovox/marching_cubes.hpp"
@@ -117,6 +118,13 @@ public:
     // true; set false via `fused_walker:=false` launch arg for A/B
     // parity testing against the two-DDA split path.
     SP.fused_walker = fused_walker_;
+    // Fine TSDF band (fine_ratio_log2=0 → all of this is inert).
+    SP.fine_ratio_log2       = static_cast<uint8_t>(fine_ratio_log2_);
+    SP.fine_sdf_trunc_voxels = fine_trunc_voxels_;
+    SP.fine_region_margin    = static_cast<float>(fine_region_margin_);
+    SP.fine_anchor_enable    = fine_anchor_enable_;
+    SP.fine_anchor.min_points = fine_anchor_min_pts_;
+    SP.fine_anchor.max_shift  = static_cast<float>(fine_anchor_max_shift_);
     split_map_ = std::make_unique<scovox::ScovoxMapSplit>(SP);
     // Change-gate shadow grids: the last-EMITTED wire state per voxel, same
     // geometry as the live grids. Only the wire path reads/writes these, and
@@ -155,6 +163,7 @@ public:
         publishScovoxMap();
         if (pub_pc_) publishPointCloud();
         if (tsdf_pub_) publishTSDFPointCloud();
+        if (fine_tsdf_pub_) publishFineTSDFPointCloud();
       });
     if (bin_pub_ && share_rate_hz_ > 0.0) {
       // Timer-owned binary publish (share_rate_hz > 0): the sensor callbacks
@@ -175,6 +184,35 @@ public:
         share_heartbeat_sec_, share_max_voxels_per_msg_, share_roi_z_min_,
         share_roi_z_max_,
         share_roi_z_max_ > share_roi_z_min_ ? "" : " off");
+    }
+    if (split_map_->fineEnabled()) {
+      // Region registration interface. Reliable + latched (transient_local),
+      // deep history — registrations are rare, small, and must not be lost:
+      // latching replays the publisher's retained add/remove history to a
+      // subscription that (re)joins late, and the replay converges because
+      // adds are keyed-replace and removes idempotent. NB a transient_local
+      // sub only matches transient_local publishers — manual `ros2 topic pub`
+      // needs `--qos-durability transient_local`.
+      fine_region_sub_ = create_subscription<scovox_msgs::msg::RefinementRegion>(
+          fine_region_topic_,
+          rclcpp::QoS(rclcpp::KeepLast(100)).reliable().transient_local(),
+          [this](const scovox_msgs::msg::RefinementRegion::SharedPtr m) {
+            std::unique_lock<std::shared_mutex> lock(map_mtx_);
+            onRefinementRegion(*m);
+          });
+      if (pub_fine_tsdf_) {
+        fine_tsdf_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+            "~/fine_tsdf_pointcloud", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
+      }
+      RCLCPP_INFO(get_logger(),
+        "fine TSDF band: k=%d res_fine=%.4f m trunc=%.4f m margin=%.2f m "
+        "anchor=%d (min_pts=%d max_shift=%.2f) slab=[+%.2f, +%.2f] "
+        "raw_returns=%d region_topic=%s",
+        fine_ratio_log2_, split_map_->fineResolution(),
+        fine_trunc_voxels_ * split_map_->fineResolution(), fine_region_margin_,
+        (int)fine_anchor_enable_, fine_anchor_min_pts_, fine_anchor_max_shift_,
+        fine_region_z_lo_, fine_region_z_hi_, (int)fine_raw_returns_,
+        fine_region_topic_.c_str());
     }
     RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s share_tsdf=%d fused_walker=%d",
       P.resolution, mode_.c_str(), int_frame_.c_str(), (int)share_tsdf_, (int)fused_walker_);
@@ -344,7 +382,34 @@ private:
     //     path; each robot keeps its local TSDF).
     //   share_tsdf=true: also emit the TSDF stream (opt-in for fused-geometry
     //     consensus). Maps to BinarySerializer::Options.share_tsdf.
+    //   The rev-7 fine-TSDF stream rides the same toggle: it ships iff
+    //   share_tsdf is on AND the fine band is enabled (fine_ratio_log2 > 0).
     share_tsdf_ = dp("share_tsdf", false);
+    // ── Fine TSDF band — localized two-lattice refinement ──────────────────
+    // docs/design/fine_tsdf_band_dbh_2026_07_30.md. fine_ratio_log2 = 0 (the
+    // default) disables everything (no fine grid, no subscription). k = 2 at
+    // resolution 0.10 → 2.5 cm fine voxels. The node's job ends at PRODUCING
+    // the fine lattice; measurement (e.g. the DBH circle fit, dbh_fit.hpp) is
+    // post-processing on the shared/saved map, not a mapping responsibility.
+    fine_ratio_log2_      = std::clamp<int>((int)dp("fine_ratio_log2", 0), 0, 8);
+    fine_trunc_voxels_    = std::max<int>(1, (int)dp("fine_sdf_trunc_voxels", 3));
+    fine_region_margin_   = dp("fine_region_margin", 0.15);
+    fine_anchor_enable_   = dp("fine_anchor_enable", true);
+    fine_anchor_min_pts_  = (int)dp("fine_anchor_min_points", 12);
+    fine_anchor_max_shift_ = dp("fine_anchor_max_shift", 0.30);
+    // Refined slab, relative to each region's base_z. Defaults bracket breast
+    // height (1.3 m ± 0.3 m) for the DBH post-processing use case.
+    fine_region_z_lo_     = dp("fine_region_z_lo", 1.0);
+    fine_region_z_hi_     = dp("fine_region_z_hi", 1.6);
+    // Full sensor density for refinement regions: when the per-scan voxel-grid
+    // downsample is active, in-region raw (deskewed) returns are ALSO routed
+    // straight to the fine lattice (refineHit — fine-band-only, no coarse
+    // write), so the fine band sees the sensor's native point density instead
+    // of one return per downsample cell. No effect when downsampling is off
+    // (the full cloud already reaches integrateHit).
+    fine_raw_returns_  = dp("fine_raw_returns", true);
+    fine_region_topic_ = dp("fine_region_topic", std::string("~/refinement_region"));
+    pub_fine_tsdf_     = dp("publish_fine_tsdf_pointcloud", true);
     // ── Low-bandwidth share controls (ScovoxMapBinary wire path, mode=rolling) ──
     // share_rate_hz: cadence of the binary delta publish. <=0 (default) keeps
     // the legacy per-scan publish inline in the sensor callbacks. >0 moves the
@@ -499,7 +564,12 @@ private:
     // centroid per voxel cuts that tail-sampling without throwing away coverage.
     // 0.0 = off (full per-point path, unchanged). Geometric only: when >0 the
     // per-point semantic/top-k labels are dropped (fine for the raw LiDAR path).
-    downsample_voxel_size_ = dp("downsample_voxel_size", 0.0);
+    // Default 0.5 = the swept optimum for coarse-map thinness (see the sweep
+    // table in scovox_lidar_raw_deskew.yaml: 4x thinner shared columns than
+    // 0.1 for only -7% footprint). Configs may override (geometric/fused run
+    // 0.1 = map resolution); refinement regions are unaffected either way —
+    // in-region raw returns bypass this via refineHit (fine_raw_returns).
+    downsample_voxel_size_ = dp("downsample_voxel_size", 0.5);
     {
       auto gb = dp("gyro_bias", std::vector<double>{0.0, 0.0, 0.0});
       if (gb.size() == 3) gyro_bias_ = Eigen::Vector3f((float)gb[0], (float)gb[1], (float)gb[2]);
@@ -1205,14 +1275,22 @@ private:
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
 
-    // Range gate in SQUARED distance: the per-point sqrt in (Hp-O).norm() is
-    // pure waste in the occupancy-only LiDAR config, where `rng` feeds only the
-    // gate (range_decay_length<=0 -> rw=1; carve_band<=0 -> integrateHit
-    // discards rng). Compare squared norms instead and take the sqrt lazily only
-    // when a downstream consumer actually needs the true range. The (>0?sq:raw)
-    // guard keeps the degenerate negative-threshold case bit-identical: x->x^2
-    // is monotonic only on [0,inf), and rng>=0 always, so a negative min/max
-    // threshold must be compared as-is (it can only ever always-pass/always-fail).
+    // Range gate in SQUARED distance, applied to the RAW per-point range
+    // (x^2+y^2+z^2) at parse time — BEFORE any deskew, binning, or transform
+    // work. |p| in the sensor frame IS the sensor's measured range (min/max
+    // range are sensor-relative specs: min kills self-returns/dust at the
+    // housing, max kills clamp returns), and the rotation deskew preserves it,
+    // so the early gate is exact and an out-of-range return costs three
+    // multiplies and nothing else. The old post-transform gate measured from
+    // the observer O instead — off by the static base->sensor offset plus the
+    // v*dt translation-deskew term — and let out-of-range points into the
+    // downsample medoid statistics, where a just-out-of-range medoid dropped
+    // its voxel's valid returns. `rng` (range-decay weight / carve) is still
+    // taken lazily from (Hp-O).norm() only when a consumer needs it. The
+    // (>0?sq:raw) guard keeps the degenerate negative-threshold case
+    // bit-identical: x->x^2 is monotonic only on [0,inf), and range>=0 always,
+    // so a negative min/max threshold must be compared as-is (it can only ever
+    // always-pass/always-fail).
     const bool need_rng = (P.range_decay_length > 0) || (carve_band_ > 0);
     const float min_r2 = (P.min_range > 0.f) ? P.min_range * P.min_range : P.min_range;
     const float max_r2 = (P.max_range > 0.f) ? P.max_range * P.max_range : P.max_range;
@@ -1368,6 +1446,10 @@ private:
         float y = *reinterpret_cast<const float*>(p + off_y);
         float z = *reinterpret_cast<const float*>(p + off_z);
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+        // Early range gate on the raw measured range (see min_r2/max_r2 above):
+        // culled returns never reach deskew, binning, or the medoid stats.
+        const float rr2 = x * x + y * y + z * z;
+        if (rr2 < min_r2 || rr2 > max_r2) continue;
         Eigen::Vector3f praw(x, y, z);
         float off_i = 0.f;
         if (do_deskew) {
@@ -1394,13 +1476,31 @@ private:
         if (d2 < a.best_d2) { a.best_d2 = d2; a.best_p = d.p; a.best_off = d.off; }
       }
 
+      // Full sensor density for refinement regions: the medoid downsample
+      // above is the coarse map's diet, but the fine lattice wants every
+      // return the sensor produced. Route each raw (deskewed) return through
+      // refineHit — fine-band-only (one O(1) region lookup, no coarse write),
+      // so out-of-region points cost a hash probe and nothing else. The
+      // medoid itself is skipped here: it reaches the fine band through
+      // integrateHit below, so no return is fused twice.
+      if (fine_raw_returns_ && split_map_->fineEnabled() &&
+          !split_map_->refinementRegions().empty()) {
+        for (const DPoint& d : pts) {
+          const Acc& a = accs[d.slot];
+          if (d.p.x() == a.best_p.x() && d.p.y() == a.best_p.y() &&
+              d.p.z() == a.best_p.z())
+            continue;
+          Eigen::Vector3f Hp = T_oi * d.p;
+          if (apply_trans) Hp += v_odom * d.off;
+          split_map_->refineHit(O, Hp);
+        }
+      }
+
       ds_in = N; ds_out = accs.size();
       for (const Acc& a : accs) {
         Eigen::Vector3f Hp = T_oi * a.best_p;
         if (apply_trans) Hp += v_odom * a.best_off;
-        const float r2 = (Hp - O).squaredNorm();
-        if (r2 < min_r2 || r2 > max_r2) continue;
-        const float rng = need_rng ? std::sqrt(r2) : 0.f;
+        const float rng = need_rng ? (Hp - O).norm() : 0.f;
         const float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
         integrateHit(O, Hp, rng, nullptr, rw, lidarProf());
       }
@@ -1412,6 +1512,9 @@ private:
       float y = *reinterpret_cast<const float*>(p + off_y);
       float z = *reinterpret_cast<const float*>(p + off_z);
       if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+      // Early range gate on the raw measured range (see min_r2/max_r2 above).
+      const float rr2 = x * x + y * y + z * z;
+      if (rr2 < min_r2 || rr2 > max_r2) continue;
 
       // Intra-scan deskew: rotate each point from its capture-time sensor frame
       // back to scan-start, then place it with the single scan-start pose. No-op
@@ -1424,9 +1527,7 @@ private:
       }
       Eigen::Vector3f Hp = T_oi * praw;
       if (apply_trans) Hp += v_odom * off_i;
-      const float r2 = (Hp - O).squaredNorm();
-      if (r2 < min_r2 || r2 > max_r2) continue;
-      const float rng = need_rng ? std::sqrt(r2) : 0.f;
+      const float rng = need_rng ? (Hp - O).norm() : 0.f;
       float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
       float q = rw;
 
@@ -1591,9 +1692,12 @@ private:
       RCLCPP_INFO(get_logger(), "[memUsage] rss_mb=%.1f", getVmRSSKB() / 1024.0);
       RCLCPP_INFO(get_logger(),
                   "[memSplit] tsdf_voxels=%zu tsdf_grid_mb=%.3f "
-                  "semdir_voxels=%zu semdir_grid_mb=%.3f",
+                  "semdir_voxels=%zu semdir_grid_mb=%.3f "
+                  "fine_voxels=%zu fine_grid_mb=%.3f",
                   split_map_->tsdfVoxelCount(), tsdf_mb,
-                  split_map_->semdirVoxelCount(), sembeta_mb);
+                  split_map_->semdirVoxelCount(), sembeta_mb,
+                  split_map_->fineVoxelCount(),
+                  static_cast<double>(split_map_->fineGridBytes()) / (1024.0 * 1024.0));
       // Gate-state cost (E6.6 prerequisite: "state cost is unmeasured").
       // Shared lock suffices: the publish path writes these under the unique
       // lock, so this read never races it.
@@ -1818,6 +1922,7 @@ private:
       (void)split_map_->drainTouchedTsdf();
       (void)split_map_->drainTouchedBeta();
       (void)split_map_->drainTouchedDir();
+      (void)split_map_->drainTouchedFine();
       return {0, 0};
     }
 
@@ -1853,6 +1958,13 @@ private:
     frame.resolution  = static_cast<float>(split_map_->resolution());
     frame.num_classes = static_cast<uint16_t>(num_classes_);
     frame.alpha_0     = alpha_0_;
+    // Codec rev 6 u16 quantization: the step spans exactly the representable
+    // evidence range [0, evidence_saturation]. Cap disabled (0) → evidence is
+    // unbounded, so fall back to f32 payloads (quant_step=0 sentinel — see
+    // binary_serializer.hpp).
+    frame.quant_step  = map_params_.evidence_saturation > 0
+        ? static_cast<float>(map_params_.evidence_saturation) / 65535.f
+        : 0.f;
 
     const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
     const float dir_other_prior =
@@ -1912,6 +2024,26 @@ private:
       }
     } else {
       (void)split_map_->drainTouchedTsdf();
+    }
+
+    // ----- Fine TSDF section (rev 7; rides the share_tsdf toggle) -----
+    if (split_map_->fineEnabled() && share_tsdf_) {
+      frame.fine_ratio_log2 = split_map_->fineRatioLog2();
+      auto& fgrid = split_map_->fineTsdf().grid();
+      auto facc = fgrid.createAccessor();
+      auto emit_fine = [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
+        if (v.weight <= 0.f) return;
+        frame.fine_tsdf_deltas.push_back({c, v});
+      };
+      if (snapshot) {
+        fgrid.forEachCell(emit_fine);
+        (void)split_map_->drainTouchedFine();
+      } else {
+        for (const auto& c : split_map_->drainTouchedFine())
+          if (auto* v = facc.value(c, false)) emit_fine(*v, c);
+      }
+    } else {
+      (void)split_map_->drainTouchedFine();
     }
 
     // ----- Beta section (occupancy; full-ray, always emitted) -----
@@ -2027,7 +2159,7 @@ private:
     }
 
     if (frame.tsdf_deltas.empty() && frame.beta_deltas.empty() &&
-        frame.dir_deltas.empty()) {
+        frame.dir_deltas.empty() && frame.fine_tsdf_deltas.empty()) {
       return {0, 0};
     }
 
@@ -2059,14 +2191,15 @@ private:
       bin.data = std::move(comp);
       bytes_total += bin.data.size();
       const size_t n = f.tsdf_deltas.size() + f.beta_deltas.size()
-                     + f.dir_deltas.size();
+                     + f.dir_deltas.size() + f.fine_tsdf_deltas.size();
       bin_pub_->publish(std::move(bin));
       return n;
     };
 
     size_t emitted = 0;
     const size_t total = frame.tsdf_deltas.size() + frame.beta_deltas.size()
-                       + frame.dir_deltas.size();
+                       + frame.dir_deltas.size()
+                       + frame.fine_tsdf_deltas.size();
     const size_t chunk = share_max_voxels_per_msg_ > 0
                        ? (size_t)share_max_voxels_per_msg_ : total;
     if (chunk >= total) {
@@ -2078,15 +2211,17 @@ private:
       // chunk boundaries change delivery dynamics only, never the converged
       // state. Costs: per-message envelope overhead + smaller LZ4 windows.
       scovox::BinarySerializer::Frame part;
-      part.resolution  = frame.resolution;
-      part.num_classes = frame.num_classes;
-      part.alpha_0     = frame.alpha_0;
+      part.resolution      = frame.resolution;
+      part.num_classes     = frame.num_classes;
+      part.alpha_0         = frame.alpha_0;
+      part.quant_step      = frame.quant_step;
+      part.fine_ratio_log2 = frame.fine_ratio_log2;
       size_t in_part = 0;
       auto flush = [&] {
         if (in_part == 0) return;
         emitted += publish_frame(part);
         part.tsdf_deltas.clear(); part.beta_deltas.clear();
-        part.dir_deltas.clear();
+        part.dir_deltas.clear(); part.fine_tsdf_deltas.clear();
         in_part = 0;
       };
       for (const auto& d : frame.tsdf_deltas) {
@@ -2099,6 +2234,10 @@ private:
       }
       for (const auto& d : frame.dir_deltas) {
         part.dir_deltas.push_back(d);
+        if (++in_part >= chunk) flush();
+      }
+      for (const auto& d : frame.fine_tsdf_deltas) {
+        part.fine_tsdf_deltas.push_back(d);
         if (++in_part >= chunk) flush();
       }
       flush();
@@ -2410,6 +2549,71 @@ private:
     tsdf_pub_->publish(cl);
   }
 
+  // ── Fine TSDF band: region registration / viz ──────────────────────────
+  // (docs/design/fine_tsdf_band_dbh_2026_07_30.md; all no-ops when
+  // fine_ratio_log2 = 0 — none of these callbacks are created then.)
+  // Measurement on the fine lattice (e.g. the DBH circle fit) is deliberately
+  // NOT here: the node's responsibility ends at generating the map. Consumers
+  // post-process the shared rev-7 fine stream or the saved map.
+
+  /// Caller must hold map_mtx_ (unique). Re-publishing an id updates its
+  /// canonical cylinder in place (slot-stable) — this is how a downstream
+  /// estimator refines a region's model (e.g. a fitted radius) at runtime.
+  void onRefinementRegion(const scovox_msgs::msg::RefinementRegion& m) {
+    if (!split_map_ || !split_map_->fineEnabled()) return;
+    if (m.remove) {
+      const bool ok = split_map_->removeRefinementRegion(m.id);
+      RCLCPP_INFO(get_logger(), "refinement region id=%u remove (%s)",
+                  m.id, ok ? "ok" : "unknown id");
+      return;
+    }
+    scovox::RefinementCylinder cyl;
+    cyl.id     = m.id;
+    cyl.cx     = m.x;
+    cyl.cy     = m.y;
+    cyl.radius = m.radius;
+    cyl.z_lo   = m.base_z + static_cast<float>(fine_region_z_lo_);
+    cyl.z_hi   = m.base_z + static_cast<float>(fine_region_z_hi_);
+    split_map_->addRefinementRegion(cyl);
+    RCLCPP_INFO(get_logger(),
+      "refinement region id=%u at (%.2f, %.2f) r=%.3f z=[%.2f, %.2f] "
+      "(%zu active)",
+      m.id, m.x, m.y, m.radius, cyl.z_lo, cyl.z_hi,
+      split_map_->refinementRegions().size());
+  }
+
+  /// Fine-lattice zero-crossing shell for RViz QA. Geometry-only 4-field
+  /// cloud (labels live on the coarse lattice; join there if ever needed).
+  /// Caller must hold map_mtx_ (shared).
+  void publishFineTSDFPointCloud() {
+    if (!fine_tsdf_pub_ || !split_map_ || !split_map_->fineEnabled()) return;
+    if (fine_tsdf_pub_->get_subscription_count() == 0) return;
+    const double res = split_map_->fineResolution();
+    if (res <= 0.0) return;
+    auto points = scovox::extractZeroCrossing(
+        split_map_->fineTsdf().grid(), (float)min_tsdf_w_, res);
+    if (points.empty()) return;
+    sensor_msgs::msg::PointCloud2 cl;
+    cl.header.frame_id = int_frame_;
+    cl.header.stamp = (last_input_stamp_.nanoseconds() > 0)
+        ? last_input_stamp_ : get_clock()->now();
+    cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
+    sensor_msgs::PointCloud2Modifier mod(cl);
+    mod.setPointCloud2Fields(4,
+        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "distance", 1, sensor_msgs::msg::PointField::FLOAT32);
+    mod.resize(points.size());
+    sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"), iy(cl,"y"), iz(cl,"z"), id(cl,"distance");
+    for (const auto& p : points) {
+      *ix = p.position.x(); *iy = p.position.y(); *iz = p.position.z();
+      *id = p.distance;
+      ++ix; ++iy; ++iz; ++id;
+    }
+    fine_tsdf_pub_->publish(cl);
+  }
+
   void onExtractMesh(
       const scovox_msgs::srv::ExtractMesh::Request::SharedPtr rq,
       scovox_msgs::srv::ExtractMesh::Response::SharedPtr rs)
@@ -2506,6 +2710,18 @@ private:
   int topk_topk_max_{5};
   std::unique_ptr<scovox::TopkProvider> topk_;
   bool trace_nr_{false}, pub_pc_, pub_plan_{false}, pub_tsdf_{true};
+  // ── Fine TSDF band (fine_ratio_log2 = 0 → everything below is inert) ──
+  int    fine_ratio_log2_{0}, fine_trunc_voxels_{3};
+  double fine_region_margin_{0.15};
+  bool   fine_anchor_enable_{true};
+  int    fine_anchor_min_pts_{12};
+  double fine_anchor_max_shift_{0.30};
+  double fine_region_z_lo_{1.0}, fine_region_z_hi_{1.6};
+  bool   fine_raw_returns_{true};
+  std::string fine_region_topic_;
+  bool   pub_fine_tsdf_{true};
+  rclcpp::Subscription<scovox_msgs::msg::RefinementRegion>::SharedPtr fine_region_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr fine_tsdf_pub_;
   double carve_band_{-1.0};
   double min_tsdf_w_{0.5};
   double plan_res_{0.2}, plan_sz_{80}, plan_ox_{-40}, plan_oy_{-40}, plan_zmin_{-1}, plan_zmax_{2}, plan_infl_{0};
