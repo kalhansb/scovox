@@ -91,6 +91,15 @@ where the bandwidth actually is.
 
 ## Design: codec revision 6
 
+> **Status: implemented 2026-08-01.** `binary_serializer.hpp` FORMAT_VERSION 6
+> (block-run coords + u16 quantization, `quant_step` header field);
+> `scovox_node.cpp` sets `quant_step = evidence_saturation / 65535` (0 when the
+> cap is disabled → f32 payloads). Round-trip, clamp, block-mode and
+> malformed-frame coverage in `test_binary_serializer.cpp`; the offline decoder
+> `experiments/uncertainty/scovox_bin.py` reads both revisions. The
+> `scripts/wire_study/` tools stay rev-5-only (they reproduce the baseline
+> measurement) and now fail loud on a rev-6 capture.
+
 Two changes, both to the Beta and Dir record layouts only.
 
 ### 1. Block-run coordinate coding (the lossless 2.4x)

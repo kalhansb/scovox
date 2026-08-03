@@ -67,6 +67,10 @@
     # Knee at 0.5: 4x thinner (17->4) for only -7% footprint; past it the footprint
     # tax accelerates for little extra thinness. 0.5 matches the 0.40m thinness of
     # feeding GLIM's downsampled /glim_ros/points, natively, at 2.6x the points.
+    #
+    # 0.5 is also the in-code default (the sweep knee above); kept explicit
+    # here as this config's sweep is the evidence for it. Refinement regions
+    # are unaffected (raw returns bypass this via fine_raw_returns).
     downsample_voxel_size: 0.5
 
     # --- TF placement timing (the actual smear lever) --------------------

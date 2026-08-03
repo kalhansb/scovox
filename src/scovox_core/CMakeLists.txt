@@ -90,6 +90,14 @@ target_link_libraries(test_binary_serializer scovox_core Eigen3::Eigen)
 ament_add_gtest(test_consensus_merge test/test_consensus_merge.cpp)
 target_link_libraries(test_consensus_merge scovox_core Eigen3::Eigen)
 
+# Fine TSDF band (fine_tsdf_band_dbh_2026_07_30.md): region registry gate,
+# gated two-lattice integration, per-scan anchor re-registration (drift
+# absorption), raw-return fine-only path (refineHit), rev-7 fine wire
+# stream + merge. Uses the DBH circle fit (dbh_fit.hpp, a post-processing
+# utility the mapping runtime never calls) as its accuracy metric.
+ament_add_gtest(test_fine_tsdf test/test_fine_tsdf.cpp)
+target_link_libraries(test_fine_tsdf scovox_core Eigen3::Eigen)
+
 # ==================================================================
 # Tools (CLI demos / diagnostics, lib-only no ROS)
 # ==================================================================

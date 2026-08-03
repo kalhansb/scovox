@@ -45,6 +45,11 @@ def lz4_size(buf: bytes) -> int:
 def parse_frame(blob: bytes):
     magic, ver = struct.unpack_from("<IB", blob, 0)
     assert magic == 0x53435658, f"bad magic {magic:#x}"
+    # These scripts reproduce the REV-5 baseline measurement and parse the flat
+    # rev-5 layout only. Rev-6 captures (block-run + quantized — the very layout
+    # the V1/V3 variants below prototyped) decode with
+    # experiments/uncertainty/scovox_bin.py instead.
+    assert ver == 5, f"codec revision {ver}: rev-5 captures only"
     res, nclass, ktop = struct.unpack_from("<fHB", blob, 5)
     alpha0, = struct.unpack_from("<f", blob, 12)
     off = 16

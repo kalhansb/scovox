@@ -86,7 +86,7 @@ the other side lacks, in either direction; the corollary is that SCovox
 legitimately appears at *two* configs in the same E4/E5 tables (stated there,
 so it reads as matched reporting, not inconsistency).
 
-**Baselines.** Two tiers. **OctoMap** (log-odds occupancy octree) is now *in scope*
+**Baselines.** Three tiers. **OctoMap** (log-odds occupancy octree) is now *in scope*
 as the C1/C4 geometric+memory baseline — apt-installable, CPU-only, no learned
 weights, ingests the same clouds+poses; it fills at least one comparison column for
 C1 (occupancy AUROC, H1.1) and C4 (bytes/leaf, H4.3) without waiting on anything.
@@ -95,7 +95,18 @@ C2/C3 but is **🚫 blocked** — source/image/weights absent from disk (see §7
 Voxblox/Kimera, S-BKI, segmenter-only stay out of current scope. All SCovox
 own-numbers are unaffected; the SLIM-VDB *columns* fill in once it is obtained (or by
 citing prior-round numbers — legitimate only if the protocol has not drifted, see the
-encoding gate in §7).
+encoding gate in §7). **ROAM (SSMI-family)** is the **distributed-fusion baseline**
+(E6.8) — the one public system that is semantic *and* multi-robot, and unlike
+SLIM-VDB it is *in scope*: ROS source on GitHub
+([ROAM](https://github.com/ExistentialRobotics/ROAM) /
+[SSMI](https://github.com/ExistentialRobotics/SSMI); cloned and code-read
+2026-08-01; ROAM-Mapping builds on SSMI's `semantic_octomap` package).
+References (from the repos' own citation blocks): Asgharivaskasi, Girke &
+Atanasov, "Riemannian Optimization for Active Mapping With Robot Teams," *IEEE
+T-RO* vol. 41, pp. 1077–1097, 2025, arXiv:2404.18321, doi
+10.1109/TRO.2025.3526295; Asgharivaskasi & Atanasov, "Semantic OcTree Mapping
+and Shannon Mutual Information Computation for Robot Exploration," *IEEE T-RO*
+vol. 39, no. 3, 2023, arXiv:2112.04063.
 
 ---
 
@@ -328,8 +339,10 @@ all signals derive from the Beta–Dirichlet state.
      rel∈{0.5, 1, 3}; heartbeat = `share_heartbeat_sec`.)*
   3. **Metrics** — bandwidth; **peer lag** (time for a voxel's merged value to
      come within ε of the sender's — the quantity binarizing baselines cannot
-     even express); merged-map agreement (SSMI) vs the ungated run; one
-     planner-level metric (map quality only matters through its consumers).
+     even express); merged-map agreement vs the ungated run (the design doc's
+     "SSMI/agreement" map-similarity metric — unrelated to the SSMI *system*
+     baselined in E6.8); one planner-level metric (map quality only matters
+     through its consumers).
   4. **Ablations** — negative information on/off (silence ⇒ `|Δp| ≤ τ`, a
      map-quality gain at zero bandwidth); τ fixed vs τ shrinking with last-sent
      evidence (the constant-KL correction — fixed τ over-transmits at thin
@@ -364,6 +377,48 @@ all signals derive from the Beta–Dirichlet state.
   merge is snapshot-replace per (source, coord), so chunk boundaries cannot
   change the converged state, only the path to it. Rides the E6.2 byte
   counters and the E6.4 relay; no new harness.
+- **E6.8 External distributed baseline — ROAM (SSMI-family semantic octree)** ⬜
+  *(repos cloned + code-read 2026-08-01; the comparison below is against the
+  published artifact, not the paper's description).* What the code does:
+  per-node state = top-**3** semantic classes + an `others` bucket in
+  **log-odds**, classes keyed by RGB color (`NUM_SEMANTICS = 3`, compile-time,
+  `Semantics.h`); occupancy *derived* from the semantic log-odds by log-sum of
+  odds; measurement update = fixed ±(ψ=1, φ=−0.3) log-odds increments from the
+  **argmax** segmentation color, a new class entering by splitting `others`,
+  slot overflow evicted back into `others` by log-sum-exp; **the wire is the
+  full serialized octree** (`octomap_msgs::fullMapToMsg`, ~35 B/leaf raw
+  struct) broadcast every `pub_timer` = 10 s; the receiver expands every peer
+  leaf to max depth and folds it as `l_host + w·l_peer` consensus-weighted
+  log-odds (w = 0.8), integrating at most one peer map per `sub_timer` = 10 s
+  and silently dropping the rest (queue depth 1). Three structural contrasts,
+  each to be *demonstrated*, not asserted from code reading:
+  (a) **convergent evidence for the S-thesis** — the closest distributed
+  semantic system also ships a truncated K+OTHER per-voxel state (K=3), but
+  point-estimate log-odds carry no evidence counts: no aleatoric/epistemic
+  split (C3), no evidence-doubling or τ(n) trigger (E6.6), no calibrated n —
+  exactly the differentiators SCovox claims;
+  (b) **snapshot-broadcast vs gated deltas** — per-robot offered load O(map)
+  per tick vs O(significantly-changed voxels);
+  (c) **consensus refold vs snapshot-replace merge** — re-delivering the same
+  peer map re-adds w·l_peer (walks to the clamps: not idempotent, not
+  order-invariant), vs SCovox's replace-per-(source,coord) + refold, where the
+  E6.3 properties hold by construction.
+  Protocol: ROAM-Mapping on the E6.1 partitions at matched inputs and
+  resolution (its pipeline ingests depth + semantic-segmentation images →
+  XYZRGB+label clouds; SceneNet fits directly, KITTI needs a point-type shim);
+  n=1 descriptive first. Measure: per-robot bytes on wire (each side at its
+  declared stack level); merged-map dual-support mIoU vs the centralised
+  reference (fraction-of-gap-recovered, same metric as E6.1); per-voxel/leaf
+  memory; peer lag; and the E6.3 consistency battery run on *both* systems.
+  Rides the E6.1 partitions and E6.2 byte counters; new code is only the input
+  shim.
+- **H6.7** at matched inputs and resolution, SCovox (codec-6 + gated) reaches
+  ≥ ROAM's merged-map mIoU at ≥ 10× lower steady-state per-robot bandwidth —
+  ROAM's floor is one full-map serialization per 10 s, SCovox's is gated
+  deltas. **H6.8** ROAM fails at least one E6.3 consistency property
+  (idempotence under re-delivery of the same peer map) that SCovox passes —
+  predicted from the fold's `l_host + w·l_peer` form, but it must be shown
+  empirically.
 - **H6.4** fused-map mIoU loss < 0.01 at 10% delta loss (0.25 Hz publish); after
   the 30 s blackout, the late-joining robot's map equals the
   continuous-participation map within float tolerance after one snapshot resync.
@@ -447,7 +502,7 @@ appendix material).
 | C3 uncertainty | ✅ calibration/decomp; ⬜ E3.3 validation | **E3.3 injectors** · SceneNet-soft E3.2 · KITTI encoding † · SLIM-VDB col 🚫 |
 | C4 memory | ✅ analytical (16 B, 3.5–5.0×); 🔧 measured (n=1) | grid MB (core/TSDF `[memSplit]` lines) · scaling · n=3 · OctoMap col (buildable, core config) |
 | C5 CPU | ✅ RTF + 2-way split (n=1) | 5-way perf split (buildable) · scaling · n=3 · (E7 hardware) |
-| C6 fusion | ✅ disjoint only | FOV/redundant · centralised bound (both K cells) · **E6.2 bandwidth spec ①–④** · consistency (late-join = outage cell) · **loss cell** · **E6.6 significance gate** (τ/κ arms in code; needs heartbeat + baselines + Dirichlet-trigger decision) · **E6.7 message-size sweep** |
+| C6 fusion | ✅ disjoint only | FOV/redundant · centralised bound (both K cells) · **E6.2 bandwidth spec ①–④** · consistency (late-join = outage cell) · **loss cell** · **E6.6 significance gate** (τ/κ arms in code; needs heartbeat + baselines + Dirichlet-trigger decision) · **E6.7 message-size sweep** · **E6.8 ROAM distributed baseline** (buildable — source public) |
 | **S sufficiency (thesis)** | 🔧 E3.4 selftest ✅ · H3.1 p_OTHER signal ✅ (†) | **S1 four-leg K_top campaign** (incl. exposure statistic) · **S2 fused-fold 2×2** · A7 OTHER ablation |
 
 ---
@@ -486,6 +541,12 @@ appendix material).
    code's v1 (slot change OR class-evidence growth) is acceptable if declared.
    Codec revision 6 (comms Part 1) is engineering, not an experiment; it lands
    whenever, but bandwidth numbers must state whether it was active.
+8. **E6.8 ROAM baseline** — build ROAM-Mapping + SSMI `semantic_octomap`
+   (public; repos verified 2026-08-01), SceneNet partitions first (its
+   depth+segmentation input format matches directly); rides step 4's
+   partitions and byte counters, new code is only the input shim. This is the
+   first external column that tests *distribution*, not just mapping — and the
+   only baseline comparison that exercises C6 end-to-end.
 
 ---
 

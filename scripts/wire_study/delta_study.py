@@ -30,6 +30,9 @@ def lz4_size(buf):
 
 
 def parse(blob):
+    # Rev-5 flat layout only; rev-6 captures decode with
+    # experiments/uncertainty/scovox_bin.py (see wire_study.py).
+    assert blob[4] == 5, f"codec revision {blob[4]}: rev-5 captures only"
     off = 16
     tsdf_n, = struct.unpack_from("<I", blob, off); off += 4 + tsdf_n * 20
     beta_n, = struct.unpack_from("<I", blob, off); off += 4

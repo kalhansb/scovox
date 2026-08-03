@@ -1,0 +1,47 @@
+# =======================================================================
+# SCovox — fine-TSDF band OVERLAY (high-resolution refinement regions)
+# =======================================================================
+# Load AFTER a base mapper config (e.g. scovox_lidar_geometric.yaml) to
+# enable the localized two-lattice fine TSDF band:
+#   ros2 run scovox_mapping scovox_mapping_node --ros-args \
+#     --params-file /scovox/config/scovox_lidar_geometric.yaml \
+#     --params-file /scovox/config/scovox_fine_band.yaml
+# Design: docs/design/fine_tsdf_band_dbh_2026_07_30.md.
+#
+# Regions arrive on <node>/refinement_region (scovox_msgs/RefinementRegion,
+# field-compatible with explo_planner TreeTarget). The node only GENERATES
+# the fine map; measurement (e.g. the DBH circle fit, scovox/dbh_fit.hpp)
+# is post-processing on the shared rev-7 fine stream or the saved map.
+# =======================================================================
+
+/**:
+  ros__parameters:
+    # --- Fine lattice -----------------------------------------------------
+    # res_fine = resolution / 2^k. At base 0.10 m: k=2 -> 2.5 cm, k=3 ->
+    # 1.25 cm. k=3 is the sensor floor for the Hesai XT32 at 3-4 m orbit
+    # range (~1.1 cm horizontal beam spacing, ~1 cm range sigma); beyond it
+    # voxels go hit-starved and noise dominates. Pair k=3 with
+    # fine_sdf_trunc_voxels: 3 (trunc 3.75 cm, still > 2x range sigma).
+    fine_ratio_log2: 2            # res_fine = resolution / 4 (0.10 -> 0.025)
+    fine_sdf_trunc_voxels: 3      # fine trunc = 3 * res_fine (7.5 cm at k=2)
+    fine_region_margin: 0.15      # gate radius = trunk model radius + this
+
+    # --- Full sensor density in regions -----------------------------------
+    # In-region raw (deskewed) returns bypass downsample_voxel_size and feed
+    # the fine lattice directly (fine-band-only; the coarse map still gets
+    # the downsampled medoids). This is what lets a 0.1-0.5 m scan
+    # downsample coexist with cm-scale refinement.
+    fine_raw_returns: true
+
+    # --- Per-scan anchor re-registration (drift absorption) ---------------
+    fine_anchor_enable: true
+    fine_anchor_min_points: 12    # fewer in-region points -> odometry fallback
+    fine_anchor_max_shift: 0.30   # fitted shift beyond this = mis-fit, reject
+
+    # --- Refined slab (relative to each region's base_z) -------------------
+    # Defaults bracket breast height (1.3 m +/- 0.3 m) for DBH post-processing.
+    fine_region_z_lo: 1.0
+    fine_region_z_hi: 1.6
+
+    # --- Viz --------------------------------------------------------------
+    publish_fine_tsdf_pointcloud: true   # <node>/fine_tsdf_pointcloud (RViz QA)
