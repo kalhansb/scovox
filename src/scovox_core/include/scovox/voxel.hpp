@@ -8,7 +8,21 @@
 
 namespace scovox {
 
-constexpr int K_TOP = 2;
+/// Number of tracked class slots per voxel. **Ship value 2** — the paper /
+/// production configuration; every default build is byte-identical to the
+/// hard-coded constant this replaced.
+///
+/// Overridable at *build* time only (`-DSCOVOX_K_TOP=n`), for the S1
+/// sufficiency sweep (experiments/PLAN.md §3 S) which needs K ∈ {1,2,3,full}
+/// as four separate builds. It is a struct-layout constant: every translation
+/// unit in the workspace must see the same value, so a sweep build must pass
+/// the flag to `colcon build` as a whole and install into its own base — never
+/// mix objects across values.
+#ifndef SCOVOX_K_TOP
+#define SCOVOX_K_TOP 2
+#endif
+constexpr int K_TOP = SCOVOX_K_TOP;
+static_assert(K_TOP >= 1, "K_TOP must be >= 1");
 
 /// Default symmetric Dirichlet prior `α₀` applied per underlying class
 /// dimension. **Recommended ship value `0.01`** — matches the "Beta starts

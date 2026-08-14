@@ -67,6 +67,7 @@ public:
     // hot path in place of the old `!topk_probs_dir_.empty()` checks.
     topk_ = std::make_unique<scovox::TopkProvider>(
         get_logger(), get_clock(), topk_probs_dir_, max_sem_);
+    topk_->setTopkTrunc(semantic_topk_trunc_);
     // Raw launch sdf_trunc (0 == "TSDF off"). TsdfMap re-clamps a <=0 value
     // back up internally, so the ~/tsdf_pointcloud publisher, the
     // ~/extract_mesh service, and publishTSDFPointCloud gate on this cached
@@ -80,6 +81,7 @@ public:
     SP.resolution = P.resolution;
     SP.inner_bits = P.inner_bits;
     SP.leaf_bits  = P.leaf_bits;
+    SP.dir_leaf_bits = P.dir_leaf_bits;
     // TsdfMap: SLIM-VDB-equivalent defaults; only sdf_trunc + space_carving
     // carry over from P. weighting_function defaults to constant(1).
     SP.tsdf.sdf_trunc     = P.sdf_trunc;
@@ -105,6 +107,10 @@ public:
     SP.semsplit.batch_free_carve        = P.batch_free_carve;
     SP.semsplit.evidence_saturation     = static_cast<float>(P.evidence_saturation);
     SP.semsplit.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
+    SP.semsplit.evict_by_confidence     = evict_by_confidence_;
+    SP.semsplit.semantic_spread_radius  = static_cast<float>(semantic_spread_radius_);
+    SP.semsplit.semantic_band_length    = static_cast<float>(semantic_band_length_);
+    SP.semsplit.semantic_band_require_occ = semantic_band_require_occ_;
     SP.semsplit.range_decay_length      = static_cast<float>(P.range_decay_length);
     SP.semsplit.semantic_mode           = P.semantic_mode;
     // num_classes / alpha_0 — dataset-dependent priors that govern the
@@ -132,8 +138,13 @@ public:
     if (share_change_gate_ && mode_ == "rolling") {
       gate_beta_ = std::make_unique<Bonxai::VoxelGrid<GateBeta>>(
           P.resolution, P.inner_bits, P.leaf_bits);
+      // The Dir shadow mirrors the Dir grid's occupancy pattern (it is written
+      // one-for-one with every emitted Dir voxel), so it inherits the same
+      // block-fill problem — and the same fix. Read the EFFECTIVE value back
+      // from SemSplitMap so the clamp in sanitise() applies here too.
       gate_dir_ = std::make_unique<Bonxai::VoxelGrid<GateDir>>(
-          P.resolution, P.inner_bits, P.leaf_bits);
+          P.resolution, P.inner_bits,
+          split_map_->semsplit().params().dir_leaf_bits);
     }
     loadSemanticColorMap();  initializeSemanticColors();
     setupSubscribers();
@@ -179,9 +190,12 @@ public:
         });
       RCLCPP_INFO(get_logger(),
         "share timer: ScovoxMapBinary coalesced at %.2f Hz (change_gate=%d "
-        "mode=%s heartbeat=%.1fs chunk=%d z_band=[%.2f, %.2f]%s)",
+        "mode=%s heartbeat=%.1fs chunk=%d chunk_interleave=%d "
+        "byte_budget=%lld z_band=[%.2f, %.2f]%s)",
         share_rate_hz_, (int)share_change_gate_, share_gate_mode_.c_str(),
-        share_heartbeat_sec_, share_max_voxels_per_msg_, share_roi_z_min_,
+        share_heartbeat_sec_, share_max_voxels_per_msg_,
+        (int)share_chunk_interleave_,
+        (long long)share_max_bytes_per_tick_, share_roi_z_min_,
         share_roi_z_max_,
         share_roi_z_max_ > share_roi_z_min_ ? "" : " off");
     }
@@ -214,19 +228,47 @@ public:
         fine_region_z_lo_, fine_region_z_hi_, (int)fine_raw_returns_,
         fine_region_topic_.c_str());
     }
-    RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s share_tsdf=%d fused_walker=%d",
-      P.resolution, mode_.c_str(), int_frame_.c_str(), (int)share_tsdf_, (int)fused_walker_);
+    RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s share_tsdf=%d share_dir=%d fused_walker=%d",
+      P.resolution, mode_.c_str(), int_frame_.c_str(), (int)share_tsdf_, (int)share_dir_, (int)fused_walker_);
+    if (!share_dir_) {
+      RCLCPP_WARN(get_logger(),
+        "share_dir=false: GEOMETRY-ONLY sharing — the Dir (semantics) stream "
+        "is elided from every wire frame; peers receive occupancy updates only "
+        "and keep whatever semantics they already hold.");
+    }
     {
       const auto& tg = split_map_->tsdf().grid();
-      RCLCPP_INFO(get_logger(), "grid leaf_bits=%u inner_bits=%u block=%ux%ux%u voxels_per_leaf=%u",
+      const auto& dg = split_map_->semsplit().dirGrid();
+      RCLCPP_INFO(get_logger(), "grid leaf_bits=%u inner_bits=%u block=%ux%ux%u voxels_per_leaf=%u "
+        "| dir grid leaf_bits=%u block=%ux%ux%u voxels_per_leaf=%u",
         tg.leafBits(), tg.innetBits(),
         1u << tg.leafBits(), 1u << tg.leafBits(), 1u << tg.leafBits(),
-        1u << (3u * tg.leafBits()));
+        1u << (3u * tg.leafBits()),
+        dg.leafBits(),
+        1u << dg.leafBits(), 1u << dg.leafBits(), 1u << dg.leafBits(),
+        1u << (3u * dg.leafBits()));
     }
     RCLCPP_INFO(get_logger(), "TSDF: sdf_trunc=%.3f m space_carving=%d band_only=%d (sdf_trunc=0 means off; set via enable_tsdf / sdf_trunc_voxels)",
       P.sdf_trunc, (int)P.tsdf_space_carving, (int)P.band_only_integration);
     RCLCPP_INFO(get_logger(), "split substrate: sizeof(TsdfVoxel)=%zu sizeof(BetaVoxel)=%zu sizeof(DirVoxel)=%zu",
       sizeof(scovox::TsdfVoxel), sizeof(scovox::BetaVoxel), sizeof(scovox::DirVoxel));
+    // Print the SANITISED deposit rule, read back out of the constructed map,
+    // never the launch argument. A binary predating either knob accepts the
+    // parameter and ignores it, which is how a sweep silently measures nothing;
+    // this line is the only thing that distinguishes "band ran" from "band was
+    // spelled correctly". Drivers should grep for it, not for the launch arg.
+    {
+      const auto& sp = split_map_->semsplit().params();
+      RCLCPP_INFO(get_logger(),
+        "semantic deposit: mode=%s band_length=%.3f m band_require_occ=%d "
+        "spread_radius=%.3f m (band walks |sdf|<=b on the existing DDA; "
+        "spread scans a ball; 0/0 = endpoint-only)",
+        sp.semantic_band_length > 0.f
+          ? (sp.semantic_band_require_occ ? "BAND-gated" : "BAND-slimvdb")
+          : (sp.semantic_spread_radius > 0.f ? "SPREAD" : "endpoint"),
+        sp.semantic_band_length, (int)sp.semantic_band_require_occ,
+        sp.semantic_spread_radius);
+    }
   }
   ~SCovoxNode() override {
     // Join the diagnostic memlog worker (scheduleMemUsage) before any node
@@ -245,6 +287,12 @@ private:
     P.resolution = dp("resolution", 0.10);
     P.inner_bits = (uint8_t)std::clamp((int)dp("inner_bits", 2), 1, 4);
     P.leaf_bits  = (uint8_t)std::clamp((int)dp("leaf_bits", 3), 1, 4);
+    // Semantic (Dir) grid block size. Independent of leaf_bits because the Dir
+    // grid is hit-only + Stream-B gated — ~18× sparser than the full-ray Beta
+    // grid — so it wastes ~9 of every 10 slots in an 8³ block. SemSplitMap
+    // clamps this to <= leaf_bits; pass dir_leaf_bits:=3 to restore the old
+    // shared geometry exactly. See SemSplitMap::Params::dir_leaf_bits.
+    P.dir_leaf_bits = (uint8_t)std::clamp((int)dp("dir_leaf_bits", 2), 1, 4);
     P.w_free = dp("w_free", 1.0);  P.w_occ = dp("w_occ", 2.0);
     P.kappa0 = dp("kappa0", 2.0);
     {
@@ -298,6 +346,32 @@ private:
       else if (sm == "majority_vote") P.semantic_mode = scovox::SemanticMode::MAJORITY_VOTE;
       else P.semantic_mode = scovox::SemanticMode::DIRICHLET; }
     max_sem_ = dp("max_semantic_classes", 10);
+    // Semantic mechanism knobs (SceneNN mechanism round). Shipped defaults are
+    // off/0, so an unmodified launch is byte-identical to before.
+    semantic_topk_trunc_    = dp("semantic_topk_trunc", 0);
+    evict_by_confidence_    = dp("semantic_evict_by_confidence", false);
+    semantic_spread_radius_ = dp("semantic_spread_radius", 0.0);
+    semantic_band_length_   = dp("semantic_band_length", 0.0);
+    semantic_band_require_occ_ = dp("semantic_band_require_occ", true);
+    // Both set is a config error, not a blend. SemSplitMap::sanitise resolves it
+    // silently in favour of the ball; say so here, because a sweep that thinks
+    // it is measuring the band would otherwise report the ball's numbers.
+    if (semantic_band_length_ > 0.0 && semantic_spread_radius_ > 0.0) {
+      RCLCPP_WARN(get_logger(),
+          "semantic_band_length=%.3f IGNORED: semantic_spread_radius=%.3f is "
+          "also set and takes precedence. Set exactly one — the ball and the "
+          "band are alternative deposit rules, not composable.",
+          semantic_band_length_, semantic_spread_radius_);
+    }
+#if !SCOVOX_TRACK_QMAX
+    if (evict_by_confidence_) {
+      RCLCPP_WARN(get_logger(),
+          "semantic_evict_by_confidence=true ignored: this binary was built "
+          "without -DSCOVOX_TRACK_QMAX=1, so DirVoxel has no per-slot "
+          "confidence to compare against. Rebuild to enable it.");
+      evict_by_confidence_ = false;
+    }
+#endif
     transient_decay_rate_ = dp("transient_decay_rate", 0.8);
     // Dynamic classes: a hit whose argmax(cp) is one of these is routed to the
     // transient decaying grid instead of the persistent map (see node
@@ -385,6 +459,16 @@ private:
     //   The rev-7 fine-TSDF stream rides the same toggle: it ships iff
     //   share_tsdf is on AND the fine band is enabled (fine_ratio_log2 > 0).
     share_tsdf_ = dp("share_tsdf", false);
+    // Sender-side wire toggle for the Dir (semantics) stream — share_tsdf's
+    // mirror, default ON so the wire is unchanged unless a robot opts into
+    // geometry-only sharing (E6.9):
+    //   share_dir=false: elide the Dir section (dir_count=0 — a zero-length
+    //     stream is already legal wire, same codec rev). Receiver contract,
+    //     verified in dscovox onBinaryMap: ingest is snapshot-replace per
+    //     RECORD and the refold walks only arrived cells, so an absent stream
+    //     means "no semantic update", never "erase semantics" — a peer keeps
+    //     any semantics it already holds, it just stops receiving updates.
+    share_dir_ = dp("share_dir", true);
     // ── Fine TSDF band — localized two-lattice refinement ──────────────────
     // docs/design/fine_tsdf_band_dbh_2026_07_30.md. fine_ratio_log2 = 0 (the
     // default) disables everything (no fine grid, no subscription). k = 2 at
@@ -432,6 +516,13 @@ private:
     share_change_gate_ = dp("share_change_gate", true);
     share_gate_p_eps_ = dp("share_gate_p_eps", 0.02);
     share_gate_evidence_rel_ = dp("share_gate_evidence_rel", 0.10);
+    // Per-stream cadence (E6.9): let the Dir (semantics) stream re-sync at a
+    // different κ than occupancy. <0 (the default) inherits
+    // share_gate_evidence_rel — resolved once here so the gate predicate
+    // reads a single member — and nothing moves unless the knob is set.
+    share_gate_evidence_rel_dir_ = dp("share_gate_evidence_rel_dir", -1.0);
+    if (share_gate_evidence_rel_dir_ < 0.0)
+      share_gate_evidence_rel_dir_ = share_gate_evidence_rel_;
     // ── E6.6 gate-policy experiment knobs (experiment_plan.md §E6.6) ──
     // share_gate_mode selects the emit TRIGGER when share_change_gate is on:
     //   "significance"      (default) — |Δp_occ| > τ OR relative evidence
@@ -492,6 +583,35 @@ private:
     // vs per-message overhead and LZ4 ratio). 0 (default) = one message per
     // tick, the legacy wire behaviour.
     share_max_voxels_per_msg_ = static_cast<int>(dp("share_max_voxels_per_msg", 0));
+    // share_chunk_interleave: how the chunker DIVIDES a tick between the four
+    // sections. true (default) = proportional interleave, so any prefix of the
+    // chunk sequence carries each section in proportion to its size and a
+    // receiver gets semantics from the first message. false = the legacy
+    // section-at-a-time drain (tsdf → beta → dir → fine), which puts every
+    // semantic record behind the entire occupancy stream. Inert unless
+    // share_max_voxels_per_msg > 0, and it cannot change the converged state
+    // either way (merge is replace-per-(source, coord)) — kept as a knob so
+    // the two orderings can be A/B'd in one binary.
+    share_chunk_interleave_ = dp("share_chunk_interleave", true);
+    // share_max_bytes_per_tick: > 0 caps the COMPRESSED bytes put on the wire
+    // in one publish tick; chunks past the cap are deferred FIFO to later
+    // ticks. This is the burst shaper the voxel cap above is not: chunking
+    // bounds message SIZE but still emits every chunk back-to-back within the
+    // tick. Deferral cannot change the converged state — chunks carry
+    // absolute state, the publisher preserves order, and the receiver merge
+    // is replace-per-(source, coord) — it trades burst height for convergence
+    // delay. Every tick sends at least one message even if that message alone
+    // exceeds the budget (progress guarantee), so without chunking the cap
+    // degenerates to one-whole-tick-message-per-tick — hence the warning.
+    // 0 (default) = unlimited: the legacy publish path, wire-identical.
+    share_max_bytes_per_tick_ =
+        static_cast<int64_t>(dp("share_max_bytes_per_tick", 0));
+    if (share_max_bytes_per_tick_ > 0 && share_max_voxels_per_msg_ <= 0) {
+      RCLCPP_WARN(get_logger(),
+        "share_max_bytes_per_tick is set but share_max_voxels_per_msg is 0 — "
+        "one whole-tick message is always sent, so the budget cannot shape "
+        "bursts; set a chunk size");
+    }
     // share_roi_z_min/max: vertical band (integration frame, metres) outside
     // which voxels stay OFF the wire (both Beta and Dir streams). The LOCAL
     // map is untouched — this filters only what is shared, so out-of-band
@@ -1698,6 +1818,27 @@ private:
                   split_map_->semdirVoxelCount(), sembeta_mb,
                   split_map_->fineVoxelCount(),
                   static_cast<double>(split_map_->fineGridBytes()) / (1024.0 * 1024.0));
+      // Per-grid block accounting. [memSplit] lumps Beta+Dir into one figure,
+      // which hides that the Dir grid's cost is block-fill waste rather than
+      // per-voxel struct size (S1 leg 3). A separate tag so every existing
+      // `grep [memSplit]` parser keeps working unchanged.
+      {
+        const auto bd = split_map_->semsplit().betaGrid().memUsageDetailed();
+        const auto dd = split_map_->semsplit().dirGrid().memUsageDetailed();
+        RCLCPP_INFO(get_logger(),
+                    "[memBlocks] beta_lb=%u beta_vox=%zu beta_leaves=%zu "
+                    "beta_slots=%zu beta_fill=%.3f beta_mb=%.3f | "
+                    "dir_lb=%u dir_vox=%zu dir_leaves=%zu dir_slots=%zu "
+                    "dir_fill=%.3f dir_mb=%.3f",
+                    split_map_->semsplit().betaGrid().leafBits(),
+                    bd.active_voxels, bd.leaf_count,
+                    bd.leaf_count * bd.voxels_per_leaf, bd.leaf_fill_ratio(),
+                    static_cast<double>(bd.total_bytes) / (1024.0 * 1024.0),
+                    split_map_->semsplit().dirGrid().leafBits(),
+                    dd.active_voxels, dd.leaf_count,
+                    dd.leaf_count * dd.voxels_per_leaf, dd.leaf_fill_ratio(),
+                    static_cast<double>(dd.total_bytes) / (1024.0 * 1024.0));
+      }
       // Gate-state cost (E6.6 prerequisite: "state cost is unmeasured").
       // Shared lock suffices: the publish path writes these under the unique
       // lock, so this read never races it.
@@ -1909,7 +2050,7 @@ private:
     for (int i = 0; i < scovox::K_TOP; ++i)
       if (now.cls[i] != last.cls[i]) return true;
     const float s0 = last.s_class();
-    return (now.s_class() - s0) > (float)share_gate_evidence_rel_ * s0;
+    return (now.s_class() - s0) > (float)share_gate_evidence_rel_dir_ * s0;
   }
 
   std::pair<size_t,double> publishBinaryMap() {
@@ -1918,12 +2059,43 @@ private:
 
     const size_t cur_sub = bin_pub_->get_subscription_count();
     if (cur_sub == 0) {
+      // Deferred chunks addressed subscribers that no longer exist; the next
+      // connect triggers a full snapshot, so the backlog is redundant.
+      share_deferred_.clear();
+      share_deferred_bytes_ = 0;
       prev_sub_count_ = cur_sub;
       (void)split_map_->drainTouchedTsdf();
       (void)split_map_->drainTouchedBeta();
       (void)split_map_->drainTouchedDir();
       (void)split_map_->drainTouchedFine();
       return {0, 0};
+    }
+
+    // ── Per-tick wire-byte budget (share_max_bytes_per_tick > 0) ────────────
+    // Deferred chunks drain FIRST, FIFO: every chunk carries absolute state
+    // and the publisher preserves order, so an older record for a voxel hits
+    // the wire before any newer one and snapshot-replace at the receiver
+    // makes the newest win. Drained before the TF lookup — each deferred
+    // message already pins its build-time pose, so a TF outage must not
+    // stall the backlog. A tick that has sent nothing yet always sends one
+    // message even over budget, so an oversized chunk cannot wedge the queue.
+    const size_t byte_budget = share_max_bytes_per_tick_ > 0
+        ? static_cast<size_t>(share_max_bytes_per_tick_)
+        : std::numeric_limits<size_t>::max();
+    size_t bytes_total = 0;   // bytes actually published by THIS call
+    size_t emitted     = 0;   // deltas actually published by THIS call
+    auto wire_send = [&](scovox_msgs::msg::ScovoxMapBinary&& bin, size_t n) {
+      bytes_total += bin.data.size();
+      emitted     += n;
+      bin_pub_->publish(std::move(bin));
+    };
+    while (!share_deferred_.empty()) {
+      auto& d = share_deferred_.front();
+      if (bytes_total > 0 && bytes_total + d.msg.data.size() > byte_budget)
+        break;
+      share_deferred_bytes_ -= d.msg.data.size();
+      wire_send(std::move(d.msg), d.n_deltas);
+      share_deferred_.pop_front();
     }
 
     // Snapshot the source->map pose from TF and carry it with this update so the
@@ -1948,7 +2120,7 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "publishBinaryMap: no %s <- %s transform yet (%s); deferring publish",
         map_frame_.c_str(), int_frame_.c_str(), e.what());
-      return {0, 0};
+      return {emitted, double(bytes_total) / (1024.0 * 1024.0)};
     }
 
     bool snapshot = (cur_sub > prev_sub_count_);
@@ -1958,12 +2130,12 @@ private:
     frame.resolution  = static_cast<float>(split_map_->resolution());
     frame.num_classes = static_cast<uint16_t>(num_classes_);
     frame.alpha_0     = alpha_0_;
-    // Codec rev 6 u16 quantization: the step spans exactly the representable
-    // evidence range [0, evidence_saturation]. Cap disabled (0) → evidence is
-    // unbounded, so fall back to f32 payloads (quant_step=0 sentinel — see
-    // binary_serializer.hpp).
+    // Codec rev 8 u8 sqrt-companded quantization: q=255 reconstructs exactly
+    // evidence_saturation, so the scale is S_max/255². Cap disabled (0) →
+    // evidence is unbounded, so fall back to f32 payloads (quant_step=0
+    // sentinel — see binary_serializer.hpp).
     frame.quant_step  = map_params_.evidence_saturation > 0
-        ? static_cast<float>(map_params_.evidence_saturation) / 65535.f
+        ? static_cast<float>(map_params_.evidence_saturation) / 65025.f
         : 0.f;
 
     const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
@@ -2085,8 +2257,8 @@ private:
       }
     }
 
-    // ----- Dir section (semantics; hit-sparse) -----
-    {
+    // ----- Dir section (semantics; hit-sparse; elided when share_dir_=false) -----
+    if (share_dir_) {
       auto& dgrid = ss.dirGrid();
       auto dacc = dgrid.createAccessor();
       std::optional<Bonxai::VoxelGrid<GateDir>::Accessor> gacc;
@@ -2126,6 +2298,11 @@ private:
         for (const auto& c : split_map_->drainTouchedDir())
           if (auto* v = dacc.value(c, false)) emit_dir(*v, c);
       }
+    } else {
+      // Geometry-only sharing: drop the touched set on the floor each tick.
+      // gate_dir_ never gains entries (emit_dir above is its only writer), so
+      // the heartbeat's Dir walk below is a no-op in this mode.
+      (void)split_map_->drainTouchedDir();
     }
 
     // ----- Heartbeat arm (share_heartbeat_sec > 0; E6.6) -----
@@ -2160,23 +2337,23 @@ private:
 
     if (frame.tsdf_deltas.empty() && frame.beta_deltas.empty() &&
         frame.dir_deltas.empty() && frame.fine_tsdf_deltas.empty()) {
-      return {0, 0};
+      return {emitted, double(bytes_total) / (1024.0 * 1024.0)};
     }
 
     scovox::BinarySerializer::Options opts;
     opts.share_tsdf = share_tsdf_;
 
-    // Serialize + LZ4 + publish one frame. Returns the deltas it shipped
-    // (0 on an LZ4 error — the consumer always expects the LZ4 framing, so
-    // shipping a raw blob would be undecodable; drop the frame instead).
-    size_t bytes_total = 0;
-    auto publish_frame = [&](const scovox::BinarySerializer::Frame& f) -> size_t {
+    // Serialize + LZ4 + one frame onto the wire — or onto the deferral queue
+    // when the byte budget says this tick is full. An LZ4 error drops the
+    // frame (the consumer always expects the LZ4 framing, so shipping a raw
+    // blob would be undecodable).
+    auto publish_frame = [&](const scovox::BinarySerializer::Frame& f) {
       auto data = scovox::BinarySerializer::serialize(f, opts);
       auto comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
       if (comp.empty()) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
           "publishBinaryMap: LZ4 compression failed; dropping frame");
-        return 0;
+        return;
       }
       scovox_msgs::msg::ScovoxMapBinary bin;
       bin.header.stamp    = get_clock()->now();
@@ -2189,27 +2366,59 @@ private:
       bin.little_endian = false;
 #endif
       bin.data = std::move(comp);
-      bytes_total += bin.data.size();
       const size_t n = f.tsdf_deltas.size() + f.beta_deltas.size()
                      + f.dir_deltas.size() + f.fine_tsdf_deltas.size();
-      bin_pub_->publish(std::move(bin));
-      return n;
+      // Budget routing: defer whenever older chunks still wait (FIFO order is
+      // global, not per-tick) or this chunk would blow the tick budget — but
+      // a tick that has sent nothing yet always sends (progress guarantee).
+      if (share_max_bytes_per_tick_ > 0 &&
+          (!share_deferred_.empty() ||
+           (bytes_total > 0 && bytes_total + bin.data.size() > byte_budget))) {
+        share_deferred_bytes_ += bin.data.size();
+        share_deferred_.push_back({std::move(bin), n});
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+          "share budget: deferring chunks (backlog %zu msgs / %.0f KB)",
+          share_deferred_.size(), share_deferred_bytes_ / 1024.0);
+        return;
+      }
+      wire_send(std::move(bin), n);
     };
 
-    size_t emitted = 0;
     const size_t total = frame.tsdf_deltas.size() + frame.beta_deltas.size()
                        + frame.dir_deltas.size()
                        + frame.fine_tsdf_deltas.size();
     const size_t chunk = share_max_voxels_per_msg_ > 0
                        ? (size_t)share_max_voxels_per_msg_ : total;
     if (chunk >= total) {
-      emitted = publish_frame(frame);
+      publish_frame(frame);
     } else {
-      // E6.7 chunking: greedy split preserving section order. Every chunk is a
-      // complete, independently decodable ScovoxMapBinary (own envelope, pose,
-      // LZ4 stream) — the receiver merge is per-(source, coord) replace, so
-      // chunk boundaries change delivery dynamics only, never the converged
-      // state. Costs: per-message envelope overhead + smaller LZ4 windows.
+      // E6.7 chunking: split one tick's frame across several messages. Every
+      // chunk is a complete, independently decodable ScovoxMapBinary (own
+      // envelope, pose, LZ4 stream) and may mix sections — the receiver merge
+      // is per-(source, coord) replace, so chunk boundaries change delivery
+      // dynamics only, never the converged state. Costs: per-message envelope
+      // overhead + smaller LZ4 windows.
+      //
+      // The split is a PROPORTIONAL INTERLEAVE across the four sections, not
+      // the section-at-a-time drain it used to be. Draining tsdf → beta → dir →
+      // fine in full put every semantic record behind the ENTIRE occupancy
+      // stream: on the connect-triggered full snapshot (~1 M Beta voxels) at
+      // cap 500 a late-joining receiver saw ~2 000 pure-geometry messages
+      // before its first class label, and semantics only completed when the
+      // whole transfer did. Interleaving makes any prefix of the chunk
+      // sequence carry each section in proportion to its size, so a receiver
+      // has usable labels from message 0 and its semantic coverage grows with
+      // the transfer instead of stepping in at the end.
+      //
+      // Mechanism: give record `i` of a section of size `n` the position key
+      // (2i+1)/(2n) on a normalized [0,1) axis and 4-way merge the sections by
+      // that key. Keys within a section are already ascending, so this is a
+      // linear merge (no sort), it preserves within-section order exactly, and
+      // after m records each section has contributed within 1 record of its
+      // proportional share m·n/N. Ties break in the historical section order,
+      // so the split stays deterministic. Nothing here touches the wire
+      // format, the envelope, or the serializer — only which records ride in
+      // which message.
       scovox::BinarySerializer::Frame part;
       part.resolution      = frame.resolution;
       part.num_classes     = frame.num_classes;
@@ -2219,28 +2428,60 @@ private:
       size_t in_part = 0;
       auto flush = [&] {
         if (in_part == 0) return;
-        emitted += publish_frame(part);
+        publish_frame(part);
         part.tsdf_deltas.clear(); part.beta_deltas.clear();
         part.dir_deltas.clear(); part.fine_tsdf_deltas.clear();
         in_part = 0;
       };
-      for (const auto& d : frame.tsdf_deltas) {
-        part.tsdf_deltas.push_back(d);
-        if (++in_part >= chunk) flush();
-      }
-      for (const auto& d : frame.beta_deltas) {
-        part.beta_deltas.push_back(d);
-        if (++in_part >= chunk) flush();
-      }
-      for (const auto& d : frame.dir_deltas) {
-        part.dir_deltas.push_back(d);
-        if (++in_part >= chunk) flush();
-      }
-      for (const auto& d : frame.fine_tsdf_deltas) {
-        part.fine_tsdf_deltas.push_back(d);
+      // Section sizes / cursors, in the historical drain order (which is also
+      // the tie-break priority): 0 tsdf, 1 beta, 2 dir, 3 fine_tsdf.
+      const std::size_t n_sec[4] = {frame.tsdf_deltas.size(),
+                                    frame.beta_deltas.size(),
+                                    frame.dir_deltas.size(),
+                                    frame.fine_tsdf_deltas.size()};
+      std::size_t cur[4] = {0, 0, 0, 0};
+      // Section boundaries at which the LEGACY drain switches sections — used
+      // only when share_chunk_interleave is false (the A/B arm).
+      const std::size_t seq_end[4] = {n_sec[0],
+                                      n_sec[0] + n_sec[1],
+                                      n_sec[0] + n_sec[1] + n_sec[2],
+                                      total};
+      for (std::size_t k = 0; k < total; ++k) {
+        // Pick the section whose next record has the smallest position key
+        // (2·cur+1)/(2·n). Compared cross-multiplied in int64 to stay exact:
+        // both factors are bounded by ~2·(voxels in one frame), so the product
+        // cannot overflow for any frame that fits in memory.
+        int best = -1;
+        if (!share_chunk_interleave_) {
+          // Legacy: exhaust section by section, in order.
+          for (int s = 0; s < 4; ++s)
+            if (k < seq_end[s]) { best = s; break; }
+        } else {
+          for (int s = 0; s < 4; ++s) {
+            if (cur[s] >= n_sec[s]) continue;
+            if (best < 0) { best = s; continue; }
+            const int64_t lhs = static_cast<int64_t>(2 * cur[s] + 1)
+                              * static_cast<int64_t>(n_sec[best]);
+            const int64_t rhs = static_cast<int64_t>(2 * cur[best] + 1)
+                              * static_cast<int64_t>(n_sec[s]);
+            if (lhs < rhs) best = s;  // strict < → ties keep the lower section id
+          }
+        }
+        switch (best) {
+          case 0:  part.tsdf_deltas.push_back(frame.tsdf_deltas[cur[0]++]);      break;
+          case 1:  part.beta_deltas.push_back(frame.beta_deltas[cur[1]++]);      break;
+          case 2:  part.dir_deltas.push_back(frame.dir_deltas[cur[2]++]);        break;
+          default: part.fine_tsdf_deltas.push_back(frame.fine_tsdf_deltas[cur[3]++]); break;
+        }
         if (++in_part >= chunk) flush();
       }
       flush();
+    }
+    if (share_deferred_bytes_ > (size_t{64} << 20)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+        "share budget backlog %.1f MB (%zu msgs) — share_max_bytes_per_tick "
+        "may be below steady-state production",
+        share_deferred_bytes_ / (1024.0 * 1024.0), share_deferred_.size());
     }
     return {emitted, double(bytes_total) / (1024.0 * 1024.0)};
   }
@@ -2701,6 +2942,12 @@ private:
   std::unordered_map<uint16_t, sensor_msgs::msg::Image::ConstSharedPtr> ds_depth_cache_, ds_seg_cache_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr ds_depth_sub_, ds_seg_sub_;
   int max_sem_, stride_{1}; double min_d_{0.1}, max_d_{10.0}, min_occ_, transient_decay_rate_{0.8}, sem_vis_thresh_{-1.0};
+  // Mechanism knobs measured offline on SceneNN; all default to shipped behaviour.
+  int    semantic_topk_trunc_{0};
+  bool   evict_by_confidence_{false};
+  double semantic_spread_radius_{0.0};
+  double semantic_band_length_{0.0};
+  bool   semantic_band_require_occ_{true};
   // Soft-probability mode: directory of <frame>.topk flat-binary blobs, with
   // file names matching the low 16 bits of header.stamp.nanosec the replay
   // node sets (zero-padded to 6 digits). Empty = legacy hard-label path.
@@ -2744,11 +2991,13 @@ private:
   // (BetaVoxel ∥ DirVoxel). Always allocated — the node has one path.
   std::unique_ptr<scovox::ScovoxMapSplit> split_map_;
   bool share_tsdf_{false};        // TSDF stream toggle (wire opts.share_tsdf)
+  bool share_dir_{true};          // Dir stream toggle — false = geometry-only sharing (E6.9)
   // ── Low-bandwidth share controls (see declareNodeParams) ────────────────
   double share_rate_hz_{0.0};            // <=0 = legacy per-scan inline publish
   bool   share_change_gate_{true};       // emit only changed-since-last-emit voxels
   double share_gate_p_eps_{0.02};        // |Δp_occ| emit threshold (τ)
   double share_gate_evidence_rel_{0.10}; // relative evidence-growth emit threshold (κ−1)
+  double share_gate_evidence_rel_dir_{0.10}; // Dir-stream κ−1; param default -1 = inherit (resolved at declare)
   // ── E6.6 gate-policy knobs (see declareNodeParams for semantics) ──
   std::string share_gate_mode_{"significance"};
   bool   gate_state_flip_{false};        // cached: mode starts with "state_flip"
@@ -2759,6 +3008,15 @@ private:
   double share_stateflip_p_occ_{0.5};    // occ/free threshold, state_flip modes
   double share_binarize_evidence_{20.0}; // pseudo-count mass of a binarized payload
   int    share_max_voxels_per_msg_{0};   // E6.7: >0 chunks one tick into N-delta msgs
+  bool   share_chunk_interleave_{true};  // chunker: proportional interleave vs legacy drain
+  int64_t share_max_bytes_per_tick_{0};  // >0: per-tick published-byte budget; excess chunks defer
+  // Chunks awaiting a later tick's budget. Fully built messages — stamp and
+  // envelope pose pinned at build time (the pose must match the data), so a
+  // drain tick just publishes. FIFO; cleared when the last subscriber leaves
+  // (reconnect re-triggers a full snapshot anyway).
+  struct DeferredChunk { scovox_msgs::msg::ScovoxMapBinary msg; size_t n_deltas; };
+  std::deque<DeferredChunk> share_deferred_;
+  size_t share_deferred_bytes_{0};
   double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
   // Last-EMITTED wire state per voxel (the change gate's memory) plus its emit
   // time — node-clock seconds, double not float: wall-clock epoch seconds are

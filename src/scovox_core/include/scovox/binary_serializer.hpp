@@ -75,22 +75,46 @@
 /// the FINE lattice (`resolution / 2^fine_ratio_log2`); payload layout is
 /// identical to the coarse TSDF stream. Everything else is unchanged from 6.
 ///
+/// Revision 8 shrinks the evidence payloads to ONE byte each and packs class
+/// ids, changing nothing else:
+///
+///  1. **u8 sqrt-companded evidence.** Linear u8 (step = S_max/255 ≈ 3.9 at
+///     the default cap) would open a ±step/2 dead band around the prior wide
+///     enough to swallow a voxel's first observations — the receiver's refold
+///     drops exact-prior records, so young voxels would vanish from peers'
+///     maps (~0.8% of records on real captures). Companding spends the 8 bits
+///     where evidence is scarce instead:
+///       q = clamp(round(sqrt((a − prior) / quant_step)), 0, 255)   (sender)
+///       a = prior + q² · quant_step                                (receiver)
+///     with `quant_step = evidence_saturation / 255²`. The q=0→1 step equals
+///     rev 7's u16 step (S_max/65025 vs S_max/65535), so the at-prior band is
+///     as tight as before; the local step grows as step·(2q+1) ≈ 2·√(step·e),
+///     i.e. quantization error stays below the √e sampling noise of the count
+///     itself at every evidence level. q=255 reconstructs exactly the cap.
+///     At-prior q=0 still reconstructs the prior bit-exactly.
+///  2. **u8 class ids** when the header's num_classes ≤ 255 (every real
+///     taxonomy here: SceneNet 14, NYU40, KITTI): the empty-slot sentinel
+///     0xFFFF maps to 0xFF on the wire and back. num_classes > 255 keeps u16
+///     ids — the width is implied by the header, so the frame stays
+///     self-describing. Serialize throws on a real id ≥ 0xFF when packing
+///     (sender invariant violation: ids are < num_classes ≤ 255).
+///
 /// Frame layout (uncompressed, little-endian):
-///   [MAGIC: u32 = "SCVX"] [VERSION: u8 = 7]
+///   [MAGIC: u32 = "SCVX"] [VERSION: u8 = 8]
 ///   [resolution: f32]
-///   [num_classes: u16]   ← C
+///   [num_classes: u16]   ← C (also selects the cls width: u8 iff C ≤ 255)
 ///   [K_TOP_wire: u8]     ← K_TOP at sender; receiver asserts match
 ///   [alpha_0_wire: f32]  ← symmetric Dirichlet prior at sender
-///   [quant_step: f32]    ← u16 quantization step; 0.0 = f32 payloads
+///   [quant_step: f32]    ← sqrt-companding scale (S_max/255²); 0.0 = f32
 ///   [fine_ratio_log2: u8] ← fine lattice ratio k; 0 = no fine grid
 ///   [tsdf_count: u32]
 ///     ([x:i32][y:i32][z:i32][distance:f32][weight:f32]) × tsdf_count   // 20 B
-///   [beta_count: u32]  <block runs>   // payload: [q_occ:u16][q_free:u16] (4 B)
+///   [beta_count: u32]  <block runs>   // payload: [q_occ:u8][q_free:u8] (2 B)
 ///                                     //      or  [a_occ:f32][a_free:f32] (8 B)
-///   [dir_count: u32]   <block runs>   // payload: [q_other:u16][q_cnt:u16 ×K]
-///                                     //          [cls:u16 ×K]   (2+4K B)
+///   [dir_count: u32]   <block runs>   // payload: [q_other:u8][q_cnt:u8 ×K]
+///                                     //          [cls:u8|u16 ×K]
 ///                                     //      or  [other:f32][cnt:f32 ×K]
-///                                     //          [cls:u16 ×K]   (4+6K B)
+///                                     //          [cls:u8|u16 ×K]
 ///   [fine_tsdf_count: u32]            // fine-lattice coords, 20 B records
 ///     ([x:i32][y:i32][z:i32][distance:f32][weight:f32]) × fine_tsdf_count
 ///
@@ -136,10 +160,12 @@ class BinarySerializer {
   // to this codec). Bumped 5→6 for the block-run coordinate coding + u16
   // payload quantization (comms_design_2026_07_30.md Part 1); 6→7 for the
   // fine-TSDF band (fine_ratio_log2 header byte + trailing fine stream,
-  // fine_tsdf_band_dbh_2026_07_30.md). Any layout change means a
-  // mixed-revision fleet fails loud (deserialize rejects the VERSION byte and
-  // the frame is dropped with a warning) instead of silently misparsing.
-  static constexpr uint8_t  FORMAT_VERSION = 7;
+  // fine_tsdf_band_dbh_2026_07_30.md); 7→8 for u8 sqrt-companded evidence
+  // payloads + u8 class ids (see the revision-8 block in the file header).
+  // Any layout change means a mixed-revision fleet fails loud (deserialize
+  // rejects the VERSION byte and the frame is dropped with a warning) instead
+  // of silently misparsing.
+  static constexpr uint8_t  FORMAT_VERSION = 8;
   // Sanity ceiling on the fine-lattice ratio: k=8 is res/256 — far beyond any
   // deployable fine resolution. A forged large k would reconstruct absurd
   // fine lattices downstream (res_fine underflow in consumers).
@@ -187,10 +213,14 @@ class BinarySerializer {
     const float other_prior = residual_dims > 0
         ? static_cast<float>(residual_dims) * frame.alpha_0 : 0.f;
 
-    const std::size_t beta_payload = quant ? 4u : 8u;
-    const std::size_t dir_payload  = quant
-        ? (2u + 4u * static_cast<std::size_t>(K_TOP))
-        : (4u + 6u * static_cast<std::size_t>(K_TOP));
+    // Rev 8: class-id width is implied by the header's num_classes.
+    const bool        cls8  = frame.num_classes <= 255;
+    const std::size_t cls_w = cls8 ? 1u : 2u;
+    const std::size_t beta_payload = quant ? 2u : 8u;
+    const std::size_t dir_payload  =
+        (quant ? (1u + 1u * static_cast<std::size_t>(K_TOP))
+               : (4u + 4u * static_cast<std::size_t>(K_TOP)))
+        + cls_w * static_cast<std::size_t>(K_TOP);
     const std::size_t tsdf_n = opts.share_tsdf ? frame.tsdf_deltas.size() : 0;
     if (frame.fine_ratio_log2 > MAX_FINE_RATIO_LOG2)
       throw std::runtime_error(
@@ -233,11 +263,27 @@ class BinarySerializer {
       }
     }
 
+    // Rev 8 class-id emit: u8 when num_classes ≤ 255 (sentinel 0xFFFF ↔ 0xFF),
+    // u16 otherwise. A real id that doesn't fit the packed width is a sender
+    // invariant violation (ids are < num_classes) — fail loud.
+    auto writeCls = [&](uint16_t cls) {
+      if (cls8) {
+        if (cls != 0xFFFF && cls >= 0xFF)
+          throw std::runtime_error(
+              "BinarySerializer: class id " + std::to_string(cls) +
+              " does not fit u8 packing (num_classes ≤ 255)");
+        const uint8_t c = (cls == 0xFFFF) ? 0xFF : static_cast<uint8_t>(cls);
+        appendBytes(out, &c, sizeof(c));
+      } else {
+        appendBytes(out, &cls, sizeof(cls));
+      }
+    };
+
     // Beta stream (occupancy), block-run coded.
     writeBlockStream(out, frame.beta_deltas, [&](const BetaDelta& d) {
       if (quant) {
-        const uint16_t q_occ  = quantize(d.data.a_occ,  kBetaOccPrior,  step);
-        const uint16_t q_free = quantize(d.data.a_free, kBetaFreePrior, step);
+        const uint8_t q_occ  = quantize8(d.data.a_occ,  kBetaOccPrior,  step);
+        const uint8_t q_free = quantize8(d.data.a_free, kBetaFreePrior, step);
         appendBytes(out, &q_occ,  sizeof(q_occ));
         appendBytes(out, &q_free, sizeof(q_free));
       } else {
@@ -246,15 +292,15 @@ class BinarySerializer {
       }
     });
 
-    // Dir stream (occupied-class semantics), block-run coded. Class ids stay
-    // u16 and are never quantized; empty slots (cls=0xFFFF, cnt=α₀) quantize
-    // to q=0 and reconstruct their placeholder exactly.
+    // Dir stream (occupied-class semantics), block-run coded. Empty slots
+    // (cls=0xFFFF, cnt=α₀) quantize to q=0 and reconstruct their placeholder
+    // exactly.
     writeBlockStream(out, frame.dir_deltas, [&](const DirDelta& d) {
       if (quant) {
-        const uint16_t q_other = quantize(d.data.other, other_prior, step);
+        const uint8_t q_other = quantize8(d.data.other, other_prior, step);
         appendBytes(out, &q_other, sizeof(q_other));
         for (int i = 0; i < K_TOP; ++i) {
-          const uint16_t q_cnt = quantize(d.data.cnt[i], frame.alpha_0, step);
+          const uint8_t q_cnt = quantize8(d.data.cnt[i], frame.alpha_0, step);
           appendBytes(out, &q_cnt, sizeof(q_cnt));
         }
       } else {
@@ -263,7 +309,7 @@ class BinarySerializer {
           appendBytes(out, &d.data.cnt[i], sizeof(float));
       }
       for (int i = 0; i < K_TOP; ++i)
-        appendBytes(out, &d.data.cls[i], sizeof(uint16_t));
+        writeCls(d.data.cls[i]);
     });
 
     // Fine TSDF stream (rev 7; flat records like the coarse TSDF stream,
@@ -377,10 +423,21 @@ class BinarySerializer {
       f.tsdf_deltas.push_back(d);
     }
 
+    // Rev 8: class-id width is implied by the header's num_classes; the u8
+    // sentinel 0xFF widens back to the in-memory 0xFFFF empty-slot marker.
+    const bool cls8 = f.num_classes <= 255;
+    auto readCls = [&]() -> uint16_t {
+      if (cls8) {
+        const uint8_t c = r.get<uint8_t>();
+        return (c == 0xFF) ? uint16_t{0xFFFF} : static_cast<uint16_t>(c);
+      }
+      return r.get<uint16_t>();
+    };
+
     // Beta stream. Same DoS guard as TSDF: every record carries at least
     // payload_bytes on the wire (block headers only add more), so a count
     // exceeding the remaining byte budget is rejected before the reserve.
-    const std::size_t beta_payload = quant ? 4u : 8u;
+    const std::size_t beta_payload = quant ? 2u : 8u;
     const uint32_t beta_count = r.get<uint32_t>();
     if (beta_count > r.remaining() / beta_payload)
       throw std::runtime_error("BinarySerializer: truncated frame");
@@ -389,8 +446,8 @@ class BinarySerializer {
       BetaDelta d{};
       d.coord = c;
       if (quant) {
-        d.data.a_occ  = dequantize(r.get<uint16_t>(), kBetaOccPrior,  step);
-        d.data.a_free = dequantize(r.get<uint16_t>(), kBetaFreePrior, step);
+        d.data.a_occ  = dequantize8(r.get<uint8_t>(), kBetaOccPrior,  step);
+        d.data.a_free = dequantize8(r.get<uint8_t>(), kBetaFreePrior, step);
       } else {
         d.data.a_occ  = r.get<float>();
         d.data.a_free = r.get<float>();
@@ -399,9 +456,11 @@ class BinarySerializer {
     });
 
     // Dir stream.
-    const std::size_t dir_payload = quant
-        ? (2u + 4u * static_cast<std::size_t>(K_TOP))
-        : (4u + 6u * static_cast<std::size_t>(K_TOP));
+    const std::size_t cls_w = cls8 ? 1u : 2u;
+    const std::size_t dir_payload =
+        (quant ? (1u + 1u * static_cast<std::size_t>(K_TOP))
+               : (4u + 4u * static_cast<std::size_t>(K_TOP)))
+        + cls_w * static_cast<std::size_t>(K_TOP);
     const uint32_t dir_count = r.get<uint32_t>();
     if (dir_count > r.remaining() / dir_payload)
       throw std::runtime_error("BinarySerializer: truncated frame");
@@ -410,16 +469,16 @@ class BinarySerializer {
       DirDelta d{};
       d.coord = c;
       if (quant) {
-        d.data.other = dequantize(r.get<uint16_t>(), other_prior, step);
+        d.data.other = dequantize8(r.get<uint8_t>(), other_prior, step);
         for (int j = 0; j < K_TOP; ++j)
-          d.data.cnt[j] = dequantize(r.get<uint16_t>(), f.alpha_0, step);
+          d.data.cnt[j] = dequantize8(r.get<uint8_t>(), f.alpha_0, step);
       } else {
         d.data.other = r.get<float>();
         for (int j = 0; j < K_TOP; ++j)
           d.data.cnt[j] = r.get<float>();
       }
       for (int j = 0; j < K_TOP; ++j)
-        d.data.cls[j] = r.get<uint16_t>();
+        d.data.cls[j] = readCls();
       f.dir_deltas.push_back(d);
     });
 
@@ -452,13 +511,19 @@ class BinarySerializer {
   // 64 B bitmask vs (2 + 2n) B index list: the mask wins at n ≥ 32.
   static constexpr std::size_t kBitmaskMinCount = 32;
 
-  static uint16_t quantize(float a, float prior, float step) {
-    // Below-prior clamps to 0 (→ prior); above-cap clamps to 65535 (→ cap).
-    const long q = std::lround((a - prior) / step);
-    return static_cast<uint16_t>(std::clamp(q, 0L, 65535L));
+  // Rev 8 u8 sqrt companding (see the revision-8 block in the file header):
+  // step = evidence_saturation / 255², q = round(√((a−prior)/step)) clamped
+  // to [0, 255], a = prior + q²·step. Below-prior clamps to 0 (→ prior);
+  // above-cap clamps to 255 (→ prior + 255²·step = the cap, exactly).
+  static uint8_t quantize8(float a, float prior, float step) {
+    const float e = a - prior;
+    if (!(e > 0.f)) return 0;
+    const long q = std::lround(std::sqrt(static_cast<double>(e) / step));
+    return static_cast<uint8_t>(std::clamp(q, 0L, 255L));
   }
-  static float dequantize(uint16_t q, float prior, float step) {
-    return prior + static_cast<float>(q) * step;
+  static float dequantize8(uint8_t q, float prior, float step) {
+    const float qf = static_cast<float>(q);
+    return prior + qf * qf * step;
   }
 
   /// Emit one stream as [count:u32] followed by block runs. Records are

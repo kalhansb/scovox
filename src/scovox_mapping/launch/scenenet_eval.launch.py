@@ -31,6 +31,12 @@ def _launch_setup(context):
     # Phase 2.5-v2 — integration-time admission gate (distinct from
     # the publish-time occupancy_vis_threshold above).
     dirichlet_min_p_occ_arg = float(context.launch_configurations.get("dirichlet_min_p_occ", "0.5"))
+    # A9 inverse-sensor-model weights. Were hardcoded 6.0/1.0 below; plumbed
+    # through context (as semantickitti_eval.launch.py already does) so the A9
+    # sweep can vary them per cell. Defaults reproduce the previous constants
+    # exactly, so every run that does not pass them is bit-identical to before.
+    w_occ_arg = float(context.launch_configurations.get("w_occ", "6.0"))
+    w_free_arg = float(context.launch_configurations.get("w_free", "1.0"))
     # Soft-prob input: per-frame image .topk blobs (H,W,C) from a 2D segmenter.
     # When non-empty, scovox_node reads per-pixel class distributions instead of
     # the one-hot seg colour. Frame index = depth-stamp low 16 bits.
@@ -45,6 +51,10 @@ def _launch_setup(context):
     map_mode_arg = context.launch_configurations.get("map_mode", "persistent")
     share_rate_hz_arg = float(context.launch_configurations.get("share_rate_hz", "0.0"))
     scovox_publish_rate_arg = float(context.launch_configurations.get("scovox_publish_rate", "1.0"))
+    # E4 measured-memory hook: emits the periodic [memSplit] (+ [memGate]) grid
+    # MB lines. Diagnostic-only walk of the grid, off unless a run asks for it.
+    log_mem_usage_arg = context.launch_configurations.get(
+        "log_mem_usage", "false").lower() in ("true", "1", "yes")
 
     scovox_node = Node(
         package="scovox_mapping",
@@ -58,12 +68,11 @@ def _launch_setup(context):
 
             # Map model — match SLIM-VDB: 5cm voxels
             "resolution": resolution,
-            "w_free": 1.0,
-            "w_occ": 6.0,
+            "w_free": w_free_arg,
+            "w_occ": w_occ_arg,
 
             # Semantics — 14 SceneNet NYUv2 classes
             "kappa0": 2.0,
-            "semantic_top_k": 10,
             "semantic_occ_gate": 0.6,
             "semantic_mode": semantic_mode,
             "max_semantic_classes": 14,
@@ -100,6 +109,7 @@ def _launch_setup(context):
             # Mode: persistent (paper offline eval) or rolling (E1 binary capture).
             "mode": map_mode_arg,
             "share_rate_hz": share_rate_hz_arg,
+            "log_mem_usage": log_mem_usage_arg,
             "submap_max_distance": 999.0,
             "robot_id": robot_name,
 
@@ -141,10 +151,40 @@ def _launch_setup(context):
             "fused_walker": fused_walker_arg,
             # Soft-prob per-pixel input (empty = one-hot seg colour path).
             "topk_probs_dir": topk_probs_dir_arg,
+            # SceneNN mechanism round. Defaults reproduce the shipped path
+            # exactly; semantic_evict_by_confidence additionally needs a
+            # -DSCOVOX_TRACK_QMAX=1 build or the node warns and ignores it.
+            "semantic_topk_trunc": int(
+                context.launch_configurations.get("semantic_topk_trunc", "0")),
+            "semantic_evict_by_confidence":
+                context.launch_configurations.get(
+                    "semantic_evict_by_confidence", "false").lower() == "true",
+            "semantic_spread_radius": float(
+                context.launch_configurations.get("semantic_spread_radius", "0.0")),
+            # Perf-attribution knobs (SLIM-VDB frame-time comparison). Every
+            # default below is the value the node already used, so an unset
+            # launch is byte-identical; they exist so the cost of the full-ray
+            # carve, the TSDF band and the carve staging can be measured
+            # SEPARATELY instead of inferred from a single frame_ms.
+            "carve_band": float(
+                context.launch_configurations.get("carve_band", "-1.0")),
+            "sdf_trunc_voxels": int(
+                context.launch_configurations.get("sdf_trunc_voxels", "3")),
+            "batch_free_carve":
+                context.launch_configurations.get(
+                    "batch_free_carve", "true").lower() == "true",
         }],
     )
 
-    return [scovox_node]
+    # publishBinaryMap is TF-gated: it looks up map <- integration_frame at
+    # publish time and defers (never publishes) until the transform exists.
+    # The replay node only broadcasts odom -> base -> camera, so pin the
+    # map <- odom identity here (same pattern as scenenet_eval_fusion).
+    static_map_tf = Node(package="tf2_ros", executable="static_transform_publisher",
+        name=f"static_map_to_{robot_name}_odom", output="log",
+        arguments=["0", "0", "0", "0", "0", "0", "map", f"{robot_name}/odom"])
+
+    return [scovox_node, static_map_tf]
 
 
 def generate_launch_description():
@@ -169,11 +209,40 @@ def generate_launch_description():
                                           "gate inside SemDirMap::applyHitUpdate. Below this "
                                           "p_occ_post the per-class dirichletUpdate is skipped "
                                           "(mass routes to OTHER). 0.0 = label every hit."),
+        DeclareLaunchArgument("w_occ", default_value="6.0",
+                              description="A9: Beta hit weight (a_occ = 1 + w_occ*H). Default "
+                                          "reproduces the pre-A9 hardcoded constant."),
+        DeclareLaunchArgument("w_free", default_value="1.0",
+                              description="A9: Beta carve weight (a_free = 1 + w_free*F). Default "
+                                          "reproduces the pre-A9 hardcoded constant."),
         DeclareLaunchArgument("fused_walker", default_value="true",
                               description="iter6 single-DDA fused ray walker (production default)."),
         DeclareLaunchArgument("topk_probs_dir", default_value="",
                               description="Soft-prob input: dir of per-frame image .topk "
                                           "blobs (H,W,C). Empty = one-hot seg colour path."),
+        DeclareLaunchArgument("semantic_topk_trunc", default_value="0",
+                              description="Keep only the N most probable classes per "
+                                          "observation; dropped mass becomes OTHER. "
+                                          "0 (default) = full distribution."),
+        DeclareLaunchArgument("semantic_evict_by_confidence", default_value="false",
+                              description="Evict the weakest slot on incoming class "
+                                          "PROBABILITY rather than accumulated evidence. "
+                                          "Needs a -DSCOVOX_TRACK_QMAX=1 build."),
+        DeclareLaunchArgument("semantic_spread_radius", default_value="0.0",
+                              description="Metres. >0 spreads Stream B class evidence over "
+                                          "already-occupied voxels within this radius "
+                                          "(Melkumyan-Ramos kernel); Stream A occupancy "
+                                          "still commits at the endpoint only."),
+        DeclareLaunchArgument("carve_band", default_value="-1.0",
+                              description="Perf attribution: metres of free-space "
+                                          "carve before the surface. -1 (default) = "
+                                          "full ray, origin to hit."),
+        DeclareLaunchArgument("sdf_trunc_voxels", default_value="3",
+                              description="Perf attribution: TSDF truncation in "
+                                          "voxels. 0 disables the band update."),
+        DeclareLaunchArgument("batch_free_carve", default_value="true",
+                              description="Perf attribution: stage carves in a hash "
+                                          "map and write once per voxel per scan."),
         DeclareLaunchArgument("map_mode", default_value="persistent",
                               description="E1: 'rolling' enables the ScovoxMapBinary "
                                           "publisher (a_occ/a_free/Dir snapshot capture); "
@@ -186,5 +255,8 @@ def generate_launch_description():
                               description="Pointcloud republish timer rate (Hz). Lowered by "
                                           "the E1 runner for offline capture; default 1.0 "
                                           "preserves the paper runs."),
+        DeclareLaunchArgument("log_mem_usage", default_value="false",
+                              description="E4: emit the periodic [memSplit]/[memGate] grid-MB "
+                                          "lines (diagnostic full-grid walk). Off by default."),
         OpaqueFunction(function=_launch_setup),
     ])

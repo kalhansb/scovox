@@ -140,6 +140,18 @@ scovox_node:
     share_gate_evidence_rel:        # double, default 0.10, dimensionless
       # Relative total-evidence growth since last emit that forces a re-send.
 
+    share_gate_evidence_rel_dir:    # double, default -1.0 (= inherit), dimensionless
+      # Per-stream override of share_gate_evidence_rel for the Dir (semantics)
+      # stream, letting semantics re-sync at a different cadence than
+      # occupancy. <0 inherits share_gate_evidence_rel.
+
+    share_dir:                      # bool, default true
+      # Sender-side toggle for the Dir (semantics) stream — share_tsdf's
+      # mirror. false = GEOMETRY-ONLY sharing: the Dir section is elided
+      # (dir_count=0, same codec rev). Receivers treat an absent stream as
+      # "no semantic update" (per-record snapshot-replace), never as
+      # "erase semantics".
+
     share_roi_z_min:                # double, default 0.0, meters
     share_roi_z_max:                # double, default 0.0, meters
       # Vertical band kept ON the wire (integration frame); the LOCAL map is

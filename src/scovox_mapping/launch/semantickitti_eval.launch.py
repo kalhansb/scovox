@@ -61,6 +61,10 @@ def _launch_setup(context):
     # replay recv stays 100/100). Defaults preserve the paper persistent runs.
     map_mode_arg = context.launch_configurations.get("map_mode", "persistent")
     share_rate_hz_arg = float(context.launch_configurations.get("share_rate_hz", "0.0"))
+    # E4 measured-memory hook: emits the periodic [memSplit] (+ [memGate]) grid
+    # MB lines. Diagnostic-only walk of the grid, off unless a run asks for it.
+    log_mem_usage_arg = context.launch_configurations.get(
+        "log_mem_usage", "false").lower() in ("true", "1", "yes")
 
     scovox_node = Node(
         package="scovox_mapping",
@@ -78,6 +82,12 @@ def _launch_setup(context):
             # clouds lose UDP fragments on a best-effort link (small rmem_max),
             # dropping ~60% of frames. Reliable retransmits -> full delivery.
             "input_reliable_qos": True,
+            # Per-scan medoid downsample: the node default flipped 0.0 -> 0.5
+            # upstream (for live raw-LiDAR configs). When > 0 the scan is
+            # thinned AND integrated geometry-only — the semantic_label field
+            # and the topk soft-prob table are both dropped — so the eval pins
+            # it off: full per-point path, the config every capture ran.
+            "downsample_voxel_size": 0.0,
 
             # Map model — leaf_bits=1 for sparse outdoor LiDAR (2×2×2 blocks)
             "resolution": resolution,
@@ -110,7 +120,6 @@ def _launch_setup(context):
 
             # Semantics — 20 classes for SemanticKITTI (0=unlabeled, 1-19=semantic)
             "kappa0": kappa0_arg,
-            "semantic_top_k": 10,
             "semantic_occ_gate": sem_occ_gate,
             "semantic_mode": semantic_mode,
             "max_semantic_classes": 20,
@@ -160,6 +169,7 @@ def _launch_setup(context):
             # Mode: persistent (paper offline eval) or rolling (E1 binary capture).
             "mode": map_mode_arg,
             "share_rate_hz": share_rate_hz_arg,
+            "log_mem_usage": log_mem_usage_arg,
             "submap_max_distance": 999.0,
             "robot_id": robot_name,
 
@@ -197,7 +207,15 @@ def _launch_setup(context):
         }],
     )
 
-    return [scovox_node]
+    # publishBinaryMap is TF-gated: it looks up map <- integration_frame at
+    # publish time and defers (never publishes) until the transform exists.
+    # The replay node only broadcasts odom -> base -> velodyne, so pin the
+    # map <- odom identity here (same pattern as scenenet_eval_fusion).
+    static_map_tf = Node(package="tf2_ros", executable="static_transform_publisher",
+        name=f"static_map_to_{robot_name}_odom", output="log",
+        arguments=["0", "0", "0", "0", "0", "0", "map", f"{robot_name}/odom"])
+
+    return [scovox_node, static_map_tf]
 
 
 def generate_launch_description():
@@ -275,5 +293,8 @@ def generate_launch_description():
                               description="E1: >0 gives a timer-owned binary publish so a "
                                           "post-replay capture subscriber triggers a full "
                                           "snapshot. 0 (default) = legacy inline publish."),
+        DeclareLaunchArgument("log_mem_usage", default_value="false",
+                              description="E4: emit the periodic [memSplit]/[memGate] grid-MB "
+                                          "lines (diagnostic full-grid walk). Off by default."),
         OpaqueFunction(function=_launch_setup),
     ])

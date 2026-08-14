@@ -102,6 +102,51 @@ TEST(ConsensusMerge, DirEvictionRoutesToOther) {
   EXPECT_NEAR(f.other, (kC - scovox::K_TOP) * kAlpha + 3.0f + 2.0f, 1e-5f);
 }
 
+// E6.3 (order-invariance, pairwise leg). The Beta merge is plain addition, so
+// `BetaMergeIsSymmetricAndAdditive` above settles occupancy. The Dir merge is
+// addition PLUS truncation, and truncation is where order can start to matter —
+// so commutativity has to be pinned separately, and specifically in the regime
+// that truncates. Both cases below carry more than K_TOP distinct classes
+// between them, so eviction is live in every assertion.
+//
+// This holds because mergeDir builds a union dict (its upsert is additive, hence
+// order-free) and then applies a strict total order — count desc, class id asc.
+// The class-id tie-break is load-bearing: without it two classes with equal
+// counts straddling the K_TOP boundary would be kept-or-dumped according to
+// which source was folded first. `DirMergeTieAtTruncationBoundaryIsCommutative`
+// pins exactly that case.
+TEST(ConsensusMerge, DirMergeIsCommutativeUnderEviction) {
+  auto a = dirPrior(); a.cls[0] = 1; a.cnt[0] = kAlpha + 5.0f; a.cls[1] = 2; a.cnt[1] = kAlpha + 4.0f;
+  auto b = dirPrior(); b.cls[0] = 3; b.cnt[0] = kAlpha + 4.5f; b.cls[1] = 4; b.cnt[1] = kAlpha + 1.0f;
+  const auto ab = scovox::mergeDir(a, b, kC, kAlpha);
+  const auto ba = scovox::mergeDir(b, a, kC, kAlpha);
+  for (int i = 0; i < scovox::K_TOP; ++i) {
+    EXPECT_EQ(ab.cls[i], ba.cls[i]) << "slot " << i << " class differs by merge order";
+    EXPECT_FLOAT_EQ(ab.cnt[i], ba.cnt[i]) << "slot " << i << " count differs by merge order";
+  }
+  EXPECT_FLOAT_EQ(ab.other, ba.other);
+}
+
+TEST(ConsensusMerge, DirMergeTieAtTruncationBoundaryIsCommutative) {
+  // Classes 2 and 3 tie exactly ON the K_TOP boundary: one is kept, one is
+  // dumped to OTHER, and only the class-id tie-break decides which. Swap the
+  // merge order and the winner must not change.
+  auto a = dirPrior(); a.cls[0] = 1; a.cnt[0] = kAlpha + 9.0f; a.cls[1] = 3; a.cnt[1] = kAlpha + 2.0f;
+  auto b = dirPrior(); b.cls[0] = 2; b.cnt[0] = kAlpha + 2.0f; b.cls[1] = 7; b.cnt[1] = kAlpha + 0.5f;
+  const auto ab = scovox::mergeDir(a, b, kC, kAlpha);
+  const auto ba = scovox::mergeDir(b, a, kC, kAlpha);
+  for (int i = 0; i < scovox::K_TOP; ++i) {
+    EXPECT_EQ(ab.cls[i], ba.cls[i]) << "tie at the truncation boundary broke by fold order";
+    EXPECT_FLOAT_EQ(ab.cnt[i], ba.cnt[i]);
+  }
+  EXPECT_FLOAT_EQ(ab.other, ba.other);
+  if (scovox::K_TOP == 2) {
+    // Lower class id wins the tie, deterministically and regardless of order.
+    EXPECT_EQ(ab.cls[0], uint16_t(1));
+    EXPECT_EQ(ab.cls[1], uint16_t(2));
+  }
+}
+
 TEST(ConsensusMerge, DirMassConservation) {
   // Δ(other + Σcnt) = a.s_class + b.s_class − C·α₀ (one prior removed), holds
   // through eviction (evicted mass routes to OTHER, never lost).

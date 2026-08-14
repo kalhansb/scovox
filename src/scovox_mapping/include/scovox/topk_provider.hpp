@@ -43,6 +43,12 @@ public:
   // True when a probs directory is configured (soft-prob mode active).
   bool enabled() const { return !probs_dir_.empty(); }
 
+  // Keep only the `n` most probable classes per observation; 0 (default) keeps
+  // the full distribution. Applied here, at the observation, so each pixel is
+  // truncated exactly once no matter how many voxels the deposit reaches.
+  void setTopkTrunc(int n) { topk_trunc_ = (n > 0 && n < kMaxTrunc) ? n : 0; }
+  int  topkTrunc() const { return topk_trunc_; }
+
   // Loader telemetry (running totals; exposed for tests + shutdown summaries).
   uint64_t loadSuccess() const { return load_success_; }
   uint64_t loadFailure() const { return load_failure_; }
@@ -177,6 +183,7 @@ public:
         any = true;
       }
     }
+    if (any) truncate(cp);
     return any;
   }
 
@@ -195,14 +202,47 @@ public:
         any = true;
       }
     }
+    if (any) truncate(cp);
     return any;
   }
 
 private:
+  // Truncation cap. Beyond a handful of classes the truncation is a no-op on a
+  // 14-class taxonomy, so a fixed selection buffer avoids a per-pixel malloc.
+  static constexpr int kMaxTrunc = 16;
+
+  // Zero every probability outside the `topk_trunc_` largest. The dropped mass
+  // is deliberately NOT renormalized onto the survivors: dirichletUpdate turns
+  // whatever is missing from 1.0 into OTHER, so a truncated observation reads
+  // as "this class, and I decline to guess about the rest" rather than as a
+  // more confident version of the same distribution.
+  void truncate(std::vector<float>& cp) const {
+    const int N = topk_trunc_;
+    if (N <= 0) return;
+    float top[kMaxTrunc];
+    int   n = 0;
+    for (float v : cp) {
+      if (v <= 0.f) continue;
+      int i;
+      if (n < N) {
+        i = n++;
+      } else {
+        if (v <= top[N - 1]) continue;   // not in the running top-N
+        i = N - 1;
+      }
+      while (i > 0 && top[i - 1] < v) { top[i] = top[i - 1]; --i; }
+      top[i] = v;
+    }
+    if (n < N) return;                   // fewer classes present than the cap
+    const float cut = top[n - 1];        // N-th largest, duplicates counted
+    for (float& v : cp) if (v < cut) v = 0.f;
+  }
+
   rclcpp::Logger logger_;
   rclcpp::Clock::SharedPtr clock_;
   std::string probs_dir_;
   int max_sem_;
+  int topk_trunc_{0};
 
   // Cache the most recently loaded frame so we don't read the file twice
   // (once for the hit lookup, once for the integration loop).
