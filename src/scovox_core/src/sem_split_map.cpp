@@ -24,7 +24,8 @@ namespace {
 void dirichletUpdate(DirVoxel*                 d,
                      const std::vector<float>* class_probs,
                      float                     class_share,
-                     float                     alpha_0) {
+                     float                     alpha_0,
+                     bool                      evict_by_confidence = false) {
   if (!class_probs || class_probs->empty()) {
     d->other += class_share;  // mass landed but no class signal to distribute
     return;
@@ -41,9 +42,22 @@ void dirichletUpdate(DirVoxel*                 d,
 
   for (size_t i = 0; i < obs.size(); ++i) {
     if (obs[i] <= 0.f) continue;
-    const float inc = class_share * obs[i] * norm;
+    // The class's own (normalized) probability: what fraction of this
+    // observation backs class i, independent of how much mass the voxel is
+    // being given. That is the confidence the eviction comparator wants —
+    // `inc` mixes it with class_share and so tracks the geometry, not the label.
+    const float p_i = obs[i] * norm;
+    const float inc = class_share * p_i;
     if (inc <= 0.f) continue;
+#if SCOVOX_TRACK_QMAX
+    sparse_add_class(d->cnt, d->cls, static_cast<uint16_t>(i), inc, &d->other,
+                     alpha_0,
+                     evict_by_confidence ? p_i : -1.0f,
+                     evict_by_confidence ? d->qmax : nullptr);
+#else
+    (void)evict_by_confidence;
     sparse_add_class(d->cnt, d->cls, static_cast<uint16_t>(i), inc, &d->other, alpha_0);
+#endif
   }
   const float covered = sum_p * norm;
   d->other += class_share * (1.0f - covered);
@@ -84,6 +98,17 @@ SemSplitMap::Params sanitise(SemSplitMap::Params p) {
   if (p.range_decay_length < 0.f)  p.range_decay_length = 0.f;
   if (p.alpha_0 <= 0.f)            p.alpha_0            = kDefaultDirichletPrior;
   if (p.num_classes < (K_TOP + 1)) p.num_classes        = K_TOP + 1;
+  // Dir-grid block geometry: independent of the Beta grid's, but never coarser
+  // (a sparser grid never wants BIGGER blocks) and never below Bonxai's
+  // minimum of 1. 0 is accepted as "inherit leaf_bits".
+  if (p.dir_leaf_bits == 0)          p.dir_leaf_bits      = p.leaf_bits;
+  if (p.dir_leaf_bits > p.leaf_bits) p.dir_leaf_bits      = p.leaf_bits;
+  // Band and ball are two answers to the same question; running both would
+  // double-deposit every endpoint and make neither arm interpretable. The ball
+  // is the older knob, so it wins and the band is dropped — a config asking for
+  // both gets the documented `semantic_spread_radius` behaviour, not a hybrid.
+  if (p.semantic_band_length < 0.f)  p.semantic_band_length = 0.f;
+  if (p.semantic_spread_radius > 0.f) p.semantic_band_length = 0.f;
   return p;
 }
 
@@ -96,9 +121,12 @@ SemSplitMap::Params sanitise(SemSplitMap::Params p) {
 SemSplitMap::SemSplitMap(const Params& p)
     : params_(sanitise(p))
     , beta_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
-    , dir_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
+    // Dir grids get their OWN (smaller) leaf blocks — see Params::dir_leaf_bits.
+    // Coord identity with the Beta grid is unaffected: posToCoord/coordToPos
+    // depend only on `resolution`.
+    , dir_grid_(params_.resolution, params_.inner_bits, params_.dir_leaf_bits)
     , transient_beta_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
-    , transient_dir_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
+    , transient_dir_grid_(params_.resolution, params_.inner_bits, params_.dir_leaf_bits)
     , beta_acc_(beta_grid_.createAccessor())
     , dir_acc_(dir_grid_.createAccessor())
     , transient_beta_acc_(transient_beta_grid_.createAccessor())
@@ -344,7 +372,9 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   // contributes nothing — a semantics-only source must not touch geometry.
   if (prof && prof->kernel_radius > 0.f) {
     if (sem_probs && !sem_probs->empty())
-      applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir, prof);
+      applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir,
+                           prof->kernel_radius, prof->kappa0,
+                           prof->dirichlet_min_p_occ);
     return;
   }
 
@@ -392,17 +422,90 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
 
     case SemanticMode::DIRICHLET:
     default:
+      // Single-sensor semantic spread. Stream A has already committed this
+      // scan's occupancy at `c` above, so the endpoint is in the neighbourhood
+      // the kernel sees and carries its freshly-updated p_occ — the spread adds
+      // neighbours, it does not redirect the deposit away from the hit.
+      if (params_.semantic_spread_radius > 0.f && sem_probs && !sem_probs->empty()) {
+        applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir,
+                             params_.semantic_spread_radius, kappa0, min_p_occ);
+        break;
+      }
       if (p_occ_post >= min_p_occ) {
         const float class_share = kappa0 * p_occ_post * quality;
         if (class_share > 0.f) {
           DirVoxel* d = getOrAllocateDirOn(dacc, c);
-          dirichletUpdate(d, sem_probs, class_share, params_.alpha_0);
+          dirichletUpdate(d, sem_probs, class_share, params_.alpha_0,
+                          params_.evict_by_confidence);
           applyDirSaturation(d);
           if (touched_dir) touched_dir->push_back(c);
         }
       }
       break;
   }
+}
+
+// ===========================================================================
+// SLIM-VDB-style flat semantic band — Stream B only, on the walked ray
+// ===========================================================================
+//
+// SLIM-VDB's Integrate (VDBVolume.cpp) walks [depth−sdf_trunc, depth+sdf_trunc]
+// per point because that is what the TSDF update needs, and folds the semantic
+// write into the same DDA iteration:
+//
+//     if (sdf > -sdf_trunc_) { ...tsdf/weight...; alpha[label] += 1; }
+//
+// This is that write. The caller (ScovoxMapSplit::integrateHitFused) owns the
+// |sdf| ≤ band gate and the endpoint exclusion; by the time we are here the
+// voxel has already been chosen. Keep this function branch-light: it runs once
+// per band voxel per point, which on KITTI is ~5 extra calls per return.
+void SemSplitMap::applyBandSemantic(const CoordT&             c,
+                                    const std::vector<float>* sem_probs,
+                                    float                     quality,
+                                    const HitWeights*         prof) {
+  // No class signal ⇒ nothing to pool. Unlike the endpoint path we must NOT
+  // fall through to `other += class_share` here: a bare geometric return
+  // carries no opinion about its neighbours' classes, and dumping prior mass
+  // into every band voxel would dilute exactly the evidence this is meant to
+  // concentrate.
+  if (!sem_probs || sem_probs->empty()) return;
+
+  // Only DIRICHLET has a meaningful notion of accumulating fractional evidence.
+  // NAIVE overwrites slot 0 and MAJORITY_VOTE takes a hard argmax, so banding
+  // them would let the LAST band voxel visited win the whole neighbourhood —
+  // an order-dependent result, not a pooling one.
+  if (params_.semantic_mode != SemanticMode::DIRICHLET) return;
+
+  const float kappa0    = prof ? prof->kappa0              : params_.kappa0;
+  const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
+
+  float class_share;
+  if (params_.semantic_band_require_occ) {
+    // LiDAR authority, read-only: no Beta voxel here means no beam has ever
+    // stopped near this cell, so it is free space in front of the surface (or
+    // the unobserved interior behind it) and takes no label.
+    // `create_if_missing=false` is load-bearing — allocating would grow the
+    // Beta grid along every ray.
+    const BetaVoxel* b = beta_acc_.value(c, /*create_if_missing=*/false);
+    if (!b) return;
+    const float p_occ = b->p_occ();
+    if (p_occ < min_p_occ) return;
+    class_share = kappa0 * p_occ * quality;
+  } else {
+    // Faithful SLIM-VDB mirror: no occupancy model, no gate, flat weight. This
+    // is `alpha[label] += 1` with kappa0 as the unit. Skipping the Beta read is
+    // not just a shortcut — an ungated band voxel may have no Beta entry at all,
+    // so there is no p_occ to weight by, and inventing one (say 1.0) would
+    // quietly re-introduce a different rule again.
+    class_share = kappa0 * quality;
+  }
+  if (class_share <= 0.f) return;
+
+  DirVoxel* d = getOrAllocateDirOn(dir_acc_, c);
+  dirichletUpdate(d, sem_probs, class_share, params_.alpha_0,
+                  params_.evict_by_confidence);
+  applyDirSaturation(d);
+  touched_dir_.push_back(c);
 }
 
 // ===========================================================================
@@ -430,10 +533,10 @@ void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
                                        float                     quality,
                                        DirGrid::Accessor&        dacc,
                                        std::vector<CoordT>*      touched_dir,
-                                       const HitWeights*         prof) {
-  const float l         = prof->kernel_radius;                 // > 0 (caller-gated)
-  const float kappa0    = prof->kappa0;
-  const float min_p_occ = prof->dirichlet_min_p_occ;
+                                       float                     l,
+                                       float                     kappa0,
+                                       float                     min_p_occ) {
+  if (l <= 0.f) return;                                        // caller-gated
   const float res       = static_cast<float>(params_.resolution);
   if (res <= 0.f) return;
   const int   R         = std::max(1, static_cast<int>(std::floor(l / res)));
@@ -461,7 +564,8 @@ void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
         if (class_share <= 0.f) continue;
 
         DirVoxel* dv = getOrAllocateDirOn(dacc, n);
-        dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0);
+        dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0,
+                        params_.evict_by_confidence);
         applyDirSaturation(dv);
         if (touched_dir) touched_dir->push_back(n);
       }

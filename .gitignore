@@ -6,6 +6,13 @@
 **/install/
 **/log/
 
+# Per-experiment colcon trees (build_s1, install_s1, build_band, build_e85g, ...)
+# These are experiment build products, not source; install_s1 holds the campaign's
+# per-K mapper binaries and must never be rewritten by a checkout.
+build_*/
+install_*/
+log_*/
+
 # Python
 **/__pycache__/
 *.pyc

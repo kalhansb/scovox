@@ -1,11 +1,13 @@
 /// @file
-/// @brief Wire format (revision 6: block-run coords + u16 quantization)
-/// round-trip, quantization edge semantics, and header/structure validation.
+/// @brief Wire format (revision 8: block-run coords + u8 sqrt-companded
+/// quantization + packed class ids) round-trip, quantization edge semantics,
+/// and header/structure validation.
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <bonxai/bonxai.hpp>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -16,8 +18,19 @@
 
 namespace {
 
-// Default-cap quantization step: evidence_saturation(1000) / 65535.
-constexpr float kStep = 1000.f / 65535.f;
+// Default-cap rev-8 companding scale: evidence_saturation(1000) / 255².
+constexpr float kStep = 1000.f / 65025.f;
+
+// Expected rev-8 reconstruction: the same sqrt-companding round trip the
+// serializer performs (quantize8 → dequantize8), for exact expectations.
+float q8(float a, float prior) {
+  const float e = a - prior;
+  if (!(e > 0.f)) return prior;
+  const long q = std::clamp(
+      std::lround(std::sqrt(static_cast<double>(e) / kStep)), 0L, 255L);
+  const float qf = static_cast<float>(q);
+  return prior + qf * qf * kStep;
+}
 
 scovox::BinarySerializer::Frame makeFrame() {
   scovox::BinarySerializer::Frame f;
@@ -241,33 +254,34 @@ TEST(BinarySerializer, EmitSizeMatchesSpec) {
   // TSDF:   4 (count) + 2 × 20 = 44 B                        (flat records)
   // Block:  12 (coord) + 1 (mode) + 2 (n) + 2·2 (idx) = 19 B
   // Beta:   4 (count) + 19 + 2 × 8  = 39 B                   (f32 payloads)
-  // Dir:    4 (count) + 19 + 2 × 16 = 55 B                   (f32: other +
-  //                                                cnt 4·K + cls 2·K, K=2)
+  // Dir:    4 (count) + 19 + 2 × 14 = 51 B                   (f32: other +
+  //                              cnt 4·K + cls 1·K, K=2; rev 8 u8 class ids)
   // Fine:   4 (count, empty here) = 4 B                      (rev 7 tail)
   if (scovox::K_TOP == 2) {
     auto full = scovox::BinarySerializer::serialize(
         f, scovox::BinarySerializer::Options{/*share_tsdf=*/true});
-    EXPECT_EQ(full.size(), 21u + 44u + 39u + 55u + 4u) << "share_tsdf=true emit size";  // 163
+    EXPECT_EQ(full.size(), 21u + 44u + 39u + 51u + 4u) << "share_tsdf=true emit size";  // 159
 
     auto no_tsdf = scovox::BinarySerializer::serialize(f);
-    EXPECT_EQ(no_tsdf.size(), 21u + 4u + 39u + 55u + 4u) << "share_tsdf=false emit size";  // 123
+    EXPECT_EQ(no_tsdf.size(), 21u + 4u + 39u + 51u + 4u) << "share_tsdf=false emit size";  // 119
 
-    // Quantized payloads: Beta 4 B (q_occ, q_free), Dir 10 B (q_other,
-    // q_cnt·K, cls·K).
+    // Rev 8 quantized payloads: Beta 2 B (q_occ, q_free u8), Dir 5 B
+    // (q_other u8, q_cnt u8·K, cls u8·K).
     f.quant_step = kStep;
     auto quant = scovox::BinarySerializer::serialize(f);
-    EXPECT_EQ(quant.size(), 21u + 4u + (4u + 19u + 8u) + (4u + 19u + 20u) + 4u)
-        << "quantized emit size";  // 103
+    EXPECT_EQ(quant.size(), 21u + 4u + (4u + 19u + 4u) + (4u + 19u + 10u) + 4u)
+        << "quantized emit size";  // 89
   }
 }
 
 // ---------------------------------------------------------------------------
-// Revision 6: quantization semantics.
+// Revision 8: u8 sqrt-companded quantization semantics.
 // ---------------------------------------------------------------------------
 
-// Above-prior evidence must round-trip within quant_step/2; class ids and the
-// empty-slot α₀ placeholder must be exact.
-TEST(BinarySerializer, QuantizedRoundTripWithinHalfStep) {
+// Above-prior evidence must round-trip to exactly the companded grid value
+// (q8 mirrors quantize8→dequantize8); class ids and the empty-slot α₀
+// placeholder must be exact.
+TEST(BinarySerializer, QuantizedRoundTripOnCompandedGrid) {
   scovox::BinarySerializer::Frame f;
   f.resolution  = 0.05f;
   f.num_classes = 14;
@@ -287,17 +301,23 @@ TEST(BinarySerializer, QuantizedRoundTripWithinHalfStep) {
 
   auto g = scovox::BinarySerializer::deserialize(
       scovox::BinarySerializer::serialize(f));
-  const float half = kStep / 2.f + 1e-4f;
+  const float other_prior = (14.f - scovox::K_TOP) * f.alpha_0;
 
   ASSERT_EQ(g.beta_deltas.size(), 2u);
   for (std::size_t i = 0; i < 2; ++i) {
-    EXPECT_NEAR(g.beta_deltas[i].data.a_occ,  f.beta_deltas[i].data.a_occ,  half);
-    EXPECT_NEAR(g.beta_deltas[i].data.a_free, f.beta_deltas[i].data.a_free, half);
+    const auto& in  = f.beta_deltas[i].data;
+    const auto& out = g.beta_deltas[i].data;
+    EXPECT_FLOAT_EQ(out.a_occ,  q8(in.a_occ,  scovox::kBetaOccPrior));
+    EXPECT_FLOAT_EQ(out.a_free, q8(in.a_free, scovox::kBetaFreePrior));
+    // The companded error stays below the local step 2·√(step·e) + step.
+    const float e_occ = in.a_occ - scovox::kBetaOccPrior;
+    EXPECT_NEAR(out.a_occ, in.a_occ,
+                2.f * std::sqrt(kStep * std::max(e_occ, 0.f)) + kStep);
   }
   ASSERT_EQ(g.dir_deltas.size(), 1u);
   const auto& d = g.dir_deltas[0].data;
-  EXPECT_NEAR(d.other,  a.other,  half);
-  EXPECT_NEAR(d.cnt[0], a.cnt[0], half);
+  EXPECT_FLOAT_EQ(d.other,  q8(a.other,  other_prior));
+  EXPECT_FLOAT_EQ(d.cnt[0], q8(a.cnt[0], f.alpha_0));
   EXPECT_EQ(d.cls[0], 5);
   // Empty slot: q=0 reconstructs the α₀ placeholder bit-exactly.
   EXPECT_EQ(d.cls[1], 0xFFFF);
@@ -335,7 +355,7 @@ TEST(BinarySerializer, QuantizedAtPriorReconstructsExactly) {
 // Below-prior inputs (normal on saturated lopsided voxels — the total-cap
 // rescale erodes the minority bucket) clamp to the prior, which is exactly the
 // floor mergeBeta applies on the receiver anyway. Above-cap inputs clamp to
-// prior + 65535·step (= evidence_saturation).
+// prior + 255²·step (= evidence_saturation).
 TEST(BinarySerializer, QuantizedClampsBelowPriorAndAboveCap) {
   scovox::BinarySerializer::Frame f;
   f.resolution  = 0.05f;
@@ -352,8 +372,42 @@ TEST(BinarySerializer, QuantizedClampsBelowPriorAndAboveCap) {
       scovox::BinarySerializer::serialize(f));
   ASSERT_EQ(g.beta_deltas.size(), 2u);
   EXPECT_FLOAT_EQ(g.beta_deltas[0].data.a_free, scovox::kBetaFreePrior);
-  EXPECT_NEAR(g.beta_deltas[0].data.a_occ, 999.5f, kStep / 2.f + 1e-3f);
-  EXPECT_NEAR(g.beta_deltas[1].data.a_occ, 1.f + 1000.f, 1e-2f);
+  // 999.5 sits in the top companding cell (q=255) → the cap, 1.5 above the
+  // input but within the ~7.9 local step there.
+  EXPECT_FLOAT_EQ(g.beta_deltas[0].data.a_occ, 1.f + 1000.f);
+  EXPECT_FLOAT_EQ(g.beta_deltas[1].data.a_occ, 1.f + 1000.f);
+}
+
+// Rev 8 class-id packing: num_classes > 255 keeps u16 ids on the wire (the
+// width is implied by the header), and a real id that cannot fit the packed
+// u8 width is rejected at serialize time.
+TEST(BinarySerializer, ClassIdWidthFollowsNumClasses) {
+  scovox::BinarySerializer::Frame f;
+  f.resolution  = 0.05f;
+  f.num_classes = 300;   // > 255 → u16 class ids
+  f.alpha_0     = scovox::kDefaultDirichletPrior;
+  f.quant_step  = kStep;
+
+  scovox::DirVoxel a = scovox::defaultDirVoxel(300, f.alpha_0);
+  a.cls[0] = 299; a.cnt[0] = f.alpha_0 + 3.f;
+  f.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, a});
+
+  auto g = scovox::BinarySerializer::deserialize(
+      scovox::BinarySerializer::serialize(f));
+  ASSERT_EQ(g.dir_deltas.size(), 1u);
+  EXPECT_EQ(g.dir_deltas[0].data.cls[0], 299);
+  EXPECT_EQ(g.dir_deltas[0].data.cls[1], 0xFFFF);
+
+  // num_classes ≤ 255 packs ids to u8; an id ≥ 0xFF (other than the sentinel)
+  // violates the ids-<-num_classes invariant and must throw.
+  scovox::BinarySerializer::Frame bad;
+  bad.resolution  = 0.05f;
+  bad.num_classes = 14;
+  bad.alpha_0     = scovox::kDefaultDirichletPrior;
+  scovox::DirVoxel v = scovox::defaultDirVoxel(14, bad.alpha_0);
+  v.cls[0] = 300; v.cnt[0] = bad.alpha_0 + 1.f;
+  bad.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, v});
+  EXPECT_THROW(scovox::BinarySerializer::serialize(bad), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -41,6 +43,11 @@ class ScovoxMapSplit {
     double  resolution = 0.05;
     uint8_t inner_bits = 2;
     uint8_t leaf_bits  = 3;
+    /// Semantic (Dir) grid leaf bits — the ONE piece of geometry that is not
+    /// shared. Coord identity across grids is a function of `resolution` only,
+    /// so the labelMesh / cross-grid queries above are unaffected. See
+    /// SemSplitMap::Params::dir_leaf_bits. 0 = inherit leaf_bits.
+    uint8_t dir_leaf_bits = 2;
 
     TsdfMap::Params     tsdf;
     SemSplitMap::Params semsplit;
@@ -85,17 +92,32 @@ class ScovoxMapSplit {
                        t.leaf_bits  = p.leaf_bits;
                        return t; }())
       , semsplit_([&]{ auto s = p.semsplit;
-                       s.resolution = p.resolution;
-                       s.inner_bits = p.inner_bits;
-                       s.leaf_bits  = p.leaf_bits;
+                       s.resolution    = p.resolution;
+                       s.inner_bits    = p.inner_bits;
+                       s.leaf_bits     = p.leaf_bits;
+                       s.dir_leaf_bits = p.dir_leaf_bits;
                        return s; }())
       , resolution_(p.resolution)
       , fused_walker_(p.fused_walker)
       , tsdf_enabled_(p.tsdf_enabled)
+      , sem_band_(semsplit_.params().semantic_band_length)
       , fine_ratio_log2_(p.fine_ratio_log2)
       , fine_region_margin_(p.fine_region_margin)
       , fine_anchor_enable_(p.fine_anchor_enable)
       , fine_anchor_params_(p.fine_anchor) {
+    // The band lives in the fused walker only (see integrateHitSplit). Asking
+    // for both is a request that cannot be honoured, and honouring it silently
+    // as "endpoint only" would hand back a null result that looks like a
+    // measurement. Refuse loudly and zero the knob so `sem_band_` and the
+    // params() the node prints agree with what actually runs.
+    if (sem_band_ > 0.f && !fused_walker_) {
+      std::fprintf(stderr,
+          "[scovox] FATAL CONFIG: semantic_band_length=%.3f requires "
+          "fused_walker=true; the split walker does not implement the band. "
+          "Refusing to run endpoint-only under a band label.\n",
+          static_cast<double>(sem_band_));
+      std::abort();
+    }
     if (fine_ratio_log2_ > 0) {
       // Second, independent TSDF lattice at res_fine. Band-only by
       // construction (space_carving=false → integrateRay walks exactly
@@ -177,11 +199,34 @@ class ScovoxMapSplit {
     const float trunc = tparams.sdf_trunc;
     const float h     = 0.5f * static_cast<float>(tparams.resolution);
 
+    // SLIM-VDB-style flat semantic band (Params::semantic_band_length). Decided
+    // once per ray, not per voxel, so the branch inside the DDA is a bool test.
+    // Excluded cases, all of them deliberate:
+    //   is_dynamic     — a moving object must not paint its class onto the
+    //                    static surfaces its beam passes through or stops on;
+    //                    its endpoint already routes to the transient grids.
+    //   geometry_off /
+    //   kernel_radius  — an RGB-D overlay source owns the BKI ball path
+    //                    (applyHitUpdateKernel). Running the band as well would
+    //                    deposit that source's class twice per hit.
+    //   no sem_probs   — a bare geometric return has no opinion to pool.
+    const bool band_active = sem_band_ > 0.f && !is_dynamic && !geometry_off
+                          && !(prof && prof->kernel_radius > 0.f)
+                          && sem_probs && !sem_probs->empty();
+
     const float walk_back = tparams.space_carving
         ? depth
         : std::max(depth, trunc);
+    // The band is symmetric about the surface, but the walk behind it normally
+    // stops at `trunc`. Extend the far end when the band reaches deeper, else
+    // the behind-surface half is silently clipped and the knob stops meaning
+    // what it says. At band ≤ trunc — the mirror configuration, both 0.30 m on
+    // KITTI — this is the old expression exactly and costs no extra steps.
+    // Voxels gained beyond trunc have sdf ≤ −trunc, which applyBandUpdate drops
+    // and the semCarve gate (sdf > 0) never sees, so TSDF/occupancy are unmoved.
+    const float back_reach = band_active ? std::max(trunc, sem_band_) : trunc;
     const Eigen::Vector3f start_pos = endpoint - walk_back * u;
-    const Eigen::Vector3f end_pos   = endpoint + trunc * u;
+    const Eigen::Vector3f end_pos   = endpoint + back_reach * u;
 
     auto& grid = tsdf_.grid();
     const auto k0    = grid.posToCoord(start_pos.x(), start_pos.y(), start_pos.z());
@@ -239,6 +284,24 @@ class ScovoxMapSplit {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
+      // (1b) SLIM-VDB-style flat semantic band. This is the exact window
+      // SLIM-VDB's Integrate writes `alpha[label] += 1` over — `sdf > -trunc`
+      // on a ray it truncates at depth ± trunc — evaluated on voxels this DDA
+      // is already standing on, which is why it costs no traversal.
+      //
+      // The endpoint is excluded: semHit above already deposited there, and
+      // banding it too would give the surface voxel double weight relative to
+      // its neighbours, inverting the smoothing this is meant to apply.
+      //
+      // Ordered BEFORE the carve so the occupancy `applyBandSemantic` reads is
+      // this voxel's pre-carve state on the immediate path. On the live batched
+      // path the carve is staged until flushCarveFrame, so p_occ cannot move
+      // mid-scan and the two orders coincide — but they must not diverge
+      // between paths, so the order is pinned here rather than left to luck.
+      if (band_active && c != k_hit && sdf > -sem_band_ && sdf <= sem_band_) {
+        semBand(c, sem_probs, quality, prof);
+      }
+
       // (2) semantic carve (interior of carve band, not the hit voxel).
       if (c != k_hit && !carve_blocked && sdf > 0.f && sdf <= carve_band) {
         if (!semCarve(c, quality, prof)) {
@@ -274,6 +337,14 @@ class ScovoxMapSplit {
   }
 
   /// Non-fused split walker (two DDAs). Kept for A/B parity testing.
+  ///
+  /// NOTE: this path does NOT implement `semantic_band_length`. The band is
+  /// defined as "deposit on the voxels the walker is already standing on", and
+  /// the whole claim being tested is that this costs no extra traversal — which
+  /// is only true of the fused walker's single DDA. Reimplementing it here
+  /// would mean a third DDA and would measure something else. Callers get a
+  /// hard warning at construction rather than silent endpoint-only numbers;
+  /// see the `band + !fused_walker` check in ScovoxMapSplit's constructor.
   void integrateHitSplit(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
@@ -582,12 +653,20 @@ class ScovoxMapSplit {
               bool is_dynamic, const HitWeights* prof = nullptr) {
     semsplit_.applyHitUpdate(c, sem_probs, quality, is_dynamic, prof);
   }
+  void semBand(const CoordT& c, const std::vector<float>* sem_probs, float quality,
+               const HitWeights* prof = nullptr) {
+    semsplit_.applyBandSemantic(c, sem_probs, quality, prof);
+  }
 
   TsdfMap     tsdf_;       ///< TSDF surface (band-only)
   SemSplitMap semsplit_;   ///< Split Beta/Dir semantic substrate
   double      resolution_;
   bool        fused_walker_;
   bool        tsdf_enabled_;
+  /// Cached from semsplit_.params() AFTER sanitise(), so a config that sets
+  /// both band and spread reads 0 here and the walker's band branch stays cold.
+  /// Declared after semsplit_ so the ctor's member-init order is valid.
+  float       sem_band_;
 
   // Fine TSDF band state (null / empty when fine_ratio_log2 == 0).
   std::unique_ptr<TsdfMap>    fine_tsdf_;

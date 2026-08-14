@@ -47,6 +47,20 @@
 
 #include "scovox/voxel.hpp"  // K_TOP + g_sparse_*_count counters
 
+/// Per-slot confidence track for the max-probability eviction comparator.
+/// Build-time only (`-DSCOVOX_TRACK_QMAX=1`), following the `SCOVOX_K_TOP`
+/// one-install-tree-per-variant convention, because it changes
+/// `sizeof(DirVoxel)` (4 + 6·K_TOP → 4 + 8·K_TOP; 16 B → 20 B at K_TOP=2) and
+/// we must be able to quote the shipped build's bytes unchanged.
+///
+/// Never serialized: binary_serializer.hpp emits only `other`, `cnt[]` and
+/// `cls[]`, so a `SCOVOX_TRACK_QMAX=1` sender stays wire-compatible with a
+/// `=0` receiver. The comparator only changes *which* class wins a slot, and
+/// that outcome is already fully visible in the `cls`/`cnt` that do go out.
+#ifndef SCOVOX_TRACK_QMAX
+#define SCOVOX_TRACK_QMAX 0
+#endif
+
 namespace scovox {
 
 /// Per-voxel occupied-class Dirichlet state. `cls[i] == 0xFFFF` marks an empty
@@ -62,6 +76,14 @@ struct DirVoxel {
   float    cnt[K_TOP];
   uint16_t cls[K_TOP];
 
+#if SCOVOX_TRACK_QMAX
+  /// Running maximum of the *deposit probability* each slot has ever seen, as
+  /// u16 fixed point (`round(q · 65535)`). Read only by the confidence
+  /// eviction comparator in `sparse_add_class`; zero-init means "no deposit
+  /// yet", which is only ever the state of an EMPTY slot.
+  uint16_t qmax[K_TOP];
+#endif
+
   /// Total class (occupied-semantic) evidence: `other + Σ cnt`. The analogue
   /// of `SemDirVoxel::s_occ()` (which additionally folds in occupancy mass);
   /// here it is purely semantic.
@@ -76,14 +98,19 @@ struct DirVoxel {
 //   sizeof == 4 (other) + 4·K_TOP (cnt) + 2·K_TOP (cls) = 4 + 12 = 16.
 // General K_TOP: 4 + 6·K_TOP, rounded up to 4-byte alignment for the trailing
 // uint16_t pair.
+/// 6 B per slot (4 cnt + 2 cls), or 8 B when the qmax confidence track is
+/// compiled in.
+constexpr std::size_t kDirSlotBytes = SCOVOX_TRACK_QMAX ? 8u : 6u;
 constexpr std::size_t kDirExpectedSize =
-    ((4u + 6u * static_cast<std::size_t>(K_TOP) + 3u) / 4u) * 4u;
+    ((4u + kDirSlotBytes * static_cast<std::size_t>(K_TOP) + 3u) / 4u) * 4u;
 static_assert(sizeof(DirVoxel) == kDirExpectedSize,
     "DirVoxel size mismatch — layout is 4 B fixed + 6 B per K_TOP slot "
-    "rounded up to 4-byte alignment.");
-static_assert(K_TOP != 2 || sizeof(DirVoxel) == 16,
+    "(8 B with SCOVOX_TRACK_QMAX) rounded up to 4-byte alignment.");
+static_assert(SCOVOX_TRACK_QMAX || K_TOP != 2 || sizeof(DirVoxel) == 16,
     "Production K_TOP=2 invariant: DirVoxel must be exactly 16 B "
     "(SemDirVoxel 20 B minus the 4 B FREE dimension moved to BetaVoxel).");
+static_assert(!SCOVOX_TRACK_QMAX || K_TOP != 2 || sizeof(DirVoxel) == 20,
+    "K_TOP=2 with SCOVOX_TRACK_QMAX: 16 B + 2 B per slot confidence = 20 B.");
 static_assert(std::is_trivial_v<DirVoxel>,
     "DirVoxel must be trivial for Bonxai's pool allocator (zero-init).");
 static_assert(std::is_standard_layout_v<DirVoxel>,
@@ -119,12 +146,23 @@ inline DirVoxel defaultDirVoxel(uint16_t num_classes = 14,
 ///
 /// Direct port of `sparse_add_unified` (semdir_map.cpp), with `alpha_other`
 /// renamed `other` and no FREE interaction (FREE is in the Beta grid).
+/// `q` is the deposit's own class probability in [0,1] (for a Dirichlet update
+/// that is `inc / class_share`). It is *not* evidence and never changes what is
+/// deposited — it only feeds the optional confidence eviction comparator, and
+/// is ignored unless `qmax != nullptr` (which requires SCOVOX_TRACK_QMAX).
 inline void sparse_add_class(float*    cnt,
                              uint16_t* cls,
                              uint16_t  c,
                              float     inc,
                              float*    other,
-                             float     alpha_0) {
+                             float     alpha_0,
+                             float     q    = -1.0f,
+                             uint16_t* qmax = nullptr) {
+  // Fixed-point form of the incoming confidence, computed once.
+  const bool     track = (qmax != nullptr) && (q >= 0.0f);
+  const uint16_t q_fx  = !track            ? uint16_t{0}
+                       : (q >= 1.0f)       ? uint16_t{65535}
+                                           : static_cast<uint16_t>(q * 65535.0f + 0.5f);
   // (0) Sentinel guard. `0xFFFF` is the empty-slot marker in `cls[]`, so a real
   // observation of class id 0xFFFF (e.g. a 65535-class taxonomy, or a classifier
   // whose argmax index hits 0xFFFF) must NOT be written into a slot: it would
@@ -142,6 +180,7 @@ inline void sparse_add_class(float*    cnt,
   for (int i = 0; i < K_TOP; ++i) {
     if (cls[i] != 0xFFFF && cls[i] == c) {
       cnt[i] += inc;
+      if (track && q_fx > qmax[i]) qmax[i] = q_fx;
       g_sparse_match_count.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -151,6 +190,7 @@ inline void sparse_add_class(float*    cnt,
     if (cls[i] == 0xFFFF) {
       cls[i] = c;
       cnt[i] = alpha_0 + inc;
+      if (track) qmax[i] = q_fx;
       g_sparse_empty_count.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -167,12 +207,21 @@ inline void sparse_add_class(float*    cnt,
   // path also floors filled slots at α₀, so this is normally a no-op safety net.
   const float raw_evicted = cnt[min_i] - alpha_0;
   const float evicted_evidence = raw_evicted > 0.f ? raw_evicted : 0.f;
-  if (inc > evicted_evidence) {
+  // Comparator choice changes only WHICH deposits win a contested slot, never
+  // how much mass moves: both branches below conserve Δ(other + Σcnt) == inc.
+  // Shipped rule weighs accumulated evidence, so a class that arrives often
+  // beats one that arrives certain; the confidence rule inverts that, letting a
+  // single high-probability observation displace a pile of low-probability
+  // ones. On noisy real-camera labels the latter measured better.
+  const bool evict_now = track ? (q_fx > qmax[min_i])
+                               : (inc > evicted_evidence);
+  if (evict_now) {
     // Evict: incoming class displaces slot min_i. Displaced accumulated
     // evidence flows to OTHER; the α₀ placeholder stays for the new class.
     *other += evicted_evidence;
     cls[min_i] = c;
     cnt[min_i] = alpha_0 + inc;
+    if (track) qmax[min_i] = q_fx;
     g_sparse_evict_count.fetch_add(1, std::memory_order_relaxed);
   } else {
     // Drop: incoming evidence smaller than every tracked class. Mass to OTHER.

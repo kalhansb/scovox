@@ -32,6 +32,12 @@ struct Params {
   uint8_t inner_bits = 2;  ///< Inner grid dimension bits (2 → 4×4×4 inner cells)
   uint8_t leaf_bits  = 3;  ///< Leaf block dimension bits (3 → 8×8×8 = 512 voxels/block)
                            ///< Use leaf_bits=1 for sparse outdoor LiDAR to reduce waste
+  /// Leaf block bits for the SEMANTIC (Dirichlet) grid only — see
+  /// SemSplitMap::Params::dir_leaf_bits. The Dir grid is ~18× sparser than the
+  /// Beta grid (hit-only + gated) so it wastes far more of an 8³ block; 2 →
+  /// 4×4×4 = 64 voxels/block. Clamped to <= leaf_bits (never coarser than the
+  /// occupancy grid), so a leaf_bits=1 LiDAR config is unaffected.
+  uint8_t dir_leaf_bits = 2;
 
   // -- Occupancy update weights --
   // Sensor-physics derivation (Beta-Bernoulli equivalent of OctoMap log-odds).

@@ -266,6 +266,138 @@ TEST(SplitRefold, DuplicateSnapshotIsIdempotent) {
   EXPECT_GT(naive_double.a_occ, beta_fused.a_occ);  // the trap is real
 }
 
+// =====================================================================
+// E6.3 — consistency of the receiver under network reordering/duplication.
+//
+// The idempotence test above is SINGLE-source. The three below cover what the
+// merger actually runs: several sources refolded together, in an order the node
+// chooses rather than the network. Read together they say:
+//
+//   Beta  (addition only)          — order-free up to float rounding
+//   Dir   at 2 sources             — order-free EXACTLY  (the shipped rig)
+//   Dir   at ≥3 sources            — NOT order-free; the node pins the order
+//   duplicate receipt, any N       — a no-op, because refold resets first
+// =====================================================================
+
+namespace {
+// Three sources carrying more than K_TOP distinct classes between them, so the
+// mergeDir truncation is live rather than a formality.
+scovox::DirVoxel dirSrc(uint16_t c0, float n0, uint16_t c1, float n1) {
+  auto v = dirPrior();
+  v.cls[0] = c0; v.cnt[0] = kAlpha + n0;
+  if (scovox::K_TOP > 1) { v.cls[1] = c1; v.cnt[1] = kAlpha + n1; }
+  return v;
+}
+bool sameDir(const scovox::DirVoxel& x, const scovox::DirVoxel& y) {
+  for (int i = 0; i < scovox::K_TOP; ++i)
+    if (x.cls[i] != y.cls[i] || x.cnt[i] != y.cnt[i]) return false;
+  return x.other == y.other;
+}
+}  // namespace
+
+// A duplicate snapshot from ONE source while OTHER sources are present. The
+// receiver replaces that source's grid entry and refolds the whole set, so the
+// duplicate cannot accumulate. The second half pins the trap: an implementation
+// that appended the duplicate as an extra source would double-count class 1.
+TEST(SplitRefold, DuplicateSnapshotIsIdempotentMultiSource) {
+  const auto A = dirSrc(1, 5.0f, 2, 4.0f);
+  const auto B = dirSrc(3, 4.5f, 4, 1.0f);
+  const auto C = dirSrc(2, 3.0f, 5, 0.5f);
+
+  const auto first  = scovox::refoldDir({&A, &B, &C}, kC, kAlpha);
+  const auto second = scovox::refoldDir({&A, &B, &C}, kC, kAlpha);
+  EXPECT_TRUE(sameDir(first, second)) << "re-refolding the same source set drifted";
+
+  const auto appended = scovox::refoldDir({&A, &B, &C, &A}, kC, kAlpha);
+  EXPECT_FALSE(sameDir(first, appended))
+      << "append-the-duplicate trap did not fire — this test proves nothing";
+
+  scovox::BetaVoxel bA{4.0f, 1.5f}, bB{2.0f, 3.0f}, bC{1.2f, 6.0f};
+  const auto bfirst  = scovox::refoldBeta({&bA, &bB, &bC}, kC, kAlpha);
+  const auto bsecond = scovox::refoldBeta({&bA, &bB, &bC}, kC, kAlpha);
+  EXPECT_FLOAT_EQ(bfirst.a_occ,  bsecond.a_occ);
+  EXPECT_FLOAT_EQ(bfirst.a_free, bsecond.a_free);
+}
+
+// Two sources — the configuration every E6 cell actually ran — is exactly
+// order-free, because refoldDir reduces to a single commutative mergeDir call.
+TEST(SplitRefold, DirRefoldIsOrderFreeAtTwoSources) {
+  const auto A = dirSrc(1, 5.0f, 2, 4.0f);
+  const auto B = dirSrc(3, 4.5f, 4, 1.0f);
+  const auto ab = scovox::refoldDir({&A, &B}, kC, kAlpha);
+  const auto ba = scovox::refoldDir({&B, &A}, kC, kAlpha);
+  EXPECT_TRUE(sameDir(ab, ba)) << "two-source refold is order-dependent";
+  EXPECT_EQ(scovox::dominantClass(ab, kAlpha, kC),
+            scovox::dominantClass(ba, kAlpha, kC));
+}
+
+// ⚠ At three or more sources the refold is NOT order-independent, and this test
+// PINS THAT LIMITATION rather than asserting it away. mergeDir truncates at each
+// pairwise step and a class dumped to OTHER can never climb back, so the fused
+// slots depend on which sources met first (consensus_merge.hpp says so in situ).
+//
+// Fixture: classes 7 and 2 compete for the top slot. Folding A+B first keeps
+// {2, 7}, so C's extra 1.5 lands ON class 7 and carries it past class 2 → 7.
+// Folding A+C first evicts class 7 (its 1.5 loses to class 4's 2.5 and class 0's
+// 1.9), and evicted evidence cannot come back, so class 2 keeps the slot → 2.
+// Both are *confident* labels, not abstentions: this is a real label flip, not a
+// degradation to OTHER. A 500k-draw random search over 3-source configurations
+// put these at ~1.0% of draws (with a further ~13.5% flipping class↔abstain and
+// 20.6% differing in the fused slots), so the fixture is representative, not a
+// hand-built pathology.
+//
+// The node's mitigation is to fix the order, NOT to make the merge commutative:
+// dscovox_node.cpp sorts sources by id before folding Dir, so the fused result
+// is reproducible across runs and rehashes even though it is not permutation-
+// invariant. The last two assertions are that actual guarantee.
+//
+// Scope: every E6 cell ran N=2, where the fold is exactly order-free
+// (DirRefoldIsOrderFreeAtTwoSources above), so no campaign result depends on
+// this. E6.5's N∈{3,4} scaling arm was dropped 2026-08-06.
+//
+// If a future change makes mergeDir truly commutative (accumulate every source,
+// then truncate once), THIS TEST SHOULD FAIL. Replace it with an equality
+// assertion; do not silently relax it.
+TEST(SplitRefold, DirRefoldDependsOnSourceOrderAtThreeSources) {
+  if (scovox::K_TOP != 2) GTEST_SKIP() << "fixture is written for K_TOP == 2";
+  const auto A = dirSrc(2, 9.0f, 4, 2.5f);
+  const auto B = dirSrc(7, 8.0f, 1, 3.0f);
+  const auto C = dirSrc(7, 1.5f, 0, 1.9f);
+
+  const auto abc = scovox::refoldDir({&A, &B, &C}, kC, kAlpha);
+  const auto acb = scovox::refoldDir({&A, &C, &B}, kC, kAlpha);
+
+  // The limitation is semantic, not merely numeric: the reported label changes,
+  // and both orders report a real class rather than abstaining.
+  EXPECT_EQ(scovox::dominantClass(abc, kAlpha, kC), uint16_t(7));
+  EXPECT_EQ(scovox::dominantClass(acb, kAlpha, kC), uint16_t(2));
+  EXPECT_FALSE(sameDir(abc, acb));
+
+  // What the node guarantees instead: fold in a fixed order, get a fixed answer.
+  EXPECT_TRUE(sameDir(abc, scovox::refoldDir({&A, &B, &C}, kC, kAlpha)));
+  EXPECT_TRUE(sameDir(acb, scovox::refoldDir({&A, &C, &B}, kC, kAlpha)));
+}
+
+// Beta carries no truncation, so it is order-free semantically — but float
+// addition is not associative, so it is NOT bit-exact across fold orders. The
+// node folds Beta in unordered_map order (unsorted, unlike Dir), which is safe
+// precisely because the spread is rounding-scale: measured at ≤2 ULP
+// (relative ~1.5e-7) over 200k random 4-source draws in all 24 orders.
+// EXPECT_FLOAT_EQ's 4-ULP tolerance is the right assertion here; EXPECT_EQ on
+// the bits would be wrong and would flake.
+TEST(SplitRefold, BetaRefoldOrderInvariantToFloatTolerance) {
+  scovox::BetaVoxel a{4.0f, 1.5f}, b{2.0f, 3.0f}, c{1.2f, 6.0f};
+  const auto abc = scovox::refoldBeta({&a, &b, &c}, kC, kAlpha);
+  const auto cab = scovox::refoldBeta({&c, &a, &b}, kC, kAlpha);
+  const auto bca = scovox::refoldBeta({&b, &c, &a}, kC, kAlpha);
+  EXPECT_FLOAT_EQ(abc.a_occ,  cab.a_occ);
+  EXPECT_FLOAT_EQ(abc.a_occ,  bca.a_occ);
+  EXPECT_FLOAT_EQ(abc.a_free, cab.a_free);
+  EXPECT_FLOAT_EQ(abc.a_free, bca.a_free);
+  // Additive with one prior removed per extra source: 4.0+2.0+1.2 − 2·prior.
+  EXPECT_FLOAT_EQ(abc.a_occ, 7.2f - 2.0f * scovox::kBetaOccPrior);
+}
+
 // Finding 20 (at-prior skip path): a source sitting AT PRIOR contributes nothing
 // — refoldBeta/refoldDir skip it via isPriorBeta/isPriorDir — so the fused result
 // for sources {A, prior} is identical to {A}, and {prior} alone stays at prior.
