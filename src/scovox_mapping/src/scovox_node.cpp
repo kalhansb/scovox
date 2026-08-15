@@ -444,6 +444,32 @@ private:
     // mode=rolling. Ignored in mode=persistent (which uses the fixed
     // (plan_ox_, plan_oy_, plan_sz_) envelope).
     plan_window_size_m_ = dp("planning_map_window_size_m", 20.0);
+    // --- second, WORLD-FIXED planning map (exploration planner) -------------
+    // The planning_map above is sized for the local navigation planner: in
+    // mode=rolling it is a small robot-centred crop, and its extent IS that
+    // planner's window (simple_nav_3d has no separate window param). An
+    // exploration planner needs the opposite: a fixed envelope covering the
+    // whole ROI, because it rejects candidates whose cell is out of bounds
+    // (isCellOccupied treats out-of-bounds as occupied) and measures its
+    // coverage-termination unknown fraction over the ROI clipped to the grid.
+    // Point both at one topic and you must pick which consumer to break, so
+    // this is a SECOND publisher over the same voxel grid with its own
+    // envelope, resolution and rate. Off by default: nothing that does not ask
+    // for it pays the cost, and mode=persistent (the other way to get a fixed
+    // envelope) is not an option because it disables the ScovoxMapBinary
+    // publish that multi-robot map sharing depends on.
+    pub_plan_glob_ = dp("publish_global_planning_map", false);
+    plan_glob_res_ = dp("global_planning_map_resolution", 0.40);
+    plan_glob_sz_  = dp("global_planning_map_size_m", 200.0);
+    plan_glob_ox_  = dp("global_planning_map_origin_x", -100.0);
+    plan_glob_oy_  = dp("global_planning_map_origin_y", -100.0);
+    plan_glob_infl_ = dp("global_planning_map_inflation_m", plan_infl_);
+    // Publish period, seconds. Unlike planning_map this one is NOT free to
+    // emit per integration frame: the inflation pass is O(occupied * (r/res)^2)
+    // over the whole envelope and the message is O(size^2/res^2) bytes, both of
+    // which run on the integration thread. An exploration planner re-reads the
+    // latched map about once per planning step, so ~1 Hz is already generous.
+    plan_glob_period_ = dp("global_planning_map_period_sec", 1.0);
     pub_tsdf_ = dp("publish_tsdf_pointcloud", true);
     min_tsdf_w_ = dp("min_tsdf_weight_publish", 0.5);
     dataset_mode_ = dp("dataset_mode", false);
@@ -875,6 +901,7 @@ private:
     auto pc_t = dp("pointcloud_topic", std::string("~/pointcloud"));
     auto sm_t = dp("scovox_topic", std::string("~/scovox"));
     auto pl_t = dp("planning_map_topic", std::string("~/planning_map"));
+    auto plg_t = dp("global_planning_map_topic", std::string("~/global_planning_map"));
     auto tsdf_t = dp("tsdf_pointcloud_topic", std::string("~/tsdf_pointcloud"));
     sm_pub_ = create_publisher<scovox_msgs::msg::ScovoxMap>(sm_t, 10);
     if (mode_ == "rolling") {
@@ -894,6 +921,7 @@ private:
     pc_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         pc_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
     if (pub_plan_) pl_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(pl_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    if (pub_plan_glob_) pl_glob_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(plg_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
     if (pub_tsdf_ && sdf_trunc_launch_ > 0.f) {
       tsdf_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
           tsdf_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
@@ -1228,6 +1256,7 @@ private:
       split_map_->clearTouchedSemDir();
     }
     if (pub_plan_ && pl_pub_) publishPlanningMap();
+    if (pub_plan_glob_ && pl_glob_pub_) publishGlobalPlanningMap();
     // Pointcloud is published on the 1Hz timer — not per-frame, to avoid blocking integration
     auto t_end = std::chrono::high_resolution_clock::now();
     float frame_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
@@ -1761,6 +1790,7 @@ private:
       split_map_->clearTouchedSemDir();
     }
     if (pub_plan_ && pl_pub_) publishPlanningMap();
+    if (pub_plan_glob_ && pl_glob_pub_) publishGlobalPlanningMap();
     auto t_end = std::chrono::high_resolution_clock::now();
     float frame_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
     size_t mem_kb = getVmRSSKB();
@@ -2514,13 +2544,40 @@ private:
       ox = std::floor((O.x() - sz * 0.5) / r) * r;
       oy = std::floor((O.y() - sz * 0.5) / r) * r;
     }
+    projectPlanningMap(*pl_pub_, ox, oy, sz, plan_res_, plan_infl_);
+  }
 
-    const int w = std::max(1, (int)std::round(sz / plan_res_));
+  // Publish the world-fixed planning map for the exploration planner. Same
+  // projection as publishPlanningMap, but never robot-centred (the whole point
+  // is an envelope that does not move under the consumer) and rate-limited,
+  // because this runs on the integration thread and the envelope is large.
+  void publishGlobalPlanningMap() {
+    if (!pl_glob_pub_ || pl_glob_pub_->get_subscription_count() == 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (plan_glob_period_ > 0.0 &&
+        plan_glob_last_.time_since_epoch().count() != 0 &&
+        std::chrono::duration<double>(now - plan_glob_last_).count() <
+            plan_glob_period_)
+      return;
+    plan_glob_last_ = now;
+    projectPlanningMap(*pl_glob_pub_, plan_glob_ox_, plan_glob_oy_,
+                       plan_glob_sz_, plan_glob_res_, plan_glob_infl_);
+  }
+
+  // Shared body: 2D projection of the persistent voxel grid over the axis-
+  // aligned envelope [ox, ox+sz) x [oy, oy+sz), at `res` metres per cell, with
+  // occupied cells dilated by `infl` metres. The z band, terrain-relative mode
+  // and occupancy threshold are shared node state — only the envelope,
+  // resolution and inflation differ between the two publishers.
+  void projectPlanningMap(rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>& pub,
+                          double ox, double oy, double sz, double res,
+                          double infl) {
+    const int w = std::max(1, (int)std::round(sz / res));
     const int h = w;
     nav_msgs::msg::OccupancyGrid g;
     g.header.stamp = get_clock()->now();
     g.header.frame_id = int_frame_;
-    g.info.resolution = float(plan_res_);
+    g.info.resolution = float(res);
     g.info.width = w;
     g.info.height = h;
     g.info.origin.position.x = ox;
@@ -2551,8 +2608,8 @@ private:
       });
       for (auto& [key, col] : cols) {
         (void)key;
-        const int gx = int(std::floor((col.x - ox) / plan_res_));
-        const int gy = int(std::floor((col.y - oy) / plan_res_));
+        const int gx = int(std::floor((col.x - ox) / res));
+        const int gy = int(std::floor((col.y - oy) / res));
         if (gx < 0 || gy < 0 || gx >= w || gy >= h) continue;
         std::sort(col.occ_z.begin(), col.occ_z.end());
         // Ground anchor = lowest occupied voxel (robust to canopy, which
@@ -2583,20 +2640,20 @@ private:
       bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         auto p = bgrid.coordToPos(c);
         if (p.z < plan_zmin_ || p.z > plan_zmax_) return;
-        int gx = int(std::floor((p.x - ox) / plan_res_));
-        int gy = int(std::floor((p.y - oy) / plan_res_));
+        int gx = int(std::floor((p.x - ox) / res));
+        int gy = int(std::floor((p.y - oy) / res));
         if (gx < 0 || gy < 0 || gx >= w || gy >= h) return;
         int i = gy * w + gx;
         if (v.p_occ() >= float(min_occ_)) g.data[i] = 100;
         else if (g.data[i] != 100) g.data[i] = 0;
       });
     }
-    int ic=int(std::ceil(plan_infl_/plan_res_)); int ic2=ic*ic;
+    int ic=int(std::ceil(infl/res)); int ic2=ic*ic;
     if (ic>0) { auto inf=g.data; for (int y=0;y<h;++y) for (int x=0;x<w;++x) { if (g.data[y*w+x]!=100) continue;
       for (int dy=-ic;dy<=ic;++dy) for (int dx=-ic;dx<=ic;++dx) { if (dx*dx+dy*dy>ic2) continue;
         int nx=x+dx,ny=y+dy;
         if (nx>=0&&nx<w&&ny>=0&&ny<h) inf[ny*w+nx]=100; } } g.data=std::move(inf); }
-    pl_pub_->publish(g);
+    pub.publish(g);
   }
   // Caller must hold map_mtx_ (shared). The timer body locks once for both
   // publishScovoxMap and publishPointCloud so they see the same map state.
@@ -2973,6 +3030,13 @@ private:
   double min_tsdf_w_{0.5};
   double plan_res_{0.2}, plan_sz_{80}, plan_ox_{-40}, plan_oy_{-40}, plan_zmin_{-1}, plan_zmax_{2}, plan_infl_{0};
   double plan_window_size_m_{20.0};
+  bool   pub_plan_glob_{false};
+  double plan_glob_res_{0.4}, plan_glob_sz_{200}, plan_glob_ox_{-100},
+         plan_glob_oy_{-100}, plan_glob_infl_{0}, plan_glob_period_{1.0};
+  // Steady-clock stamp of the last global planning_map publish. Steady, not the
+  // ROS clock: this throttles work on the integration thread, so it must not
+  // stall on a paused sim clock or jump on a clock step.
+  std::chrono::steady_clock::time_point plan_glob_last_{};
   // Terrain-relative planning_map projection (see param comment).
   bool plan_terrain_rel_{false};
   double plan_rel_zmin_{0.4}, plan_rel_zmax_{2.0}, plan_ground_stack_m_{0.6};
@@ -3095,6 +3159,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tsdf_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr bin_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_glob_pub_;
   rclcpp::Service<scovox_msgs::srv::ExtractMesh>::SharedPtr extract_mesh_srv_;
   tf2_ros::Buffer tf_buffer_; tf2_ros::TransformListener tf_listener_;
 };

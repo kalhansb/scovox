@@ -213,10 +213,23 @@ public:
     // silently dropped large ScovoxMapBinary payloads under any
     // backpressure. Combined with scovox_node's fire-and-forget
     // dirty_.clear() after publish, drops became permanent voxel loss.
-    // KeepLast(50) absorbs publish bursts when this node is busy
+    // KeepLast absorbs publish bursts when this node is busy
     // rebuilding the fused grid; reliable forces redelivery of any
     // packet the transport drops.
-    auto bin_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
+    //
+    // Depth is a parameter because the binding limit is the SHALLOWEST end of
+    // the chain, and under a comms emulator the sender end is not the direct
+    // publisher: an outage queues deltas, and reconnect releases the whole
+    // backlog in one pass, far faster than this node drains it. A reliable
+    // KEEP_LAST reader that overflows discards the excess with no error and no
+    // counter — the relay's drop_overflow only sees its own pre-relay queue —
+    // so the loss surfaces as permanently missing voxels in the fused map with
+    // nothing anywhere recording that it happened. Size it to the emulator's
+    // rx_qos_depth (or larger) for those runs. Default 50 = prior behaviour.
+    const int bin_depth = std::max(
+        1, static_cast<int>(declare_parameter<int>("scovox_bin_qos_depth", 50)));
+    auto bin_qos =
+        rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(bin_depth))).reliable();
     for (auto& t : input_topics_) {
       subs_.push_back(create_subscription<scovox_msgs::msg::ScovoxMapBinary>(
         t, bin_qos,
