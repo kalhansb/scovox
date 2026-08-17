@@ -127,6 +127,16 @@ explo_planner:
     roi_max_z:  4.0
 
     # FOV evaluation for EIG scoring (matches the RGB-D-ish default geometry).
+    #
+    # UNVERIFIED FOR THIS CAMPAIGN. shared_params.yaml has moved fov_vfov to
+    # 0.5236 (the sim husky's VLP-16, +-15 deg) because its runs are that
+    # sensor. These bags are a different unit, and nobody has written down its
+    # actual vertical FOV, beam count or usable range here -- so the values are
+    # left alone rather than assumed to match. Before this config is used for
+    # anything but replaying the existing bags, set fov_vfov / fov_v_rays /
+    # fov_max_range from that unit's spec sheet. The horizontal figure is a
+    # 60 deg stand-in for a 360 deg sensor in both files; see the longer note in
+    # shared_params.yaml for why that is not a one-line fix.
     fov_hfov: 1.047
     fov_vfov: 0.785
     fov_min_range: 0.3
