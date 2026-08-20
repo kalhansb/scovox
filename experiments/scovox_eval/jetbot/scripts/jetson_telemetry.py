@@ -2,7 +2,7 @@
 """Capture per-second telemetry for the Jetson scovox_mapping_node:
   - RSS (MB), VSZ (MB)
   - CPU% (per-process, sum across cores)
-  - Per-core CPU% (system-wide, 4 cores on Nano)
+  - Per-core CPU% busy (system-wide; core count read from /proc/stat)
   - System memory available (MB)
 
 Writes a CSV one row per second until killed (Ctrl-C or SIGTERM).
@@ -64,18 +64,26 @@ def read_proc_stat_cpu(pid):
 
 
 def read_total_cpu_jiffies():
-    """Returns (aggregate, [per_core...]) of total jiffies."""
+    """Returns (aggregate_total, [(busy, total) per core]).
+
+    /proc/stat fields are user nice system idle iowait irq softirq steal ...
+    Busy must exclude idle+iowait -- summing every field gives each core's
+    elapsed time, which is identical for all cores and so measures nothing.
+    """
     total = 0
     per_core = []
     with open("/proc/stat") as f:
         for line in f:
             parts = line.split()
-            if not parts:
+            if not parts or not parts[0].startswith("cpu"):
                 continue
+            vals = [int(x) for x in parts[1:]]
+            core_total = sum(vals)
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
             if parts[0] == "cpu":
-                total = sum(int(x) for x in parts[1:])
-            elif parts[0].startswith("cpu") and parts[0] != "cpu":
-                per_core.append(sum(int(x) for x in parts[1:]))
+                total = core_total
+            else:
+                per_core.append((core_total - idle, core_total))
     return total, per_core
 
 
@@ -103,11 +111,15 @@ def main():
     last_total_jiffies = 0
     last_per_core_jiffies = []  # List[int]
 
+    # Core count is read from the machine, not assumed -- this was written for
+    # the 4-core Nano but also runs on the 12-core AGX Orin.
+    n_cpu = len(read_total_cpu_jiffies()[1])
+
     with out_path.open("w", buffering=1) as fp:
         wr = csv.writer(fp)
-        wr.writerow(["wall_time", "pid", "rss_mb", "vsz_mb", "proc_cpu_pct",
-                     "core0_pct", "core1_pct", "core2_pct", "core3_pct",
-                     "mem_avail_mb"])
+        wr.writerow(["wall_time", "pid", "rss_mb", "vsz_mb", "proc_cpu_pct"]
+                    + [f"core{i}_pct" for i in range(n_cpu)]
+                    + ["mem_avail_mb"])
 
         sig = signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         try:
@@ -133,18 +145,14 @@ def main():
                 proc_pct = 100.0 * d_proc / (d_total / n_cores) if d_total > 0 else 0.0
 
                 core_pcts = []
-                for i, cj in enumerate(per_core_jiffies):
+                for i, (busy, tot) in enumerate(per_core_jiffies):
                     if i < len(last_per_core_jiffies):
-                        d_core = cj - last_per_core_jiffies[i]
-                        # Idle is field 4 in /proc/stat per-core; read again
-                        # for idle delta. Simpler: approximate as busy fraction
-                        # of total delta on that core (close enough for this).
-                        # Approximation: report d_core relative to mean across cores.
-                        core_pcts.append(round(100.0 * d_core / max(1, d_total / n_cores), 1))
+                        d_busy = busy - last_per_core_jiffies[i][0]
+                        d_tot = tot - last_per_core_jiffies[i][1]
+                        core_pcts.append(round(100.0 * d_busy / d_tot, 1) if d_tot > 0 else 0.0)
                     else:
                         core_pcts.append(0.0)
-                # Pad to 4 cores.
-                while len(core_pcts) < 4:
+                while len(core_pcts) < n_cpu:
                     core_pcts.append(0.0)
 
                 wr.writerow([
@@ -152,7 +160,7 @@ def main():
                     round(rss_kb / 1024.0, 1),
                     round(vsz_kb / 1024.0, 1),
                     round(proc_pct, 1),
-                    *core_pcts[:4],
+                    *core_pcts[:n_cpu],
                     round(read_meminfo_available_kb() / 1024.0, 1),
                 ])
 
