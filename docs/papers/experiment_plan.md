@@ -238,6 +238,12 @@ all signals derive from the Beta–Dirichlet state.
   Beta+Dirichlet core**; the TSDF grid is a separate `[memSplit]` line item
   (module cost → costs-vs-buys **row ②**), never folded into the core number.
 - **Scaling** memory vs frames (long-run) and vs resolution {5,10,20} cm — ⬜.
+- **Block fill dominates allocated bytes at sparse occupancy (E7.5, Orin).** 3.6×
+  more active Beta voxels cost +0.007 MB because leaf fill rose 0.158 → 0.415;
+  allocated bytes/voxel fell 186 → 53 B. **The analytical 16 B is a struct fact and
+  does not predict allocated bytes** — the measured cell must report `[memBlocks]`
+  fill alongside `[memSplit]` MB, or the 3.5–5.0× advantage will be read as a
+  claim about grid MB, which it is not.
 - **H4.1** grid memory sub-linear in frames after coverage saturates. **H4.2** at
   matched allocation per-voxel advantage ≈ analytical **3.5–5.0×** (split-build 16 B
   struct; was 2.8–4.0× at the paper's 20 B `SemDirVoxel`). **H4.3** ≤
@@ -256,7 +262,11 @@ all signals derive from the Beta–Dirichlet state.
   inside run-to-run noise → **this is exactly what n=3 resolves** (report mean ± SD,
   not a single pass).
 - **2-way** TSDF-vs-semantic stage split via `fused_walker:=false` — ✅ feasible,
-  no code change.
+  no code change. **The split arm is mandatory, not optional:** on the default
+  fused path `semdirTimeUs()` is 0 by design and `tsdf_ms` reports the *combined*
+  walk, so a `tsdf_ms` read off a default run is not TSDF cost and must never be
+  tabulated as one. First ARM measurement in **E7.6** (semantic 2.5× TSDF at the
+  ±1-band point) — note the arm is not verified map-identical to the fused path.
 - **5-way** carve/Beta/Dirichlet/TSDF/serialise split — ⬜ *buildable via a sampling
   profiler* (`perf record`, Release) **+ differential configs** (TSDF on/off,
   K_top 1 vs 6, `fused_walker` on/off): a decomposed cost model at zero instrumentation
@@ -435,8 +445,171 @@ all signals derive from the Beta–Dirichlet state.
   curve is *not* flat, that is a transport finding worth reporting on its own.
 
 ### E7 — Embedded feasibility · C5
-Jetson Nano: sustained Hz, p95 latency, RSS, payload, stage breakdown on ARM;
-full-state cross-platform determinism check. 🚫 **hardware-gated** (no Nano attached).
+**Hardware changed: a Jetson AGX Orin Developer Kit is attached and measured, so
+E7 is no longer fully blocked.** The original Nano cell stays 🚫 (no Nano) — Orin
+is a far larger part (12× Cortex-A78AE @ 2.2 GHz, 64 GB) and **does not stand in
+for it**; read the numbers below as "embedded ARM, upper end", not "Nano".
+
+**Protocol deviation, stated up front.** E7 rides **SceneNN 016** (5 cm **and
+3 cm**, stride 1, oracle NYU-40 labels, 393 frames), *not* the §2 principal
+protocol — SceneNN is
+what is staged on the Jetson, and the native build (no container) is the one that
+exists there. E7 is therefore **descriptive and self-comparing**: Orin-vs-Orin
+across configurations. It is **not** cross-platform comparable to the E5 desktop
+cells, and no number here is evidence for or against H5.1.
+
+**Operating point.** The fastest configuration that still keeps a usable TSDF —
+`enable_tsdf:=true sdf_trunc_voxels:=1 batch_free_carve:=false`, range 0.5–3.5 m
+(`trunc1` in `scenenn_fps_sweep.sh`). This is **not the shipped default**: it buys
+speed by narrowing the TSDF band to ±1 voxel *and* dropping batched free-space
+carving, so the free-space map is not maintained. The shipped default is measured
+alongside as the honest floor. Both trades are named in every table row. The same
+two configs are run at **5 cm and 3 cm** (`RES=` on the harness); nothing else
+changes between them.
+
+**Measured — Orin, n=3 timing runs, last 200 frames, run-to-run SD reported.**
+Two resolutions, identical protocol.
+
+| res | config | mean ms | p50 | p95 | p99 | **Hz** | RTF@25 Hz | CPU (% of 1 core) | RSS MB | grid MB (core / +TSDF) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **5 cm** | fast (±1 band, carve off) | **185.3 ± 0.6** (SD 0.35%) | 184.0 | 193.4 | 198.6 | **5.40** | 4.63 | 64.5 | 76.5 | 3.081 / 5.107 |
+| **5 cm** | shipped default (±3 band, carve on) | 421.6 | 415.4 | 462.4 | 469.5 | 2.37 | 10.54 | 100.9 | 316.4 | 3.088 / 5.117 |
+| **3 cm** | fast (±1 band, carve off) | **221.0 ± 0.3** (SD 0.12%) | 219.3 | 232.6 | 235.4 | **4.52** | 5.53 | 77.0 | 78.0 | 3.711 / 5.779 |
+| **3 cm** | shipped default (±3 band, carve on) | 695.9 | 690.5 | 779.9 | 798.9 | 1.44 | 17.40 | 100.7 | 529.0 | 5.737 / 7.819 |
+
+**E7.1 The frame cost is single-threaded CPU-bound work — confirmed, not assumed.**
+Integrating process CPU-seconds over each run and dividing by Σ`frame_ms` gives
+**0.99–1.01** on every run. One core's worth of compute, nothing blocked, nothing
+parallel. This is the one C5 premise E7 *does* support cleanly.
+
+**E7.2 Sustained rate is loader-limited, so "sustained Hz" here measures the
+harness, not SCovox.** The Python replay decodes a label PNG (PIL) and copies
+~2 MB of image bytes per frame; it caps out near **3.4 Hz**. At the fast point the
+mapper (5.40 Hz capable) is therefore **starved — idle 35% of wall clock** — and
+end-to-end throughput reads 3.43 Hz. The control is decisive: at the *shipped*
+default the mapper (2.37 Hz) is slower than the loader, duty rises to **101%**, and
+end-to-end equals per-frame (2.38 vs 2.37 Hz). **Report `1000/mean(frame_ms)`; a
+genuine sustained-rate cell needs a pre-decoded in-RAM loader and does not exist
+yet.**
+
+**E7.3 Negative result: neither resolution meets the sensor rate on embedded ARM.**
+Against SceneNN's 25 Hz, RTF is **4.63** (5 cm fast), **10.54** (5 cm shipped),
+**5.53** (3 cm fast) and **17.40** (3 cm shipped). Even against a 10 Hz sensor the
+best cell is RTF 1.85. C5's "meets sensor rates" is **not supported at either
+resolution on this hardware in any configuration measured** — and the 5.40 Hz best
+case already spends the free-space map and most of the TSDF band to get there.
+Threading or the sensor rate has to give; **dropping resolution does not rescue it**,
+because 5 cm is only 19% cheaper than 3 cm at the armed point (E7.7). This is a
+real constraint on the claim as worded, not a tuning gap.
+
+**E7.4 RSS is not map size — the Orin data makes this unmissable.** At 5 cm RSS
+differs **4.1×** between configs (76.5 vs 316.4 MB) while the grids differ by
+**0.2%** (5.107 vs 5.117 MB); at 3 cm it is **6.8×** (78.0 vs 529.0 MB) against a
+**35%** grid difference (5.779 vs 7.819 MB). In both cases RSS overstates the map
+by roughly an order of magnitude: carving touches far more voxels transiently and
+the allocator keeps the arena. Only `[memSplit]` bytes are a memory result.
+
+**E7.5 Block fill, not struct size, sets grid bytes — until fill saturates (feeds
+E4/S1 leg 3).** At **5 cm**, turning carving on takes the Beta grid from 11 390 to
+**40 542** active voxels — 3.6× the content — for **+0.007 MB** (2.025 → 2.032 MB),
+because leaf fill absorbs it (0.158 → 0.415): allocated bytes/voxel fall 186 → 53 B.
+At **3 cm** that free ride ends — 39 860 → **175 727** voxels (4.4×) costs
+**+98%** (2.065 → 4.093 MB) as fill goes 0.223 → **0.574** and new leaves must
+actually be allocated. **So "carving is nearly free in memory" is a sparsity
+artifact, not a property of the encoding**, and the analytical 16 B/voxel is a
+struct fact that predicts neither number. E4's measured cell must report
+`[memBlocks]` fill next to `[memSplit]` MB, at every resolution it claims.
+
+**E7.6 Stage split on ARM (2-way, `fused_walker:=false`, n=1).** The shipped log
+cannot attribute cost at this operating point: under the fused walker
+`semdirTimeUs()` is **0 by design** and `tsdf_ms` carries the whole combined walk
+(`scovox_map_split.hpp:566-569`) — so the `tsdf_ms=161` in the table above is *not*
+TSDF cost. Splitting the brackets:
+
+| bracket | 5 cm ms | of frame | 3 cm ms | of frame |
+|---|---|---|---|---|
+| semantic substrate (Beta+Dirichlet) | **115.8** | 63% | **160.4** | 70% |
+| TSDF substrate | 45.5 | 25% | 45.0 | 20% |
+| caller work outside both (deproject, label, normals) | 21.9 | 12% | 22.7 | 10% |
+
+**The semantic substrate costs 2.5–3.6× the TSDF substrate**, and it is the only
+bracket that grows with resolution — **the TSDF bracket is flat (45.5 → 45.0 ms)**,
+as the window argument in E7.7 predicts. Two honest qualifiers: this is the
+±1-band config, which deliberately minimises TSDF, so the *ratio* is favourable to
+that reading by construction; and `sembeta_ms` is Beta and Dirichlet **combined**,
+not Dirichlet alone. It therefore does not directly refute **H5.2** ("Dirichlet
+cost … <15% of frame") — but it does mean H5.2 cannot be settled from this
+counter, and the 5-way `perf` split is the test that can.
+
+**E7.7 Resolution scaling splits by whether the far-voxel skip is armed — and the
+mechanism is exact, not fitted.** With `sem_band = 0` (the default, unplumbed) and
+`h = res/2`, the skip threshold `(max(trunc+h, sem_band)+h)/res + 1` collapses to
+**`sdf_trunc_voxels + 2` voxels — independent of resolution**. So at
+`sdf_trunc_voxels:=1` the armed walker touches a 3-voxel window per ray at *both*
+5 cm and 3 cm, while the shipped config (carve on → skip inert) walks the whole
+ray, whose length in voxels scales as 1/res.
+
+| 5 cm → 3 cm | predicted | measured |
+|---|---|---|
+| fast (skip armed, window-bounded) | ~flat + grid-density cost | **+19.3%** (185.3 → 221.0 ms) |
+| shipped (skip inert, ray-bounded) | +66.7% (= 5/3 voxel-length) | **+65.1%** (421.6 → 695.9 ms) |
+
+The shipped arm lands within 1.6 points of the ray-length prediction. The fast
+arm's residual +19.3% is grid density, not path length — confirmed by the stage
+split, where the **TSDF bracket is flat across resolutions (45.5 → 45.0 ms)** while
+the semantic bracket grows 115.8 → 160.4 ms with the 3.5× rise in active voxels.
+**Practical consequence: at the armed operating point, halving the voxel size is
+much cheaper than the usual 1/res intuition — the cost lives in voxel count, not
+ray length.**
+
+Voxel-count scaling matches geometry: surface-only (carve off) 11 390 → 39 860
+(**3.50×**, vs 2.78× for an ideal (5/3)² surface law) and free-space (carve on)
+40 542 → 175 727 (**4.33×**, vs 4.63× for the (5/3)³ volume law).
+
+**E7.8 The 5 cm non-fused anomaly does not replicate — treat it as noise.** At 5 cm
+`fused_walker:=false` ran 1% *faster* (183.2 vs 185.3 ms); at 3 cm it runs 3%
+*slower* (228.1 vs 221.0 ms). The sign flips, so the E7.6 lead is withdrawn: there
+is no evidence the non-fused path beats the fused walker.
+
+**Instrumentation cost is negligible** — `log_mem_usage:=true` (whole-grid walk
+every 10 frames) perturbs the frame mean by **+0.5%** at 5 cm and **−0.3%** at 3 cm
+(i.e. within noise), so memory and timing may be read from the same operating point.
+
+**Caveat on the environment:** an unrelated RViz session (running since 2026-08-05)
+was live during these runs at ~17% of one core, as it was for every earlier
+measurement in this investigation. On 12 cores it does not contend for the mapper's
+core, but the runs are not on an otherwise-idle machine.
+
+**E7-KITTI is 🚫 blocked on this machine — data, not code.** The Orin has **no
+SemanticKITTI at all**: both roots the harness expects
+(`$HOME/Projects/HMR_Exploration_Experiment/.../semantickitti/dataset` and
+`${WS}/data/semantickitti/dataset`) are absent, and a filesystem sweep finds no
+`.label` files, no `velodyne/`, no `predictions_topk/`. Three things must land
+before the KITTI cells can run here, and only the first is a download:
+1. **scans + labels** — seq 06–10 velodyne/labels is >13 GB; the Jetson has a
+   single 57.8 GB eMMC with **11 GB free** and no external mount, so this needs
+   disk provisioning, not just a fetch;
+2. **PolarNet top-K predictions** (`sequences/<seq>/predictions_topk`) — the §2
+   protocol's soft evidence. No torch/onnxruntime is available on this box, so
+   these must be produced off-robot and shipped in;
+3. a resolution decision — the §2 KITTI principal is **10 cm**, so "both
+   resolutions" is read here as **10 cm + 5 cm** (the principal and the SceneNN
+   headline), *not* 5/3 cm; 3 cm on 80 m outdoor LiDAR is a different experiment
+   and is not assumed.
+
+None of the Orin numbers above depend on this; the existing KITTI cells elsewhere
+in the plan are desktop numbers and are unaffected.
+
+**Still open in E7:** Nano cell (🚫 hardware) · **KITTI cells (🚫 data, above)** ·
+sustained-rate cell (needs the RAM loader, E7.2) · payload/bandwidth on ARM ·
+**full-state cross-platform determinism check** — partial evidence only: the
+far-skip A/B (`det1` vs `SCOVOX_DISABLE_FAR_SKIP=1`) is bit-identical across all 13
+npz fields on aarch64, which tests *that change*, not Orin-vs-x86 agreement.
+
+Harness: `experiments/scovox_eval/scripts/scenenn_e7_embedded.sh` (voxel size via
+`RES=`, default 0.05) + `scenenn_e7_report.py`; raw logs/telemetry in
+`experiments/results/scenenn/016/e7/` (5 cm) and `…/e7_r03/` (3 cm). Depth:
+`docs/scenenn_jetson_run.md`.
 
 ### A — Supporting ablations · P2  *(anchors, n=1, descriptive)*
 κ₀/α₀ · S_max sweep (**A8** below) · quality-weighting on/off · carve band ·
@@ -501,7 +674,7 @@ appendix material).
 | C2 semantic | ✅ dual-mIoU (n=1) | KITTI encoding † · rule sweeps at n=3 · K_top sweep → **S1** · SLIM-VDB col 🚫 (*external* "competitive" only — internal sufficiency lives in S) |
 | C3 uncertainty | ✅ calibration/decomp; ⬜ E3.3 validation | **E3.3 injectors** · SceneNet-soft E3.2 · KITTI encoding † · SLIM-VDB col 🚫 |
 | C4 memory | ✅ analytical (16 B, 3.5–5.0×); 🔧 measured (n=1) | grid MB (core/TSDF `[memSplit]` lines) · scaling · n=3 · OctoMap col (buildable, core config) |
-| C5 CPU | ✅ RTF + 2-way split (n=1) | 5-way perf split (buildable) · scaling · n=3 · (E7 hardware) |
+| C5 CPU | ✅ RTF + 2-way split (n=1) · **E7 Orin n=3 ✅** | 5-way perf split (buildable) · scaling · n=3 · **⚠ E7.3 contradicts "meets sensor rates" at 5 cm on ARM (RTF 4.63 best case) — the claim needs rewording or a resolution/threading qualifier** · E7 sustained-rate cell (loader-bound) · Nano 🚫 |
 | C6 fusion | ✅ disjoint only | FOV/redundant · centralised bound (both K cells) · **E6.2 bandwidth spec ①–④** · consistency (late-join = outage cell) · **loss cell** · **E6.6 significance gate** (τ/κ arms in code; needs heartbeat + baselines + Dirichlet-trigger decision) · **E6.7 message-size sweep** · **E6.8 ROAM distributed baseline** (buildable — source public) |
 | **S sufficiency (thesis)** | 🔧 E3.4 selftest ✅ · H3.1 p_OTHER signal ✅ (†) | **S1 four-leg K_top campaign** (incl. exposure statistic) · **S2 fused-fold 2×2** · A7 OTHER ablation |
 
@@ -560,7 +733,13 @@ appendix material).
   below)* · keep deferred. Until resolved, the SLIM-VDB *columns* are blank (C2/C3
   "competitive", H1.2, H2.1 wait on it); SCovox own-numbers + the OctoMap column stand
   alone.
-- **E7 embedded** 🚫 — needs a Jetson Nano.
+- **E7 embedded** 🔧 — **partially unblocked**: an AGX Orin is attached and E7 is
+  measured on it at **5 cm and 3 cm** (n=3, see E7). Still blocked: the **Nano**
+  cell (no Nano; Orin is not a substitute); the **sustained-rate** cell, gated on a
+  pre-decoded in-RAM replay loader rather than on hardware — the current Python
+  loader caps at ~3.4 Hz and starves the mapper (E7.2); and the **E7-KITTI** cells,
+  gated on staging SemanticKITTI + PolarNet top-K onto the Jetson (>13 GB against
+  11 GB free, and no inference stack on-box — see E7).
 
 **Were false blockers → now buildable.**
 - **E6.4 network robustness** — *not* netem-gated **and no longer a factorial**:
