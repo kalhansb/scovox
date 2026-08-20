@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -197,6 +198,11 @@ class ScovoxMapSplit {
 
     const auto& tparams = tsdf_.params();
     const float trunc = tparams.sdf_trunc;
+    // `grid` below was constructed from this exact double (TsdfMap's ctor
+    // passes its sanitised params_.resolution through unchanged), so
+    // `(double)c.x * res` in visit_one reproduces grid.coordToPos()
+    // bit-for-bit. Hoisted here so the DDA loop pays no accessor call.
+    const double res  = tparams.resolution;
     const float h     = 0.5f * static_cast<float>(tparams.resolution);
 
     // SLIM-VDB-style flat semantic band (Params::semantic_band_length). Decided
@@ -233,17 +239,69 @@ class ScovoxMapSplit {
     const auto k_far = grid.posToCoord(end_pos.x(),   end_pos.y(),   end_pos.z());
     const auto k_hit = grid.posToCoord(endpoint.x(),  endpoint.y(),  endpoint.z());
 
+    // Far-voxel skip. When free-space carving is a guaranteed no-op — a carve
+    // frame is open (the live pipeline) AND batch_free_carve=false, so
+    // applyCarveUpdate returns before touching any state — and space_carving
+    // is off (the upper TSDF band gate is active), a voxel far enough from
+    // the hit can produce NO observable write:
+    //   - TSDF band:  front voxels beyond trunc+h fail `sdf <= trunc + h`;
+    //     the walk never extends more than back_reach behind the hit, so
+    //     every behind-surface voxel stays inside the threshold.
+    //   - semantic band: |sdf| <= sem_band_ fails beyond the threshold.
+    //   - carve: the no-op above, which also returns true, so carve_blocked
+    //     latches identically with or without the skip.
+    // The threshold is Chebyshev distance in COORD units because the DDA and
+    // the voxel-centre geometry are max-norm; +1 is a guard ring absorbing
+    // float rounding at the gate boundaries (endpoint-inside-voxel offset is
+    // < h·√3 < res). Computed in double and clamped BEFORE the int cast so an
+    // absurd sdf_trunc cannot overflow the cast into "skip everything".
+    const bool far_skip = !far_skip_disabled_
+                       && !tparams.space_carving
+                       && semsplit_.carveFrameOpen()
+                       && !semsplit_.params().batch_free_carve;
+    int64_t far_thr = 0;
+    if (far_skip) {
+      const double thr_vox =
+          (std::max(static_cast<double>(trunc) + h,
+                    static_cast<double>(sem_band_)) + h) / res + 1.0;
+      far_thr = (thr_vox >= static_cast<double>(std::numeric_limits<int64_t>::max()))
+          ? std::numeric_limits<int64_t>::max()
+          : static_cast<int64_t>(thr_vox);
+    }
+
     const auto tsdf_weight_fn = TsdfMap::constant(1.0f);  // SLIM-VDB default
     bool carve_blocked = false;
     bool k_hit_visited = false;
 
     auto visit_one = [&](const CoordT& c) {
+      // Three integer subtractions replace the whole float body on far
+      // voxels (see the derivation above). The hit voxel is at distance 0,
+      // so k_hit can never be skipped and the flag below stays correct.
+      if (far_skip) {
+        const int64_t dx = static_cast<int64_t>(c.x) - k_hit.x;
+        const int64_t dy = static_cast<int64_t>(c.y) - k_hit.y;
+        const int64_t dz = static_cast<int64_t>(c.z) - k_hit.z;
+        if (dx > far_thr || -dx > far_thr ||
+            dy > far_thr || -dy > far_thr ||
+            dz > far_thr || -dz > far_thr) {
+          return;
+        }
+      }
+
       if (c == k_hit) k_hit_visited = true;
 
-      const auto p = grid.coordToPos(c);
-      const Eigen::Vector3f vc(static_cast<float>(p.x) + h,
-                               static_cast<float>(p.y) + h,
-                               static_cast<float>(p.z) + h);
+      // Inlined grid.coordToPos(c): identical double multiply (`res` is the
+      // grid's own resolution), identical float narrowing order — the product
+      // narrows to float BEFORE the +h add, as coordToPos's double return did
+      // via static_cast<float>(p.x). An all-double form narrowed once at the
+      // end rounds differently on 244 of 801 coords at res=0.05 — enough to
+      // land a centre exactly on the ray origin or endpoint, where proj
+      // collapses to 0 and the voxel takes the degeneracy return below.
+      // Covered by AxisAlignedTsdfValuesBitIdenticalToSplitWalker.
+      const Eigen::Vector3f vc(
+          static_cast<float>(static_cast<double>(c.x) * res) + h,
+          static_cast<float>(static_cast<double>(c.y) * res) + h,
+          static_cast<float>(static_cast<double>(c.z) * res) + h);
       const Eigen::Vector3f v_voxel_origin = vc - origin;
       const Eigen::Vector3f v_point_voxel  = endpoint - vc;
       const float dist = v_point_voxel.norm();
@@ -333,6 +391,15 @@ class ScovoxMapSplit {
     // sem_ns_ untouched on the fused path (it reads 0). For a true per-substrate
     // split, run the non-fused integrateHitSplit walker, which times the two
     // DDAs separately. See tsdfTimeUs()/semdirTimeUs() docs.
+    //
+    // This bracket is PER RAY, deliberately. A cheaper once-per-scan bracket in
+    // beginCarveFrame/flushCarveFrame was tried and reverted: it also swallows
+    // the caller's per-pixel deproject/label/normal work, which silently
+    // redefines tsdf_ms from "the walker" to "the whole scan loop" under an
+    // unchanged log token (~+12 ms on SceneNN — several times larger than the
+    // ~2.1 ms of clock overhead it saves) and double-counts on the non-fused
+    // path, whose own brackets sit inside it. Scope comparability with
+    // SLIM-VDB's Integrate+Prune column depends on this staying per-walker.
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
 
@@ -487,6 +554,14 @@ class ScovoxMapSplit {
   /// loop interleaves both substrates and is not separable without per-voxel
   /// clock overhead. Only the non-fused integrateHitSplit / integrateMiss paths
   /// attribute TSDF and semantic time to separate accumulators.
+  ///
+  /// Scope is the RAY WALKS PLUS THE CARVE FLUSH, and nothing else — in
+  /// particular it excludes the caller's per-pixel/per-point preparation
+  /// (deproject, label lookup, normals, deskew). Downstream `tsdf_ms` columns
+  /// are quoted as walker-scope against SLIM-VDB's Integrate+Prune; do not
+  /// widen this bracket without renaming the field. A once-per-scan bracket
+  /// spanning beginCarveFrame→flushCarveFrame was tried and reverted for
+  /// exactly that reason (see integrateHitFused).
   std::int64_t tsdfTimeUs()   const noexcept { return tsdf_ns_ / 1000; }
   /// Accumulated semantic-substrate time. On the fused walker this is 0 by
   /// design (the combined cost is reported under tsdfTimeUs()); it is non-zero
@@ -562,6 +637,16 @@ class ScovoxMapSplit {
   double resolution() const { return resolution_; }
 
  private:
+  /// A/B kill-switch for the far-voxel skip in integrateHitFused. Latched from
+  /// the environment ONCE, at construction, PER INSTANCE — not per process —
+  /// so one binary (or one test process) can host a full-walk map and a
+  /// skipping map side by side: set SCOVOX_DISABLE_FAR_SKIP before
+  /// constructing the first, unset it before constructing the second.
+  static bool envFarSkipDisabled() noexcept {
+    const char* e = std::getenv("SCOVOX_DISABLE_FAR_SKIP");
+    return e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }
+
   // -------------------------------------------------------------------
   // Fine-band internals
   // -------------------------------------------------------------------
@@ -667,6 +752,9 @@ class ScovoxMapSplit {
   /// both band and spread reads 0 here and the walker's band branch stays cold.
   /// Declared after semsplit_ so the ctor's member-init order is valid.
   float       sem_band_;
+  /// See envFarSkipDisabled() — per-instance A/B kill-switch, read here at
+  /// construction time.
+  bool        far_skip_disabled_ = envFarSkipDisabled();
 
   // Fine TSDF band state (null / empty when fine_ratio_log2 == 0).
   std::unique_ptr<TsdfMap>    fine_tsdf_;
