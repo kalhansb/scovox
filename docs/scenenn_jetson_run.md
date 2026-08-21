@@ -522,6 +522,20 @@ captured cloud to confirm semantics are present.
 
 ## E7 embedded feasibility — measured (AGX Orin, repo build `962a9c1`)
 
+> ✅ **PROMOTED 2026-08-21 — SCOPED TO SCENENN.** On the user's instruction
+> *"Set E7 done only with scenenn results"*, this section is claim-bearing and
+> the E7 cell is **done**. Promoted copy: `experiments/RESULTS.md` **Part XI**;
+> decision recorded in `experiments/PLAN.md` **rev 58**. The SceneNN scope is
+> binding and "done" does not widen it: this is an **AGX Orin, not the Jetson
+> Nano E7 was specified against** (read it as *"embedded ARM, upper end"*, never
+> as a Nano estimate), and there is **no KITTI leg** — see the end of this
+> section for why none can be produced from this box. Three caveats are promoted
+> *with* the numbers and are not detachable: sustained Hz is not readable off
+> this harness, neither resolution meets the sensor rate, and RSS overstates the
+> map by ~an order of magnitude. This section is hand-written — the scripts emit
+> logs and a report, not this prose — so the banner lives here rather than in a
+> generator.
+
 ```bash
              ./experiments/scovox_eval/scripts/scenenn_e7_embedded.sh 400 016   # 5 cm
 RES=0.03     ./experiments/scovox_eval/scripts/scenenn_e7_embedded.sh 400 016   # 3 cm
