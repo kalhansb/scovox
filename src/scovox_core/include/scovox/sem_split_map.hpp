@@ -106,8 +106,9 @@ class SemSplitMap {
     /// snapshots this halves the allocated slots (fill 12% → 25%) and cuts the
     /// Dir grid ~55%; 1 (2³) saves a further ~20% but makes per-leaf
     /// bookkeeping ~48% of the grid and is slower to write.
-    /// Clamped into [1, leaf_bits] by sanitise(), so a leaf_bits=1 sparse-LiDAR
-    /// config is byte-identical to before.
+    /// Clamped into [1, leaf_bits] by sanitise(), so a leaf_bits=1 config is
+    /// byte-identical to before. (The LiDAR configs no longer set 1 — see
+    /// MapParams::leaf_bits.)
     uint8_t dir_leaf_bits              = 2;
 
     float   w_occ                      = 1.0f;   ///< Beta a_occ increment per hit (Stream A)

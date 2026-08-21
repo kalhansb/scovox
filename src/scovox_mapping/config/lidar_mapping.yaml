@@ -29,7 +29,12 @@
     # --- Voxel grid ------------------------------------------------------
     resolution: 0.10          # voxel edge length [m]
     inner_bits: 2             # Bonxai inner node = 2^2 = 4 blocks per side
-    leaf_bits:  1             # leaf = 2^1 = 2 voxels per side (sparse outdoor LiDAR)
+    leaf_bits:  3             # leaf = 2^3 = 8 voxels per side. Was 1 ("sparse
+                              # outdoor LiDAR") until 2026-08-21; reserved
+                              # decision ⑤ took it to 3 on E8.2 stage 2 — the
+                              # map is bit-identical across all leaf_bits arms,
+                              # so 1 was buying no accuracy while costing
+                              # −31.81 ms frame p50 and −69.38 MB RSS.
 
     # --- Occupancy (Beta) evidence weights -------------------------------
     # Sensor-physics defaults for a LiDAR time-of-flight sensor: very low
