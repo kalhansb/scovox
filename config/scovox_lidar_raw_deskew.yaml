@@ -84,7 +84,7 @@
     # --- Voxel grid ------------------------------------------------------
     resolution: 0.10
     inner_bits: 2
-    leaf_bits:  1
+    leaf_bits:  3             # was 1; reserved decision ⑤ (2026-08-21, E8.2)
 
     # --- Occupancy (Beta) evidence weights -------------------------------
     w_occ:  8.0
