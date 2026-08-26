@@ -64,10 +64,9 @@ scovox/                     ← the colcon workspace root (build from HERE)
 └── README.md, compose.yaml
 ```
 
-**Ignore for mapping work:** everything under `build*`, `install*`, `log`,
-`experiments/`, and any `scovox_paper_code` snapshot. They contain copies of
-the source that are *not* the live code; a grep that lands there wastes your
-edit.
+**Ignore for mapping work:** everything under `build*`, `install*`, `log`, and
+`experiments/`. They contain copies of the source that are *not* the live code;
+a grep that lands there wastes your edit.
 
 ## 3. `scovox_core` — the reusable library
 
