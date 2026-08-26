@@ -1,6 +1,6 @@
 # SCovox reproduction on the `scovox` repo — results
 
-Experiments from `scovox_paper_code` rerun against the `scovox` repository
+Experiments from the original paper code rerun against the `scovox` repository
 (system under test). Datasets staged under `scovox_ws/data/`, harness under
 `scovox_ws/experiments/`.
 

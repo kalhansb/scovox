@@ -11,8 +11,8 @@ is quoted it comes from the earlier measured campaigns and is labelled as such;
 everything else is an estimate from reading the code.
 **Scope:** `scovox_mapping` + `scovox_core` live code, and
 [dscovox_node.cpp](../../src/scovox_mapping/src/dscovox_node.cpp). Excludes
-`scovox_paper_code`, experiments, and offline tooling (marching cubes noted
-briefly since it backs a live publisher).
+experiments and offline tooling (marching cubes noted briefly since it backs a
+live publisher).
 **Non-goals:** re-scoping the per-ray timing brackets to per-scan (that exact
 change was tried and reverted as a defect — it silently changed what `tsdf_ms`
 measures under an unchanged log token); any change to `batch_free_carve`
