@@ -14,10 +14,30 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra)
 endif()
 
-find_package(ament_cmake REQUIRED)
+# Dual build.  scovox_core is declared "zero ROS dependencies" and every one of
+# its test binaries links only scovox_core + Eigen, so the ament layer here is
+# pure packaging.  Finding it QUIET rather than REQUIRED lets the same file
+# build two ways from one source of truth:
+#
+#   inside a ROS 2 workspace   ament_cmake is found; ament_add_gtest registers
+#                              the suites and the package is exported to colcon.
+#   plain cmake, no ROS        GTest is found directly and gtest_discover_tests
+#                              registers the same suites with ctest.
+#
+# The library, its sources, its include dirs and its tests are declared exactly
+# once.  A standalone mirror of this file previously lived out-of-tree and had
+# already drifted -- it silently skipped test_carve_stage, so seven cases were
+# reported as passing while never being built.  Structurally that cannot recur.
+find_package(ament_cmake QUIET)
 find_package(Eigen3 REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LZ4 REQUIRED liblz4)
+
+if(ament_cmake_FOUND)
+  message(STATUS "scovox_core: ament build (ROS 2 workspace)")
+else()
+  message(STATUS "scovox_core: standalone build (plain cmake, no ROS)")
+endif()
 
 # ==================================================================
 # Core library: scovox_core (zero ROS dependencies)
@@ -46,54 +66,73 @@ target_include_directories(scovox_core PUBLIC ${LZ4_INCLUDE_DIRS})
 # Tests (GTest, no ROS dependencies)
 # ==================================================================
 
-find_package(ament_cmake_gtest REQUIRED)
+if(ament_cmake_FOUND)
+  find_package(ament_cmake_gtest REQUIRED)
+else()
+  find_package(GTest REQUIRED)
+  include(GoogleTest)
+  enable_testing()
+endif()
 
-ament_add_gtest(test_uncertainty test/test_uncertainty.cpp)
+# One call site, two registration backends.  Uses the plain (non-keyword)
+# target_link_libraries signature because every call below links its target the
+# same way, and cmake forbids mixing the two forms on one target.
+function(scovox_add_gtest name)
+  if(ament_cmake_FOUND)
+    ament_add_gtest(${name} ${ARGN})
+  else()
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name} GTest::gtest GTest::gtest_main)
+    gtest_discover_tests(${name} DISCOVERY_TIMEOUT 60)
+  endif()
+endfunction()
+
+scovox_add_gtest(test_uncertainty test/test_uncertainty.cpp)
 target_link_libraries(test_uncertainty scovox_core Eigen3::Eigen)
 
-ament_add_gtest(test_sparse_add test/test_sparse_add.cpp)
+scovox_add_gtest(test_sparse_add test/test_sparse_add.cpp)
 target_link_libraries(test_sparse_add scovox_core Eigen3::Eigen)
 
 # Step-1 gate of the split-grid refactor (see docs/design/slimvdb_like_tsdf_mapping_plan.md):
 # forces tsdf_voxel.hpp and sembeta_voxel.hpp through the compiler so the
 # header-side static_asserts on layout / sizes / triviality fire.
-ament_add_gtest(test_voxel_layouts test/test_voxel_layouts.cpp)
+scovox_add_gtest(test_voxel_layouts test/test_voxel_layouts.cpp)
 target_link_libraries(test_voxel_layouts scovox_core Eigen3::Eigen)
 
 # Step-2 gate: TsdfMap parity (Euclidean SDF, voxel CENTRE, per-voxel weight)
 # + Curless-Levoy fundamentals + drainTouched semantics.
-ament_add_gtest(test_tsdf_map test/test_tsdf_map.cpp)
+scovox_add_gtest(test_tsdf_map test/test_tsdf_map.cpp)
 target_link_libraries(test_tsdf_map scovox_core Eigen3::Eigen)
 
 # Step-4 gate: TSDF-typed extractMesh / extractZeroCrossing / extractPointCloud
 # overloads + free labelMesh / labelPointCloud functions.
-ament_add_gtest(test_mesh_labelling test/test_mesh_labelling.cpp)
+scovox_add_gtest(test_mesh_labelling test/test_mesh_labelling.cpp)
 target_link_libraries(test_mesh_labelling scovox_core Eigen3::Eigen)
 
 # Step-5 gate: ScovoxMapSplit composer end-to-end (integrate, mesh, drain).
-ament_add_gtest(test_scovox_map_split test/test_scovox_map_split.cpp)
+scovox_add_gtest(test_scovox_map_split test/test_scovox_map_split.cpp)
 target_link_libraries(test_scovox_map_split scovox_core Eigen3::Eigen)
 
 # Split Beta/Dirichlet substrate (SemSplitMap): de-unifies SemDir into a
 # BetaVoxel occupancy grid + DirVoxel semantics grid. Layout/prior, two-stream
 # update, STRICT per-grid mass conservation, gate + sparse-semantics memory win.
-ament_add_gtest(test_sem_split_map test/test_sem_split_map.cpp)
+scovox_add_gtest(test_sem_split_map test/test_sem_split_map.cpp)
 target_link_libraries(test_sem_split_map scovox_core Eigen3::Eigen)
 
 # Batched-carve staging substrate (CarveStage): differential gate vs the
 # retired unordered_map + per-scan-sort staging — identical staged set /
 # max weights / block visit order (efficiency_audit_2026_08_26.md item 1).
-ament_add_gtest(test_carve_stage test/test_carve_stage.cpp)
+scovox_add_gtest(test_carve_stage test/test_carve_stage.cpp)
 target_link_libraries(test_carve_stage scovox_core Eigen3::Eigen)
 
 # Wire format (triple-stream: TSDF + BetaVoxel + DirVoxel) round-trip +
 # header/size/truncation validation.
-ament_add_gtest(test_binary_serializer test/test_binary_serializer.cpp)
+scovox_add_gtest(test_binary_serializer test/test_binary_serializer.cpp)
 target_link_libraries(test_binary_serializer scovox_core Eigen3::Eigen)
 
 # Consensus merge: independent BetaVoxel + DirVoxel conjugate merges,
 # per-grid mass conservation, frame-level prior assertions.
-ament_add_gtest(test_consensus_merge test/test_consensus_merge.cpp)
+scovox_add_gtest(test_consensus_merge test/test_consensus_merge.cpp)
 target_link_libraries(test_consensus_merge scovox_core Eigen3::Eigen)
 
 # Fine TSDF band (fine_tsdf_band_dbh_2026_07_30.md): region registry gate,
@@ -101,7 +140,7 @@ target_link_libraries(test_consensus_merge scovox_core Eigen3::Eigen)
 # absorption), raw-return fine-only path (refineHit), rev-7 fine wire
 # stream + merge. Uses the DBH circle fit (dbh_fit.hpp, a post-processing
 # utility the mapping runtime never calls) as its accuracy metric.
-ament_add_gtest(test_fine_tsdf test/test_fine_tsdf.cpp)
+scovox_add_gtest(test_fine_tsdf test/test_fine_tsdf.cpp)
 target_link_libraries(test_fine_tsdf scovox_core Eigen3::Eigen)
 
 # ==================================================================
@@ -136,9 +175,26 @@ install(DIRECTORY include/third_party/bonxai
 # Ament exports
 # ==================================================================
 
-ament_export_include_directories(include include/third_party/bonxai)
-ament_export_libraries(scovox_core)
-ament_export_targets(scovox_core_export HAS_LIBRARY_TARGET)
-ament_export_dependencies(Eigen3)
-
-ament_package()
+if(ament_cmake_FOUND)
+  ament_export_include_directories(include include/third_party/bonxai)
+  ament_export_libraries(scovox_core)
+  ament_export_targets(scovox_core_export HAS_LIBRARY_TARGET)
+  ament_export_dependencies(Eigen3)
+  ament_package()
+else()
+  # The same export set, installed by hand so a non-ROS consumer can
+  # find_package(scovox_core) and link scovox_core::scovox_core.
+  include(CMakePackageConfigHelpers)
+  install(EXPORT scovox_core_export
+          FILE scovox_coreTargets.cmake
+          NAMESPACE scovox_core::
+          DESTINATION lib/cmake/scovox_core)
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/scovox_coreConfig.cmake"
+"include(CMakeFindDependencyMacro)\nfind_dependency(Eigen3)\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/scovox_coreTargets.cmake\")\n")
+  write_basic_package_version_file(
+          "${CMAKE_CURRENT_BINARY_DIR}/scovox_coreConfigVersion.cmake"
+          VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/scovox_coreConfig.cmake"
+                "${CMAKE_CURRENT_BINARY_DIR}/scovox_coreConfigVersion.cmake"
+          DESTINATION lib/cmake/scovox_core)
+endif()
