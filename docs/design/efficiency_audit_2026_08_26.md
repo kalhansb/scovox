@@ -40,6 +40,10 @@ The problems below are mostly *around* well-optimized cores, not in them:
 
 ### 1. Free-space carving pays a full float body + a hash probe per walked voxel, and the far-skip cannot arm
 
+**Status, part (a): IMPLEMENTED 2026-08-26 (Run 7a, edit-only — build/test/digests deferred to the batched pass).** New `carve_stage.hpp` (`CarveStage`): staging keyed by leaf block (`coord >> leaf_bits`) into a reused open-addressed index (Teschner-prime hash, load ≤ ½) of dense per-block weight arrays + occupancy bitmask, with a last-leaf cache for ray-coherent adds; flush sorts only the block keys (same ascending `(x>>lb,y>>lb,z>>lb)` order the retired per-voxel sort produced — root-map first-touch order and hence serialized bytes preserved; within-block order was never observable) and walks the bitmask. Replaces the `unordered_map<CoordT,float>` member and the per-scan sort in `flushCarveFrame`. Differential gate `test_carve_stage.cpp` (vs the retired staging verbatim: staged set, max weights, block sequence; lb=1 and 3, negative coords, index growth, frame reuse). Part (b) is Run 7b.
+
+**Status, part (b): IMPLEMENTED 2026-08-26 (Run 7b, edit-only — build/test/digests deferred to the batched pass).** Far-voxel fast CARVE in `integrateHitFused`: the `batch_free_carve=true` counterpart of the far skip. Arms on `!space_carving && carveFrameOpen() && batch_free_carve && depth >= trunc` (mutually exclusive with the skip via the batch flag); beyond the SAME `far_thr` a voxel's exact body reduces to the carve branch alone (TSDF and band gates provably fail; no behind-surface voxel reaches `far_thr`; `depth >= trunc` keeps every walk voxel in front of the origin), so it is carved with integer-only Chebyshev tests — no `vc`/`dist`/`proj` floats — with the `carve_blocked` latch guard verbatim. Voxels within Chebyshev 2 of the EXACT origin voxel (recomputed via `posToCoord(origin)`, immune to the ±1 `k0` float-reconstruction wobble) fall through to the exact body, absorbing the `dist > carve_band` / `proj -> 0` degeneracies near the sensor. Kill-switch `SCOVOX_DISABLE_FAR_CARVE`, latched per instance like the skip's. Differential gate in `test_scovox_map_split.cpp` (`ScovoxMapSplitFarCarve`): byte-identity full-walk-vs-fast on the shipped batched config over both band arms plus short rays straddling `depth == trunc`, and a `space_carving=true` inertness config (the one observable arming conjunct). Post-review hardening: latch-canary accessors (`farSkipDisabled()`/`farCarveDisabled()`) asserted in both identity tests so a broken kill-switch latch cannot silently turn them into fast-vs-fast; and the numeric operating envelope the reduction rests on — |world coord|/res ≲ 8×10⁷, ray length/res ≲ 3×10⁷, an assumption shared with the far skip — documented at the arming site.
+
 **Where:**
 [sem_split_map.cpp#L235-L251](../../src/scovox_core/src/sem_split_map.cpp#L235-L251)
 (staging),
@@ -86,6 +90,8 @@ verification recipe used for the original far-skip is the acceptance gate.
 
 ### 2. Touched-set churn: duplicate pushes, per-scan sort — then discarded in the default config
 
+**Status: IMPLEMENTED 2026-08-26 (Run 4, edit-only — build/test deferred to the batched pass).** All `drainTouched*` now return a `const&` into a member scratch (swap, sort+unique in place — capacity recycled on both sides); the eight drain-and-discard sites in `publishBinaryMap` are O(n) clears (`clearTouchedBeta`/`clearTouchedDir` added); bonus: the two persistent-mode no-`bin_pub_` blocks also cleared Fine, fixing a latent unbounded-growth leak when refinement regions run without a binary subscriber.
+
 **Where:**
 [tsdf_map.cpp#L181](../../src/scovox_core/src/tsdf_map.cpp#L181) (push per
 band write),
@@ -127,6 +133,8 @@ allocator churn).
 
 ### 3. O(map) publishers on the single executor thread; cloud publishers have no dirty gate
 
+**Status: IMPLEMENTED 2026-08-26 (Runs 4+6, edit-only — NOT yet built/tested).** Run 4: per-publisher dirty gates `pc_dirty_`/`tsdf_pc_dirty_` (set via a single `markMapDirty()` at the three mutation sites, consumed after the subscriber gate so an unsubscribed tick keeps the flag, and a subscriber-count RISE re-arms one publish so a late/re-subscriber on a quiescent map is not stranded — review finding, mirrors `publishBinaryMap`'s `prev_sub_count_`); `extractZeroCrossing` reserve (+ conditional shrink); `publish_uncertainty_fields` param (default off) that OMITS posterior_variance/eig from the cloud schema — omission, not zero-fill, so `pointcloud_to_npz.py`'s `if name in fields` copy degrades gracefully (checked: it is the only live consumer, and the uncertainty campaign reads offline snapshots). Run 6: the executor change — viz timer (`sm_timer_`) moved to its own MutuallyExclusive callback group; `main()` now runs a 2-thread `MultiThreadedExecutor`; ALL other callbacks stay in the default (also mutually exclusive) group, so the serialization that the node's lock-free plain members rely on (`loc_*` gate state, `imu_buf_`, `di_`, dataset caches, `frame_recv_`) is preserved group-locally — audited every viz-path member: map state is under the timer's `shared_lock(map_mtx_)` (integration already takes unique at its two sites), dirty flags are atomics, and `pc_scratch_`/prev-sub-counts are written only inside the viz group. Net effect: an O(map) viz walk overlaps a scan's pre-lock phase (decode, TF, snapshot assembly) instead of occupying the sensor callbacks' executor slot; headless eval runs are unaffected (viz bodies early-out on zero subscribers). Four stale "SingleThreadedExecutor serializes…" comments rewritten to name the default-group guarantee.
+
 **Where:**
 [scovox_node.cpp#L3104](../../src/scovox_mapping/src/scovox_node.cpp#L3104)
 (single-threaded spin), timer at
@@ -163,6 +171,8 @@ eig/variance fill (default off).
 
 ### 4. Planning map: full-grid walk per scan for a fixed-size window, default ON
 
+**Status: IMPLEMENTED 2026-08-26 (Run 4, edit-only).** New file-local `forEachCellInBox` mirrors Bonxai's `forEachCell` descent but rejects whole root blocks (and leaf blocks, and cells) outside an inclusive coord box; `publishPlanningMap` derives the box from the window (±1 voxel slack; terrain mode leaves z open with ±INT32_MAX/2 sentinels) and keeps every per-cell predicate unchanged, so output is identical. Terrain column map is now the persistent member `plan_cols_`. Launch check PASSED: all 16 eval/experiment launches set `publish_planning_map: False`; only the operational single/multi-robot launches enable it.
+
 **Where:** called per scan at
 [scovox_node.cpp#L1763](../../src/scovox_mapping/src/scovox_node.cpp#L1763),
 body at
@@ -187,6 +197,8 @@ launches actually disable it, so it is not silently taxing benchmark runs.
 **Risk:** **low** — iteration-domain change only, identical output.
 
 ### 5. dscovox: full-map nested-vector message per dirty tick + double full-grid walk for the cloud
+
+**Status: IMPLEMENTED 2026-08-26 (Run 5, edit-only).** Viz cloud: `pc_dirty_` set on binary ingest, checked after a subscriber-rise re-arm (`pc_prev_subs_` atomic exchange before the zero-subscriber return, so detach→reattach counts as a rise on a KeepLast(1) non-latched topic); single collect pass into `static thread_local` scratch, then one sized fill — the count pass is gone. `regionOnGrid`: `reserve` bounded by min(`activeCellsCount()`, bbox volume) with per-axis extent guards, then a windowed walk via the shared `scovox::forEachCellInBox` (node_utils.hpp) using the clip's **own** `mn`/`mx` as the window, so the visited set equals the clip-accepted set for every request corner — responses byte-identical. `occupancyGridOnGrid`: z-band window (floor(z/res)±1 slack, ±INT32_MAX/2 sentinels for non-finite bounds); the metric per-cell predicate stays the sole membership authority. The delta topic stays parked (contract change).
 
 **Where:**
 [dscovox_node.cpp#L770-L787](../../src/scovox_mapping/src/dscovox_node.cpp#L770-L787)
@@ -219,6 +231,8 @@ in `regionOnGrid` via root keys. Longer term: publish the fused map as deltas
 
 ### 6. `publishScovoxMap` ships every carved free-space voxel
 
+**Status: IMPLEMENTED 2026-08-26 (Run 6, edit-only — NOT yet built/tested).** The consumer check came back decisive (fresh-agent enumeration of every `ScovoxMap` consumer): `explo_planner_node` in the sibling `hmr_explo_ws` workspace consumes free voxels as LOAD-BEARING input — frontier extraction requires `p_occ < 0.5` cells, coverage termination counts free-swept columns, and absent cells score as max-EIG unknown — and the coupling config lives inside this repo (`config/exploration_fused_bag.yaml`). So the filter is opt-in exactly as the ⚠ required: new param `scovox_occupied_only` (default **false** = ship everything, current behavior everywhere), which when enabled skips voxels with `p_occ() < min_occ_` — the same `occupancy_threshold` the message itself advertises, so a consumer that binarizes at the advertised threshold sees an identical occupied set. Safe to enable for `tree_detector_node` (already discards `p < occ_thresh`); `simple_nav_3d` uses the dscovox GetRegion service, not this topic; zero Python/bag/RViz consumers found.
+
 **Where:**
 [scovox_node.cpp#L1956-L1990](../../src/scovox_mapping/src/scovox_node.cpp#L1956-L1990).
 
@@ -238,7 +252,7 @@ from this topic, the filter must be opt-in.
 
 ### 7. Gate shadow grids: 40 B per emitted voxel, 16 B dead by default
 
-**Where:** allocation at
+**Status: IMPLEMENTED 2026-08-26 (Run 6, edit-only — NOT yet built/tested).** The `GateBeta`/`GateDir` wrapper structs are gone: `gate_beta_`/`gate_dir_` are now raw `VoxelGrid<BetaVoxel>` (8 B) / `VoxelGrid<DirVoxel>` (16 B), and the per-voxel `t_emit` doubles live in separate `VoxelGrid<double>` twins (`gate_beta_t_`/`gate_dir_t_`) allocated ONLY when `share_heartbeat_sec > 0` — so the default config sheds the full 16 B/voxel of dead stamp weight (40→24 B of shadow state). Stamp stays `double`, not float/u32: epoch seconds exceed float's exact-integer range, and the twin grid is heartbeat-armed-only so there is nothing to save by default. The twins are written in lockstep at EVERY wire emit (both snapshot and delta paths go through the same emit lambdas), which makes the twin's active set and Bonxai iteration order identical to the gate grid's — the heartbeat walk (extracted to `scovox::heartbeatReemit` in node_utils.hpp, shared Beta/Dir via accept/emit lambdas) walks the stamps twin and produces byte-identical wire output and order to the pre-split combined-struct walk. Gate COMPARISON values untouched (`betaChangedSinceEmit`/`dirChangedSinceEmit` unchanged — the wire-delta semantics invariant). Regression test added: `test/test_heartbeat.cpp` (registered in `SCOVOX_TEST_SOURCES`) covers stale re-emit + gate refresh + stamp advance, fresh skip, the ==period boundary, accept-veto and missing-live-voxel both leaving the stamp untouched (retry-next-tick semantics), the Dir binarize-style veto, and a split-vs-pre-split reference-equivalence walk over multi-root coords comparing emitted (coord, value) SEQUENCE and post-state.
 [scovox_node.cpp#L3026-L3029](../../src/scovox_mapping/src/scovox_node.cpp#L3026-L3029),
 structs at
 [scovox_node.cpp#L138-L148](../../src/scovox_mapping/src/scovox_node.cpp#L138-L148).
@@ -259,7 +273,7 @@ values must stay exact — they define wire-delta semantics.
 
 ### 8. Dataset mode: `KeepLast(1000)` reliable queues on both image topics
 
-**Where:**
+**Status: IMPLEMENTED 2026-08-26 (Run 6, edit-only — NOT yet built/tested) — parameterized, default UNCHANGED, and the ⚠ resolved AGAINST shrinking.** A fresh-agent replay-pacing audit proved the deep queue is the lossless-replay mechanism: every image replay node (`scenenet_replay_node` + subclasses, `replica_replay_node`, `gazebo_replay_node`) is open-loop — fixed-rate timer, no backpressure, only a one-shot startup discovery wait — and RELIABLE provides none either (a KEEP_LAST reader acks samples as it substitutes them out, so the writer never blocks; verified empirically: replay held 4.000 Hz while the mapper ran 30+ s behind). Measured peak queue occupancy on PASSING eval cells: **176 frames** (`scenenet_soft_e2/0_182`), 161 (`s1_ktop/K20`), 158 (K2) — the mapper integrates ~17% slower than the 4 Hz feed so the backlog grows monotonically all sequence. `KeepLast(200)` leaves only 12–24% margin and a slower host/finer res/heavier mechanism config would silently drop frames (invisible in artefacts: a DDS-dropped frame produces no `recv=` line at all); `KeepLast(100)` drops on cells that pass today. The real invariant is depth > longest replay sequence. Also: sizing to the 200-entry pairing caches is a category error — those hold only *unmatched* halves and empirically stay near-empty (300/300 matches, zero overflows, in a run with a 130-frame queue backlog). Fix as landed: `dataset_queue_depth` param (default 1000), with the mechanism + measurements documented at the QoS site. Shrink only together with replay-side pacing (the `ssmi_bridge_node` `max_in_flight` pattern). The ~2 GB RSS estimate revises to ~95 MB at the measured peak for SceneNet 320×240 (≈4× per-frame at SceneNN VGA) — if memory bounding is still wanted later, bound by *bytes*, not count.
 [scovox_node.cpp#L857-L862](../../src/scovox_mapping/src/scovox_node.cpp#L857-L862).
 
 **Problem:** dataset mode subscribes depth *and* segmentation with
@@ -278,6 +292,8 @@ cache and confirm the bag player paces.
 
 ### 9. `std::function` weight callback per ray, indirect call per band voxel
 
+**Status: IMPLEMENTED 2026-08-26 (Run 4, edit-only).** Plain-float `applyBandUpdate(c, sdf, w)` overload holds the original body; the fused walker passes `constexpr float 1.0f` (no `std::function` on the hot path). The `WeightFn` overload gates on the band FIRST and then delegates, so `weight_fn` is still evaluated only in-band with the same argument — bit-identical, and `integrateRay` call sites are untouched.
+
 **Where:**
 [scovox_map_split.hpp#L272](../../src/scovox_core/include/scovox/scovox_map_split.hpp#L272),
 consumed at
@@ -294,6 +310,8 @@ uses). ~Ten lines.
 **Impact:** speed **low–medium** · memory none. **Risk:** **low**.
 
 ### 10. BKI/spread kernel: sqrt per offset, ~half outside support, recomputed per hit
+
+**Status: IMPLEMENTED 2026-08-26 (Run 5, edit-only).** In-support offset+weight list precomputed once when the radii are configured (same `d = res·sqrt(dx²+dy²+dz²)` expression, same iteration order over the surviving offsets); the per-hit loop iterates the compact list with zero transcendentals. Default config (both radii 0) untouched.
 
 **Where:**
 [sem_split_map.cpp#L531-L572](../../src/scovox_core/src/sem_split_map.cpp#L531-L572).
@@ -314,7 +332,7 @@ the default config** (both radii default 0). **Risk:** **low**.
 
 ### 11. TF: 600 s buffer cache + blocking waits on the executor thread
 
-**Where:** cache at
+**Status: IMPLEMENTED 2026-08-26 (Run 6, edit-only — NOT yet built/tested) — parameterized, defaults UNCHANGED, and the ⚠ resolved AGAINST shrinking the cache.** The replay-pacing audit (item 8) settles the cache question with a measurement: the mapper falls up to ~44 s of TF-stamp span behind the open-loop replay feed, so the exact-stamp lookup for frame N needs history far older than the newest broadcast — a 10–30 s cache would break every current eval cell. Fix as landed: `tf_cache_time_sec` param (default 600.0, declared in the member initializer — safe because the Node base is fully constructed before member init), shrink only for live runs with a real-time TF source. The blocking waits: onImages' two hardcoded 0.2 s exact-stamp waits now use a new `rgbd_tf_timeout_sec` param (default 0.2 — deliberately SEPARATE from `tf_lookup_timeout_sec`, which shipped configs raise to 1.0 for GLIM's LiDAR TF latency; reusing it would silently change the image path in `scovox_fused_lidar_rgbd.yaml`). Setting either knob to 0.0 gives exactly the suggested zero-timeout-drop behavior per-config; the DEFAULT keeps the wait because it is load-bearing live (GLIM broadcasts the pose after the scan arrives — a zero-timeout default would reintroduce the stale-pose smear the wait exists to prevent) and a frame-0 discovery race in replay could otherwise drop a frame and change eval output. Requeue-once was rejected: re-injection changes integration order, which is tie-break-visible. Bonus correction from the same audit, verified in-code: the zero-timeout comment in `publishBinaryMap` claimed the TF listener shares the executor thread — false (`tf_listener_(tf_buffer_)` is the `spin_thread=true` overload with a dedicated thread, which is also why 30+ s-lagging eval runs show zero TF failures); comment rewritten with the correct rationale (Time(0) lookup ⇒ already cached if it exists), conclusion unchanged. The two 0.05 s `Time(0)` fallback waits (deskew extrinsic, planning-map crop) only ever wait while the buffer is still empty at startup and were left alone.
 [scovox_node.cpp#L54](../../src/scovox_mapping/src/scovox_node.cpp#L54);
 0.2 s-timeout lookups in the scan callbacks; 0.05 s in the planning map.
 
@@ -333,6 +351,8 @@ requeue-once.
 **Risk:** low–medium (replay dependency).
 
 ### 12. Per-frame logging: /proc parse + 18-field INFO per scan; dscovox per-binary INFO + full diag counts
+
+**Status: IMPLEMENTED 2026-08-26 (Run 5, edit-only).** `sampledVmRSSKB()` behind a new `rss_sample_every` parameter, **default 1 = parse /proc every frame** (current behaviour and the `rss_mb=` token cadence preserved exactly, per the ⚠ below); >1 returns the cached value between samples. dscovox: the diag `activeCellsCount()` walks now run only when the 5 s throttle will actually fire, via a manual replication of Humble's `RCLCPP_INFO_THROTTLE` (fire when `now >= last + 5 s`, `last` starts 0) so the emitted line and its cadence are byte-identical.
 
 **Where:**
 [scovox_node.cpp#L1766-L1781](../../src/scovox_mapping/src/scovox_node.cpp#L1766-L1781);
@@ -357,6 +377,8 @@ current default preserved, or bench tooling breaks.
 
 ### 13. Wire-path copies: LZ4 decompress round-trips an extra full-payload buffer
 
+**Status: IMPLEMENTED 2026-08-26 (Run 5, edit-only), receive side only.** `decompressLZ4` now decompresses directly into `std::string(orig_size, '\0')` — the intermediate `std::vector<char>` copy is gone. **Correction to this item's send-side claim:** the send side already did `bin.data = std::move(comp)` — there was no serialized-string → vector → message copy chain to remove, so no send-side change was made.
+
 **Where:**
 [lz4_codec.hpp#L59-L64](../../src/scovox_core/include/scovox/lz4_codec.hpp#L59-L64);
 plus the serialize → compress → message copy chain on the send side.
@@ -375,6 +397,8 @@ the message's `data` field on the send side.
 memory low. **Risk:** **low**.
 
 ### 14. Smaller items
+
+**Status: PARTIALLY IMPLEMENTED 2026-08-26 (Run 5, edit-only).** Done: medoid scratch → members + `clear()`; `gateTauEff` → exact-double memo keyed on the evidence total (**correction: the item over-counted — there is exactly one `std::pow` per call, not two**; the memoised value is the same exact double, wire gate semantics untouched); marching-cubes anchor re-fetch removed in **both** `extractMesh` overloads (corner 0 and the semantic-label read now use the visited cell directly); the dscovox GetRegion/occupancy clips got the item-5 windowed walks. The `extractZeroCrossing` reserve (+ overshoot shrink) landed earlier, in Run 4's item-3 pass (TsdfVoxel overload — the one cited below). Not done: binary PLY (parked), the two per-ray `steady_clock::now()` compile-gate (Run 7 territory — touches the timing bracket), and the legacy Voxel-typed `extractZeroCrossing`'s reserve (dormant legacy path, left alone).
 
 - **Medoid downsample scratch rebuilt per scan** (LiDAR path,
   ~[scovox_node.cpp#L1560-L1620](../../src/scovox_mapping/src/scovox_node.cpp#L1560-L1620)):

@@ -34,11 +34,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "scovox/beta_voxel.hpp"
+#include "scovox/carve_stage.hpp"
 #include "scovox/dir_voxel.hpp"
 #include "scovox/semantics.hpp"  // SemanticMode
 
@@ -371,8 +371,15 @@ class SemSplitMap {
   // Touched-set drains (per grid — Beta is full-ray, Dir is hit-sparse)
   // ----------------------------------------------------------------------
 
-  std::vector<CoordT> drainTouchedBeta();
-  std::vector<CoordT> drainTouchedDir();
+  /// Drains return a reference into a per-stream member scratch, valid until
+  /// the same stream's next drain; accumulator and scratch keep their
+  /// capacity across frames (see TsdfMap::drainTouched).
+  const std::vector<CoordT>& drainTouchedBeta();
+  const std::vector<CoordT>& drainTouchedDir();
+  /// O(n) per-stream clears for paths that would discard the drained coords
+  /// anyway (snapshot publishes, share toggles off) — skips the sort+unique.
+  void                clearTouchedBeta() noexcept { touched_beta_.clear(); }
+  void                clearTouchedDir()  noexcept { touched_dir_.clear(); }
   void                clearTouched() noexcept { touched_beta_.clear(); touched_dir_.clear(); }
   std::size_t         touchedBetaCount() const noexcept { return touched_beta_.size(); }
   std::size_t         touchedDirCount()  const noexcept { return touched_dir_.size(); }
@@ -499,15 +506,24 @@ class SemSplitMap {
   DirGrid::Accessor    transient_dir_acc_;
   std::vector<CoordT>  touched_beta_;
   std::vector<CoordT>  touched_dir_;
+  // Drain swap targets — hold each stream's previous drain result so the
+  // buffers are recycled instead of freed (see drainTouchedBeta/Dir).
+  std::vector<CoordT>  scratch_beta_;
+  std::vector<CoordT>  scratch_dir_;
 
-  // Per-scan carve accumulator (batched path). `carve_stage_` maps each free
-  // voxel to the MAX `w_free·quality` seen this scan (strongest free evidence,
-  // one write); `carve_hits_` holds voxels observed as a surface this scan so
-  // flush can honour occupied-wins. Both are clear()ed (capacity retained) at
-  // beginCarveFrame, so steady-state framing allocates no new buckets.
-  std::unordered_map<CoordT, float> carve_stage_;
-  std::unordered_set<CoordT>        carve_hits_;
-  bool                              carve_frame_open_ = false;
+  // Per-scan carve accumulator (batched path). `carve_stage_` keys each free
+  // voxel by its Beta leaf block (`coord >> leaf_bits`) into a reused
+  // open-addressed table of dense per-block weight arrays + occupancy bitmask,
+  // keeping the MAX `w_free·quality` seen this scan (strongest free evidence,
+  // one write); flush then walks blocks in ascending block-key order — the
+  // same block order the retired per-voxel std::sort produced — without ever
+  // sorting individual voxels (see carve_stage.hpp for the identity argument).
+  // `carve_hits_` holds voxels observed as a surface this scan so flush can
+  // honour occupied-wins. Both retain capacity across beginCarveFrame, so
+  // steady-state framing allocates nothing.
+  CarveStage                 carve_stage_;
+  std::unordered_set<CoordT> carve_hits_;
+  bool                       carve_frame_open_ = false;
 
   /// Symmetric Beta(1,1) occupancy prior (kBetaOccPrior/kBetaFreePrior) →
   /// p_occ_prior = 0.5. Hot-path constants; see docs/occupancy_prior.md.
@@ -556,6 +572,20 @@ class SemSplitMap {
                                   float                     l,
                                   float                     kappa0,
                                   float                     min_p_occ);
+
+  // Precomputed in-support spread offsets (audit item 10). The
+  // (dx,dy,dz) -> k(d) mapping is invariant per (resolution, l), yet the old
+  // per-hit loop redid a sqrt for every cube offset (~48% outside support)
+  // plus cos+sin for the survivors. Tables are built lazily with the exact
+  // same expressions and dz/dy/dx order as the old loop, so deposits and
+  // touch order are value-identical. Keyed by the exact float `l`; the two
+  // callers pass at most two distinct values per run (a source profile's
+  // kernel_radius and the map-global semantic_spread_radius), so a linear
+  // scan over a tiny vector beats any map.
+  struct SpreadOffset { int16_t dx, dy, dz; float wk; };
+  struct SpreadTable  { float l; std::vector<SpreadOffset> offsets; };
+  const std::vector<SpreadOffset>& spreadTable(float l);
+  std::vector<SpreadTable> spread_tables_;
 
   void applyBetaSaturation(BetaVoxel* b) const;
   void applyDirSaturation(DirVoxel* d) const;

@@ -29,8 +29,8 @@ _NYU14_COLOR_CLASSES = list(range(14))
 
 
 def _make_scovox(robot_name, resolution,
-                 use_split=False, share_tsdf=False, fused_walker=True,
-                 wire_format="v2", num_classes=14, dirichlet_prior=0.01,
+                 share_tsdf=False, fused_walker=True,
+                 num_classes=14, dirichlet_prior=0.01,
                  semantic_mode="dirichlet"):
     from launch_ros.actions import Node
     return Node(
@@ -43,7 +43,6 @@ def _make_scovox(robot_name, resolution,
             "use_sim_time": False,
             "dataset_mode": True,
             "mode": "rolling",
-            "submap_max_distance": 9999.0,
             "resolution": resolution,
             "w_free": 1.0, "w_occ": 6.0,
             "kappa0": 2.0,
@@ -71,13 +70,11 @@ def _make_scovox(robot_name, resolution,
             "publish_planning_map": False,
             "semantic_color_map_keys":    _NYU14_COLOR_KEYS,
             "semantic_color_map_classes": _NYU14_COLOR_CLASSES,
-            # Split-grid + v3 wire toggles. Both robots MUST share
+            # Split-grid toggles. Both robots MUST share
             # (num_classes, dirichlet_prior) — dscovox pins from the
             # first frame and rejects mismatched followups.
-            "use_split": use_split,
             "share_tsdf": share_tsdf,
             "fused_walker": fused_walker,
-            "wire_format": wire_format,
             "num_classes": num_classes,
             "dirichlet_prior": dirichlet_prior,
         }],
@@ -89,18 +86,16 @@ def _launch_setup(context):
     robot_a = context.launch_configurations["robot_a"]
     robot_b = context.launch_configurations["robot_b"]
     resolution = float(context.launch_configurations["resolution"])
-    use_split = context.launch_configurations.get("use_split", "false").lower() in ("true", "1", "yes")
     share_tsdf = context.launch_configurations.get("share_tsdf", "false").lower() in ("true", "1", "yes")
     fused_walker = context.launch_configurations.get("fused_walker", "true").lower() in ("true", "1", "yes")
-    wire_format = context.launch_configurations.get("wire_format", "v2")
     num_classes = int(context.launch_configurations.get("num_classes", "14"))
     dirichlet_prior = float(context.launch_configurations.get("dirichlet_prior", "0.01"))
     semantic_mode = context.launch_configurations.get("semantic_mode", "dirichlet")
 
-    scovox_a = _make_scovox(robot_a, resolution, use_split, share_tsdf, fused_walker,
-                            wire_format, num_classes, dirichlet_prior, semantic_mode)
-    scovox_b = _make_scovox(robot_b, resolution, use_split, share_tsdf, fused_walker,
-                            wire_format, num_classes, dirichlet_prior, semantic_mode)
+    scovox_a = _make_scovox(robot_a, resolution, share_tsdf, fused_walker,
+                            num_classes, dirichlet_prior, semantic_mode)
+    scovox_b = _make_scovox(robot_b, resolution, share_tsdf, fused_walker,
+                            num_classes, dirichlet_prior, semantic_mode)
 
     # Identity static TFs map → <robot>/odom — same shape as Replica fusion.
     static_a = Node(package="tf2_ros", executable="static_transform_publisher",
@@ -120,13 +115,11 @@ def _launch_setup(context):
                 f"/{robot_b}/scovox_node/scovox_bin",
             ],
             "pointcloud_topic": "~/pointcloud",
-            "resolution": resolution,
-            "publish_planning_map": False,
-            "use_split": use_split,
-            "share_tsdf": share_tsdf,
-            # MUST match the two robot scovox_nodes' wire_format. dscovox
-            # onBinaryMapV3 pins (num_classes, alpha_0) on the first frame.
-            "wire_format": wire_format,
+            # dscovox reads the wire format from each frame's envelope
+            # (ScovoxMapBinary.version) and pins (num_classes, alpha_0,
+            # resolution) from the first frame — no launch-side format
+            # selector. share_tsdf/resolution/publish_planning_map were
+            # removed here as dead: dscovox_node declares none of them.
         }],
     )
     return [static_a, static_b, scovox_a, scovox_b, dscovox_node]
@@ -138,11 +131,8 @@ def generate_launch_description():
         DeclareLaunchArgument("robot_b", default_value="robotB"),
         DeclareLaunchArgument("resolution", default_value="0.05"),
         DeclareLaunchArgument("semantic_mode", default_value="dirichlet"),
-        DeclareLaunchArgument("use_split", default_value="false"),
         DeclareLaunchArgument("share_tsdf", default_value="false"),
         DeclareLaunchArgument("fused_walker", default_value="true"),
-        DeclareLaunchArgument("wire_format", default_value="v2",
-            description="Step 8: v2=SemBeta-projected, v3=SemDir-native. All 3 nodes share."),
         DeclareLaunchArgument("num_classes", default_value="14",
             description="Step 8: SceneNet NYU14. Both robots and dscovox pin the same value."),
         DeclareLaunchArgument("dirichlet_prior", default_value="0.01"),

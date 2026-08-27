@@ -56,12 +56,15 @@ struct ScovoxBinarySerializer {
     const int payload_size = comp_size - static_cast<int>(sizeof(uint32_t));
     // Sanity cap: reject obviously corrupt sizes (>256 MB)
     if (orig_size == 0 || orig_size > 256u * 1024u * 1024u) return {};
-    std::vector<char> buf(orig_size);
+    // Decompress straight into the returned string (audit item 13) — the old
+    // vector<char> staging buffer cost a second full copy of every payload.
+    std::string out(orig_size, '\0');
     const int decomp_size = LZ4_decompress_safe(
         reinterpret_cast<const char*>(compressed.data() + sizeof(uint32_t)),
-        buf.data(), payload_size, static_cast<int>(orig_size));
+        out.data(), payload_size, static_cast<int>(orig_size));
     if (decomp_size < 0) return {};
-    return std::string(buf.data(), static_cast<size_t>(decomp_size));
+    out.resize(static_cast<size_t>(decomp_size));
+    return out;
   }
 };
 

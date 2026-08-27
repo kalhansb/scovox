@@ -4,14 +4,105 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <utility>
 #include <vector>
 #include <cmath>
+
+#include <bonxai/bonxai.hpp>
 
 #include "scovox/voxel.hpp"
 #include "scovox/uncertainty.hpp"
 
 namespace scovox {
+
+// Window-restricted variant of Bonxai::VoxelGrid::forEachCell (audit items
+// 4/5) — shared by scovox_node's planning-map walk and dscovox_node's
+// region/occupancy-service walks. Bonxai root-map keys are block-base voxel
+// coords with the low (inner_bits + leaf_bits) bits zero (getRootKey), so a
+// whole root block — 2^(inner_bits+leaf_bits) voxels per axis — can be
+// rejected with six integer compares before its masks are touched; surviving
+// blocks descend with the same bit arithmetic as forEachCell. `box_min`/
+// `box_max` are INCLUSIVE voxel-coord bounds and must be conservative
+// (over-cover the region of interest): the visitor's own predicates stay the
+// sole authority on cell membership, so the output is identical to a full
+// walk — only the iteration domain shrinks. Unlike forEachCell this has no
+// EmptyVoxel special case (Grid::cell static_asserts on it) — extend before
+// reusing on such a grid.
+template <typename DataT, typename VisitorFn>
+void forEachCellInBox(
+    const Bonxai::VoxelGrid<DataT>& grid, const Bonxai::CoordT& box_min,
+    const Bonxai::CoordT& box_max, VisitorFn&& fn) {
+  const int32_t leaf_bits = int32_t(grid.leafBits());
+  const int32_t inner_bits = int32_t(grid.innetBits());  // [sic] Bonxai API
+  const int32_t mask_leaf = (1 << leaf_bits) - 1;
+  const int32_t mask_inner = (1 << inner_bits) - 1;
+  const int32_t root_span = 1 << (inner_bits + leaf_bits);
+  const int32_t leaf_span = 1 << leaf_bits;
+  for (const auto& [root_key, inner_grid] : grid.rootMap()) {
+    if (root_key.x + root_span <= box_min.x || root_key.x > box_max.x ||
+        root_key.y + root_span <= box_min.y || root_key.y > box_max.y ||
+        root_key.z + root_span <= box_min.z || root_key.z > box_max.z) {
+      continue;
+    }
+    for (auto inner_it = inner_grid.mask().beginOn(); inner_it; ++inner_it) {
+      const int32_t inner_index = *inner_it;
+      const int32_t xB = root_key.x | ((inner_index & mask_inner) << leaf_bits);
+      const int32_t yB =
+          root_key.y | (((inner_index >> inner_bits) & mask_inner) << leaf_bits);
+      const int32_t zB =
+          root_key.z |
+          (((inner_index >> (inner_bits * 2)) & mask_inner) << leaf_bits);
+      if (xB + leaf_span <= box_min.x || xB > box_max.x ||
+          yB + leaf_span <= box_min.y || yB > box_max.y ||
+          zB + leaf_span <= box_min.z || zB > box_max.z) {
+        continue;
+      }
+      const auto& leaf_grid = inner_grid.cell(inner_index);
+      for (auto leaf_it = leaf_grid->mask().beginOn(); leaf_it; ++leaf_it) {
+        const int32_t leaf_index = *leaf_it;
+        const Bonxai::CoordT c = {
+            xB | (leaf_index & mask_leaf),
+            yB | ((leaf_index >> leaf_bits) & mask_leaf),
+            zB | ((leaf_index >> (leaf_bits * 2)) & mask_leaf)};
+        if (c.x < box_min.x || c.x > box_max.x || c.y < box_min.y ||
+            c.y > box_max.y || c.z < box_min.z || c.z > box_max.z) {
+          continue;
+        }
+        fn(leaf_grid->cell(leaf_index), c);
+      }
+    }
+  }
+}
+
+// Heartbeat re-emit sweep for the change-gate wire path (audit item 7 split
+// the last-emit timestamp out of the gate grids so it is allocated only when
+// share_heartbeat_sec > 0). `stamps` is written one-for-one with `gate` at
+// every wire emit, so its active set and iteration order ARE the ever-emitted
+// set in the order the pre-split single-grid walk used to yield. For each
+// voxel whose stamp is at least `period` old: fetch the live voxel via
+// `live`; if absent, leave the stamp untouched (retried next tick, as
+// before); if `accept(live)` rejects (the Dir binarize veto), leave the stamp
+// too — the voxel is re-checked every tick until it becomes emittable;
+// otherwise refresh the gate copy, stamp t_now, and hand the voxel to `emit`.
+// The stamp stays a double: node-clock epoch seconds are outside float's
+// exact-integer range and the sweep compares differences of these.
+template <typename GateV, typename LiveAcc, typename AcceptFn, typename EmitFn>
+void heartbeatReemit(Bonxai::VoxelGrid<GateV>& gate,
+                     Bonxai::VoxelGrid<double>& stamps, LiveAcc& live,
+                     double t_now, double period, AcceptFn&& accept,
+                     EmitFn&& emit) {
+  auto gacc = gate.createAccessor();
+  stamps.forEachCell([&](double& t_emit, const Bonxai::CoordT& c) {
+    if (t_now - t_emit < period) return;
+    const auto* v = live.value(c, false);
+    if (!v) return;
+    if (!accept(*v)) return;
+    if (auto* g = gacc.value(c, false)) *g = *v;
+    t_emit = t_now;
+    emit(*v, c);
+  });
+}
 
 /// Generate a semantic color palette of the given size.
 /// First 10 entries are fixed well-known colors, rest are golden-angle HSV.

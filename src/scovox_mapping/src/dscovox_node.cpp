@@ -253,14 +253,26 @@ public:
           // like every other publisher here — disabling the publish timer also
           // disables the fused-map topic the planner depends on.
           publishFusedMap();
-          // Map size is keyed on occupancy (the fused Beta grid).
-          size_t fc = split_fused_beta_ ? split_fused_beta_->activeCellsCount() : 0;
-          size_t ts = 0;
-          for (auto& [k, sg] : sources_)
-            if (sg.beta_grid) ts += sg.beta_grid->activeCellsCount();
-          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-            "dscovox_diag: sources=%zu src_voxels=%zu fused_voxels=%zu",
-            sources_.size(), ts, fc);
+          // Map size is keyed on occupancy (the fused Beta grid). Compute the
+          // mask-popcount walks over the fused grid PLUS every source grid
+          // only when the 5 s throttle actually fires (audit item 12) — they
+          // used to run every tick and be thrown away on suppressed ticks.
+          // Manual throttle replicating RCLCPP_INFO_THROTTLE's condition
+          // (now >= last + duration, then last = now — including the
+          // sim-time-start behavior); the log line is byte-identical. Plain
+          // member is fine: rclcpp never runs one timer's callback
+          // concurrently with itself, so this has a single writer.
+          const int64_t diag_now_ns = get_clock()->now().nanoseconds();
+          if (diag_now_ns >= diag_last_ns_ + 5000000000LL) {
+            diag_last_ns_ = diag_now_ns;
+            size_t fc = split_fused_beta_ ? split_fused_beta_->activeCellsCount() : 0;
+            size_t ts = 0;
+            for (auto& [k, sg] : sources_)
+              if (sg.beta_grid) ts += sg.beta_grid->activeCellsCount();
+            RCLCPP_INFO(get_logger(),
+              "dscovox_diag: sources=%zu src_voxels=%zu fused_voxels=%zu",
+              sources_.size(), ts, fc);
+          }
         });
     }
 
@@ -528,9 +540,12 @@ private:
       n_sources, n_sources == 1 ? "" : "s");
 
     // The fused grid changed; mark it so the publish timer re-publishes the
-    // fused-map topic on its next tick (and only then). Reaching here implies
-    // non-empty deltas were fused (empty frames returned early above).
+    // fused-map topic on its next tick (and only then), and so the next
+    // pointcloud publish actually rebuilds the cloud (see the gate in
+    // publishPointCloud). Reaching here implies non-empty deltas were fused
+    // (empty frames returned early above).
     fused_dirty_.store(true, std::memory_order_relaxed);
+    pc_dirty_.store(true, std::memory_order_relaxed);
 
     // Step 3 — visualisation publish.
     {
@@ -607,22 +622,50 @@ private:
   // (occupancy) and joins the fused Dir grid (semantics) at each coord,
   // projecting to a transient SemBetaVoxel for the 11-field PointCloud2 schema.
   void publishPointCloud() {
-    if (!pc_pub_ || !split_fused_beta_ ||
-        pc_pub_->get_subscription_count() == 0) return;
+    if (!pc_pub_ || !split_fused_beta_) return;
+    // Dirty gate + subscriber-rise re-arm (audit item 5), mirroring
+    // scovox_node's publishPointCloud: without it the full cloud is rebuilt
+    // on every 1 Hz timer tick even when the fused map is quiescent. The
+    // topic is KeepLast(1) reliable, NOT transient_local, so a gate alone
+    // would strand a late/re-subscriber on a quiescent map — the rise
+    // re-publishes for them. prev-subs is updated on zero-subscriber ticks
+    // too (the exchange below runs before the count check) so detach→
+    // reattach registers as a rise; atomics because this runs under only a
+    // SHARED lock from both the timer and binary-callback tails, and the
+    // exchange makes each rise/dirty a single-consumer claim even under a
+    // multi-threaded executor.
+    const size_t cur_sub = pc_pub_->get_subscription_count();
+    const size_t prev_sub =
+        pc_prev_subs_.exchange(cur_sub, std::memory_order_relaxed);
+    const bool sub_rise = cur_sub > prev_sub;
+    if (cur_sub == 0) return;
+    if (!pc_dirty_.exchange(false, std::memory_order_relaxed) && !sub_rise)
+      return;
     auto& g = *split_fused_beta_;
     auto dacc = split_fused_dir_->createConstAccessor();
     const float ot = (float)min_occ_;
-    size_t cnt = 0;
-    g.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT&) {
+    // Single grid walk (audit item 5): collect passing cells once into a
+    // persistent scratch (scovox_node's pc_scratch_ pattern), then size the
+    // message from scratch.size() and fill from the scratch — the fused Beta
+    // grid was previously traversed twice (count pass + fill pass).
+    // thread_local rather than a member: this can run on any executor thread
+    // under only a SHARED lock, and a shared member would be a data race
+    // under a multi-threaded executor. clear() keeps capacity, so steady
+    // state allocates nothing per publish.
+    static thread_local std::vector<std::pair<Bonxai::CoordT, scovox::BetaVoxel>>
+        pc_scratch;
+    pc_scratch.clear();
+    g.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& co) {
       // Skip prior-only cells via isPriorBeta, independent of the prior's p_occ.
       // (Gating on isPriorBeta rather than a p_occ threshold keeps this correct
       // for any prior: the old calibrated prior p_occ ≈ 0.933 exceeded the 0.7
       // threshold and would publish as phantom occupied; the prior is now
       // Beta(1,1)/0.5. See docs/occupancy_prior.md.) Mirror the RPC walkers' gate.
       if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
-      if (v.p_occ() >= ot) ++cnt;
+      if (v.p_occ() >= ot) pc_scratch.emplace_back(co, v);
     });
-    if (!cnt) return;
+    if (pc_scratch.empty()) return;
+    const size_t cnt = pc_scratch.size();
 
     sensor_msgs::msg::PointCloud2 cl;
     cl.header.frame_id = map_frame_;
@@ -650,12 +693,12 @@ private:
       iv(cl, "posterior_variance"), ie(cl, "eig"),
       iao(cl, "a_occ"), iaf(cl, "a_free");
     sensor_msgs::PointCloud2Iterator<uint8_t> ik(cl, "semantic_class");
-    g.forEachCell([&](const scovox::BetaVoxel& vb, const Bonxai::CoordT& co) {
-      // Same prior gate as the counting pass above — keep the two passes in
-      // lock-step so the emitted point count matches md.resize(cnt).
-      if (isPriorBeta(vb, fused_num_classes_, fused_alpha_0_)) return;
+    // Every scratch entry already passed the prior + threshold gates in the
+    // collect pass above, so the emitted point count matches md.resize(cnt)
+    // by construction; scratch order is the collect pass's forEachCell order,
+    // so the emitted point order is unchanged too.
+    for (const auto& [co, vb] : pc_scratch) {
       float pr = vb.p_occ();
-      if (pr < ot) return;
       const scovox::DirVoxel* dv = dacc.value(co);
       const scovox::SemBetaVoxel v =
           projectBetaDirToSemBetaForViz(vb, dv, fused_alpha_0_, fused_num_classes_);
@@ -683,7 +726,7 @@ private:
       *ie = scovox::expectedInformationGain(v);
       *iao = v.a_occ; *iaf = v.a_free;
       ++ix; ++iy; ++iz; ++ir; ++ip; ++ik; ++ic; ++iv; ++ie; ++iao; ++iaf;
-    });
+    }
     pc_pub_->publish(cl);
   }
 
@@ -700,7 +743,29 @@ private:
     auto& m = rs->map;
     auto mn = g.posToCoord(rq->min_corner.x, rq->min_corner.y, rq->min_corner.z);
     auto mx = g.posToCoord(rq->max_corner.x, rq->max_corner.y, rq->max_corner.z);
-    g.forEachCell([&](const CellT& cell, const Bonxai::CoordT& c) {
+    // Reserve bounded by min(active cells, bbox volume) — never over-commits
+    // beyond what the map could actually yield (audit item 5). Extents checked
+    // per axis, not as a product: a box inverted in exactly two axes would
+    // multiply two negatives into a positive "volume" despite matching nothing.
+    // Volume in double so a full-coverage request (publishFusedMap's
+    // ±1e8-voxel box) can't overflow.
+    {
+      const double ex = double(mx.x) - double(mn.x) + 1.0;
+      const double ey = double(mx.y) - double(mn.y) + 1.0;
+      const double ez = double(mx.z) - double(mn.z) + 1.0;
+      if (ex > 0.0 && ey > 0.0 && ez > 0.0) {
+        const double bound =
+            std::min(static_cast<double>(g.activeCellsCount()), ex * ey * ez);
+        m.voxels.reserve(m.voxels.size() + static_cast<size_t>(bound));
+      }
+    }
+    // Windowed walk (audit item 5): mn/mx are the clip's own inclusive coord
+    // bounds, so the window visits exactly the cells the per-cell clip below
+    // accepts — the clip stays the membership authority and responses are
+    // byte-identical to the old full forEachCell walk; only off-box root/leaf
+    // blocks are skipped.
+    scovox::forEachCellInBox(g, mn, mx,
+        [&](const CellT& cell, const Bonxai::CoordT& c) {
       if (isPriorCell(cell)) return;
       if (c.x < mn.x || c.x > mx.x || c.y < mn.y || c.y > mx.y || c.z < mn.z || c.z > mx.z) return;
       const scovox::Voxel v = project(cell, c);
@@ -799,7 +864,28 @@ private:
     float ot = (float)min_occ_;
     double xn = std::numeric_limits<double>::max(), xx = -xn, yn = xn, yx = -yn;
     std::unordered_map<int64_t, float> cells;
-    g.forEachCell([&](const CellT& v, const Bonxai::CoordT& c) {
+    // z-band window for the walk (audit item 5). x/y are unconstrained, so
+    // they get ±INT32_MAX/2 sentinels (half-range keeps forEachCellInBox's
+    // root-span arithmetic overflow-free; Bonxai coords beyond that are far
+    // outside any physical map). The z bounds come from the request's METRIC
+    // band: coordToPos is exact-corner (c.z * resolution), so floor(z/res)
+    // with ±1 voxel slack strictly over-covers every cell the metric predicate
+    // below can accept — that predicate stays the sole membership authority
+    // and the response bytes are unchanged. Non-finite bounds fall back to the
+    // unbounded sentinel (NaN currently disables the clip; ±inf just loses the
+    // speedup) and huge finite bounds clamp to the sentinel half-range, so the
+    // window is conservative for every representable request.
+    constexpr int32_t kUnb = std::numeric_limits<int32_t>::max() / 2;
+    const double vres = g.voxelSize();
+    auto zBound = [&](double z, double slack, int32_t unbounded) -> int32_t {
+      if (!std::isfinite(z)) return unbounded;
+      const double b = std::floor(z / vres) + slack;
+      return (int32_t)std::max(-(double)kUnb, std::min((double)kUnb, b));
+    };
+    const Bonxai::CoordT box_min = {-kUnb, -kUnb, zBound(rq->z_min, -1.0, -kUnb)};
+    const Bonxai::CoordT box_max = {kUnb, kUnb, zBound(rq->z_max, 1.0, kUnb)};
+    scovox::forEachCellInBox(g, box_min, box_max,
+        [&](const CellT& v, const Bonxai::CoordT& c) {
       if (isPriorCell(v)) return;
       auto p = g.coordToPos(c);
       if (p.z < rq->z_min || p.z > rq->z_max) return;
@@ -867,6 +953,13 @@ private:
   // publishFusedMap so the fused-map topic is only rebuilt+serialized when it
   // actually changed, not every publish tick. Mirrors scovox_node's sm_dirty_.
   std::atomic<bool> fused_dirty_{false};
+  // Same contract for the visualisation pointcloud (audit item 5), plus the
+  // subscriber-rise re-arm state — see the gate comment in publishPointCloud.
+  std::atomic<bool> pc_dirty_{false};
+  std::atomic<size_t> pc_prev_subs_{0};
+  // dscovox_diag manual-throttle state (audit item 12); written only from the
+  // publish timer's callback. 0 start replicates RCLCPP_INFO_THROTTLE.
+  int64_t diag_last_ns_{0};
   int top_k_;
   float res_{0.f};
   std::vector<std::array<float, 3>> sem_col_;

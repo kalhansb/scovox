@@ -26,7 +26,7 @@ FROM osrf/ros:jazzy-desktop
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Build tooling. The ROS-side deps (rclcpp, tf2*, cv_bridge, message_filters,
+# Build tooling. The ROS-side deps (rclcpp, tf2*, message_filters,
 # sensor/geometry/nav_msgs, eigen3_cmake_module, liblz4-dev, ament_cmake_gtest)
 # are resolved from the package.xml manifests by rosdep below.
 RUN apt-get update && apt-get install -y --no-install-recommends \

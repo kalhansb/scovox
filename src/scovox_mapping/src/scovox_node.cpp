@@ -49,9 +49,20 @@
 
 namespace enc = sensor_msgs::image_encodings;
 
+// The window-restricted grid walk (audit item 4) lives in
+// scovox/node_utils.hpp (scovox::forEachCellInBox) — shared with
+// dscovox_node's region/occupancy walks (audit item 5).
+
 class SCovoxNode : public rclcpp::Node {
 public:
-  SCovoxNode() : Node("scovox_node"), tf_buffer_(this->get_clock(), tf2::Duration(std::chrono::seconds(600))), tf_listener_(tf_buffer_) {
+  // TF buffer cache depth (audit item 11). Default 600 s — 60× the tf2 default,
+  // and load-bearing for dataset replay: the replay feed is open-loop and the
+  // mapper falls behind by the whole backlog (measured ~44 s / 176 frames on
+  // SceneNet e2 cells), so the exact-stamp lookup for frame N needs TF stamps
+  // far older than the newest broadcast. Shrink only for live runs with a
+  // real-time TF source. (declare_parameter in the member initializer is safe:
+  // the Node base is fully constructed before any member init runs.)
+  SCovoxNode() : Node("scovox_node"), tf_buffer_(this->get_clock(), tf2::durationFromSec(this->declare_parameter("tf_cache_time_sec", 600.0))), tf_listener_(tf_buffer_) {
     auto P = declareMapParams();
     declareNodeParams();
     // Cache the launch param block. scovox::Params still carries the
@@ -136,15 +147,27 @@ public:
     // geometry as the live grids. Only the wire path reads/writes these, and
     // only in mode=rolling (no bin_pub_ otherwise).
     if (share_change_gate_ && mode_ == "rolling") {
-      gate_beta_ = std::make_unique<Bonxai::VoxelGrid<GateBeta>>(
+      gate_beta_ = std::make_unique<Bonxai::VoxelGrid<scovox::BetaVoxel>>(
           P.resolution, P.inner_bits, P.leaf_bits);
       // The Dir shadow mirrors the Dir grid's occupancy pattern (it is written
       // one-for-one with every emitted Dir voxel), so it inherits the same
       // block-fill problem — and the same fix. Read the EFFECTIVE value back
       // from SemSplitMap so the clamp in sanitise() applies here too.
-      gate_dir_ = std::make_unique<Bonxai::VoxelGrid<GateDir>>(
+      gate_dir_ = std::make_unique<Bonxai::VoxelGrid<scovox::DirVoxel>>(
           P.resolution, P.inner_bits,
           split_map_->semsplit().params().dir_leaf_bits);
+      // Last-emit stamps exist only when the heartbeat can read them (audit
+      // item 7). declareNodeParams already forced share_heartbeat_sec to 0
+      // when the change gate is off, and these params are constructor-time —
+      // the twins can never be needed later. Same geometry as their gate
+      // twin, so the heartbeat walk's iteration order is unchanged.
+      if (share_heartbeat_sec_ > 0.0) {
+        gate_beta_t_ = std::make_unique<Bonxai::VoxelGrid<double>>(
+            P.resolution, P.inner_bits, P.leaf_bits);
+        gate_dir_t_ = std::make_unique<Bonxai::VoxelGrid<double>>(
+            P.resolution, P.inner_bits,
+            split_map_->semsplit().params().dir_leaf_bits);
+      }
     }
     loadSemanticColorMap();  initializeSemanticColors();
     setupSubscribers();
@@ -160,28 +183,41 @@ public:
                     std::placeholders::_1, std::placeholders::_2));
     }
     double sm_rate = this->declare_parameter<double>("scovox_publish_rate", 1.0);
+    // Own callback group (audit item 3): under the MultiThreadedExecutor in
+    // main() this timer runs concurrently with the default group, so an O(map)
+    // viz walk no longer occupies the sensor callbacks' executor slot — the
+    // pre-lock phase of a scan (decode, TF, snapshot assembly) overlaps with
+    // it, and only the map_mtx_ acquire still waits. Everything the body
+    // touches is either under the shared_lock (split_map_), an atomic
+    // (*_dirty_), or written solely inside this group (pc_scratch_, prev
+    // sub-counts) — the group is MutuallyExclusive, so the timer never races
+    // itself. All other callbacks stay in the DEFAULT group, also mutually
+    // exclusive, which preserves the serialization the plain-member comments
+    // below rely on (loc_* gate state, ds caches, imu_buf_, ...) exactly as
+    // the old SingleThreadedExecutor did.
+    viz_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     sm_timer_ = rclcpp::create_timer(this, get_clock(), std::chrono::duration<double>(1.0/sm_rate),
       [this]{
         // Hold one shared_lock for the whole timer tick so the ScovoxMap and
         // PointCloud always represent the same map state, and so neither
-        // helper races against scheduleMemUsage's detached reader thread.
-        // SingleThreadedExecutor already serializes us against onImages, but
-        // wrapping here makes the contract explicit and survives a future
-        // switch to MultiThreadedExecutor. publishScovoxMap and
-        // publishPointCloud must NOT take map_mtx_ themselves —
+        // helper races against scheduleMemUsage's detached reader thread or,
+        // now that this timer lives in its own callback group under the
+        // MultiThreadedExecutor, against integration itself. publishScovoxMap
+        // and publishPointCloud must NOT take map_mtx_ themselves —
         // std::shared_mutex is non-recursive, so re-locking here would be UB.
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
         publishScovoxMap();
         if (pub_pc_) publishPointCloud();
         if (tsdf_pub_) publishTSDFPointCloud();
         if (fine_tsdf_pub_) publishFineTSDFPointCloud();
-      });
+      }, viz_cb_group_);
     if (bin_pub_ && share_rate_hz_ > 0.0) {
       // Timer-owned binary publish (share_rate_hz > 0): the sensor callbacks
       // skip their inline publishBinaryMap and touched coords accumulate until
       // this tick. Unique lock — publishBinaryMap drains the touched-sets and
-      // writes the change-gate shadow grids, both mutations. Under the
-      // SingleThreadedExecutor this also serializes us against integration.
+      // writes the change-gate shadow grids, both mutations. This timer lives
+      // in the DEFAULT (mutually exclusive) callback group, so the executor
+      // also serializes it against integration (see main()'s group layout).
       bin_timer_ = rclcpp::create_timer(this, get_clock(),
         std::chrono::duration<double>(1.0 / share_rate_hz_),
         [this]{
@@ -309,8 +345,8 @@ private:
     // resolution across launch files. The whole legacy fused path treats
     // sdf_trunc==0 as "TSDF off" — no band walk in fused_integrate_ray_static,
     // no ~/tsdf_pointcloud publisher, no ~/extract_mesh service. `enable_tsdf`
-    // (default true) is the explicit off-switch that forces it there; split
-    // mode (use_split=true) can't honor it (TsdfMap re-clamps sdf_trunc<=0 in
+    // (default true) is the explicit off-switch that forces it there; the
+    // split-grid path can't honor it (TsdfMap re-clamps sdf_trunc<=0 in
     // tsdf_map.cpp), so the constructor warns. `carve_band` is independent.
     {
       const bool enable_tsdf = dp("enable_tsdf", true);
@@ -416,6 +452,14 @@ private:
     robot_id_ = dp("robot_id", std::string(""));
     pub_pc_ = dp("publish_pointcloud", true);
     min_occ_ = dp("occupancy_vis_threshold", 0.7);
+    // Per-voxel posterior_variance/eig fields in ~/pointcloud. Filling them
+    // costs ~6 transcendental-heavy calls (digammas + logs) per published
+    // voxel per tick, and nothing in the live stack consumes them — the
+    // uncertainty campaign reads offline ScovoxMapBinary snapshots, and
+    // pointcloud_to_npz.py copies the fields only when present. When off, the
+    // two fields are omitted from the cloud schema entirely (not zero-filled)
+    // so a capture cannot mistake padding for measurements.
+    pub_unc_fields_ = dp("publish_uncertainty_fields", false);
     pub_plan_ = dp("publish_planning_map", true);
     plan_res_ = dp("planning_map_resolution", 0.20);
     plan_sz_ = dp("planning_map_size_m", 80.0);
@@ -676,6 +720,21 @@ private:
     // drops a scan rather than integrating it at a stale Time(0) pose.
     tf_lookup_timeout_sec_ = dp("tf_lookup_timeout_sec", 0.2);
     tf_require_exact_ = dp("tf_require_exact", false);
+    // RGB-D exact-stamp wait (audit item 11). Deliberately a SEPARATE knob from
+    // tf_lookup_timeout_sec: the LiDAR param is documented against GLIM's TF
+    // latency and shipped configs raise it to 1.0 s, while the RGB-D path has
+    // its own exact-stamp-or-reject policy (no Time(0) fallback) and has always
+    // waited 0.2 s. Reusing the LiDAR knob would silently change the image path
+    // in every config that tuned it for LiDAR (e.g. scovox_fused_lidar_rgbd).
+    rgbd_tf_timeout_sec_ = dp("rgbd_tf_timeout_sec", 0.2);
+    // RSS sampling cadence for the per-frame perf line (audit item 12).
+    // getVmRSSKB() opens and parses /proc/self/status; at LiDAR rates that is
+    // a measurable fixed per-frame cost on the executor thread. N > 1 parses
+    // every N-th frame and repeats the cached value in between — the rss_mb=
+    // token itself stays on EVERY perf line (experiment parsers grep it), only
+    // its refresh rate changes. Default 1 = parse every frame, the shipped
+    // behavior, so existing benches are untouched unless a config opts in.
+    rss_sample_every_ = (int)dp("rss_sample_every", 1);
     // Uniform voxel-grid downsample, applied per-scan in the SENSOR frame BEFORE
     // integration (after deskew) — this is what GLIM does in preprocessing
     // (config_preprocess.json: voxel-grid @ downsample_resolution). The raw
@@ -855,7 +914,21 @@ private:
       di_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(di_topic_, rclcpp::QoS(10),
         [this](sensor_msgs::msg::CameraInfo::SharedPtr m){ di_ = *m; have_di_.store(true, std::memory_order_release); });
       if (dataset_mode_) {
-        auto qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable();
+        // Dataset-replay queue depth (audit item 8). The deep RELIABLE queue is
+        // the lossless-replay mechanism, NOT a tuning accident: every image
+        // replay node is open-loop (fixed-rate timer, no backpressure — and
+        // RELIABLE gives none either: a KEEP_LAST reader acks samples as it
+        // substitutes them out, so the writer never blocks), and the mapper
+        // integrates slower than the 4 Hz feed, so the backlog lives entirely
+        // in this subscription history. Measured peak occupancy on passing
+        // eval cells: 176 frames (scenenet_soft_e2/0_182), 161 (s1_ktop/K20).
+        // The real invariant is depth > longest replay sequence; 1000 covers
+        // every current eval. Shrinking below ~200 silently drops frames on
+        // runs that pass today — lower this only with replay-side pacing.
+        const int ds_depth = static_cast<int>(
+            this->declare_parameter("dataset_queue_depth", 1000));
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(
+            static_cast<size_t>(std::max(1, ds_depth)))).reliable();
         ds_depth_sub_ = create_subscription<sensor_msgs::msg::Image>(depth_topic_, qos,
           [this](sensor_msgs::msg::Image::ConstSharedPtr m){ onDatasetDepth(m); });
         ds_seg_sub_ = create_subscription<sensor_msgs::msg::Image>(seg_topic_, qos,
@@ -874,6 +947,17 @@ private:
     auto dp = [&](auto n, auto d){ return this->declare_parameter<decltype(d)>(n, d); };
     auto pc_t = dp("pointcloud_topic", std::string("~/pointcloud"));
     auto sm_t = dp("scovox_topic", std::string("~/scovox"));
+    // Opt-in free-space filter for the ScovoxMap topic (audit item 6). MUST
+    // default to shipping everything: explo_planner_node (hmr_explo_ws)
+    // consumes free voxels as load-bearing input — frontier extraction needs
+    // p_occ < 0.5 cells, coverage termination counts free-swept columns, and
+    // absent cells score as max-EIG unknown, so filtering them out silently
+    // breaks exploration (coupling config: config/exploration_fused_bag.yaml).
+    // Safe to enable for occupied-only consumers (e.g. tree_detector_node,
+    // which already discards p < occ_thresh): skips voxels below the
+    // occupancy_threshold the message itself advertises, so a consumer that
+    // binarizes at that threshold sees an identical occupied set.
+    sm_occupied_only_ = dp("scovox_occupied_only", false);
     auto pl_t = dp("planning_map_topic", std::string("~/planning_map"));
     auto tsdf_t = dp("tsdf_pointcloud_topic", std::string("~/tsdf_pointcloud"));
     sm_pub_ = create_publisher<scovox_msgs::msg::ScovoxMap>(sm_t, 10);
@@ -947,6 +1031,15 @@ private:
       }
     }
     return 0;
+  }
+  // Cadence wrapper for the per-frame perf lines (audit item 12; see the
+  // rss_sample_every declaration). Own tick counter — one call per integrated
+  // frame from whichever pipeline tail runs — first call always parses. With
+  // the default cadence of 1 every call parses, i.e. exactly the old behavior.
+  size_t sampledVmRSSKB() {
+    if (rss_sample_every_ <= 1 || (rss_tick_++ % (size_t)rss_sample_every_) == 0)
+      rss_cached_kb_ = getVmRSSKB();
+    return rss_cached_kb_;
   }
 
   // TF quality gate shared by the depth and LiDAR paths. Returns true when the
@@ -1148,14 +1241,78 @@ private:
     return {true, t_tf, t_integrate};
   }
 
+  // ── Shared per-scan tail (audit item 5 / duplicated-tail code smell) ─────
+  // Everything both scan callbacks (onImages / onPointCloud) did after
+  // integration, verbatim: binary-share publish (or the touched-buffer clear
+  // that replaces it in persistent mode), planning-map publish, and the
+  // perf-timing numbers. The per-frame RCLCPP_INFO stays in each callback so
+  // both format strings remain string literals, byte-identical to the
+  // pre-refactor lines — the perf tokens (frame_ms=, tf_ms=, rss_mb=,
+  // tsdf_ms=, sembeta_ms=, bin_bytes=) and their bracket scopes are a frozen
+  // parser contract. Operation order is preserved exactly: t_end is captured
+  // before the RSS read, so frame_ms/publish_ms exclude the
+  // /proc/self/status parse just as before.
+  struct ScanTailStats {
+    size_t bin_bytes = 0;
+    float frame_ms = 0.f, tf_ms = 0.f, integrate_ms = 0.f, publish_ms = 0.f;
+    float tsdf_ms = 0.f, sembeta_ms = 0.f;
+    double rss_mb = 0.0;
+  };
+  ScanTailStats finishScanTail(
+      const std::chrono::high_resolution_clock::time_point& t_start,
+      const std::chrono::high_resolution_clock::time_point& t_tf,
+      const std::chrono::high_resolution_clock::time_point& t_integrate) {
+    ScanTailStats st;
+    if (bin_pub_) {
+      // share_rate_hz > 0: the share timer owns the publish. Touched coords
+      // just accumulate here and coalesce at the next tick (drainTouched*
+      // sort+uniques, so N same-voxel writes become one wire record).
+      if (share_rate_hz_ <= 0.0) {
+        auto [bv,bm] = publishBinaryMap(); st.bin_bytes = bv; (void)bm;
+      }
+    }
+    else {
+      // No bin_pub_ in persistent mode → publishBinaryMap is never
+      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
+      // (every integrated ray appends coords). Clear via the O(n)
+      // path: drainTouched* sorts+uniques, but the result is unused here,
+      // so a plain clear is ~µs. The bin_pub_ branch above still uses
+      // drainTouched* for the wire-format dedup it needs.
+      split_map_->clearTouchedTsdf();
+      split_map_->clearTouchedSemDir();
+      split_map_->clearTouchedFine();
+    }
+    if (pub_plan_ && pl_pub_) publishPlanningMap();
+    // Pointcloud is published on the 1Hz timer — not per-frame, to avoid
+    // blocking integration (holds for both scan callbacks).
+    auto t_end = std::chrono::high_resolution_clock::now();
+    st.frame_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    st.rss_mb = sampledVmRSSKB() / 1024.0;
+    st.tf_ms = std::chrono::duration<float, std::milli>(t_tf - t_start).count();
+    st.integrate_ms = std::chrono::duration<float, std::milli>(t_integrate - t_tf).count();
+    st.publish_ms = std::chrono::duration<float, std::milli>(t_end - t_integrate).count();
+    st.tsdf_ms = static_cast<float>(split_map_->tsdfTimeUs())   / 1000.0f;
+    st.sembeta_ms = static_cast<float>(split_map_->semdirTimeUs()) / 1000.0f;
+    return st;
+  }
+  // Post-log trio both scan callbacks end with.
+  void scanLogEpilogue() {
+    if (frame_recv_ % 10 == 1) scheduleMemUsage();
+    logEvictionDelta(frame_recv_);
+    topk_->logSummary(/*throttle_ms=*/10000);
+  }
+
   void onImages(const sensor_msgs::msg::Image::ConstSharedPtr& depth, const sensor_msgs::msg::Image::ConstSharedPtr& seg) {
     auto t_start = std::chrono::high_resolution_clock::now();
     split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
-    last_input_stamp_ = rclcpp::Time(depth->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
     if (!have_di_.load(std::memory_order_acquire)) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: waiting for CameraInfo", frame_recv_, replay_idx); return; }
     std::unique_lock<std::shared_mutex> lock(map_mtx_);
+    // TF-safe map republish stamp. Written under the unique_lock: the viz timer
+    // (own callback group, second executor thread) reads it under a shared_lock,
+    // and rclcpp::Time is not atomic — a pre-lock write would race it.
+    last_input_stamp_ = rclcpp::Time(depth->header.stamp, RCL_ROS_TIME);
     if (depth->width != seg->width || depth->height != seg->height) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: size mismatch", frame_recv_, replay_idx); return; }
     if (std::abs(rclcpp::Time(seg->header.stamp).seconds() - rclcpp::Time(depth->header.stamp).seconds()) > 0.05) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: timestamp mismatch dt=%.3f", frame_recv_, replay_idx, std::abs(rclcpp::Time(seg->header.stamp).seconds() - rclcpp::Time(depth->header.stamp).seconds())); return; }
     const int W = (int)depth->width, H = (int)depth->height;
@@ -1177,7 +1334,8 @@ private:
     // (~5% of frames in testing). Reject instead: drop the frame on any exact-stamp
     // miss. (LiDAR onPointCloud keeps its own fallback; this policy is RGB-D only.)
     Eigen::Isometry3f T_oo;
-    try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rclcpp::Duration::from_seconds(0.2)));
+    const auto rgbd_tf_to = rclcpp::Duration::from_seconds(rgbd_tf_timeout_sec_);
+    try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rgbd_tf_to));
     } catch (const std::exception& e) {
       RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: TF FAILED (no exact-stamp pose): %s", frame_recv_, replay_idx, e.what());
       return;
@@ -1187,7 +1345,7 @@ private:
     T_oo.linear() = T_oo.linear() * kR;
     Eigen::Vector3f O;
     const std::string& obs_frame = fuse_lidar_rgbd_ ? rgbd_base_frame_ : base_frame_;
-    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, depth->header.stamp, rclcpp::Duration::from_seconds(0.2));
+    try { auto t = tf_buffer_.lookupTransform(int_frame_, obs_frame, depth->header.stamp, rgbd_tf_to);
       O << t.transform.translation.x, t.transform.translation.y, t.transform.translation.z;
     } catch (const std::exception& e) {
       // Same exact-stamp-or-reject policy for the ray-origin (observer) pose.
@@ -1206,47 +1364,14 @@ private:
     snap.st = st; snap.sch = sch; snap.srgb = srgb;
     const DepthIntegrateResult res = integrateDepthSnapshot(snap);
     if (!res.admitted) return;   // frame-admission gate rejected the pose
-    const auto t_tf = res.t_tf;
-    const auto t_integrate = res.t_integrate;
-    size_t bin_bytes_ = 0;
-    if (bin_pub_) {
-      // share_rate_hz > 0: the share timer owns the publish. Touched coords
-      // just accumulate here and coalesce at the next tick (drainTouched*
-      // sort+uniques, so N same-voxel writes become one wire record).
-      if (share_rate_hz_ <= 0.0) {
-        auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm;
-      }
-    }
-    else {
-      // No bin_pub_ in persistent mode → publishBinaryMap is never
-      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
-      // (every integrated ray appends coords). Clear via the O(n)
-      // path: drainTouched* sorts+uniques, but the result is unused here,
-      // so a plain clear is ~µs. The bin_pub_ branch above still uses
-      // drainTouched* for the wire-format dedup it needs.
-      split_map_->clearTouchedTsdf();
-      split_map_->clearTouchedSemDir();
-    }
-    if (pub_plan_ && pl_pub_) publishPlanningMap();
-    // Pointcloud is published on the 1Hz timer — not per-frame, to avoid blocking integration
-    auto t_end = std::chrono::high_resolution_clock::now();
-    float frame_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
-    size_t mem_kb = getVmRSSKB();
-    float tf_ms = std::chrono::duration<float, std::milli>(t_tf - t_start).count();
-    float integrate_ms = std::chrono::duration<float, std::milli>(t_integrate - t_tf).count();
-    float publish_ms = std::chrono::duration<float, std::milli>(t_end - t_integrate).count();
-    {
-      const float t_ms = static_cast<float>(split_map_->tsdfTimeUs())    / 1000.0f;
-      const float s_ms = static_cast<float>(split_map_->semdirTimeUs()) / 1000.0f;
-      RCLCPP_INFO(get_logger(),
-                  "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
-                  "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu",
-                  frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms,
-                  publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_);
-    }
-    if (frame_recv_ % 10 == 1) scheduleMemUsage();
-    logEvictionDelta(frame_recv_);
-    topk_->logSummary(/*throttle_ms=*/10000);
+    // `tail`, not `st`: this scope already has `const int st = stride_` above.
+    const ScanTailStats tail = finishScanTail(t_start, res.t_tf, res.t_integrate);
+    RCLCPP_INFO(get_logger(),
+                "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
+                "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu",
+                frame_recv_, replay_idx, tail.frame_ms, tail.tf_ms, tail.integrate_ms,
+                tail.publish_ms, tail.rss_mb, tail.tsdf_ms, tail.sembeta_ms, tail.bin_bytes);
+    scanLogEpilogue();
   }
 
   // ── Intra-scan deskew (gyro-based) ──────────────────────────────────────
@@ -1277,9 +1402,10 @@ private:
     }
   }
 
-  // Buffer the gyro stream. The single-threaded executor serializes this against
-  // onPointCloud, so no lock is needed (same contract the map_mtx_ comments rely
-  // on). Stores angular velocity only — translation deskew is phase 2.
+  // Buffer the gyro stream. The default mutually-exclusive callback group
+  // serializes this against onPointCloud (only the viz timer runs in another
+  // group — see main()), so no lock is needed. Stores angular velocity only —
+  // translation deskew is phase 2.
   void onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& m) {
     if (imu_frame_.empty() && !m->header.frame_id.empty()) imu_frame_ = m->header.frame_id;
     ImuSample s;
@@ -1538,13 +1664,6 @@ private:
     split_map_->beginCarveFrame();
     if (downsample_voxel_size_ > 0.0) {
       const float inv = 1.0f / static_cast<float>(downsample_voxel_size_);
-      struct Acc {
-        float sx = 0.f, sy = 0.f, sz = 0.f;              // centroid accumulator
-        uint32_t n = 0;
-        float best_d2 = std::numeric_limits<float>::infinity();
-        Eigen::Vector3f best_p{0.f, 0.f, 0.f};           // measured return nearest centroid
-        float best_off = 0.f;
-      };
       // pack three voxel indices into one int64 (21 bits each, signed-wrap safe
       // for |index| < 2^20 ≈ ±10 km at 1 cm — far beyond any LiDAR range here).
       auto vkey = [](int ix, int iy, int iz) -> int64_t {
@@ -1553,13 +1672,11 @@ private:
       // Single deskew pass: cache each deskewed return + its voxel slot and
       // accumulate the per-voxel centroid. Slots index a flat vector, so the
       // nearest-point pass below needs neither a map lookup nor a second deskew.
-      struct DPoint { Eigen::Vector3f p; float off; uint32_t slot; };
-      std::unordered_map<int64_t, uint32_t> grid;
-      grid.reserve(N / 2 + 16);
-      std::vector<Acc> accs;
-      accs.reserve(N / 2 + 16);
-      std::vector<DPoint> pts;
-      pts.reserve(N);
+      // Scratches are members (audit item 14): contents rebuilt every scan,
+      // but the map's bucket array and the vectors' capacity persist.
+      auto& grid = ds_grid_;  grid.clear();  grid.reserve(N / 2 + 16);
+      auto& accs = ds_accs_;  accs.clear();  accs.reserve(N / 2 + 16);
+      auto& pts  = ds_pts_;   pts.clear();   pts.reserve(N);
       for (size_t i = 0; i < N; ++i) {
         const uint8_t* p = data + i * step;
         float x = *reinterpret_cast<const float*>(p + off_x);
@@ -1581,15 +1698,15 @@ private:
         const int iz = (int)std::floor(praw.z() * inv);
         auto [it, inserted] = grid.try_emplace(vkey(ix, iy, iz), (uint32_t)accs.size());
         if (inserted) accs.emplace_back();
-        Acc& a = accs[it->second];
+        DsAcc& a = accs[it->second];
         a.sx += praw.x(); a.sy += praw.y(); a.sz += praw.z(); ++a.n;
         pts.push_back({praw, off_i, it->second});
       }
       // Keep one ORIGINAL return per voxel: the cached point nearest the voxel
       // centroid (a medoid). No deskew here — every point is already cached, and
       // each voxel has ≥1 point, so best_p is always a real measurement.
-      for (const DPoint& d : pts) {
-        Acc& a = accs[d.slot];
+      for (const DsPoint& d : pts) {
+        DsAcc& a = accs[d.slot];
         const float invn = 1.0f / float(a.n);
         const Eigen::Vector3f c(a.sx * invn, a.sy * invn, a.sz * invn);
         const float d2 = (d.p - c).squaredNorm();
@@ -1605,8 +1722,8 @@ private:
       // integrateHit below, so no return is fused twice.
       if (fine_raw_returns_ && split_map_->fineEnabled() &&
           !split_map_->refinementRegions().empty()) {
-        for (const DPoint& d : pts) {
-          const Acc& a = accs[d.slot];
+        for (const DsPoint& d : pts) {
+          const DsAcc& a = accs[d.slot];
           if (d.p.x() == a.best_p.x() && d.p.y() == a.best_p.y() &&
               d.p.z() == a.best_p.z())
             continue;
@@ -1617,7 +1734,7 @@ private:
       }
 
       ds_in = N; ds_out = accs.size();
-      for (const Acc& a : accs) {
+      for (const DsAcc& a : accs) {
         Eigen::Vector3f Hp = T_oi * a.best_p;
         if (apply_trans) Hp += v_odom * a.best_off;
         const float rng = need_rng ? (Hp - O).norm() : 0.f;
@@ -1683,8 +1800,9 @@ private:
     split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
-    last_input_stamp_ = rclcpp::Time(cloud->header.stamp, RCL_ROS_TIME);  // for TF-safe map republish stamp
     std::unique_lock<std::shared_mutex> lock(map_mtx_);
+    // TF-safe map republish stamp — under the unique_lock; see onImages note.
+    last_input_stamp_ = rclcpp::Time(cloud->header.stamp, RCL_ROS_TIME);
 
     // Find field offsets
     int off_x=-1, off_y=-1, off_z=-1, off_lbl=-1, off_t=-1;
@@ -1737,52 +1855,19 @@ private:
     snap.lbl_type = lbl_type; snap.t_type = t_type;
     const LidarIntegrateResult res = integrateLidarSnapshot(snap);
     if (!res.admitted) return;   // gate reject or malformed cloud
-    const auto t_tf = res.t_tf;
-    const auto t_integrate = res.t_integrate;
     const bool do_deskew = res.do_deskew;
     const size_t ds_in = res.ds_in, ds_out = res.ds_out;
-    size_t bin_bytes_ = 0;
-    if (bin_pub_) {
-      // share_rate_hz > 0: the share timer owns the publish. Touched coords
-      // just accumulate here and coalesce at the next tick (drainTouched*
-      // sort+uniques, so N same-voxel writes become one wire record).
-      if (share_rate_hz_ <= 0.0) {
-        auto [bv,bm] = publishBinaryMap(); bin_bytes_ = bv; (void)bm;
-      }
-    }
-    else {
-      // No bin_pub_ in persistent mode → publishBinaryMap is never
-      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
-      // (every integrated ray appends coords). Clear via the O(n)
-      // path: drainTouched* sorts+uniques, but the result is unused here,
-      // so a plain clear is ~µs. The bin_pub_ branch above still uses
-      // drainTouched* for the wire-format dedup it needs.
-      split_map_->clearTouchedTsdf();
-      split_map_->clearTouchedSemDir();
-    }
-    if (pub_plan_ && pl_pub_) publishPlanningMap();
-    auto t_end = std::chrono::high_resolution_clock::now();
-    float frame_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
-    size_t mem_kb = getVmRSSKB();
-    float tf_ms = std::chrono::duration<float, std::milli>(t_tf - t_start).count();
-    float integrate_ms = std::chrono::duration<float, std::milli>(t_integrate - t_tf).count();
-    float publish_ms = std::chrono::duration<float, std::milli>(t_end - t_integrate).count();
-    {
-      const float t_ms = static_cast<float>(split_map_->tsdfTimeUs())    / 1000.0f;
-      const float s_ms = static_cast<float>(split_map_->semdirTimeUs()) / 1000.0f;
-      RCLCPP_INFO(get_logger(),
-                  "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
-                  "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu "
-                  "gated=%zu rearm=%zu reject_gated=%zu deskew=%d knots=%zu tf_fb=%zu ds=%zu/%zu",
-                  frame_recv_, replay_idx, frame_ms, tf_ms, integrate_ms,
-                  publish_ms, mem_kb / 1024.0, t_ms, s_ms, bin_bytes_,
-                  frames_gated_, tf_rearm_count_, frames_gated_reject_,
-                  (int)do_deskew, do_deskew ? deskew_table_.size() : (size_t)0,
-                  tf_fallback_count_, ds_out, ds_in);
-    }
-    if (frame_recv_ % 10 == 1) scheduleMemUsage();
-    logEvictionDelta(frame_recv_);
-    topk_->logSummary(/*throttle_ms=*/10000);
+    const ScanTailStats tail = finishScanTail(t_start, res.t_tf, res.t_integrate);
+    RCLCPP_INFO(get_logger(),
+                "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
+                "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu "
+                "gated=%zu rearm=%zu reject_gated=%zu deskew=%d knots=%zu tf_fb=%zu ds=%zu/%zu",
+                frame_recv_, replay_idx, tail.frame_ms, tail.tf_ms, tail.integrate_ms,
+                tail.publish_ms, tail.rss_mb, tail.tsdf_ms, tail.sembeta_ms, tail.bin_bytes,
+                frames_gated_, tf_rearm_count_, frames_gated_reject_,
+                (int)do_deskew, do_deskew ? deskew_table_.size() : (size_t)0,
+                tf_fallback_count_, ds_out, ds_in);
+    scanLogEpilogue();
   }
 
   void scheduleMemUsage() {
@@ -1910,7 +1995,7 @@ private:
       if (best >= 0 && dyn_cls_.count((uint16_t)best)) is_dynamic = true;
     }
     split_map_->integrateHit(co, Hp, cp, q, is_dynamic, prof);
-    sm_dirty_.store(true, std::memory_order_relaxed);
+    markMapDirty();
   }
   // Decay the transient (dynamic-class) grid one step toward the prior. Called
   // once per admitted frame, before this frame's hits are integrated, so stale
@@ -1919,7 +2004,7 @@ private:
   void decayTransientFrame() {
     if (dyn_cls_.empty()) return;
     split_map_->decayTransient(static_cast<float>(transient_decay_rate_));
-    sm_dirty_.store(true, std::memory_order_relaxed);
+    markMapDirty();
   }
   void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps,
                          const scovox::HitWeights* prof = nullptr) {
@@ -1929,9 +2014,18 @@ private:
     // NO a_free here, so its many no-return (sky/far) rays can't erode LiDAR
     // occupancy on the shared Beta grid.
     for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f, prof);
-    sm_dirty_.store(true, std::memory_order_relaxed);
+    markMapDirty();
   }
   void loadSemanticColorMap() {
+    // Keys pack a segmentation color as (R<<16 | G<<8 | B) — same packing as
+    // the lookup at the integration site. The defaults are the legacy Gazebo
+    // sim palette that pairs with the default /atlas/* topics (all R=0):
+    //   0x4382 RGB(0, 67,130) -> 1     0xCA88 RGB(0,202,136) -> 6
+    //   0x21C1 RGB(0, 33,193) -> 2     0xA8C7 RGB(0,168,199) -> 5
+    //   0x8605 RGB(0,134,  5) -> 4     0x6544 RGB(0,101, 68) -> 3
+    //   0x0    RGB(0,  0,  0) -> 0 (unknown: no semantic vote — the hit
+    //                               still integrates geometry-only)
+    // Every eval launch overrides both lists (SceneNet/SceneNN/KITTI/outdoor).
     const std::vector<int64_t> dk={0x4382,0x21C1,0x8605,0xCA88,0xA8C7,0x6544,0}, dc={1,2,4,6,5,3,0};
     auto ck = declare_parameter<std::vector<int64_t>>("semantic_color_map_keys", dk);
     auto ci = declare_parameter<std::vector<int64_t>>("semantic_color_map_classes", dc);
@@ -1951,6 +2045,15 @@ private:
       sem_col_.push_back(c);
     }
   }
+  // One dirt source for every map mutation site: the ScovoxMap publisher and
+  // both cloud publishers each consume their own flag, so one publisher
+  // firing does not blind the others.
+  void markMapDirty() noexcept {
+    sm_dirty_.store(true, std::memory_order_relaxed);
+    pc_dirty_.store(true, std::memory_order_relaxed);
+    tsdf_pc_dirty_.store(true, std::memory_order_relaxed);
+  }
+
   // Caller must hold map_mtx_ (shared). Lock removed from this function so
   // the timer body can hold one outer shared_lock spanning both publishers.
   std::pair<size_t,double> publishScovoxMap() {
@@ -1969,6 +2072,13 @@ private:
     auto dacc = ss.dirGrid().createConstAccessor();
     m.voxels.reserve(bgrid.activeCellsCount());
     bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& c) {
+      // Opt-in occupied-only filter (audit item 6); default ships every cell —
+      // free space is load-bearing for exploration consumers (see
+      // setupPublishers). Compared in float so the kept set is exactly what a
+      // consumer binarizing at the advertised (float32) m.occupancy_threshold
+      // would keep — min_occ_ is double, and the double compare disagrees with
+      // the narrowed threshold by one ulp at the boundary.
+      if (sm_occupied_only_ && b.p_occ() < float(min_occ_)) return;
       scovox_msgs::msg::ScovoxVoxel vv;
       vv.position.x=c.x*res; vv.position.y=float(c.y*res); vv.position.z=float(c.z*res);
       vv.a_occ=b.a_occ; vv.a_free=b.a_free;
@@ -2016,12 +2126,24 @@ private:
   // frozen) never re-emits at all.
   // τ(n) ablation: effective mean-arm threshold given the LAST-SENT evidence
   // (the receiver's belief mass — that is what the trigger's KL is against).
+  // One-entry memo (audit item 14): the pow runs only in the τ(n) ablation
+  // arm (ref_n > 0; default 0 = arm off, constant return), and there the
+  // dominant repeated key is the evidence-saturation cap — every saturated
+  // voxel's last-sent s_total() is the identical float. Exact: a hit returns
+  // the stored result of the same expression (tau *= pow ≡ eps * pow, one
+  // double multiply either way); the gate params are construction-fixed (no
+  // dynamic parameter callbacks) and the only caller runs on the publish
+  // timer thread, so the mutable memo needs no synchronization.
   double gateTauEff(float n_last) const {
-    double tau = share_gate_p_eps_;
-    if (share_gate_tau_ref_n_ > 0.0 && n_last > share_gate_tau_ref_n_)
-      tau *= std::pow(share_gate_tau_ref_n_ / (double)n_last,
-                      share_gate_tau_n_pow_);
-    return tau;
+    if (!(share_gate_tau_ref_n_ > 0.0 && n_last > share_gate_tau_ref_n_))
+      return share_gate_p_eps_;
+    if (n_last != tau_memo_n_) {
+      tau_memo_n_ = n_last;
+      tau_memo_tau_ = share_gate_p_eps_ *
+                      std::pow(share_gate_tau_ref_n_ / (double)n_last,
+                               share_gate_tau_n_pow_);
+    }
+    return tau_memo_tau_;
   }
   bool betaChangedSinceEmit(const scovox::BetaVoxel& last,
                             const scovox::BetaVoxel& now) const {
@@ -2064,10 +2186,11 @@ private:
       share_deferred_.clear();
       share_deferred_bytes_ = 0;
       prev_sub_count_ = cur_sub;
-      (void)split_map_->drainTouchedTsdf();
-      (void)split_map_->drainTouchedBeta();
-      (void)split_map_->drainTouchedDir();
-      (void)split_map_->drainTouchedFine();
+      // Discard path: nothing consumes the coords, so skip drainTouched*'s
+      // sort+unique (~1 s/frame at Replica res 0.05 stride 1) for a ~µs clear.
+      split_map_->clearTouchedTsdf();
+      split_map_->clearTouchedSemDir();
+      split_map_->clearTouchedFine();
       return {0, 0};
     }
 
@@ -2108,11 +2231,13 @@ private:
     // integration_frame:"map" presets.)
     geometry_msgs::msg::Transform map_from_source;
     try {
-      // Zero timeout: under the SingleThreadedExecutor the TF listener callback
-      // runs on this same thread, so blocking here can never let a new transform
-      // arrive — the pose can only be found if it is already cached. A nonzero
-      // timeout would just burn dead wait while holding map_mtx_. On a miss we
-      // defer and retry next tick (see the catch below).
+      // Zero timeout: this is a Time(0) latest-available lookup, so if any
+      // pose exists it is already in the buffer — the TransformListener drains
+      // TF on its own dedicated thread (tf_listener_(tf_buffer_) is the
+      // spin_thread=true overload), independent of this executor. A nonzero
+      // timeout would only matter while the buffer is still EMPTY at startup,
+      // and would burn that wait while holding map_mtx_. On a miss we defer
+      // and retry next tick (see the catch below).
       map_from_source = tf_buffer_.lookupTransform(
           map_frame_, int_frame_, rclcpp::Time(0),
           rclcpp::Duration(0, 0)).transform;
@@ -2189,13 +2314,13 @@ private:
       };
       if (snapshot) {
         tsdf_grid.forEachCell(emit_tsdf);
-        (void)split_map_->drainTouchedTsdf();
+        split_map_->clearTouchedTsdf();  // snapshot emitted everything
       } else {
         for (const auto& c : split_map_->drainTouchedTsdf())
           if (auto* v = tacc.value(c, false)) emit_tsdf(*v, c);
       }
     } else {
-      (void)split_map_->drainTouchedTsdf();
+      split_map_->clearTouchedTsdf();
     }
 
     // ----- Fine TSDF section (rev 7; rides the share_tsdf toggle) -----
@@ -2209,21 +2334,23 @@ private:
       };
       if (snapshot) {
         fgrid.forEachCell(emit_fine);
-        (void)split_map_->drainTouchedFine();
+        split_map_->clearTouchedFine();  // snapshot emitted everything
       } else {
         for (const auto& c : split_map_->drainTouchedFine())
           if (auto* v = facc.value(c, false)) emit_fine(*v, c);
       }
     } else {
-      (void)split_map_->drainTouchedFine();
+      split_map_->clearTouchedFine();
     }
 
     // ----- Beta section (occupancy; full-ray, always emitted) -----
     {
       auto& bgrid = ss.betaGrid();
       auto bacc = bgrid.createAccessor();
-      std::optional<Bonxai::VoxelGrid<GateBeta>::Accessor> gacc;
+      std::optional<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor> gacc;
       if (gate_beta_) gacc.emplace(gate_beta_->createAccessor());
+      std::optional<Bonxai::VoxelGrid<double>::Accessor> tacc;
+      if (gate_beta_t_) tacc.emplace(gate_beta_t_->createAccessor());
       auto emit_beta = [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         // At prior → no posterior information; keep off the wire.
         const bool at_prior = (v.a_occ  <= beta_occ_prior        + 1e-4f) &&
@@ -2237,20 +2364,23 @@ private:
           // Change gate vs the last-EMITTED state. Snapshots bypass the check
           // (a fresh subscriber needs full state) but still refresh the gate.
           if (!snapshot) {
-            if (auto* g = gacc->value(c, false); g && !betaChangedSinceEmit(g->v, v))
+            if (auto* g = gacc->value(c, false); g && !betaChangedSinceEmit(*g, v))
               return;
           }
           // MUST be setValue, not `*value(c, true) = v`: the miss above caches
           // prev_leaf_ptr_ = nullptr for this inner key, and value(c, true)
           // skips the refresh on a same-key hit → returns nullptr even with
           // create_if_missing. setValue re-fetches on a null cached leaf.
-          gacc->setValue(c, GateBeta{v, t_now});
+          gacc->setValue(c, v);
+          // Stamp twin stays in lockstep with the gate (heartbeat armed only);
+          // same setValue rationale.
+          if (tacc) tacc->setValue(c, t_now);
         }
         frame.beta_deltas.push_back({c, wireBeta(v)});
       };
       if (snapshot) {
         bgrid.forEachCell(emit_beta);
-        (void)split_map_->drainTouchedBeta();
+        split_map_->clearTouchedBeta();  // snapshot emitted everything
       } else {
         for (const auto& c : split_map_->drainTouchedBeta())
           if (auto* v = bacc.value(c, false)) emit_beta(*v, c);
@@ -2261,8 +2391,10 @@ private:
     if (share_dir_) {
       auto& dgrid = ss.dirGrid();
       auto dacc = dgrid.createAccessor();
-      std::optional<Bonxai::VoxelGrid<GateDir>::Accessor> gacc;
+      std::optional<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> gacc;
       if (gate_dir_) gacc.emplace(gate_dir_->createAccessor());
+      std::optional<Bonxai::VoxelGrid<double>::Accessor> tacc;
+      if (gate_dir_t_) tacc.emplace(gate_dir_t_->createAccessor());
       auto emit_dir = [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
         bool any_sem = false;
         for (int i = 0; i < scovox::K_TOP; ++i)
@@ -2283,17 +2415,18 @@ private:
           return;
         if (gacc) {
           if (!snapshot) {
-            if (auto* g = gacc->value(c, false); g && !dirChangedSinceEmit(g->v, v))
+            if (auto* g = gacc->value(c, false); g && !dirChangedSinceEmit(*g, v))
               return;
           }
           // setValue, not `*value(c, true)` — see the Beta gate note above.
-          gacc->setValue(c, GateDir{v, t_now});
+          gacc->setValue(c, v);
+          if (tacc) tacc->setValue(c, t_now);
         }
         frame.dir_deltas.push_back({c, wireDir(v)});
       };
       if (snapshot) {
         dgrid.forEachCell(emit_dir);
-        (void)split_map_->drainTouchedDir();
+        split_map_->clearTouchedDir();  // snapshot emitted everything
       } else {
         for (const auto& c : split_map_->drainTouchedDir())
           if (auto* v = dacc.value(c, false)) emit_dir(*v, c);
@@ -2302,7 +2435,7 @@ private:
       // Geometry-only sharing: drop the touched set on the floor each tick.
       // gate_dir_ never gains entries (emit_dir above is its only writer), so
       // the heartbeat's Dir walk below is a no-op in this mode.
-      (void)split_map_->drainTouchedDir();
+      split_map_->clearTouchedDir();
     }
 
     // ----- Heartbeat arm (share_heartbeat_sec > 0; E6.6) -----
@@ -2313,26 +2446,29 @@ private:
     // touched-path emits above already stamped t_emit = t_now, so a voxel
     // never rides both paths in one tick. Snapshot ticks skip this: the
     // snapshot itself re-pins everything.
-    if (!snapshot && share_heartbeat_sec_ > 0.0 && gate_beta_ && gate_dir_) {
+    if (!snapshot && share_heartbeat_sec_ > 0.0 && gate_beta_ && gate_dir_ &&
+        gate_beta_t_ && gate_dir_t_) {
       auto bacc = ss.betaGrid().createAccessor();
       auto dacc = ss.dirGrid().createAccessor();
-      gate_beta_->forEachCell([&](GateBeta& g, const Bonxai::CoordT& c) {
-        if (t_now - g.t_emit < share_heartbeat_sec_) return;
-        if (const auto* v = bacc.value(c, false)) {
-          g.v = *v; g.t_emit = t_now;
-          frame.beta_deltas.push_back({c, wireBeta(*v)});
-        }
-      });
-      gate_dir_->forEachCell([&](GateDir& g, const Bonxai::CoordT& c) {
-        if (t_now - g.t_emit < share_heartbeat_sec_) return;
-        if (const auto* v = dacc.value(c, false)) {
-          if (gate_binarize_ &&
-              scovox::dominantClass(*v, alpha_0_, (uint16_t)num_classes_) == 0xFFFF)
-            return;
-          g.v = *v; g.t_emit = t_now;
-          frame.dir_deltas.push_back({c, wireDir(*v)});
-        }
-      });
+      // Sweeps walk the stamp twins (lockstep with the gate grids — see the
+      // member comment), so coverage and wire order match the pre-split
+      // single-grid walk exactly (scovox::heartbeatReemit, node_utils.hpp).
+      scovox::heartbeatReemit(
+          *gate_beta_, *gate_beta_t_, bacc, t_now, share_heartbeat_sec_,
+          [](const scovox::BetaVoxel&) { return true; },
+          [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+            frame.beta_deltas.push_back({c, wireBeta(v)});
+          });
+      scovox::heartbeatReemit(
+          *gate_dir_, *gate_dir_t_, dacc, t_now, share_heartbeat_sec_,
+          [&](const scovox::DirVoxel& v) {
+            return !(gate_binarize_ &&
+                     scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) ==
+                         0xFFFF);
+          },
+          [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
+            frame.dir_deltas.push_back({c, wireDir(v)});
+          });
     }
 
     if (frame.tsdf_deltas.empty() && frame.beta_deltas.empty() &&
@@ -2528,19 +2664,41 @@ private:
     g.info.origin.orientation.w = 1.0;
     g.data.assign(w * h, -1);
     const auto& bgrid = split_map_->semsplit().betaGrid();
+    // Audit item 4: restrict the grid walk to leaf blocks intersecting the
+    // publication window instead of touching every allocated voxel — in
+    // rolling mode the window is a fixed-size crop of an ever-growing map, so
+    // the full walk was O(map) per tick. The box is voxel-coord INCLUSIVE
+    // bounds, over-expanded by one voxel on every side so float rounding at
+    // the window edge can never exclude a cell the original predicates would
+    // accept; those per-cell predicates below are unchanged and remain the
+    // sole authority on membership (identical output, smaller domain).
+    // z: the terrain-relative branch classifies whole columns (the ground
+    // anchor may lie at any elevation), so only the plain branch bounds z.
+    Bonxai::CoordT box_min = bgrid.posToCoord(ox, oy, plan_zmin_);
+    Bonxai::CoordT box_max =
+        bgrid.posToCoord(ox + double(w) * plan_res_, oy + double(h) * plan_res_, plan_zmax_);
+    box_min.x -= 1; box_min.y -= 1; box_min.z -= 1;
+    box_max.x += 1; box_max.y += 1; box_max.z += 1;
     if (plan_terrain_rel_) {
+      // Half-range sentinels so block-span arithmetic in the helper can't
+      // overflow int32 while still admitting every real coordinate.
+      box_min.z = std::numeric_limits<int32_t>::min() / 2;
+      box_max.z = std::numeric_limits<int32_t>::max() / 2;
       // Terrain-relative projection: per-column ground elevation, then a
-      // band relative to it (see the param comment). One forEachCell pass
+      // band relative to it (see the param comment). One windowed grid pass
       // collects the occupied voxels per beta-grid XY column; the column map
       // is then classified without further grid access. Free voxels are not
       // consulted: an observed ground with a clear band IS the free
       // evidence (occupied still wins across beta columns sharing a plan
       // cell). coordToPos returns voxel CORNERS; the ground surface is the
       // top face (corner + one voxel) of the ground stack.
-      struct Col { double x = 0.0, y = 0.0; std::vector<float> occ_z; };
-      std::unordered_map<uint64_t, Col> cols;
+      // Persistent member scratch (audit item 4): clear() keeps the hash
+      // table's bucket array, so steady-state ticks skip the rehash churn of
+      // rebuilding the column map from an empty table every call.
+      auto& cols = plan_cols_;
+      cols.clear();
       const float vres = float(bgrid.voxelSize());
-      bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+      scovox::forEachCellInBox(bgrid, box_min, box_max, [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         if (v.p_occ() < float(min_occ_)) return;
         const uint64_t key =
             (uint64_t(uint32_t(c.x)) << 32) | uint64_t(uint32_t(c.y));
@@ -2580,7 +2738,7 @@ private:
         else if (g.data[i] != 100) g.data[i] = 0;
       }
     } else {
-      bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+      scovox::forEachCellInBox(bgrid, box_min, box_max, [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         auto p = bgrid.coordToPos(c);
         if (p.z < plan_zmin_ || p.z > plan_zmax_) return;
         int gx = int(std::floor((p.x - ox) / plan_res_));
@@ -2603,10 +2761,28 @@ private:
   // Split-substrate pointcloud publisher. Occupancy comes from the Beta
   // grid; semantics from the Dir grid at the same coord. The two are projected
   // into a SemBetaVoxel so the shared viz helpers (argmaxClassConfidence /
-  // variance / expectedInformationGain) and the 16-field schema stay stable
-  // for pointcloud_to_npz.py / RViz / eval scripts.
+  // variance / expectedInformationGain) stay usable. Schema: 14 fields by
+  // default; the eig/variance pair is appended only when
+  // publish_uncertainty_fields is set (audit item 3) — pointcloud_to_npz.py
+  // copies fields by name and tolerates their absence, and the uncertainty
+  // campaign scores offline ScovoxMapBinary snapshots, not this cloud.
   void publishPointCloud() {
-    if (!pc_pub_ || !split_map_ || pc_pub_->get_subscription_count() == 0) return;
+    if (!pc_pub_ || !split_map_) return;
+    // Subscriber-rise re-arm (Run 4 review): this topic is KeepLast(1)
+    // reliable, NOT transient_local, so with only the dirty gate a subscriber
+    // attaching (or re-attaching) after the map went quiescent would wait
+    // forever — pointcloud_to_npz.py spins with no timeout. Mirror
+    // publishBinaryMap's prev_sub_count_ logic, updating on zero-subscriber
+    // ticks too so detach->reattach still counts as a rise.
+    const size_t cur_sub = pc_pub_->get_subscription_count();
+    const bool sub_rise = cur_sub > pc_prev_subs_;
+    pc_prev_subs_ = cur_sub;
+    if (cur_sub == 0) return;
+    // Dirty gate (audit item 3): with RViz attached but the map unchanged,
+    // skip the full-grid walk. Checked after the subscriber gate so an
+    // unsubscribed tick keeps the flag; the exchange still runs on a rise so
+    // that publish consumes the flag.
+    if (!pc_dirty_.exchange(false) && !sub_rise) return;
     auto& ss = split_map_->semsplit();
     sensor_msgs::msg::PointCloud2 cl;
     cl.header.frame_id = int_frame_;
@@ -2616,20 +2792,37 @@ private:
     cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
     sensor_msgs::PointCloud2Modifier mod(cl);
     static_assert(scovox::K_TOP >= 1, "publishPointCloud requires at least 1 sparse slot");
-    mod.setPointCloud2Fields(16,
-      "x",1,sensor_msgs::msg::PointField::FLOAT32, "y",1,sensor_msgs::msg::PointField::FLOAT32,
-      "z",1,sensor_msgs::msg::PointField::FLOAT32, "rgb",1,sensor_msgs::msg::PointField::FLOAT32,
-      "occupancy_prob",1,sensor_msgs::msg::PointField::FLOAT32, "semantic_class",1,sensor_msgs::msg::PointField::UINT8,
-      "semantic_confidence",1,sensor_msgs::msg::PointField::FLOAT32,
-      "posterior_variance",1,sensor_msgs::msg::PointField::FLOAT32,
-      "eig",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_occ",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_free",1,sensor_msgs::msg::PointField::FLOAT32,
-      "a_unk",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cnt0",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cls0",1,sensor_msgs::msg::PointField::UINT16,
-      "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
-      "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
+    // posterior_variance/eig are schema-present only when
+    // publish_uncertainty_fields is set — see the param comment.
+    if (pub_unc_fields_) {
+      mod.setPointCloud2Fields(16,
+        "x",1,sensor_msgs::msg::PointField::FLOAT32, "y",1,sensor_msgs::msg::PointField::FLOAT32,
+        "z",1,sensor_msgs::msg::PointField::FLOAT32, "rgb",1,sensor_msgs::msg::PointField::FLOAT32,
+        "occupancy_prob",1,sensor_msgs::msg::PointField::FLOAT32, "semantic_class",1,sensor_msgs::msg::PointField::UINT8,
+        "semantic_confidence",1,sensor_msgs::msg::PointField::FLOAT32,
+        "posterior_variance",1,sensor_msgs::msg::PointField::FLOAT32,
+        "eig",1,sensor_msgs::msg::PointField::FLOAT32,
+        "a_occ",1,sensor_msgs::msg::PointField::FLOAT32,
+        "a_free",1,sensor_msgs::msg::PointField::FLOAT32,
+        "a_unk",1,sensor_msgs::msg::PointField::FLOAT32,
+        "sem_cnt0",1,sensor_msgs::msg::PointField::FLOAT32,
+        "sem_cls0",1,sensor_msgs::msg::PointField::UINT16,
+        "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
+        "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
+    } else {
+      mod.setPointCloud2Fields(14,
+        "x",1,sensor_msgs::msg::PointField::FLOAT32, "y",1,sensor_msgs::msg::PointField::FLOAT32,
+        "z",1,sensor_msgs::msg::PointField::FLOAT32, "rgb",1,sensor_msgs::msg::PointField::FLOAT32,
+        "occupancy_prob",1,sensor_msgs::msg::PointField::FLOAT32, "semantic_class",1,sensor_msgs::msg::PointField::UINT8,
+        "semantic_confidence",1,sensor_msgs::msg::PointField::FLOAT32,
+        "a_occ",1,sensor_msgs::msg::PointField::FLOAT32,
+        "a_free",1,sensor_msgs::msg::PointField::FLOAT32,
+        "a_unk",1,sensor_msgs::msg::PointField::FLOAT32,
+        "sem_cnt0",1,sensor_msgs::msg::PointField::FLOAT32,
+        "sem_cls0",1,sensor_msgs::msg::PointField::UINT16,
+        "sem_cnt1",1,sensor_msgs::msg::PointField::FLOAT32,
+        "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
+    }
 
     const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
     auto has_beta_evidence = [&](const scovox::BetaVoxel& b) {
@@ -2697,9 +2890,11 @@ private:
     mod.resize(pc_scratch_.size());
     sensor_msgs::PointCloud2Iterator<float> ix(cl,"x"), iy(cl,"y"), iz(cl,"z"), ir(cl,"rgb"),
       ip(cl,"occupancy_prob"), ic2(cl,"semantic_confidence"),
-      iv(cl,"posterior_variance"), ie(cl,"eig"),
       iao(cl,"a_occ"), iaf(cl,"a_free"),
       iau(cl,"a_unk"), isn0(cl,"sem_cnt0"), isn1(cl,"sem_cnt1");
+    // Optional: only constructible when the fields exist in the schema.
+    std::optional<sensor_msgs::PointCloud2Iterator<float>> iv, ie;
+    if (pub_unc_fields_) { iv.emplace(cl,"posterior_variance"); ie.emplace(cl,"eig"); }
     sensor_msgs::PointCloud2Iterator<uint8_t>  icl(cl,"semantic_class");
     sensor_msgs::PointCloud2Iterator<uint16_t> isc0(cl,"sem_cls0"), isc1(cl,"sem_cls1");
     const float vis_gate = sem_vis_thresh_ >= 0 ? (float)sem_vis_thresh_ : 0.5f;
@@ -2726,7 +2921,11 @@ private:
       // optimizer folds it to a register move.
       float rgb_f; std::memcpy(&rgb_f, &rp, sizeof(rgb_f)); *ir = rgb_f;
       *ip = pr; *icl = bc; *ic2 = cf;
-      *iv = scovox::variance(v); *ie = scovox::expectedInformationGain(v);
+      if (iv) {
+        *(*iv) = scovox::variance(v);
+        *(*ie) = scovox::expectedInformationGain(v);
+        ++(*iv); ++(*ie);
+      }
       *iao = v.a_occ; *iaf = v.a_free; *iau = v.a_unk;
       *isn0 = v.sem_cnt[0]; *isc0 = v.sem_cls[0];
       if constexpr (scovox::K_TOP >= 2) {
@@ -2734,7 +2933,7 @@ private:
       } else {
         *isn1 = 0.0f; *isc1 = static_cast<uint16_t>(0xFFFF);
       }
-      ++ix; ++iy; ++iz; ++ir; ++ip; ++icl; ++ic2; ++iv; ++ie; ++iao; ++iaf;
+      ++ix; ++iy; ++iz; ++ir; ++ip; ++icl; ++ic2; ++iao; ++iaf;
       ++iau; ++isn0; ++isc0; ++isn1; ++isc1;
     }
     pc_pub_->publish(cl);
@@ -2747,7 +2946,13 @@ private:
   // grid has no voxel at the surface coord (same convention labelMesh /
   // extractZeroCrossing already produce). 5-field schema.
   void publishTSDFPointCloud() {
-    if (!tsdf_pub_ || !split_map_ || tsdf_pub_->get_subscription_count() == 0) return;
+    if (!tsdf_pub_ || !split_map_) return;
+    // Subscriber-rise re-arm + dirty gate — see publishPointCloud.
+    const size_t cur_sub = tsdf_pub_->get_subscription_count();
+    const bool sub_rise = cur_sub > tsdf_pc_prev_subs_;
+    tsdf_pc_prev_subs_ = cur_sub;
+    if (cur_sub == 0) return;
+    if (!tsdf_pc_dirty_.exchange(false) && !sub_rise) return;
     const auto& tsdf_grid = split_map_->tsdf().grid();
     const double res = split_map_->resolution();
     if (res <= 0.0) return;
@@ -2927,8 +3132,10 @@ private:
   double reject_gate_max_accepted_gap_sec_{0.5};
   int reject_gate_min_consecutive_{0};
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr status_sub_;
-  // Plain members: the SingleThreadedExecutor serializes onAlignmentStatus
-  // against the frame callbacks, so no synchronization is needed.
+  // Plain members: onAlignmentStatus and the frame callbacks all live in the
+  // DEFAULT mutually-exclusive callback group (only the viz timer, which never
+  // touches these, runs elsewhere — see main()), so the executor serializes
+  // them and no synchronization is needed.
   bool loc_status_received_{false};
   double loc_accepted_gap_sec_{0.0};
   long loc_consec_rejects_{0};
@@ -2976,7 +3183,31 @@ private:
   // Terrain-relative planning_map projection (see param comment).
   bool plan_terrain_rel_{false};
   double plan_rel_zmin_{0.4}, plan_rel_zmax_{2.0}, plan_ground_stack_m_{0.6};
+  // Terrain-mode column scratch for publishPlanningMap (audit item 4). A
+  // member so the unordered_map's bucket array persists across ticks
+  // (clear() keeps it); safe without extra locking because the only call
+  // sites are the integration-callback tails, which are serialized. Key is
+  // packed beta-grid (x,y); occ_z collects occupied-voxel corner elevations.
+  struct PlanCol { double x = 0.0, y = 0.0; std::vector<float> occ_z; };
+  std::unordered_map<uint64_t, PlanCol> plan_cols_;
   std::atomic<bool> sm_dirty_{false};
+  // Opt-in occupied-only filter for the ScovoxMap topic (audit item 6);
+  // default false = ship free space (exploration consumers depend on it).
+  bool sm_occupied_only_{false};
+  // Per-publisher viz dirty flags (audit item 3): the two cloud publishers
+  // early-out when the map hasn't changed since their last publish, instead
+  // of re-walking the whole map every timer tick while RViz is attached.
+  // Consumed AFTER the subscriber gate (mirrors publishScovoxMap) so a tick
+  // with no subscribers keeps the flag for the next subscribed tick.
+  std::atomic<bool> pc_dirty_{false};
+  std::atomic<bool> tsdf_pc_dirty_{false};
+  // Subscriber-rise re-arm companions to the dirty flags (Run 4 review):
+  // previous tick's subscription counts, so a new/returning subscriber on a
+  // quiescent map still gets one publish (see publishPointCloud). Timer
+  // thread only — no atomics needed.
+  size_t pc_prev_subs_{0};
+  size_t tsdf_pc_prev_subs_{0};
+  bool pub_unc_fields_{false};
   std::unordered_map<uint32_t,uint16_t> color_map_;
   // Launch param block (scovox::Params). Carries the node-level sensor filters
   // (range_decay_length, min_range, max_range, grazing_angle_threshold,
@@ -3004,6 +3235,10 @@ private:
   bool   gate_binarize_{false};          // cached: mode == "state_flip_binary"
   double share_gate_tau_ref_n_{0.0};     // >0 enables τ(n) shrink above this evidence
   double share_gate_tau_n_pow_{0.5};     // τ(n) exponent: 1 = 1/n, 0.5 = const-KL rate
+  // gateTauEff one-entry memo (see its comment). -1 sentinel is unreachable as
+  // a key: the memo path requires n_last > share_gate_tau_ref_n_ > 0.
+  mutable float tau_memo_n_{-1.f};
+  mutable double tau_memo_tau_{0.0};
   double share_heartbeat_sec_{0.0};      // >0 = per-voxel re-emit period (loss healing)
   double share_stateflip_p_occ_{0.5};    // occ/free threshold, state_flip modes
   double share_binarize_evidence_{20.0}; // pseudo-count mass of a binarized payload
@@ -3018,15 +3253,23 @@ private:
   std::deque<DeferredChunk> share_deferred_;
   size_t share_deferred_bytes_{0};
   double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
-  // Last-EMITTED wire state per voxel (the change gate's memory) plus its emit
-  // time — node-clock seconds, double not float: wall-clock epoch seconds are
-  // outside float's exact-integer range, and the heartbeat compares differences
-  // of these. Shadow Bonxai grids with the live grids' geometry; allocated only
-  // when share_change_gate is on in mode=rolling.
-  struct GateBeta { scovox::BetaVoxel v; double t_emit; };
-  struct GateDir  { scovox::DirVoxel  v; double t_emit; };
-  std::unique_ptr<Bonxai::VoxelGrid<GateBeta>> gate_beta_;
-  std::unique_ptr<Bonxai::VoxelGrid<GateDir>>  gate_dir_;
+  // Last-EMITTED wire state per voxel (the change gate's memory). Shadow
+  // Bonxai grids with the live grids' geometry; allocated only when
+  // share_change_gate is on in mode=rolling. The last-emit TIMESTAMP lives in
+  // the separate *_t_ twins below (audit item 7): only the heartbeat walk ever
+  // reads it, and share_heartbeat_sec defaults to 0, so folding it into the
+  // gate structs cost 8 dead bytes per emitted voxel in the default config.
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> gate_beta_;
+  std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  gate_dir_;
+  // Heartbeat-armed only (share_heartbeat_sec > 0): per-voxel last-emit time —
+  // node-clock seconds, double not float: wall-clock epoch seconds are outside
+  // float's exact-integer range, and the heartbeat compares differences of
+  // these. Written in lockstep with the gate grids at EVERY wire emit, so each
+  // twin's active set and iteration order equal its gate grid's — which keeps
+  // the heartbeat's wire output order identical to the pre-split single-grid
+  // walk (same Bonxai geometry as the respective gate twin).
+  std::unique_ptr<Bonxai::VoxelGrid<double>> gate_beta_t_;
+  std::unique_ptr<Bonxai::VoxelGrid<double>> gate_dir_t_;
   rclcpp::TimerBase::SharedPtr bin_timer_;  // share_rate_hz publish timer
   bool fused_walker_{true};       // Step 12.10 — single-DDA hit-ray walker
   // Semantic dataset priors. Defaults match SemSplitMap::Params; KITTI launches
@@ -3061,7 +3304,7 @@ private:
   Eigen::Vector3f gyro_bias_{Eigen::Vector3f::Zero()};
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   struct ImuSample { double t; Eigen::Vector3f w; };
-  std::deque<ImuSample> imu_buf_;          // rolling gyro buffer (no lock: single-threaded executor)
+  std::deque<ImuSample> imu_buf_;          // rolling gyro buffer (no lock: default cb group serializes IMU + scan callbacks)
   Eigen::Matrix3f R_lidar_imu_{Eigen::Matrix3f::Identity()};  // rotates gyro from imu frame → cloud frame
   bool extrinsic_valid_{false};
   struct DeskewKnot { float dt; Eigen::Quaternionf q; };       // dt since scan-start, ΔR(t0→t0+dt)
@@ -3076,14 +3319,40 @@ private:
   // of silently falling back to Time(0) (the previous scan's pose).
   double tf_lookup_timeout_sec_{0.2};
   bool tf_require_exact_{false};
+  // RGB-D exact-stamp TF wait (audit item 11) — separate from the LiDAR knob
+  // above; see declareNodeParams for why.
+  double rgbd_tf_timeout_sec_{0.2};
   size_t tf_fallback_count_{0};
+  // RSS sampling cadence for the per-frame perf line — see rss_sample_every
+  // declaration and sampledVmRSSKB(). Default 1 = parse /proc every frame.
+  int rss_sample_every_{1};
+  size_t rss_cached_kb_{0};
+  size_t rss_tick_{0};
   // Uniform per-scan voxel-grid downsample (sensor frame), 0 = off. See decl in
   // declareNodeParams. Replicates GLIM's preprocess downsample inside scovox.
   double downsample_voxel_size_{0.0};
+  // Medoid-downsample per-scan scratch (audit item 14). Rebuilt from empty
+  // every scan (clear() + reserve()), but the hash map's bucket array and the
+  // vectors' capacity persist, so steady state allocates nothing. Safe as
+  // members: the only user is the serialized LiDAR integration callback.
+  struct DsAcc {
+    float sx = 0.f, sy = 0.f, sz = 0.f;              // centroid accumulator
+    uint32_t n = 0;
+    float best_d2 = std::numeric_limits<float>::infinity();
+    Eigen::Vector3f best_p{0.f, 0.f, 0.f};           // measured return nearest centroid
+    float best_off = 0.f;
+  };
+  struct DsPoint { Eigen::Vector3f p; float off; uint32_t slot; };
+  std::unordered_map<int64_t, uint32_t> ds_grid_;    // vkey -> slot in ds_accs_
+  std::vector<DsAcc> ds_accs_;
+  std::vector<DsPoint> ds_pts_;
   std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> d_sub_, s_sub_;
   using ISP = message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image,sensor_msgs::msg::Image>;
   std::shared_ptr<message_filters::Synchronizer<ISP>> sync_;
   rclcpp::TimerBase::SharedPtr sm_timer_;
+  // Viz timer's callback group (audit item 3) — see its creation site for the
+  // concurrency contract.
+  rclcpp::CallbackGroup::SharedPtr viz_cb_group_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr sm_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
   // Reused scratch for publishPointCloud's single grid walk (collect matching
@@ -3101,17 +3370,31 @@ private:
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<SCovoxNode>());
+  auto node = std::make_shared<SCovoxNode>();
+  // Two mutually-exclusive callback groups (audit item 3): the default group
+  // (sensors, services, binary-share timer) keeps the exact serialization the
+  // node's plain-member state relies on, while the viz timer's own group lets
+  // an O(map) visualization walk overlap the pre-lock phase of a scan instead
+  // of occupying the sensor callbacks' only executor slot. Two threads — one
+  // per group — is the whole win; more would idle.
+  rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions(), 2);
+  exec.add_node(node);
+  exec.spin();
+  // Shutdown diagnostic via the ROS logger, not a raw stderr write (code-smell
+  // fix 2026-08-26): fprintf bypassed log capture. The g_sparse_* globals
+  // themselves stay put — the E8.7 harnesses (e87_scan_count, e87_deposit_bench,
+  // band_perf) reset and read them directly, so they are frozen experiment API.
   const uint64_t evict = scovox::g_sparse_evict_count.load(std::memory_order_relaxed);
   const uint64_t drop  = scovox::g_sparse_drop_count.load(std::memory_order_relaxed);
   const uint64_t total = evict + drop;
-  std::fprintf(stderr,
-      "[scovox_node] sparse_add K_TOP overflow: evict=%lu drop=%lu total_overflow=%lu "
-      "(K_TOP=%d)\n",
+  RCLCPP_INFO(node->get_logger(),
+      "sparse_add K_TOP overflow: evict=%lu drop=%lu total_overflow=%lu "
+      "(K_TOP=%d)",
       static_cast<unsigned long>(evict),
       static_cast<unsigned long>(drop),
       static_cast<unsigned long>(total),
       scovox::K_TOP);
+  node.reset();
   rclcpp::shutdown();
   return 0;
 }

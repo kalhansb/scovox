@@ -29,7 +29,8 @@ def _launch_setup(context):
     topk_probs_dir_arg = context.launch_configurations.get("topk_probs_dir", "")
     eviction_stats_csv_arg = context.launch_configurations.get("eviction_stats_csv", "")
     # Step 9 (D2/D7) — split-grid v2 toggles (see replica_eval.launch.py).
-    use_split_arg = context.launch_configurations.get("use_split", "false").lower() in ("true", "1", "yes")
+    # The split substrate itself is always active in the node; the old
+    # use_split/wire_format selectors were removed as dead (never declared).
     share_tsdf_arg = context.launch_configurations.get("share_tsdf", "false").lower() in ("true", "1", "yes")
     # 2026-05-09 audit hook — when non-empty, scovox_node writes a flat
     # binary snapshot of TsdfMap on every periodic memlog tick (see
@@ -37,23 +38,22 @@ def _launch_setup(context):
     tsdf_dump_path_arg = context.launch_configurations.get("tsdf_dump_path", "")
     # Step 12.10 (2026-05-09) — fused single-DDA ray walker.
     fused_walker_arg = context.launch_configurations.get("fused_walker", "true").lower() in ("true", "1", "yes")
-    # Step 8 SemDir priors (use_split=true only). SemanticKITTI uses C=20
+    # Step 8 SemDir priors. SemanticKITTI uses C=20
     # (REPLAY layout: 0=unlabeled + 19 semantic + lane-marking at id 15).
     num_classes_arg     = int(context.launch_configurations.get("num_classes", "20"))
     dirichlet_prior_arg = float(context.launch_configurations.get("dirichlet_prior", "0.01"))
-    wire_format_arg     = context.launch_configurations.get("wire_format", "v2")
     # Phase 2.5-v2 — integration-time admission gate. Below this p_occ_post
     # the per-class dirichletUpdate inside SemDirMap::applyHitUpdate is
     # skipped (mass routes to alpha_other / OTHER). 0.0 = label every hit
     # regardless of occupancy posterior (SLIM-VDB-like envelope).
     dirichlet_min_p_occ_arg = float(context.launch_configurations.get("dirichlet_min_p_occ", "0.5"))
     # scovox-repo eval-harness extras (passed by phase0/phase1/phase2 scripts).
-    # scovox_node declares carve_skip_occ_threshold + evidence_saturation; it
-    # ignores semantic_min_confidence (no matching param) as a harmless override.
+    # scovox_node declares carve_skip_occ_threshold + evidence_saturation.
+    # (Scripts may still pass semantic_min_confidence:=… as a launch arg; it is
+    # accepted and ignored — no node declares it, so it was removed here.)
     carve_skip_occ_arg = float(context.launch_configurations.get("carve_skip_occ_threshold", "0.4"))
     # node declares evidence_saturation as an integer (dp(..., 1000)); pass an int
     evidence_saturation_arg = int(float(context.launch_configurations.get("evidence_saturation", "1000")))
-    semantic_min_confidence_arg = float(context.launch_configurations.get("semantic_min_confidence", "0.1"))
     # E1 uncertainty capture: rolling mode enables the ScovoxMapBinary publisher
     # (bin_pub_ is created only when mode==rolling); share_rate_hz>0 gives a
     # timer-owned binary publish so a snapshot fires when a capture subscriber
@@ -114,19 +114,14 @@ def _launch_setup(context):
             "band_only_integration": band_only_integration_arg,
 
             # Split-grid v2 toggles (Step 9 / D2 / D7).
-            "use_split": use_split_arg,
             "share_tsdf": share_tsdf_arg,
             "fused_walker": fused_walker_arg,
             "tsdf_dump_path": tsdf_dump_path_arg,
-            # SemDir priors — only consumed when use_split=true. KITTI default
+            # SemDir priors. KITTI default
             # is C=20 (REPLAY-layout class id range) to match the topk blob.
             "num_classes": num_classes_arg,
             "dirichlet_prior": dirichlet_prior_arg,
             "dirichlet_min_p_occ": dirichlet_min_p_occ_arg,
-            # Wire-format selector (use_split=true only). Default v2 keeps
-            # backward compat with dscovox_node's onBinaryMapV2 receiver.
-            # Set v3 once the v3 receiver lands (Step 8 follow-up).
-            "wire_format": wire_format_arg,
 
             # Semantics — 20 classes for SemanticKITTI (0=unlabeled, 1-19=semantic)
             "kappa0": kappa0_arg,
@@ -180,7 +175,6 @@ def _launch_setup(context):
             "mode": map_mode_arg,
             "share_rate_hz": share_rate_hz_arg,
             "log_mem_usage": log_mem_usage_arg,
-            "submap_max_distance": 999.0,
             "robot_id": robot_name,
 
             # Output
@@ -213,7 +207,6 @@ def _launch_setup(context):
             # scovox-repo eval-harness extras.
             "carve_skip_occ_threshold": carve_skip_occ_arg,
             "evidence_saturation": evidence_saturation_arg,
-            "semantic_min_confidence": semantic_min_confidence_arg,
         }],
     )
 
@@ -251,12 +244,8 @@ def generate_launch_description():
                               description="Soft-prob ablation: directory of <frame>.topk flat-binary blobs."),
         DeclareLaunchArgument("eviction_stats_csv", default_value="",
                               description="E5.2 — append per-frame sparse_add branch counters to this CSV."),
-        DeclareLaunchArgument("use_split", default_value="false",
-                              description="Step 9: route integration through ScovoxMapSplit "
-                                          "(TsdfMap + SemBetaMap) instead of the legacy fused scovox::Map. "
-                                          "Default false preserves the v1 wire-format path."),
         DeclareLaunchArgument("share_tsdf", default_value="false",
-                              description="Step 9: when use_split=true, controls whether v2 binary "
+                              description="Step 9: controls whether v2 binary "
                                           "frames carry the TSDF stream (true: 57 B/voxel) or just "
                                           "SemBeta deltas (false: 37 B/voxel — production default)."),
         DeclareLaunchArgument("tsdf_dump_path", default_value="",
@@ -265,17 +254,12 @@ def generate_launch_description():
                                           "snapshot of TsdfMap on every periodic memlog tick. Used "
                                           "by tools/tsdf_parity_test.py to compare voxel sets "
                                           "against SLIM-VDB after a Tr_inv frame conversion."),
-        DeclareLaunchArgument("wire_format", default_value="v2",
-                              description="Step 8 (use_split=true only): inter-robot wire format. "
-                                          "v2 = SemBeta-projected (current production, 37 B/voxel). "
-                                          "v3 = SemDir-native (20 B/voxel + header priors). Set v3 "
-                                          "after dscovox_node lands its onBinaryMapV3 receiver."),
         DeclareLaunchArgument("num_classes", default_value="20",
-                              description="Step 8 (use_split=true only): dataset class count C. "
+                              description="Step 8: dataset class count C. "
                                           "SemanticKITTI default 20 (REPLAY layout). Sets OTHER-prior "
                                           "(C−K_TOP)·α_0 and the v3 wire-format header."),
         DeclareLaunchArgument("dirichlet_prior", default_value="0.01",
-                              description="Step 8 (use_split=true only): symmetric Dirichlet prior α_0. "
+                              description="Step 8: symmetric Dirichlet prior α_0. "
                                           "Ship default 0.01 matches `defaultSemDirVoxel`. "
                                           "1/(C+1) recovers Jeffreys for ablation."),
         DeclareLaunchArgument("dirichlet_min_p_occ", default_value="0.5",
@@ -286,7 +270,7 @@ def generate_launch_description():
                                           "controlled ablation behind the SceneNet head-to-head "
                                           "gap-mechanism finding)."),
         DeclareLaunchArgument("fused_walker", default_value="true",
-                              description="Step 12.10 (2026-05-09): when use_split=true, hit rays "
+                              description="Step 12.10 (2026-05-09): hit rays "
                                           "go through a single Bresenham DDA over the union of the "
                                           "TSDF band and SemBeta carve range with per-voxel dispatch "
                                           "into both grids. Default true (production); set false to "
@@ -294,7 +278,6 @@ def generate_launch_description():
         # scovox-repo eval-harness extras (phase0/phase1/phase2 pass these).
         DeclareLaunchArgument("carve_skip_occ_threshold", default_value="0.4"),
         DeclareLaunchArgument("evidence_saturation", default_value="1000.0"),
-        DeclareLaunchArgument("semantic_min_confidence", default_value="0.1"),
         DeclareLaunchArgument("map_mode", default_value="persistent",
                               description="E1: 'rolling' enables the ScovoxMapBinary "
                                           "publisher (a_occ/a_free/Dir snapshot capture); "

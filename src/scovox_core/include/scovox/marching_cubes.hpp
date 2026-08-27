@@ -427,12 +427,17 @@ inline TriangleMesh extractMesh(
   std::unordered_map<detail::EdgeKey, int, detail::EdgeKeyHash> edge_to_vidx;
   int edge_local[12];
 
-  grid.forEachCell([&](const Voxel& /*anchor_v*/, const Bonxai::CoordT& coord) {
-    // Gather 8 corner TSDF values
+  grid.forEachCell([&](const Voxel& anchor_v, const Bonxai::CoordT& coord) {
+    // Gather 8 corner TSDF values. Corner 0 is {0,0,0} — the anchor voxel
+    // forEachCell already handed us — so read it directly instead of
+    // re-fetching it through the accessor (audit item 14).
     float f[8];
     const Voxel* cv[8];
+    if (anchor_v.tsdf_weight < min_weight) return;
+    cv[0] = &anchor_v;
+    f[0] = anchor_v.tsdf_distance;
     bool valid = true;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 1; i < 8; ++i) {
       Bonxai::CoordT cc = {
         coord.x + corners[i].x,
         coord.y + corners[i].y,
@@ -499,9 +504,9 @@ inline TriangleMesh extractMesh(
 
     // Emit triangles
     // Semantic label: argmax from the anchor voxel's sparse slots.
-    // Matches SLIM-VDB which reads semantics from the anchor coord.
-    const Voxel* anchor = acc.value(coord);
-    uint16_t label = anchor ? detail::dominantClass(*anchor) : 0;
+    // Matches SLIM-VDB which reads semantics from the anchor coord —
+    // which is anchor_v itself, so no accessor re-fetch (audit item 14).
+    const uint16_t label = detail::dominantClass(anchor_v);
 
     for (int i = 0; tri_table[cube_index][i] != -1; i += 3) {
       mesh.triangles.emplace_back(
@@ -634,10 +639,16 @@ inline TriangleMesh extractMesh(
   int edge_local[12];
   const float h = 0.5f * static_cast<float>(resolution);
 
-  grid.forEachCell([&](const TsdfVoxel& /*anchor_v*/, const Bonxai::CoordT& coord) {
+  grid.forEachCell([&](const TsdfVoxel& anchor_v, const Bonxai::CoordT& coord) {
     float f[8];
+    // Corner 0 is {0,0,0} — the anchor voxel forEachCell already handed us —
+    // so read it directly instead of re-fetching it through the accessor
+    // (audit item 14). Same voxel, same fields, same min_weight test; the
+    // remaining 7 corners still go through the accessor.
+    if (anchor_v.weight < min_weight) return;
+    f[0] = anchor_v.distance;
     bool valid = true;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 1; i < 8; ++i) {
       Bonxai::CoordT cc = {
         coord.x + corners[i].x,
         coord.y + corners[i].y,
@@ -713,6 +724,13 @@ inline std::vector<SurfacePoint> extractZeroCrossing(
     double resolution)
 {
   std::vector<SurfacePoint> points;
+  // Sizing heuristic, NOT a bound in either direction: the 3 axis probes can
+  // push up to 3 points per active cell (then the vector just reallocs), while
+  // a thick truncation band means crossings sit only on the surface shell, so
+  // this can over-reserve by roughly the band thickness. activeCellsCount()
+  // is a cheap mask popcount; the shrink below returns the overshoot before
+  // the vector (returned by value) carries it to the caller.
+  points.reserve(grid.activeCellsCount());
   auto acc = grid.createConstAccessor();
   static const Bonxai::CoordT axes[3] = {{1,0,0}, {0,1,0}, {0,0,1}};
   const float h = 0.5f * static_cast<float>(resolution);
@@ -742,6 +760,10 @@ inline std::vector<SurfacePoint> extractZeroCrossing(
     }
   });
 
+  // Drop a badly-overshot reserve (band voxels >> shell crossings on large
+  // maps) at the cost of one copy of the actual points; skip the copy when
+  // the guess was close.
+  if (points.capacity() > 2 * points.size() + 64) points.shrink_to_fit();
   return points;
 }
 

@@ -213,7 +213,7 @@ standalone memory-footprint demo.
 
 Builds library `scovoxmap` (the legacy unified `Map`) + two node executables
 (`scovox_mapping_node`, `dscovox_mapping_node`), all linking `scovox_core`,
-Eigen, LZ4, and the usual ROS 2 stack (tf2, cv_bridge, message_filters, …).
+Eigen, LZ4, and the usual ROS 2 stack (tf2, message_filters, …).
 
 ### 4.1 [scovox_node.cpp](../src/scovox_mapping/src/scovox_node.cpp) — the mapper (~3100 lines)
 

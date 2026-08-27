@@ -7,7 +7,6 @@
 #include "scovox/sem_split_map.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <utility>
 
@@ -133,6 +132,9 @@ SemSplitMap::SemSplitMap(const Params& p)
     , transient_dir_acc_(transient_dir_grid_.createAccessor())
     , touched_beta_()
     , touched_dir_()
+    // Beta-grid block geometry: the flush walk must reproduce the accessor's
+    // own leaf order, so the stage is keyed by the SAME (sanitised) leaf_bits.
+    , carve_stage_(params_.leaf_bits)
     // Shipped occupancy prior is symmetric Beta(1,1) → p_occ=0.5, decoupled from
     // the semantic (num_classes, α₀). See docs/occupancy_prior.md.
     , beta_occ_prior_(kBetaOccPrior)
@@ -245,9 +247,7 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
   // voxel per scan, block-ordered at flush.
   if (carve_frame_open_) {
     if (!params_.batch_free_carve) return true;
-    auto it = carve_stage_.find(c);
-    if (it == carve_stage_.end()) carve_stage_.emplace(c, w_inc);
-    else if (w_inc > it->second)  it->second = w_inc;
+    carve_stage_.add(c, w_inc);  // per-voxel max, keyed by leaf block
     return true;
   }
 
@@ -276,7 +276,7 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
 // ===========================================================================
 
 void SemSplitMap::beginCarveFrame() {
-  carve_stage_.clear();   // retains bucket capacity → no per-scan realloc churn
+  carve_stage_.beginFrame();  // retains all capacity → no per-scan realloc churn
   carve_hits_.clear();
   carve_frame_open_ = true;
 }
@@ -284,28 +284,17 @@ void SemSplitMap::beginCarveFrame() {
 std::size_t SemSplitMap::flushCarveFrame() {
   if (!carve_frame_open_) return 0;
 
-  // Gather staged voxels, dropping any a same-scan hit claimed as surface
-  // (occupied-wins). Then sort by leaf block so all writes into one 8^3 block
-  // are consecutive and reuse the cached accessor — recovering the locality the
-  // scan-order per-ray scatter throws away.
-  std::vector<std::pair<CoordT, float>> items;
-  items.reserve(carve_stage_.size());
-  for (const auto& kv : carve_stage_) {
-    if (carve_hits_.count(kv.first)) continue;  // occupied-wins
-    items.push_back(kv);
-  }
-  const int lb = static_cast<int>(params_.leaf_bits);
-  std::sort(items.begin(), items.end(),
-            [lb](const std::pair<CoordT, float>& a,
-                 const std::pair<CoordT, float>& b) {
-              const std::array<int32_t, 3> ba{a.first.x >> lb, a.first.y >> lb, a.first.z >> lb};
-              const std::array<int32_t, 3> bb{b.first.x >> lb, b.first.y >> lb, b.first.z >> lb};
-              return ba < bb;
-            });
-
-  for (const auto& item : items) {
-    const CoordT& c   = item.first;
-    const float   inc = item.second;
+  // Walk staged voxels leaf-block-ordered — CarveStage stages by block, so no
+  // per-voxel sort is needed; the block sequence is the same ascending
+  // (x>>lb, y>>lb, z>>lb) order the retired sort produced, keeping all writes
+  // into one block consecutive on the cached accessor AND first-touching Beta
+  // root-map blocks in the identical order (serialized-bytes invariant).
+  // Same-scan hit voxels are dropped inline (occupied-wins); a block whose
+  // staged voxels are ALL hits is never written, so it allocates nothing —
+  // exactly as when the retired path filtered before sorting.
+  std::size_t n = 0;
+  carve_stage_.forEachStagedBlockOrdered([&](const CoordT& c, float inc) {
+    if (carve_hits_.count(c)) return;  // occupied-wins
     BetaVoxel* v = beta_acc_.value(c, /*create_if_missing=*/false);
     if (!v) {
       BetaVoxel nv = defaultBetaVoxel(beta_occ_prior_, beta_free_prior_);
@@ -317,9 +306,9 @@ std::size_t SemSplitMap::flushCarveFrame() {
       applyBetaSaturation(v);
     }
     touched_beta_.push_back(c);
-  }
+    ++n;
+  });
 
-  const std::size_t n = items.size();
   carve_frame_open_ = false;
   return n;
 }
@@ -528,6 +517,36 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
 // occupied in the PERSISTENT Beta grid (`p_occ ≥ dirichlet_min_p_occ`), so
 // RGB-D can never paint a voxel LiDAR hasn't confirmed as surface. `p_occ` also
 // weights the deposit, so weakly-occupied voxels get proportionally less label.
+// Lazily build (then reuse) the in-support offset/weight table for radius l.
+// The expressions and the dz/dy/dx nesting are copied verbatim from the old
+// per-hit loop so every wk bit-matches what that loop computed, and the
+// per-hit iteration below visits neighbors in the identical order.
+const std::vector<SemSplitMap::SpreadOffset>& SemSplitMap::spreadTable(float l) {
+  for (const auto& t : spread_tables_)
+    if (t.l == l) return t.offsets;
+
+  const float res       = static_cast<float>(params_.resolution);
+  const int   R         = std::max(1, static_cast<int>(std::floor(l / res)));
+  const float inv_l     = 1.0f / l;
+  constexpr float kTwoPi = 6.283185307179586f;
+
+  SpreadTable tab;
+  tab.l = l;
+  for (int dz = -R; dz <= R; ++dz)
+    for (int dy = -R; dy <= R; ++dy)
+      for (int dx = -R; dx <= R; ++dx) {
+        const float d = res * std::sqrt(static_cast<float>(dx*dx + dy*dy + dz*dz));
+        if (d >= l) continue;                                  // compact support
+        const float t  = d * inv_l;                            // in [0,1)
+        const float wk = (1.0f/3.0f) * (2.0f + std::cos(kTwoPi * t)) * (1.0f - t)
+                       + (1.0f/kTwoPi) * std::sin(kTwoPi * t);
+        tab.offsets.push_back({static_cast<int16_t>(dx), static_cast<int16_t>(dy),
+                               static_cast<int16_t>(dz), wk});
+      }
+  spread_tables_.push_back(std::move(tab));
+  return spread_tables_.back().offsets;
+}
+
 void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
                                        const std::vector<float>* sem_probs,
                                        float                     quality,
@@ -537,38 +556,30 @@ void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
                                        float                     kappa0,
                                        float                     min_p_occ) {
   if (l <= 0.f) return;                                        // caller-gated
-  const float res       = static_cast<float>(params_.resolution);
-  if (res <= 0.f) return;
-  const int   R         = std::max(1, static_cast<int>(std::floor(l / res)));
-  const float inv_l     = 1.0f / l;
-  constexpr float kTwoPi = 6.283185307179586f;
+  // Same float-cast guard as before the table split: spreadTable divides by
+  // the float-cast resolution, so gate on that exact value.
+  if (static_cast<float>(params_.resolution) <= 0.f) return;
 
-  for (int dz = -R; dz <= R; ++dz)
-    for (int dy = -R; dy <= R; ++dy)
-      for (int dx = -R; dx <= R; ++dx) {
-        const float d = res * std::sqrt(static_cast<float>(dx*dx + dy*dy + dz*dz));
-        if (d >= l) continue;                                  // compact support
+  // Audit item 10: zero transcendentals per hit — iterate the precomputed
+  // in-support offsets and accumulate.
+  for (const auto& o : spreadTable(l)) {
+    const CoordT n{c.x + o.dx, c.y + o.dy, c.z + o.dz};
+    // LiDAR authority: read persistent occupancy; skip voxels LiDAR never
+    // built (nullptr) or that are not confidently occupied. Never allocates.
+    const BetaVoxel* b = beta_acc_.value(n, /*create_if_missing=*/false);
+    if (!b) continue;
+    const float p_occ = b->p_occ();
+    if (p_occ < min_p_occ) continue;
 
-        const CoordT n{c.x + dx, c.y + dy, c.z + dz};
-        // LiDAR authority: read persistent occupancy; skip voxels LiDAR never
-        // built (nullptr) or that are not confidently occupied. Never allocates.
-        const BetaVoxel* b = beta_acc_.value(n, /*create_if_missing=*/false);
-        if (!b) continue;
-        const float p_occ = b->p_occ();
-        if (p_occ < min_p_occ) continue;
+    const float class_share = kappa0 * p_occ * quality * o.wk;
+    if (class_share <= 0.f) continue;
 
-        const float t  = d * inv_l;                            // in [0,1)
-        const float wk = (1.0f/3.0f) * (2.0f + std::cos(kTwoPi * t)) * (1.0f - t)
-                       + (1.0f/kTwoPi) * std::sin(kTwoPi * t);
-        const float class_share = kappa0 * p_occ * quality * wk;
-        if (class_share <= 0.f) continue;
-
-        DirVoxel* dv = getOrAllocateDirOn(dacc, n);
-        dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0,
-                        params_.evict_by_confidence);
-        applyDirSaturation(dv);
-        if (touched_dir) touched_dir->push_back(n);
-      }
+    DirVoxel* dv = getOrAllocateDirOn(dacc, n);
+    dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0,
+                    params_.evict_by_confidence);
+    applyDirSaturation(dv);
+    if (touched_dir) touched_dir->push_back(n);
+  }
 }
 
 // ===========================================================================
@@ -693,7 +704,7 @@ void SemSplitMap::applyDirSaturation(DirVoxel* d) const {
 // ===========================================================================
 
 namespace {
-std::vector<Bonxai::CoordT> sortUnique(std::vector<Bonxai::CoordT>&& in) {
+void sortUnique(std::vector<Bonxai::CoordT>& in) {
   std::sort(in.begin(), in.end(), [](const Bonxai::CoordT& a, const Bonxai::CoordT& b) {
     if (a.x != b.x) return a.x < b.x;
     if (a.y != b.y) return a.y < b.y;
@@ -704,20 +715,26 @@ std::vector<Bonxai::CoordT> sortUnique(std::vector<Bonxai::CoordT>&& in) {
                          return a.x == b.x && a.y == b.y && a.z == b.z;
                        }),
            in.end());
-  return std::move(in);
 }
 }  // namespace
 
-std::vector<SemSplitMap::CoordT> SemSplitMap::drainTouchedBeta() {
-  std::vector<CoordT> out = sortUnique(std::move(touched_beta_));
-  touched_beta_.clear();
-  return out;
+// Swap the accumulator into the per-stream member scratch instead of moving
+// it out: the accumulator inherits the previous drain's capacity (no realloc
+// ramp each frame) and the returned buffer stays alive until the same
+// stream's next drain.
+
+const std::vector<SemSplitMap::CoordT>& SemSplitMap::drainTouchedBeta() {
+  scratch_beta_.clear();
+  std::swap(touched_beta_, scratch_beta_);
+  sortUnique(scratch_beta_);
+  return scratch_beta_;
 }
 
-std::vector<SemSplitMap::CoordT> SemSplitMap::drainTouchedDir() {
-  std::vector<CoordT> out = sortUnique(std::move(touched_dir_));
-  touched_dir_.clear();
-  return out;
+const std::vector<SemSplitMap::CoordT>& SemSplitMap::drainTouchedDir() {
+  scratch_dir_.clear();
+  std::swap(touched_dir_, scratch_dir_);
+  sortUnique(scratch_dir_);
+  return scratch_dir_;
 }
 
 // ===========================================================================

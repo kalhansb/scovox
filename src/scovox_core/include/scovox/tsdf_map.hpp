@@ -104,8 +104,11 @@ class TsdfMap {
 
   /// Returns the set of unique voxel coords touched since the last drain,
   /// then clears the internal buffer. O(n log n) in the touched count
-  /// (sort + unique).
-  std::vector<CoordT> drainTouched();
+  /// (sort + unique). The reference is into a member scratch buffer and is
+  /// valid until the next drainTouched() call; both the accumulator and the
+  /// scratch keep their capacity across frames, so steady-state draining
+  /// allocates nothing.
+  const std::vector<CoordT>& drainTouched();
 
   /// O(n) clear of the touched buffer without sort+unique. Use on the
   /// no-publisher path (e.g. dataset-mode runs without ~/scovox_bin
@@ -192,11 +195,20 @@ class TsdfMap {
   /// pushes `c` to the touched buffer.
   void applyBandUpdate(const CoordT& c, float sdf, const WeightFn& weight_fn);
 
+  /// Constant-weight fast path: same update with `w` a plain float instead
+  /// of a WeightFn indirect call per voxel. This is the only case the fused
+  /// walker uses (`constant(1.0f)`, the SLIM-VDB default); the WeightFn
+  /// overload above delegates here, so both share one update body.
+  void applyBandUpdate(const CoordT& c, float sdf, float w);
+
  private:
   Params              params_;
   Grid                grid_;
   Grid::Accessor      acc_;
   std::vector<CoordT> touched_;
+  /// drainTouched() swap target: holds the previous drain's result so its
+  /// buffer is recycled instead of freed (see drainTouched()).
+  std::vector<CoordT> scratch_;
 
   /// The actual integration body. Translates origin/endpoint into Bonxai
   /// coords, runs the DDA (matching SLIM-VDB's range setup modulo the

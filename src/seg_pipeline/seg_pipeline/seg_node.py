@@ -93,8 +93,10 @@ class SegNode(Node):
         try:
             self.processor.size = {"shortest_edge": self.infer_short_edge,
                                    "longest_edge": max(self.infer_short_edge * 2, 1333)}
-        except Exception:
-            pass
+        except Exception as e:
+            self.get_logger().warn(
+                f"could not bound processor resize ({e}) — inference will run at "
+                f"the model's native resolution (higher VRAM/latency)")
         self.model = (
             Mask2FormerForUniversalSegmentation.from_pretrained(self.model_name)
             .to(self.device)
@@ -115,14 +117,16 @@ class SegNode(Node):
         self.last_info: CameraInfo | None = None
         self.create_subscription(CameraInfo, self.info_topic, self._on_info, INFO_QOS)
 
-        # Synchronized depth + color
+        # Synchronized depth + color. Throughput is throttled upstream of the
+        # callback: BEST_EFFORT depth-5 QoS plus queue_size=2 here drop frames
+        # while inference (which runs synchronously inside the callback under
+        # the single-threaded spin) is busy.
         depth_sub = message_filters.Subscriber(self, Image, self.depth_topic, qos_profile=SENSOR_QOS)
         color_sub = message_filters.Subscriber(self, CompressedImage, self.color_topic, qos_profile=SENSOR_QOS)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [depth_sub, color_sub], queue_size=2, slop=self.sync_slop)
         self.sync.registerCallback(self._on_pair)
 
-        self._busy = False
         self._n_in = 0
         self._n_done = 0
         self.create_timer(10.0, self._heartbeat)
@@ -137,9 +141,6 @@ class SegNode(Node):
 
     def _on_pair(self, depth_msg: Image, color_msg: CompressedImage):
         self._n_in += 1
-        if self._busy:
-            return  # drop-while-busy -> natural throttle, sync stays correct
-        self._busy = True
         try:
             rgb = self._decode_color(color_msg)
             if rgb is None:
@@ -162,8 +163,6 @@ class SegNode(Node):
             self._n_done += 1
         except Exception as e:  # keep the node alive on a bad frame
             self.get_logger().error(f"frame failed: {e}")
-        finally:
-            self._busy = False
 
     # ---- helpers -----------------------------------------------------------
     def _decode_color(self, msg: CompressedImage):
@@ -246,9 +245,12 @@ class SegNode(Node):
                 "(e.g. ImageNet labels). Check the model's config.json.")
 
     def _heartbeat(self):
+        # _n_in counts pairs the synchronizer delivered; frames dropped upstream
+        # by QoS/sync queues while inference was busy never reach the callback
+        # and are not counted here.
         self.get_logger().info(
             f"seg: received {self._n_in} pairs, segmented {self._n_done} "
-            f"(dropped {self._n_in - self._n_done} while busy)")
+            f"({self._n_in - self._n_done} failed to decode/segment)")
 
 
 def main():
