@@ -259,8 +259,56 @@ class ScovoxMapSplit {
                        && !tparams.space_carving
                        && semsplit_.carveFrameOpen()
                        && !semsplit_.params().batch_free_carve;
+
+    // Far-voxel fast CARVE — the batch_free_carve=true counterpart of the skip
+    // above (the two share every gate except that flag, so at most one arms per
+    // ray). Beyond far_thr a voxel's exact body reduces to the carve branch
+    // ALONE: the TSDF gate (sdf <= trunc + h) and the band gate
+    // (sdf <= sem_band_) fail by the same far_thr construction the skip relies
+    // on, no behind-surface voxel can be beyond far_thr (the walk extends only
+    // back_reach ≈ far_thr·res − res behind the hit), and c != k_hit is free
+    // (the hit is at Chebyshev 0). So the fast path calls semCarve directly —
+    // all-integer distance tests, none of the vc/dist/proj float work — with
+    // the carve_blocked latch guard kept verbatim.
+    //
+    // Two structural guards make the reduction exact, not approximate:
+    //   depth >= trunc (arming): then walk_back = max(depth, trunc) = depth,
+    //     so start_pos reconstructs the ray ORIGIN (to float rounding) and no
+    //     walk voxel lies behind the origin — behind-origin voxels have
+    //     proj < 0, sdf < 0, and carve NOTHING in the exact body, so the fast
+    //     path (which always carves) must never see one. With depth < trunc
+    //     the walk does start behind the origin; the fast carve stays off and
+    //     the ray runs the exact body for every voxel, as before.
+    //   Chebyshev(c, k_origin) > 2 (origin guard ring): within ~2 voxels of
+    //     the origin, dist can exceed carve_band = depth (a voxel centre up to
+    //     h·√3 BEHIND the origin along the ray) and proj approaches the 1e-12
+    //     degeneracy guard. Outside the ring the along-ray offset is
+    //     ≥ ~1.9·res, giving carve_band − dist ≥ ~1.8·res and
+    //     proj ≥ ~5·res² — orders of magnitude beyond float noise — so
+    //     `sdf > 0 && sdf <= carve_band` holds with certainty. Ring voxels
+    //     fall through to the exact float body; their outcome is unchanged.
+    //     The ring is measured from the EXACT origin voxel (posToCoord of the
+    //     true origin, below), not from k0: start_pos = endpoint − depth·u
+    //     reconstructs the origin only to ~2 ulp, so k0 can land one voxel off
+    //     across a voxel boundary, which would shift the ring the margins
+    //     above were derived for.
+    // Operating envelope (shared with the far-voxel skip above): the margins
+    // scale with res, but the voxel-centre float `float(coord)·res + h`
+    // quantizes at ulp(|world position|) — at |world coord| ≳ 4×10⁶ m with
+    // res = 0.05 that ulp is 10 voxels, swamping the ring, and the reduction
+    // has an executed counterexample (a fast-carved voxel whose exact body
+    // computes proj < 0). The map frame must keep |world coord|/res ≲ 8×10⁷
+    // and ray length/res ≲ 3×10⁷; local/odometry frames sit 3–4 orders of
+    // magnitude inside both.
+    // Kill-switch: SCOVOX_DISABLE_FAR_CARVE, latched per instance at
+    // construction exactly like the skip's.
+    const bool far_carve = !far_carve_disabled_
+                        && !tparams.space_carving
+                        && semsplit_.carveFrameOpen()
+                        && semsplit_.params().batch_free_carve
+                        && depth >= trunc;
     int64_t far_thr = 0;
-    if (far_skip) {
+    if (far_skip || far_carve) {
       const double thr_vox =
           (std::max(static_cast<double>(trunc) + h,
                     static_cast<double>(sem_band_)) + h) / res + 1.0;
@@ -268,23 +316,46 @@ class ScovoxMapSplit {
           ? std::numeric_limits<int64_t>::max()
           : static_cast<int64_t>(thr_vox);
     }
+    // Origin voxel for the fast-carve guard ring (see above). k_hit when the
+    // fast carve is off: never read, but keeps the value initialized.
+    const auto k_origin = far_carve
+        ? grid.posToCoord(origin.x(), origin.y(), origin.z())
+        : k_hit;
 
-    const auto tsdf_weight_fn = TsdfMap::constant(1.0f);  // SLIM-VDB default
+    // SLIM-VDB default weight, as a plain float: the constant case is the only
+    // one the fused walker uses, and applyBandUpdate's float overload skips the
+    // per-voxel std::function indirect call (weight_fn(sdf) ≡ 1.0f here).
+    constexpr float tsdf_weight = 1.0f;
     bool carve_blocked = false;
     bool k_hit_visited = false;
 
     auto visit_one = [&](const CoordT& c) {
-      // Three integer subtractions replace the whole float body on far
-      // voxels (see the derivation above). The hit voxel is at distance 0,
-      // so k_hit can never be skipped and the flag below stays correct.
-      if (far_skip) {
+      // A few integer subtractions replace the whole float body on far
+      // voxels (see the derivations above). The hit voxel is at distance 0,
+      // so k_hit can never take a fast path and the flag below stays correct.
+      if (far_skip || far_carve) {
         const int64_t dx = static_cast<int64_t>(c.x) - k_hit.x;
         const int64_t dy = static_cast<int64_t>(c.y) - k_hit.y;
         const int64_t dz = static_cast<int64_t>(c.z) - k_hit.z;
         if (dx > far_thr || -dx > far_thr ||
             dy > far_thr || -dy > far_thr ||
             dz > far_thr || -dz > far_thr) {
-          return;
+          if (far_skip) return;  // carve OFF: provably no observable write
+          // far_carve: only the carve branch can fire out here — take it
+          // directly unless inside the origin guard ring, whose voxels fall
+          // through to the exact body (see the arming comment).
+          const int64_t ox = static_cast<int64_t>(c.x) - k_origin.x;
+          const int64_t oy = static_cast<int64_t>(c.y) - k_origin.y;
+          const int64_t oz = static_cast<int64_t>(c.z) - k_origin.z;
+          if (ox > 2 || -ox > 2 || oy > 2 || -oy > 2 ||
+              oz > 2 || -oz > 2) {
+            if (!carve_blocked) {
+              if (!semCarve(c, quality, prof)) {
+                carve_blocked = true;
+              }
+            }
+            return;
+          }
         }
       }
 
@@ -339,7 +410,7 @@ class ScovoxMapSplit {
       // (semHit above, is_dynamic=true); the free-space carve below stays
       // persistent (the air the object passed through is genuinely free).
       if (tsdf_enabled_ && !is_dynamic && !geometry_off && (tparams.space_carving || sdf <= trunc + h)) {
-        tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
+        tsdf_.applyBandUpdate(c, sdf, tsdf_weight);
       }
 
       // (1b) SLIM-VDB-style flat semantic band. This is the exact window
@@ -523,8 +594,9 @@ class ScovoxMapSplit {
   TsdfMap&       fineTsdf()       { return *fine_tsdf_; }
   const TsdfMap& fineTsdf() const { return *fine_tsdf_; }
 
-  std::vector<CoordT> drainTouchedFine() {
-    return fine_tsdf_ ? fine_tsdf_->drainTouched() : std::vector<CoordT>{};
+  const std::vector<CoordT>& drainTouchedFine() {
+    static const std::vector<CoordT> kEmpty;
+    return fine_tsdf_ ? fine_tsdf_->drainTouched() : kEmpty;
   }
   void clearTouchedFine() noexcept {
     if (fine_tsdf_) fine_tsdf_->clearTouched();
@@ -594,14 +666,18 @@ class ScovoxMapSplit {
   // Wire-format support (drain-on-publish)
   // -------------------------------------------------------------------
 
-  std::vector<CoordT> drainTouchedTsdf() { return tsdf_.drainTouched(); }
+  /// Drains return a reference into the owning grid's member scratch, valid
+  /// until that stream's next drain (see TsdfMap::drainTouched).
+  const std::vector<CoordT>& drainTouchedTsdf() { return tsdf_.drainTouched(); }
 
   /// SPLIT substrate: per-grid touched sets (split publish). Beta is full-ray;
   /// Dir is hit-sparse.
-  std::vector<CoordT> drainTouchedBeta() { return semsplit_.drainTouchedBeta(); }
-  std::vector<CoordT> drainTouchedDir()  { return semsplit_.drainTouchedDir(); }
+  const std::vector<CoordT>& drainTouchedBeta() { return semsplit_.drainTouchedBeta(); }
+  const std::vector<CoordT>& drainTouchedDir()  { return semsplit_.drainTouchedDir(); }
 
   void clearTouchedTsdf()   noexcept { tsdf_.clearTouched(); }
+  void clearTouchedBeta()   noexcept { semsplit_.clearTouchedBeta(); }
+  void clearTouchedDir()    noexcept { semsplit_.clearTouchedDir(); }
   void clearTouchedSemDir() noexcept { semsplit_.clearTouched(); }
 
   // -------------------------------------------------------------------
@@ -636,6 +712,14 @@ class ScovoxMapSplit {
 
   double resolution() const { return resolution_; }
 
+  /// Test canaries for the per-instance A/B kill-switch latches (see
+  /// envFarSkipDisabled() / envFarCarveDisabled() below). The identity tests
+  /// assert the latch actually SPLIT their two instances — without that, a
+  /// broken latch (env-name typo, lost member init) would silently turn a
+  /// full-vs-fast comparison into fast-vs-fast and stay green.
+  bool farSkipDisabled()  const noexcept { return far_skip_disabled_;  }
+  bool farCarveDisabled() const noexcept { return far_carve_disabled_; }
+
  private:
   /// A/B kill-switch for the far-voxel skip in integrateHitFused. Latched from
   /// the environment ONCE, at construction, PER INSTANCE — not per process —
@@ -644,6 +728,14 @@ class ScovoxMapSplit {
   /// constructing the first, unset it before constructing the second.
   static bool envFarSkipDisabled() noexcept {
     const char* e = std::getenv("SCOVOX_DISABLE_FAR_SKIP");
+    return e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+  }
+
+  /// A/B kill-switch for the far-voxel fast CARVE (the batch_free_carve=true
+  /// counterpart of the skip above). Same per-instance latch contract as
+  /// envFarSkipDisabled().
+  static bool envFarCarveDisabled() noexcept {
+    const char* e = std::getenv("SCOVOX_DISABLE_FAR_CARVE");
     return e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
   }
 
@@ -755,6 +847,8 @@ class ScovoxMapSplit {
   /// See envFarSkipDisabled() — per-instance A/B kill-switch, read here at
   /// construction time.
   bool        far_skip_disabled_ = envFarSkipDisabled();
+  /// See envFarCarveDisabled() — same latch, for the far-voxel fast carve.
+  bool        far_carve_disabled_ = envFarCarveDisabled();
 
   // Fine TSDF band state (null / empty when fine_ratio_log2 == 0).
   std::unique_ptr<TsdfMap>    fine_tsdf_;

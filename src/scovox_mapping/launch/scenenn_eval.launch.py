@@ -13,10 +13,11 @@ class set, so this differs from scenenet_eval.launch.py in three ways:
   * 5 cm voxels by default, matching the SLIM-VDB indoor protocol the other
     eval launches use.
 
-Usage:
+Usage (nyu_colormap is required — there is no default path):
   ros2 launch scovox_mapping scenenn_eval.launch.py \
-      nyu_colormap:=/home/jetsondevkit/datasets/scenenn/nyu_color.xml
-  ros2 launch scovox_mapping scenenn_eval.launch.py resolution:=0.10 semantic_mode:=majority_vote
+      nyu_colormap:=<scenenn_root>/nyu_color.xml
+  ros2 launch scovox_mapping scenenn_eval.launch.py \
+      nyu_colormap:=<scenenn_root>/nyu_color.xml resolution:=0.10 semantic_mode:=majority_vote
 """
 
 import re
@@ -31,14 +32,21 @@ NYU_NUM_CLASSES = 41
 def _load_palette(xml_path):
     """nyu_color.xml -> (keys, classes) for SCovox's colour->class lookup.
 
-    Falls back to a generated palette if the file is absent, so the launch
-    still comes up; the replay node uses the same file, so a missing colormap
-    degrades both sides consistently instead of silently mislabelling.
+    Fails loudly on a missing/unparseable file. (This replaced a silent
+    generated-palette fallback: the old default pointed into another
+    machine's home directory, so on any other box the launch came up with a
+    synthetic palette and mislabelled everything without a single warning.)
     """
+    if not xml_path:
+        raise RuntimeError(
+            "scenenn_eval.launch.py: nyu_colormap was not set. Pass "
+            "nyu_colormap:=<scenenn_root>/nyu_color.xml — it must be the same "
+            "file the replay node reads, or colours and classes drift apart.")
+    if not Path(xml_path).exists():
+        raise RuntimeError(
+            f"scenenn_eval.launch.py: nyu_colormap file not found: {xml_path}")
+    text = Path(xml_path).read_text()
     keys, classes = [], []
-    text = ""
-    if xml_path and Path(xml_path).exists():
-        text = Path(xml_path).read_text()
     seen = {}
     for m in re.finditer(r'<class\s+id="(\d+)"[^>]*color="(\d+)\s+(\d+)\s+(\d+)"', text):
         cid = int(m.group(1))
@@ -52,10 +60,9 @@ def _load_palette(xml_path):
         keys.append(rgb)
         classes.append(cid)
     if not keys:
-        for cid in range(NYU_NUM_CLASSES):
-            rgb = (cid * 7919) & 0xFFFFFF
-            keys.append(rgb)
-            classes.append(cid)
+        raise RuntimeError(
+            f"scenenn_eval.launch.py: no <class id=... color=...> entries "
+            f"parsed from {xml_path} — wrong file?")
     return keys, classes
 
 
@@ -125,7 +132,6 @@ def _launch_setup(context):
             "mode": cfg.get("map_mode", "persistent"),
             "share_rate_hz": float(cfg.get("share_rate_hz", "0.0")),
             "log_mem_usage": flag("log_mem_usage", "false"),
-            "submap_max_distance": 999.0,
             "robot_id": robot_name,
 
             "publish_pointcloud": True,
@@ -139,7 +145,6 @@ def _launch_setup(context):
             "semantic_color_map_keys": keys,
             "semantic_color_map_classes": classes,
 
-            "use_split": flag("use_split", "false"),
             "share_tsdf": flag("share_tsdf", "false"),
             "fused_walker": flag("fused_walker", "true"),
             "topk_probs_dir": cfg.get("topk_probs_dir", ""),
@@ -174,9 +179,9 @@ def generate_launch_description():
         DeclareLaunchArgument("resolution", default_value="0.05"),
         DeclareLaunchArgument("semantic_mode", default_value="dirichlet",
                               description="dirichlet | majority_vote | naive"),
-        DeclareLaunchArgument("nyu_colormap",
-                              default_value="/home/jetsondevkit/datasets/scenenn/nyu_color.xml",
-                              description="SceneNN nyu_color.xml; must match the replay node's"),
+        DeclareLaunchArgument("nyu_colormap", default_value="",
+                              description="REQUIRED: SceneNN nyu_color.xml; must match the "
+                                          "replay node's. Empty (the default) fails at launch."),
         DeclareLaunchArgument("max_range", default_value="4.0"),
         # Asus Xtion usable band is 0.4-4.0 m; tightening either end drops rays
         # rather than making each ray cheaper, so it trades map coverage for
@@ -195,7 +200,6 @@ def generate_launch_description():
         DeclareLaunchArgument("stride", default_value="2"),
         DeclareLaunchArgument("map_mode", default_value="persistent"),
         DeclareLaunchArgument("enable_tsdf", default_value="true"),
-        DeclareLaunchArgument("use_split", default_value="false"),
         DeclareLaunchArgument("share_tsdf", default_value="false"),
         DeclareLaunchArgument("fused_walker", default_value="true"),
         DeclareLaunchArgument("occupancy_vis_threshold", default_value="0.5"),

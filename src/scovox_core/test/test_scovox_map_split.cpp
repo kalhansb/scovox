@@ -560,6 +560,12 @@ void runFarSkipIdentity(float band) {
   }
   auto skip = std::make_unique<scovox::ScovoxMapSplit>(p);
 
+  // Latch canary: the env kill-switch must have SPLIT the two instances. A
+  // broken latch (env-name typo, lost member init) would otherwise turn the
+  // comparison below into skip-vs-skip and stay silently green.
+  ASSERT_TRUE(full->farSkipDisabled());
+  ASSERT_FALSE(skip->farSkipDisabled());
+
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
                   const std::vector<float>* probs, float q, bool dyn) {
@@ -681,6 +687,172 @@ void runFarSkipInert(const char* label,
   EXPECT_GT(full->tsdfVoxelCount(), 0u) << label << ": no TSDF written";
 }
 
+// ===========================================================================
+// Far-voxel fast carve — bit-identity vs the full walk (SCOVOX_DISABLE_FAR_CARVE)
+// ===========================================================================
+//
+// The batch_free_carve=true counterpart of the skip above: on the SHIPPED
+// batched config, a voxel beyond far_thr can only take the carve branch — the
+// TSDF and semantic-band gates provably fail out there — so integrateHitFused
+// carves it directly with integer-only tests and skips the float body. The
+// claim is the same BIT identity: a full-walk map (fast carve disabled via the
+// per-instance env latch) and a fast-carving map fed identical rays must agree
+// byte-for-byte on all three grids, the touched-lists, and the flush count.
+//
+// Like the far-skip identity, this cannot prove IN-PROCESS that the fast path
+// actually armed (identity is exactly the absence of a difference); execution
+// proof is the batched perf/digest pass (band_perf), mirroring how the skip's
+// arming was proven on real KITTI.
+
+void runFarCarveIdentity(float band) {
+  auto p = farSkipParams(band);
+  // The fast carve arms on the SHIPPED batched configuration — the exact flag
+  // value that keeps the far-voxel SKIP disarmed (mutually exclusive by
+  // construction, so exactly one fast path is under test here).
+  p.semsplit.batch_free_carve = true;
+
+  std::unique_ptr<scovox::ScovoxMapSplit> full;  // fast carve disabled
+  {
+    ScopedEnv disable("SCOVOX_DISABLE_FAR_CARVE", "1");
+    full = std::make_unique<scovox::ScovoxMapSplit>(p);
+  }
+  auto fast = std::make_unique<scovox::ScovoxMapSplit>(p);
+
+  // Latch canary: the env kill-switch must have SPLIT the two instances. A
+  // broken latch (env-name typo, lost member init) would otherwise turn the
+  // comparison below into fast-vs-fast and stay silently green.
+  ASSERT_TRUE(full->farCarveDisabled());
+  ASSERT_FALSE(fast->farCarveDisabled());
+
+  uint32_t s = 0xC0FFEEu;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, float q, bool dyn) {
+    full->integrateHit(O, Hp, probs, q, dyn);
+    fast->integrateHit(O, Hp, probs, q, dyn);
+  };
+
+  for (int scan = 0; scan < 5; ++scan) {
+    full->beginCarveFrame();
+    fast->beginCarveFrame();
+
+    fireScanRays(fire, scan, s);
+
+    // Short rays straddling depth == trunc (0.15): below it the walk starts
+    // BEHIND the origin (walk_back = trunc > depth) and the fast carve must
+    // stay disarmed — behind-origin voxels carve nothing in the exact body.
+    // Brackets the `depth >= trunc` arming boundary from both sides.
+    {
+      auto lcg = [&]() { s = s * 1664525u + 1013904223u; return s; };
+      auto uf  = [&](float lo, float hi) {
+        return lo + (hi - lo) * static_cast<float>(lcg() >> 8) / 16777216.0f;
+      };
+      std::vector<float> probs(14, 0.f);
+      probs[3] = 1.f;
+      for (int r = 0; r < 10; ++r) {
+        const float ox = uf(-0.2f, 0.2f);
+        const float oy = uf(-0.2f, 0.2f);
+        const float oz = uf(-0.2f, 0.2f);
+        const Eigen::Vector3f O(ox, oy, oz);
+        const float dx = uf(-1.f, 1.f);
+        const float dy = uf(-1.f, 1.f);
+        const float dz = uf(-1.f, 1.f);
+        Eigen::Vector3f dir(dx, dy, dz);
+        if (dir.norm() < 1e-3f) dir = Eigen::Vector3f::UnitZ();
+        dir.normalize();
+        const float len = uf(0.05f, 0.25f);
+        const Eigen::Vector3f Hp = O + dir * len;
+        fire(O, Hp, &probs, 0.9f, /*dyn=*/false);
+      }
+    }
+
+    EXPECT_EQ(full->flushCarveFrame(), fast->flushCarveFrame())
+        << "flush write count, scan " << scan << ", band " << band;
+
+    expectCoordListsEqual(full->drainTouchedTsdf(), fast->drainTouchedTsdf(),
+                          "tsdf", scan);
+    expectCoordListsEqual(full->drainTouchedBeta(), fast->drainTouchedBeta(),
+                          "beta", scan);
+    expectCoordListsEqual(full->drainTouchedDir(), fast->drainTouchedDir(),
+                          "dir", scan);
+
+    EXPECT_TRUE(dumpGrid(full->tsdf().grid()) == dumpGrid(fast->tsdf().grid()))
+        << "TSDF grid diverged, scan " << scan << ", band " << band;
+    EXPECT_TRUE(dumpGrid(full->semsplit().betaGrid()) ==
+                dumpGrid(fast->semsplit().betaGrid()))
+        << "Beta grid diverged, scan " << scan << ", band " << band;
+    EXPECT_TRUE(dumpGrid(full->semsplit().dirGrid()) ==
+                dumpGrid(fast->semsplit().dirGrid()))
+        << "Dir grid diverged, scan " << scan << ", band " << band;
+  }
+
+  // Non-vacuity: on this config the carve genuinely stages and flushes, and
+  // the ray fan writes all three grids.
+  EXPECT_GT(full->tsdfVoxelCount(), 0u);
+  EXPECT_GT(full->betaVoxelCount(), 0u);
+  EXPECT_GT(full->dirVoxelCount(),  0u);
+}
+
+// The fast carve must be INERT when space_carving=true — the ONE arming
+// conjunct whose deletion is observable: space carving drops the TSDF upper
+// gate, far front voxels DO take a band write, and a fast path that returns
+// right after carving loses those writes from the TSDF grid.
+//
+// The remaining conjuncts are conservative scoping, not correctness
+// load-bearing, so no inert config can kill their deletion mutants — recorded
+// here so nobody hunts for the missing tests: with batch_free_carve=false the
+// far SKIP fires first and staged/immediate carving is a no-op either way;
+// with no frame open the immediate-path carve is exactly what the exact body
+// would do beyond far_thr (latch semantics kept verbatim); with depth < trunc
+// no walk voxel can exceed far_thr at all (walk span < far_thr·res each way).
+void runFarCarveInertWhenSpaceCarving() {
+  auto p = farSkipParams(/*band=*/0.0f);
+  p.semsplit.batch_free_carve = true;
+  p.tsdf.space_carving        = true;
+
+  std::unique_ptr<scovox::ScovoxMapSplit> full;  // fast carve disabled
+  {
+    ScopedEnv disable("SCOVOX_DISABLE_FAR_CARVE", "1");
+    full = std::make_unique<scovox::ScovoxMapSplit>(p);
+  }
+  auto fast = std::make_unique<scovox::ScovoxMapSplit>(p);
+
+  uint32_t s = 0xC0FFEEu;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, float q, bool dyn) {
+    full->integrateHit(O, Hp, probs, q, dyn);
+    fast->integrateHit(O, Hp, probs, q, dyn);
+  };
+
+  for (int scan = 0; scan < 3; ++scan) {
+    full->beginCarveFrame();
+    fast->beginCarveFrame();
+
+    fireScanRays(fire, scan, s);
+
+    EXPECT_EQ(full->flushCarveFrame(), fast->flushCarveFrame())
+        << "spacecarving: flush write count, scan " << scan;
+
+    expectCoordListsEqual(full->drainTouchedTsdf(), fast->drainTouchedTsdf(),
+                          "spacecarving tsdf", scan);
+    expectCoordListsEqual(full->drainTouchedBeta(), fast->drainTouchedBeta(),
+                          "spacecarving beta", scan);
+    expectCoordListsEqual(full->drainTouchedDir(), fast->drainTouchedDir(),
+                          "spacecarving dir", scan);
+
+    EXPECT_TRUE(dumpGrid(full->tsdf().grid()) == dumpGrid(fast->tsdf().grid()))
+        << "spacecarving: TSDF grid diverged, scan " << scan;
+    EXPECT_TRUE(dumpGrid(full->semsplit().betaGrid()) ==
+                dumpGrid(fast->semsplit().betaGrid()))
+        << "spacecarving: Beta grid diverged, scan " << scan;
+    EXPECT_TRUE(dumpGrid(full->semsplit().dirGrid()) ==
+                dumpGrid(fast->semsplit().dirGrid()))
+        << "spacecarving: Dir grid diverged, scan " << scan;
+  }
+
+  EXPECT_GT(full->tsdfVoxelCount(), 0u) << "spacecarving: no TSDF written";
+  EXPECT_GT(full->betaVoxelCount(), 0u) << "spacecarving: no carve happened";
+}
+
 }  // namespace
 
 TEST(ScovoxMapSplitFarSkip, FarSkipBitIdenticalToFullWalk) {
@@ -693,6 +865,15 @@ TEST(ScovoxMapSplitFarSkip, InertUnlessEveryPreconditionHolds) {
   runFarSkipInert("production",      false,         true,             true);
   runFarSkipInert("spacecarving",    true,          false,            true);
   runFarSkipInert("noframe",         false,         false,            false);
+}
+
+TEST(ScovoxMapSplitFarCarve, FarCarveBitIdenticalToFullWalk) {
+  runFarCarveIdentity(/*band=*/0.0f);   // endpoint-only semantics (shipped)
+  runFarCarveIdentity(/*band=*/0.30f);  // band > trunc: exercises the max() arm
+}
+
+TEST(ScovoxMapSplitFarCarve, InertWhenSpaceCarving) {
+  runFarCarveInertWhenSpaceCarving();
 }
 
 // ===========================================================================

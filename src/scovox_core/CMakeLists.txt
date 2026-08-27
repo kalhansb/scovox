@@ -80,6 +80,12 @@ target_link_libraries(test_scovox_map_split scovox_core Eigen3::Eigen)
 ament_add_gtest(test_sem_split_map test/test_sem_split_map.cpp)
 target_link_libraries(test_sem_split_map scovox_core Eigen3::Eigen)
 
+# Batched-carve staging substrate (CarveStage): differential gate vs the
+# retired unordered_map + per-scan-sort staging — identical staged set /
+# max weights / block visit order (efficiency_audit_2026_08_26.md item 1).
+ament_add_gtest(test_carve_stage test/test_carve_stage.cpp)
+target_link_libraries(test_carve_stage scovox_core Eigen3::Eigen)
+
 # Wire format (triple-stream: TSDF + BetaVoxel + DirVoxel) round-trip +
 # header/size/truncation validation.
 ament_add_gtest(test_binary_serializer test/test_binary_serializer.cpp)

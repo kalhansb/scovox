@@ -158,6 +158,13 @@ void TsdfMap::visit(const CoordT&          c,
 void TsdfMap::applyBandUpdate(const CoordT&    c,
                               float            sdf,
                               const WeightFn&  weight_fn) {
+  // Gate before evaluating weight_fn so the function is only ever called on
+  // in-band voxels, exactly as before the float-overload split.
+  if (sdf <= -params_.sdf_trunc) return;
+  applyBandUpdate(c, sdf, weight_fn(sdf));
+}
+
+void TsdfMap::applyBandUpdate(const CoordT& c, float sdf, float w) {
   const float trunc = params_.sdf_trunc;
 
   // SLIM-VDB band gate: drop voxels too far behind the surface.
@@ -167,7 +174,6 @@ void TsdfMap::applyBandUpdate(const CoordT&    c,
 
   // Truncation clamp + per-voxel weight + Curless–Levoy update.
   const float d_clamped = std::min(trunc, std::max(-trunc, sdf));
-  const float w         = weight_fn(sdf);
   if (w <= 0.f) return;
 
   TsdfVoxel* v = acc_.value(c, /*create_if_missing=*/true);
@@ -186,22 +192,25 @@ void TsdfMap::applyBandUpdate(const CoordT&    c,
 // Touched-set drain (Q7)
 // ---------------------------------------------------------------------------
 
-std::vector<TsdfMap::CoordT> TsdfMap::drainTouched() {
-  std::sort(touched_.begin(), touched_.end(),
+const std::vector<TsdfMap::CoordT>& TsdfMap::drainTouched() {
+  // Swap the accumulator into the member scratch instead of moving it out:
+  // touched_ inherits the previous drain's capacity (no realloc ramp each
+  // frame) and the returned buffer stays alive until the next drain.
+  scratch_.clear();
+  std::swap(touched_, scratch_);
+  std::sort(scratch_.begin(), scratch_.end(),
             [](const CoordT& a, const CoordT& b) {
               if (a.x != b.x) return a.x < b.x;
               if (a.y != b.y) return a.y < b.y;
               return a.z < b.z;
             });
-  touched_.erase(
-      std::unique(touched_.begin(), touched_.end(),
+  scratch_.erase(
+      std::unique(scratch_.begin(), scratch_.end(),
                   [](const CoordT& a, const CoordT& b) {
                     return a.x == b.x && a.y == b.y && a.z == b.z;
                   }),
-      touched_.end());
-  std::vector<CoordT> out = std::move(touched_);
-  touched_.clear();
-  return out;
+      scratch_.end());
+  return scratch_;
 }
 
 // ---------------------------------------------------------------------------

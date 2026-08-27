@@ -18,8 +18,9 @@ def _launch_setup(context):
     robot_name = context.launch_configurations["robot_name"]
     resolution = float(context.launch_configurations["resolution"])
     semantic_mode = context.launch_configurations["semantic_mode"]
-    # Step 9 (D2/D7) — split-grid v2 toggles. Defaults preserve legacy v1.
-    use_split_arg = context.launch_configurations.get("use_split", "false").lower() in ("true", "1", "yes")
+    # Step 9 (D2/D7) — split-grid v2 toggles. The split substrate itself is
+    # always active in the node; the old use_split selector was removed as
+    # dead (never declared by the node).
     share_tsdf_arg = context.launch_configurations.get("share_tsdf", "false").lower() in ("true", "1", "yes")
     # iter6 single-DDA fused ray walker (default true to match production).
     fused_walker_arg = context.launch_configurations.get("fused_walker", "true").lower() in ("true", "1", "yes")
@@ -110,7 +111,6 @@ def _launch_setup(context):
             "mode": map_mode_arg,
             "share_rate_hz": share_rate_hz_arg,
             "log_mem_usage": log_mem_usage_arg,
-            "submap_max_distance": 999.0,
             "robot_id": robot_name,
 
             # Output
@@ -145,7 +145,6 @@ def _launch_setup(context):
             ],
 
             # Split-grid v2 toggles (Step 9 / D2 / D7).
-            "use_split": use_split_arg,
             "share_tsdf": share_tsdf_arg,
             # iter6 single-DDA fused walker (production default).
             "fused_walker": fused_walker_arg,
@@ -193,11 +192,8 @@ def generate_launch_description():
         DeclareLaunchArgument("resolution", default_value="0.05"),
         DeclareLaunchArgument("semantic_mode", default_value="dirichlet",
                               description="dirichlet | majority_vote | naive"),
-        DeclareLaunchArgument("use_split", default_value="false",
-                              description="Step 9: route integration through ScovoxMapSplit "
-                                          "(TsdfMap + SemBetaMap) instead of the legacy fused scovox::Map."),
         DeclareLaunchArgument("share_tsdf", default_value="false",
-                              description="Step 9: when use_split=true, controls whether v2 binary "
+                              description="Step 9: controls whether v2 binary "
                                           "frames carry the TSDF stream (true: 57 B/voxel) or just "
                                           "SemBeta deltas (false: 37 B/voxel — production default)."),
         DeclareLaunchArgument("occupancy_vis_threshold", default_value="0.5",
