@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 #include "scovox/ray_iterator.hpp"
@@ -213,6 +214,13 @@ SemSplitMap::Params sanitise(SemSplitMap::Params p) {
   // both gets the documented `semantic_spread_radius` behaviour, not a hybrid.
   if (p.semantic_band_length < 0.f)  p.semantic_band_length = 0.f;
   if (p.semantic_spread_radius > 0.f) p.semantic_band_length = 0.f;
+  // The ray spread is a third answer to the same deposit-shape question; the
+  // ball and the band each already exclude the other, and the spread yields to
+  // both for the same reason — two spreads at once would double-deposit and
+  // make neither arm interpretable.
+  if (p.ray_spread < 0 || p.ray_spread > 4) p.ray_spread = 0;
+  if (p.semantic_spread_radius > 0.f || p.semantic_band_length > 0.f)
+    p.ray_spread = 0;
   return p;
 }
 
@@ -231,10 +239,12 @@ SemSplitMap::SemSplitMap(const Params& p)
     , dir_grid_(params_.resolution, params_.inner_bits, params_.dir_leaf_bits)
     , transient_beta_grid_(params_.resolution, params_.inner_bits, params_.leaf_bits)
     , transient_dir_grid_(params_.resolution, params_.inner_bits, params_.dir_leaf_bits)
+    , fallback_dir_grid_(params_.resolution, params_.inner_bits, params_.dir_leaf_bits)
     , beta_acc_(beta_grid_.createAccessor())
     , dir_acc_(dir_grid_.createAccessor())
     , transient_beta_acc_(transient_beta_grid_.createAccessor())
     , transient_dir_acc_(transient_dir_grid_.createAccessor())
+    , fallback_dir_acc_(fallback_dir_grid_.createAccessor())
     , touched_beta_()
     , touched_dir_()
     // Beta-grid block geometry: the flush walk must reproduce the accessor's
@@ -283,6 +293,8 @@ void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
   carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false, prof);
   const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
   applyHitUpdate(k_hit, sem_probs, quality, prof);
+  if (params_.ray_spread != 0)
+    raySpreadDeposit(origin, endpoint, k_hit, sem_probs, quality, prof);
 }
 
 void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
@@ -295,6 +307,11 @@ void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
   carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false, prof);
   const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
   applyHitUpdate(k_hit, sem_probs, quality, is_dynamic, prof);
+  // A dynamic endpoint routes to the transient substrate; smearing a moving
+  // object's class into persistent neighbours would defeat that routing, so
+  // the spread applies to persistent hits only.
+  if (params_.ray_spread != 0 && !is_dynamic)
+    raySpreadDeposit(origin, endpoint, k_hit, sem_probs, quality, prof);
 }
 
 void SemSplitMap::integrateMiss(const Eigen::Vector3f& origin,
@@ -537,6 +554,98 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
         }
       }
       break;
+  }
+}
+
+// ===========================================================================
+// §16 three-voxel ray spread — Stream B only, at the surface's ray neighbours
+// ===========================================================================
+//
+// Geometry is build_stream_ray3.py's exactly: normalise the world-space
+// viewing ray, take the exact DDA step from the endpoint past the next voxel
+// boundary along +d (behind) and −d (front), nudged by 1e-6 m, in double
+// precision. Both neighbours are distinct from the surface voxel and from
+// each other by construction. The offline builder dropped a neighbour that
+// left its GT-bounded grid; the native map is unbounded, so that margin case
+// does not arise.
+//
+// Evidence: each neighbour takes the SAME `class_share` the surface deposit
+// used, through the same `dirichletUpdate` machinery (slots, eviction,
+// inc_mode, saturation, trace hook — a spread deposit is a deposit). The
+// surface's own `dirichlet_min_p_occ` admission is checked once, at the
+// surface; the target's occupancy is read never and written never (see the
+// Params doc for why a target-side gate would measure the gate, not the
+// spread, and why Stream A stays endpoint-only).
+
+void SemSplitMap::raySpreadDeposit(const Eigen::Vector3f&    origin,
+                                   const Eigen::Vector3f&    endpoint,
+                                   const CoordT&             k_hit,
+                                   const std::vector<float>* sem_probs,
+                                   float                     quality,
+                                   const HitWeights*         prof) {
+  if (params_.semantic_mode != SemanticMode::DIRICHLET) return;
+  if (!sem_probs || sem_probs->empty()) return;
+  // The kernel path keeps its own spread semantics (see applyHitUpdateOn).
+  if (prof && prof->kernel_radius > 0.f) return;
+
+  // Mirror the surface deposit's admission and share. Stream A has already
+  // landed at k_hit, so this p_occ is the one the endpoint commit itself saw.
+  const float kappa0    = prof ? prof->kappa0              : params_.kappa0;
+  const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
+  const BetaVoxel* b = beta_acc_.value(k_hit, /*create_if_missing=*/false);
+  if (!b) return;
+  const float p_occ_post = b->p_occ();
+  if (p_occ_post < min_p_occ) return;
+  const float class_share = kappa0 * p_occ_post * quality;
+  if (class_share <= 0.f) return;
+
+  const Eigen::Vector3d w = endpoint.cast<double>();
+  Eigen::Vector3d d = (endpoint - origin).cast<double>();
+  const double norm = d.norm();
+  if (norm <= 0.0) return;
+  d /= norm;
+
+  const double  res   = params_.resolution;
+  const int32_t cc[3] = {k_hit.x, k_hit.y, k_hit.z};
+
+  // First voxel strictly past the next boundary from `w` along `sign * d`.
+  // Voxel c spans [c·res, (c+1)·res) (Bonxai posToCoord is floor(p/res)).
+  auto step_coord = [&](double sign, CoordT* out) -> bool {
+    const Eigen::Vector3d dir = sign * d;
+    double tmin = std::numeric_limits<double>::infinity();
+    for (int a = 0; a < 3; ++a) {
+      if (dir[a] == 0.0) continue;
+      const double bound = (dir[a] > 0.0 ? double(cc[a] + 1) : double(cc[a])) * res;
+      const double t = (bound - w[a]) / dir[a];
+      if (t > 0.0 && t < tmin) tmin = t;
+    }
+    if (!std::isfinite(tmin)) return false;
+    constexpr double kStepEps = 1e-6;  // metres past the boundary, as offline
+    const Eigen::Vector3d p = w + (tmin + kStepEps) * dir;
+    *out = dir_grid_.posToCoord(p.x(), p.y(), p.z());
+    return true;
+  };
+
+  const int mode = params_.ray_spread;  // 1 behind, 2 front, 3 all3, 4 fallback
+  CoordT tc;
+  if (mode != 2 && step_coord(+1.0, &tc)) {   // behind: modes 1, 3, 4
+    DirVoxel* dv = getOrAllocateDirOn(dir_acc_, tc);
+    dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0,
+                    params_.evict_by_confidence, params_.inc_mode,
+                    params_.inc_thresh, tc.x, tc.y, tc.z);
+    applyDirSaturation(dv);
+    touched_dir_.push_back(tc);
+  }
+  if (mode != 1 && step_coord(-1.0, &tc)) {   // front: modes 2, 3, 4
+    // Mode 4 records the front claim in the fallback grid, which never feeds
+    // the fusion wire — no touched-set entry, like the transient substrate.
+    const bool to_fallback = (mode == 4);
+    DirVoxel* dv = getOrAllocateDirOn(to_fallback ? fallback_dir_acc_ : dir_acc_, tc);
+    dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0,
+                    params_.evict_by_confidence, params_.inc_mode,
+                    params_.inc_thresh, tc.x, tc.y, tc.z);
+    applyDirSaturation(dv);
+    if (!to_fallback) touched_dir_.push_back(tc);
   }
 }
 

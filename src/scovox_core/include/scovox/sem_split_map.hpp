@@ -264,6 +264,42 @@ class SemSplitMap {
     /// voxel with no Beta entry has no `p_occ` to weight by.
     bool    semantic_band_require_occ  = true;
 
+    /// Three-voxel ray spread (FINDINGS §16): deposit each hit's class
+    /// evidence not only into the surface voxel but into its first distinct
+    /// voxel neighbour(s) along the viewing ray, found by an exact DDA step
+    /// past the next voxel boundary — the same construction as the offline
+    /// stream builder (build_stream_ray3.py), in double precision.
+    ///
+    ///   0 SURFACE  — endpoint voxel only. Shipped default; the spread code
+    ///                is never entered and behaviour is byte-identical.
+    ///   1 BEHIND   — also the first voxel behind the surface (away from the
+    ///                camera; the object's interior).
+    ///   2 FRONT    — also the first voxel in front (toward the camera; the
+    ///                free space the ray traversed).
+    ///   3 ALL3     — both neighbours.
+    ///   4 FALLBACK — §16.7: behind goes into the primary Dir grid as in
+    ///                mode 1; front goes into the SEPARATE fallback Dir grid,
+    ///                consulted at readout only where the primary voxel holds
+    ///                no class evidence at all. No parameter, no weight.
+    ///
+    /// Spread deposits are Stream B ONLY — occupancy is never written at a
+    /// neighbour, so the occupancy channel (and no-return carving results)
+    /// cannot be confounded by this knob. Each neighbour takes the SAME
+    /// `class_share` the surface deposit itself used, and only when the
+    /// surface deposit passed its own `dirichlet_min_p_occ` gate: the pixel's
+    /// evidence is vetted once, at the surface. Deliberately NOT re-gated on
+    /// the neighbour's own p_occ — this very ray just carved its front
+    /// neighbour free, so a target-side gate would make FRONT structurally
+    /// inert and the factor would measure the gate, not the spread.
+    ///
+    /// DIRICHLET mode only; mutually exclusive with the ball
+    /// (`semantic_spread_radius`) and the band (`semantic_band_length`) —
+    /// `sanitise()` forces 0 if either is set. Active on BOTH walkers — the
+    /// split path's `integrateHit` and `ScovoxMapSplit::integrateHitFused`
+    /// both invoke `raySpreadDeposit` after the endpoint commit. Ignored on
+    /// the kernel (`HitWeights::kernel_radius`) path and for dynamic hits.
+    int     ray_spread                 = 0;
+
     /// Wall-blocking guard for the IMMEDIATE (unbatched) carve path only, and
     /// `<= 0` disables it (the shipped default). We trust the most recent LiDAR
     /// scan: if a beam physically reached its return, every voxel it traversed to
@@ -556,6 +592,27 @@ class SemSplitMap {
   const DirGrid&  transientDirGrid()  const noexcept { return transient_dir_grid_; }
   DirGrid&        transientDirGrid()        noexcept { return transient_dir_grid_; }
 
+  // Fallback semantic accumulator (`Params::ray_spread == 4`, §16.7). Empty on
+  // every other mode. A voxel here is a CLAIM, not a measurement: readers
+  // consult it only where the primary Dir voxel holds no class evidence.
+  const DirGrid&  fallbackDirGrid()   const noexcept { return fallback_dir_grid_; }
+  DirGrid&        fallbackDirGrid()         noexcept { return fallback_dir_grid_; }
+
+  /// `Params::ray_spread` deposit at the surface's ray neighbour(s). Must run
+  /// AFTER the endpoint update, so the surface's post-Stream-A `p_occ` (which
+  /// sets `class_share`) is the one the endpoint deposit itself saw. Stream B
+  /// only. The persistent split-path `integrateHit` overloads call it
+  /// internally; `ScovoxMapSplit::integrateHitFused` calls it from outside
+  /// after its walk — which is why it is public. Callers own the
+  /// `ray_spread != 0 && !is_dynamic` gate; every other guard (DIRICHLET
+  /// only, kernel path excluded, empty sem_probs) is internal.
+  void raySpreadDeposit(const Eigen::Vector3f&    origin,
+                        const Eigen::Vector3f&    endpoint,
+                        const CoordT&             k_hit,
+                        const std::vector<float>* sem_probs,
+                        float                     quality,
+                        const HitWeights*         prof);
+
   BetaVoxel defaultBeta() const noexcept {
     return defaultBetaVoxel(beta_occ_prior_, beta_free_prior_);
   }
@@ -572,10 +629,16 @@ class SemSplitMap {
   // pruned back to nothing; never drained to the fusion wire.
   BetaGrid             transient_beta_grid_;
   DirGrid              transient_dir_grid_;
+  // Front-deposit accumulator for ray_spread mode 4 (§16.7). Same geometry as
+  // the primary Dir grid; allocated only when mode 4 actually deposits, so it
+  // costs an empty root on every other configuration. Never drained to the
+  // fusion wire — readout-local instrument state, like the transient grids.
+  DirGrid              fallback_dir_grid_;
   BetaGrid::Accessor   beta_acc_;
   DirGrid::Accessor    dir_acc_;
   BetaGrid::Accessor   transient_beta_acc_;
   DirGrid::Accessor    transient_dir_acc_;
+  DirGrid::Accessor    fallback_dir_acc_;
   std::vector<CoordT>  touched_beta_;
   std::vector<CoordT>  touched_dir_;
   // Drain swap targets — hold each stream's previous drain result so the
