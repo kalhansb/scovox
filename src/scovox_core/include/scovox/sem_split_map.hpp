@@ -44,6 +44,44 @@
 
 namespace scovox {
 
+// ---------------------------------------------------------------------------
+// Deposit trace (diagnostic only, compiled out unless SCOVOX_DEPOSIT_TRACE=1).
+//
+// The finished map records what SURVIVED. Designing an eviction comparator
+// needs the opposite view: every arrival, with the probability it carried and
+// the state of the slot it was weighed against, including the arrivals that
+// were dropped or that displaced something. That stream exists only while the
+// map is being built, so it has to be tapped here or not at all.
+//
+// The sink is a plain function pointer rather than std::function to keep the
+// hot path free of an indirect allocation, and null by default so an
+// instrumented build with no sink installed behaves exactly like a normal one.
+// ---------------------------------------------------------------------------
+#ifndef SCOVOX_DEPOSIT_TRACE
+#define SCOVOX_DEPOSIT_TRACE 0
+#endif
+
+#if SCOVOX_DEPOSIT_TRACE
+/// One deposit offered to one voxel.
+/// @param x,y,z    voxel coordinate (grid index, not metric)
+/// @param cls      class id being deposited
+/// @param p        the class's own normalized probability in [0,1] -- the
+///                 segmentation confidence, independent of geometry
+/// @param inc      the mass actually offered (`class_share * p`)
+/// @param outcome  which `sparse_add_class` branch consumed it (see
+///                 dir_voxel.hpp: 0 sentinel, 1 match, 2 fill, 3 evict, 4 drop)
+/// @param slot     slot index touched, or 0xFF when the deposit went to OTHER
+/// @param cnt_before  the slot's accumulated evidence before this deposit
+///                    (for a drop: the weakest slot's, i.e. what it lost to)
+/// @param nhit_before the slot's deposit tally before this deposit
+using DepositTraceFn = void (*)(int32_t x, int32_t y, int32_t z,
+                                uint16_t cls, float p, float inc,
+                                uint8_t outcome, uint8_t slot,
+                                float cnt_before, uint16_t nhit_before);
+/// Installed by the driver; null means "no trace".
+extern DepositTraceFn g_deposit_trace;
+#endif
+
 /// Per-ray source weight profile for multi-sensor fusion. A non-null
 /// `HitWeights*` threaded into an integration call overrides the map's global
 /// `params_` weights for THAT ray only — letting two sensors (e.g. LiDAR and
@@ -117,12 +155,46 @@ class SemSplitMap {
     float   dirichlet_min_p_occ        = 0.5f;   ///< gate per-class update on Beta p_occ
     float   evidence_saturation        = 0.0f;   ///< 0 disables; per-grid cap (see below)
 
+    /// Per-grid cap for the CLASS channel alone.
+    ///
+    /// `evidence_saturation` is one field read by both `applyBetaSaturation`
+    /// and `applyDirSaturation`, so capping the semantic accumulation also
+    /// caps the occupancy accumulation. That coupling is not free: the Beta
+    /// rescale preserves `p_occ` exactly, but it also shrinks the accumulated
+    /// total the next observation is weighed against, so a capped occupancy
+    /// channel becomes recency-dominated and voxels fall back through the
+    /// `p_occ >= 0.5` readout gate. Measured on SceneNN 016 at cap 50, the
+    /// predicted-occupied set lost 20% of its voxels and occupancy IoU fell
+    /// from 0.6036 to 0.5260, which swamps whatever the semantic cap bought.
+    ///
+    /// Negative means "follow `evidence_saturation`", which is the default and
+    /// reproduces the previous behaviour exactly. Set it >= 0 to cap the class
+    /// channel independently -- in particular to 0, to leave the class channel
+    /// uncapped while the occupancy channel is capped, or to a small value
+    /// with `evidence_saturation` at 0, to bound how large a slot's `cnt` can
+    /// grow without touching occupancy at all. The latter is the only way to
+    /// test a live eviction rate against the shipped comparator, whose
+    /// measured evict fraction is 0.0000 precisely because `cnt` reaches the
+    /// thousands while a single `inc` stays under 1.
+    float   class_evidence_saturation  = -1.0f;
+
     /// Use the incoming class's probability, rather than its accumulated
     /// evidence, to decide whether it displaces the weakest occupied slot.
     /// Requires a `-DSCOVOX_TRACK_QMAX=1` build (the per-slot confidence has
     /// nowhere to live otherwise); ignored, with a warning from the node, on a
     /// stock build. See `sparse_add_class`.
     bool    evict_by_confidence        = false;
+
+    /// What a single observation deposits into the class slots.
+    ///   0 SOFT   — spread `class_share` over the whole softmax (shipped).
+    ///   1 HARD   — collapse to the argmax class, which takes `class_share`
+    ///              whole; the other classes deposit nothing.
+    ///   2 THRESH — SOFT, but a class whose own probability falls below
+    ///              `inc_thresh` deposits nothing and its mass goes to OTHER.
+    /// All three conserve the strict invariant `Δ(other + Σcnt) == class_share`;
+    /// they differ only in how that mass is split between slots and OTHER.
+    int     inc_mode                   = 0;
+    float   inc_thresh                 = 0.10f;  ///< only read when inc_mode == 2
 
     /// Semantic spread radius `l` in metres for the SINGLE-SENSOR path. When
     /// `> 0`, Stream A still commits occupancy at the endpoint voxel alone, but
