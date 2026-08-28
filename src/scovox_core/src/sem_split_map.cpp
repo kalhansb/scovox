@@ -14,7 +14,41 @@
 
 namespace scovox {
 
+#if SCOVOX_DEPOSIT_TRACE
+DepositTraceFn g_deposit_trace = nullptr;
+#endif
+
 namespace {
+
+/// Single entry point to `sparse_add_class` from this file. Folds the two
+/// build-define branches (`SCOVOX_TRACK_QMAX`, `SCOVOX_TRACK_NHIT`) into one
+/// place so the deposit paths below read as plain calls, and so a new tracked
+/// field never has to be threaded through them again. Behaviour is unchanged:
+/// with both defines off this is exactly the six-argument shipped call.
+inline void sparse_add_class_traced(DirVoxel* d, uint16_t c, float inc,
+                                    float alpha_0, float p,
+                                    bool evict_by_confidence,
+                                    uint8_t* outcome) {
+#if SCOVOX_TRACK_QMAX
+  uint16_t* qmax = d->qmax;
+#else
+  uint16_t* qmax = nullptr;
+  (void)evict_by_confidence;
+  (void)p;
+#endif
+#if SCOVOX_TRACK_NHIT
+  uint16_t* nhit = d->nhit;
+#else
+  uint16_t* nhit = nullptr;
+#endif
+#if SCOVOX_TRACK_QMAX
+  sparse_add_class(d->cnt, d->cls, c, inc, &d->other, alpha_0, p, qmax,
+                   evict_by_confidence, nhit, outcome);
+#else
+  sparse_add_class(d->cnt, d->cls, c, inc, &d->other, alpha_0, -1.0f, nullptr,
+                   true, nhit, outcome);
+#endif
+}
 
 /// Sparse-Dirichlet hit update on a `DirVoxel` (DIRICHLET mode). Mirrors
 /// `dirichletUpdate` in semdir_map.cpp / sembeta_map.cpp: distribute
@@ -24,7 +58,56 @@ void dirichletUpdate(DirVoxel*                 d,
                      const std::vector<float>* class_probs,
                      float                     class_share,
                      float                     alpha_0,
-                     bool                      evict_by_confidence = false) {
+                     bool                      evict_by_confidence = false,
+                     int                       inc_mode  = 0,
+                     float                     inc_thresh = 0.0f,
+                     int32_t                   tx = 0,
+                     int32_t                   ty = 0,
+                     int32_t                   tz = 0) {
+#if SCOVOX_DEPOSIT_TRACE
+  // Snapshot before each deposit so the record can report the slot state the
+  // comparator actually saw. Which slot a deposit touched is recoverable from
+  // the branch code plus this snapshot, so `sparse_add_class` does not need to
+  // report it: match/fill/evict all leave `c` sitting in the slot they used,
+  // and a drop is by definition weighed against the weakest slot.
+  auto trace_one = [&](uint16_t c, float p, float inc) {
+    if (!g_deposit_trace) {
+      sparse_add_class_traced(d, c, inc, alpha_0, p, evict_by_confidence, nullptr);
+      return;
+    }
+    float    pre_cnt [K_TOP];
+    uint16_t pre_cls [K_TOP];
+    uint16_t pre_nhit[K_TOP];
+    int      weakest = 0;
+    for (int i = 0; i < K_TOP; ++i) {
+      pre_cnt[i]  = d->cnt[i];
+      pre_cls[i]  = d->cls[i];
+#if SCOVOX_TRACK_NHIT
+      pre_nhit[i] = d->nhit[i];
+#else
+      pre_nhit[i] = 0;
+#endif
+      if (d->cnt[i] < d->cnt[weakest]) weakest = i;
+    }
+    uint8_t outcome = 255;
+    sparse_add_class_traced(d, c, inc, alpha_0, p, evict_by_confidence, &outcome);
+    uint8_t slot = 0xFF;
+    if (outcome == 1 || outcome == 2 || outcome == 3) {
+      for (int i = 0; i < K_TOP; ++i) if (d->cls[i] == c) { slot = static_cast<uint8_t>(i); break; }
+    } else if (outcome == 4) {
+      slot = static_cast<uint8_t>(weakest);
+    }
+    const float    cb = (slot == 0xFF) ? 0.f : pre_cnt[slot];
+    const uint16_t nb = (slot == 0xFF) ? uint16_t{0}
+                      : (pre_cls[slot] == 0xFFFF ? uint16_t{0} : pre_nhit[slot]);
+    g_deposit_trace(tx, ty, tz, c, p, inc, outcome, slot, cb, nb);
+  };
+#else
+  (void)tx; (void)ty; (void)tz;
+  auto trace_one = [&](uint16_t c, float p, float inc) {
+    sparse_add_class_traced(d, c, inc, alpha_0, p, evict_by_confidence, nullptr);
+  };
+#endif
   if (!class_probs || class_probs->empty()) {
     d->other += class_share;  // mass landed but no class signal to distribute
     return;
@@ -39,6 +122,21 @@ void dirichletUpdate(DirVoxel*                 d,
   }
   const float norm = (sum_p > 1.0f) ? (1.0f / sum_p) : 1.0f;
 
+  // HARD: collapse the observation onto its argmax before depositing anything.
+  // The same total mass moves, but it is not split — one class takes all of
+  // `class_share`, and the confidence the comparator sees is still that class's
+  // own (normalized) probability, not the share.
+  if (inc_mode == 1) {
+    size_t bi = 0;
+    float  bp = -1.f;
+    for (size_t i = 0; i < obs.size(); ++i) if (obs[i] > bp) { bp = obs[i]; bi = i; }
+    if (bp <= 0.f) { d->other += class_share; return; }
+    const float p_i = bp * norm;
+    trace_one(static_cast<uint16_t>(bi), p_i, class_share);
+    return;
+  }
+
+  float deposited = 0.f;
   for (size_t i = 0; i < obs.size(); ++i) {
     if (obs[i] <= 0.f) continue;
     // The class's own (normalized) probability: what fraction of this
@@ -46,20 +144,27 @@ void dirichletUpdate(DirVoxel*                 d,
     // being given. That is the confidence the eviction comparator wants —
     // `inc` mixes it with class_share and so tracks the geometry, not the label.
     const float p_i = obs[i] * norm;
+    // THRESH: a class this unsure contributes no evidence at all. Its mass is
+    // not deleted — the residual line below routes it to OTHER, so the strict
+    // invariant still holds.
+    if (inc_mode == 2 && p_i < inc_thresh) continue;
     const float inc = class_share * p_i;
     if (inc <= 0.f) continue;
-#if SCOVOX_TRACK_QMAX
-    sparse_add_class(d->cnt, d->cls, static_cast<uint16_t>(i), inc, &d->other,
-                     alpha_0,
-                     evict_by_confidence ? p_i : -1.0f,
-                     evict_by_confidence ? d->qmax : nullptr);
-#else
-    (void)evict_by_confidence;
-    sparse_add_class(d->cnt, d->cls, static_cast<uint16_t>(i), inc, &d->other, alpha_0);
-#endif
+    deposited += inc;
+    // qmax is recorded unconditionally (see sparse_add_class_traced): it costs
+    // nothing on a build that has the field, it never reaches the comparator
+    // unless `evict_by_confidence` says so, and without it an evidence-eviction
+    // dump carries no confidence trail for an offline readout rule to read.
+    trace_one(static_cast<uint16_t>(i), p_i, inc);
   }
-  const float covered = sum_p * norm;
-  d->other += class_share * (1.0f - covered);
+  if (inc_mode == 2) {
+    d->other += class_share - deposited;
+  } else {
+    // Kept in its original form so the SOFT path stays bit-identical to the
+    // pre-patch build rather than merely algebraically equal.
+    const float covered = sum_p * norm;
+    d->other += class_share * (1.0f - covered);
+  }
 }
 
 /// NAIVE mode: overwrite slot 0 with the argmax label at `α₀ + 1`, dumping
@@ -425,7 +530,8 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
         if (class_share > 0.f) {
           DirVoxel* d = getOrAllocateDirOn(dacc, c);
           dirichletUpdate(d, sem_probs, class_share, params_.alpha_0,
-                          params_.evict_by_confidence);
+                          params_.evict_by_confidence,
+                          params_.inc_mode, params_.inc_thresh, c.x, c.y, c.z);
           applyDirSaturation(d);
           if (touched_dir) touched_dir->push_back(c);
         }
@@ -492,7 +598,8 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
 
   DirVoxel* d = getOrAllocateDirOn(dir_acc_, c);
   dirichletUpdate(d, sem_probs, class_share, params_.alpha_0,
-                  params_.evict_by_confidence);
+                  params_.evict_by_confidence,
+                  params_.inc_mode, params_.inc_thresh, c.x, c.y, c.z);
   applyDirSaturation(d);
   touched_dir_.push_back(c);
 }
@@ -576,7 +683,8 @@ void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
 
     DirVoxel* dv = getOrAllocateDirOn(dacc, n);
     dirichletUpdate(dv, sem_probs, class_share, params_.alpha_0,
-                    params_.evict_by_confidence);
+                        params_.evict_by_confidence,
+                        params_.inc_mode, params_.inc_thresh, n.x, n.y, n.z);
     applyDirSaturation(dv);
     if (touched_dir) touched_dir->push_back(n);
   }
@@ -681,7 +789,10 @@ void SemSplitMap::applyBetaSaturation(BetaVoxel* b) const {
 }
 
 void SemSplitMap::applyDirSaturation(DirVoxel* d) const {
-  const float cap = params_.evidence_saturation;
+  // Negative means "share the global cap", which is what this read used to be.
+  const float cap = params_.class_evidence_saturation >= 0.f
+                      ? params_.class_evidence_saturation
+                      : params_.evidence_saturation;
   if (cap <= 0.f) return;
   const float s = d->s_class();
   if (s <= cap) return;
