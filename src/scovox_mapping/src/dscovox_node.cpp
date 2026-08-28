@@ -79,6 +79,7 @@
 #include <limits>
 #include <shared_mutex>
 #include <atomic>  // last_pc_pub_ns_ rate-limiter (shared-lock concurrent access)
+#include <chrono>  // plan_glob_last_ steady_clock rate-limiter
 
 namespace {
 
@@ -184,6 +185,42 @@ public:
     share_z_min_ = declare_parameter<double>("share_roi_z_min", 0.0);
     share_z_max_ = declare_parameter<double>("share_roi_z_max", 0.0);
 
+    // --- WORLD-FIXED planning map for the exploration planner ---------------
+    // The merger already answers GetOccupancyGrid, but that projection is
+    // sized to a TIGHT BOUNDING BOX of the observed voxels: its origin and
+    // extent move every time the map grows. An exploration planner cannot use
+    // that envelope. It indexes the grid with raw world XY and treats every
+    // out-of-bounds cell as OCCUPIED (isCellOccupied), so a shrink-wrapped
+    // grid reports the entire unexplored world as blocked — candidates are
+    // rejected as unreachable and the planner starves. This publisher is the
+    // same 2D projection over a FIXED envelope that does not move under the
+    // consumer, mirroring scovox_node's own local/global planning-map split.
+    //
+    // Deliberately NOT ~/planning_map. simple_nav_3d points its global planner
+    // at /<robot>/dscovox_node/planning_map, a topic that has never had a
+    // publisher — that planner has been inert for the whole campaign history.
+    // Publishing under that name would silently wake it (it is already
+    // subscribed transient_local) and land a second, uncontrolled behavioural
+    // change in the same build. Waking it is a separate decision.
+    //
+    // Off by default: nothing that does not ask for it pays the projection.
+    pub_plan_glob_ = declare_parameter<bool>("publish_global_planning_map", false);
+    plan_glob_res_ = declare_parameter<double>("global_planning_map_resolution", 0.40);
+    plan_glob_sz_  = declare_parameter<double>("global_planning_map_size_m", 200.0);
+    plan_glob_ox_  = declare_parameter<double>("global_planning_map_origin_x", -100.0);
+    plan_glob_oy_  = declare_parameter<double>("global_planning_map_origin_y", -100.0);
+    plan_glob_infl_ = declare_parameter<double>("global_planning_map_inflation_m", 1.5);
+    // z band, map frame. Matches scovox_node's planning_map_min_z/max_z: the
+    // slab a UGV body actually sweeps, so canopy above it is not projected
+    // down as an obstacle.
+    plan_glob_zmin_ = declare_parameter<double>("global_planning_map_min_z", 0.05);
+    plan_glob_zmax_ = declare_parameter<double>("global_planning_map_max_z", 1.0);
+    // Publish period, seconds. This runs on the publish timer and is O(active
+    // voxels) for the projection plus O(occupied * (infl/res)^2) for the
+    // inflation, over a message of O(size^2/res^2) bytes. A planner re-reads
+    // the latched map about once per planning step, so ~1 Hz is generous.
+    plan_glob_period_ = declare_parameter<double>("global_planning_map_period_sec", 1.0);
+
     initSemanticColors();
 
     // Explicit reliable + depth 1, mirroring scovox_node's pc_pub_: the fused
@@ -207,6 +244,26 @@ public:
     scovox_map_pub_ = create_publisher<scovox_msgs::msg::ScovoxMap>(
       declare_parameter<std::string>("scovox_topic", "~/scovox"),
       rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+
+    // Latched, matching the exploration planner's subscriber QoS exactly
+    // (KeepLast(1) + reliable + transient_local). The planner blocks in its
+    // start-up wait until the first map arrives, so a QoS mismatch here would
+    // present as a planner that never leaves INIT rather than as an error.
+    // The topic name is declared unconditionally so `ros2 param get` reports
+    // it even when the publisher is disabled.
+    {
+      auto plg_t = declare_parameter<std::string>("global_planning_map_topic",
+                                                 std::string("~/global_planning_map"));
+      if (pub_plan_glob_) {
+        pl_glob_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+          plg_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+        RCLCPP_INFO(get_logger(),
+          "dscovox global_planning_map: %.1f m envelope @ %.2f m/cell "
+          "(origin %.1f, %.1f), z in [%.2f, %.2f], inflation %.2f m, period %.2f s",
+          plan_glob_sz_, plan_glob_res_, plan_glob_ox_, plan_glob_oy_,
+          plan_glob_zmin_, plan_glob_zmax_, plan_glob_infl_, plan_glob_period_);
+      }
+    }
 
     // Reliable + deeper queue for binary submap deltas. The old
     // SystemDefaultsQoS resolved to BEST_EFFORT on this build, which
@@ -266,6 +323,11 @@ public:
           // like every other publisher here — disabling the publish timer also
           // disables the fused-map topic the planner depends on.
           publishFusedMap();
+          // World-fixed 2D projection for the exploration planner. Shares this
+          // tick's shared_lock (must not re-lock the non-recursive mutex) and
+          // rate-limits itself against plan_glob_period_, so publish_rate_hz
+          // and the planning-map rate stay independent.
+          publishGlobalPlanningMap();
           // Map size is keyed on occupancy (the fused Beta grid).
           size_t fc = split_fused_beta_ ? split_fused_beta_->activeCellsCount() : 0;
           size_t ts = 0;
@@ -799,6 +861,95 @@ private:
     scovox_map_pub_->publish(rs->map);
   }
 
+  // World-fixed 2D projection of the FUSED grid for the exploration planner.
+  // Caller must already hold mu_ (shared) — the publish timer does.
+  //
+  // Why this does not reuse occupancyGridOnGrid below: that one derives its
+  // origin and extent from the data (a tight bbox), which is correct for an
+  // on-demand service and fatal for a planner that reads out-of-bounds as
+  // occupied. Here the envelope is a constant of the run.
+  //
+  // THE THREE-STATE CONTRACT, which is the whole point of the fix:
+  //   -1  unknown  — no evidence. Cells outside the observed set keep this,
+  //                  and so do prior-only voxels (isPriorBeta): a voxel that
+  //                  exists in the grid carrying nothing but its Dirichlet
+  //                  prior has never been measured by anyone. Marking those 0
+  //                  would fabricate free space; marking them 100 would
+  //                  reproduce the starvation this fix exists to remove.
+  //    0  free      — observed, p_occ below the occupancy threshold.
+  //  100  occupied  — observed, p_occ at or above it. Occupied wins ties
+  //                   across voxels sharing a cell (the else-if below).
+  void publishGlobalPlanningMap() {
+    if (!pl_glob_pub_ || !split_fused_beta_) return;
+    // Nothing subscribed ⇒ nothing to pay for. transient_local still replays
+    // the last sample to a late joiner, and the first subscriber pulls a fresh
+    // one on the next tick.
+    if (pl_glob_pub_->get_subscription_count() == 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (plan_glob_period_ > 0.0 &&
+        plan_glob_last_.time_since_epoch().count() != 0 &&
+        std::chrono::duration<double>(now - plan_glob_last_).count() <
+            plan_glob_period_)
+      return;
+    plan_glob_last_ = now;
+
+    const double res = (plan_glob_res_ > 0.0) ? plan_glob_res_
+                                              : std::max((double)res_, 1e-3);
+    const int w = std::max(1, (int)std::round(plan_glob_sz_ / res));
+    const int h = w;
+    nav_msgs::msg::OccupancyGrid g;
+    g.header.stamp = get_clock()->now();
+    // map_frame_, not an integration frame: the planner indexes this grid with
+    // raw world XY and applies NO transform. scovox_node's equivalent stamps
+    // <robot>/odom and is only correct while map->odom happens to be identity;
+    // the merger already works in the map frame, so that hazard is absent here.
+    g.header.frame_id = map_frame_;
+    g.info.resolution = (float)res;
+    g.info.width = (uint32_t)w;
+    g.info.height = (uint32_t)h;
+    g.info.origin.position.x = plan_glob_ox_;
+    g.info.origin.position.y = plan_glob_oy_;
+    g.info.origin.orientation.w = 1.0;
+    g.data.assign((size_t)w * (size_t)h, -1);
+
+    auto& bg = *split_fused_beta_;
+    const float ot = (float)min_occ_;
+    bg.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+      if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
+      const auto p = bg.coordToPos(c);
+      if (p.z < plan_glob_zmin_ || p.z > plan_glob_zmax_) return;
+      const int gx = (int)std::floor((p.x - plan_glob_ox_) / res);
+      const int gy = (int)std::floor((p.y - plan_glob_oy_) / res);
+      if (gx < 0 || gy < 0 || gx >= w || gy >= h) return;
+      const size_t i = (size_t)gy * (size_t)w + (size_t)gx;
+      if (v.p_occ() >= ot) g.data[i] = 100;
+      else if (g.data[i] != 100) g.data[i] = 0;
+    });
+
+    // Dilate occupied cells by the body radius: the planner does a single-cell
+    // free check and relies on the map already carrying the clearance.
+    const int ic = (int)std::ceil(plan_glob_infl_ / res);
+    if (ic > 0) {
+      const int ic2 = ic * ic;
+      auto inf = g.data;
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          if (g.data[(size_t)y * (size_t)w + (size_t)x] != 100) continue;
+          for (int dy = -ic; dy <= ic; ++dy) {
+            for (int dx = -ic; dx <= ic; ++dx) {
+              if (dx * dx + dy * dy > ic2) continue;
+              const int nx = x + dx, ny = y + dy;
+              if (nx >= 0 && nx < w && ny >= 0 && ny < h)
+                inf[(size_t)ny * (size_t)w + (size_t)nx] = 100;
+            }
+          }
+        }
+      }
+      g.data = std::move(inf);
+    }
+    pl_glob_pub_->publish(g);
+  }
+
   // Substrate-agnostic GetOccupancyGrid core. 2D max-projection of p_occ over
   // [z_min, z_max]. Occupancy-only ⇒ no projection to scovox::Voxel needed:
   // both scovox::Voxel and BetaVoxel expose p_occ(); only `isPriorCell` and the
@@ -868,6 +1019,14 @@ private:
   // with scovox_node share_roi_z_min/max + explo_planner roi_min_z/roi_max_z.
   double share_z_min_{0.0}, share_z_max_{0.0};
   double pc_min_interval_s_;
+  // World-fixed planning map for the exploration planner (see the constructor
+  // block and publishGlobalPlanningMap). plan_glob_last_ is touched only from
+  // the publish timer.
+  bool   pub_plan_glob_{false};
+  double plan_glob_res_{0.40}, plan_glob_sz_{200.0}, plan_glob_ox_{-100.0},
+         plan_glob_oy_{-100.0}, plan_glob_infl_{1.5},
+         plan_glob_zmin_{0.05}, plan_glob_zmax_{1.0}, plan_glob_period_{1.0};
+  std::chrono::steady_clock::time_point plan_glob_last_{};
   // Rate-limiter timestamp for the visualisation pointcloud, stored as raw
   // nanoseconds in a std::atomic. maybePublishPointCloud() runs under only a
   // SHARED lock (from both the binary-callback tail and the publish timer), so
@@ -903,6 +1062,7 @@ private:
   std::vector<rclcpp::Subscription<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr> subs_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_glob_pub_;
   rclcpp::Service<scovox_msgs::srv::GetRegion>::SharedPtr get_region_srv_;
   rclcpp::Service<scovox_msgs::srv::GetOccupancyGrid>::SharedPtr get_occ_srv_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
