@@ -196,12 +196,13 @@ public:
     // same 2D projection over a FIXED envelope that does not move under the
     // consumer, mirroring scovox_node's own local/global planning-map split.
     //
-    // Deliberately NOT ~/planning_map. simple_nav_3d points its global planner
-    // at /<robot>/dscovox_node/planning_map, a topic that has never had a
-    // publisher — that planner has been inert for the whole campaign history.
-    // Publishing under that name would silently wake it (it is already
-    // subscribed transient_local) and land a second, uncontrolled behavioural
-    // change in the same build. Waking it is a separate decision.
+    // Two consumers now: the exploration planner, and — since generation 5 —
+    // simple_nav_3d's global nav planner, which was repointed here from
+    // /<robot>/dscovox_node/planning_map. That name never had a publisher, so
+    // the nav global planner sat inert for the whole campaign history before
+    // the repoint. Deliberately still NOT ~/planning_map: that name means the
+    // rolling local crop from scovox_node, and the local nav planner needs it
+    // to keep meaning exactly that.
     //
     // Off by default: nothing that does not ask for it pays the projection.
     pub_plan_glob_ = declare_parameter<bool>("publish_global_planning_map", false);
