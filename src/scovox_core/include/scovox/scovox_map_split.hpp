@@ -452,6 +452,17 @@ class ScovoxMapSplit {
       }
     }
 
+    // §16 ray-spread: one extra Stream-B deposit on the first distinct voxel
+    // past the hit's boundary behind and/or in front along the ray. Runs
+    // AFTER the walk so the p_occ it reads at k_hit is the post-commit one —
+    // the same ordering as the split path, whose integrateHit calls it after
+    // applyHitUpdate. Dynamic endpoints route to the transient substrate and
+    // must not smear persistent neighbours (same rule as the TSDF gate).
+    if (semsplit_.params().ray_spread != 0 && !is_dynamic) {
+      semsplit_.raySpreadDeposit(origin, endpoint, k_hit, sem_probs, quality,
+                                 prof);
+    }
+
     const auto t1 = clk::now();
     // Fused walker: TSDF band updates and semantic hit/carve are interleaved in
     // ONE per-voxel loop, so wall-clock cannot be cleanly attributed per
