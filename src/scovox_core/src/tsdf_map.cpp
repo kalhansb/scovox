@@ -1,10 +1,12 @@
 /// @file
 /// @brief SLIM-VDB-equivalent TSDF integration. Verbatim port of
 /// `slimvdb::VDBVolume::Integrate` (CLOSED variant), using Bonxai's
-/// `VoxelGrid<TsdfVoxel>` and `scovox::RayIterator` instead of OpenVDB's
-/// `FloatGrid` and `openvdb::math::DDA`. The Bresenham-vs-OpenVDB DDA
-/// difference and the `k_hit` revisit guard are documented as acknowledged
-/// parity gaps in §1.1 of the design plan.
+/// `VoxelGrid<TsdfVoxel>` and `scovox::ExactRayIterator` instead of OpenVDB's
+/// `FloatGrid` and `openvdb::math::DDA`. Both are Amanatides & Woo, so the
+/// traversal parity gap §1.1 of the design plan acknowledged is CLOSED as of
+/// 2026-09-02 (it existed while this file walked an integer Bresenham line).
+/// The `k_hit` revisit guard remains, for the reason given at its use below:
+/// the walk aims at the CENTRE of the end voxel, not at `endpoint`.
 
 #include "scovox/tsdf_map.hpp"
 
@@ -103,10 +105,11 @@ void TsdfMap::integrateRayImpl(const Eigen::Vector3f& origin,
     return;
   }
 
-  // Bresenham DDA can skip k_hit on oblique rays where the picked-axis path
-  // doesn't intersect the true endpoint voxel. Track and revisit. See the
-  // matching guard in scovox::Map::fused_integrate_ray_static (kept for the
-  // SCovox row's geometry parity with itself across the refactor).
+  // The walk aims at the CENTRE of k_far, not at end_pos, so over the last
+  // stretch the traversed segment can differ from the true ray by up to half a
+  // voxel diagonal (see ExactRayIterator's caveat). Track k_hit and revisit if
+  // that near-endpoint deviation stepped around it. See the matching guard in
+  // scovox::Map::fused_integrate_ray_static.
   bool k_hit_visited = false;
 
   const auto walk_body = [&](const CoordT& c) -> bool {
@@ -114,21 +117,13 @@ void TsdfMap::integrateRayImpl(const Eigen::Vector3f& origin,
     visit(c, origin, endpoint, h, trunc, weight_fn);
     return true;
   };
-  if (exact_ray_) {
-    // Closes the acknowledged parity gap in §1.1: SLIM-VDB walks with
-    // openvdb::math::DDA, which is the same Amanatides-Woo traversal this
-    // selects. Same start-included / end-excluded contract as the Bresenham
-    // sibling, so the two fix-ups below are untouched — and the k_hit revisit
-    // becomes dead here, since an exact walk cannot miss the endpoint voxel.
-    ExactRayIterator(start_pos.cast<double>(), k0, k_far,
-                     params_.resolution, walk_body);
-  } else {
-    RayIterator(k0, k_far, walk_body);
-  }
+  // Same traversal SLIM-VDB uses (openvdb::math::DDA) — this is what closes
+  // the acknowledged parity gap in §1.1.
+  ExactRayIterator(start_pos.cast<double>(), k0, k_far,
+                   params_.resolution, walk_body);
 
-  // RayIterator stops one step short of `key_end`; visit explicitly.
+  // The walk excludes its end voxel; visit it explicitly.
   if (k_far != k0) visit(k_far, origin, endpoint, h, trunc, weight_fn);
-  // And revisit k_hit if Bresenham's picked path missed it.
   if (!k_hit_visited && k_hit != k_far && k_hit != k0) {
     visit(k_hit, origin, endpoint, h, trunc, weight_fn);
   }

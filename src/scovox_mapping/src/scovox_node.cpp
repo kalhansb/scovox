@@ -285,8 +285,9 @@ public:
         1u << dg.leafBits(), 1u << dg.leafBits(), 1u << dg.leafBits(),
         1u << (3u * dg.leafBits()));
     }
-    RCLCPP_INFO(get_logger(), "TSDF: sdf_trunc=%.3f m space_carving=%d band_only=%d (sdf_trunc=0 means off; set via enable_tsdf / sdf_trunc_voxels)",
-      P.sdf_trunc, (int)P.tsdf_space_carving, (int)P.band_only_integration);
+    RCLCPP_INFO(get_logger(), "TSDF: sdf_trunc=%.3f m space_carving=%d band_only=%d far_voxel_fast_paths=%d (sdf_trunc=0 means off; set via enable_tsdf / sdf_trunc_voxels)",
+      P.sdf_trunc, (int)P.tsdf_space_carving, (int)P.band_only_integration,
+      (int)split_map_->farVoxelFastPaths());
     RCLCPP_INFO(get_logger(), "split substrate: sizeof(TsdfVoxel)=%zu sizeof(BetaVoxel)=%zu sizeof(DirVoxel)=%zu",
       sizeof(scovox::TsdfVoxel), sizeof(scovox::BetaVoxel), sizeof(scovox::DirVoxel));
     // Print the SANITISED deposit rule, read back out of the constructed map,

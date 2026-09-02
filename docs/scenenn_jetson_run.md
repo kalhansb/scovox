@@ -471,6 +471,13 @@ exists and have been replaced here rather than kept):
 
 −120.9 ms, +52%, and the two maps are bit-identical across all 13 npz fields.
 
+> **Reproducing the `noskip` arm (changed 2026-09-02).** `SCOVOX_DISABLE_FAR_SKIP`
+> no longer exists and setting it now does nothing *silently*. The switch is
+> `ScovoxMapSplit::Params::far_voxel_fast_paths = false`, which disarms the
+> far-voxel skip and the far-voxel fast carve together. Note also that these
+> timings predate the switch from the Bresenham traversal to the exact
+> Amanatides-Woo DDA, which costs ~46% more walk time on its own.
+
 **6 Hz is not reached on this build in any configuration measured.** The ceiling
 is `sdf_trunc_voxels:=1` at **185.1 ms → 5.40 Hz**, and it buys that by narrowing
 the TSDF band to ±1 voxel *on top of* carve-off. Default band is 231.3 ms

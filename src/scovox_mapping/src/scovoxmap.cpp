@@ -81,7 +81,8 @@ void Map::carve_free(const Eigen::Vector3f& origin, const Eigen::Vector3f& hit,
   // reach_prob attenuation.
   const float skip = params_.carve_skip_occ_threshold;
 
-  RayIterator(key_origin, key_end, [&](const CoordT& c) {
+  ExactRayIterator(origin.cast<double>(), key_origin, key_end,
+                   params_.resolution, [&](const CoordT& c) {
     if (c == key_end) return false;
 
     Voxel* v = acc_.value(c);
@@ -264,9 +265,10 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
   // long Beta-free carve from origin to (hit - trunc) and matches SLIM-VDB's
   // [depth-trunc, depth+trunc] DDA. Falls back to full-ray when trunc=0
   // (TSDF disabled) since there is no band to confine the walk to.
-  const CoordT k0 = (params_.band_only_integration && trunc > 0.f)
-      ? posToCoord(Eigen::Vector3f(hit - trunc * u))
-      : posToCoord(origin);
+  const Eigen::Vector3f start_pos = (params_.band_only_integration && trunc > 0.f)
+      ? Eigen::Vector3f(hit - trunc * u)
+      : origin;
+  const CoordT k0 = posToCoord(start_pos);
 
   if (k0 == k_far) return;  // degenerate ray inside one voxel
 
@@ -279,12 +281,11 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
   bool past_wall = false;
   const float skip = params_.carve_skip_occ_threshold;
 
-  // Bresenham DDA can skip k_hit when it's a corner-crossing voxel on the
-  // line (it picks one voxel per dominant-axis step, so an oblique ray's
-  // true hit voxel may not lie on the picked path even though it's on the
-  // line). Track whether k_hit was visited and explicitly visit it after
-  // the loop if not — guarantees the endpoint Beta-occupied + semantics +
-  // surface TSDF mass always lands.
+  // The DDA aims at the CENTRE of k_far, not at the continuous point that
+  // defined it, so over the last stretch its path can differ from the true ray
+  // by up to half a voxel diagonal and step around k_hit. Track whether k_hit
+  // was visited and visit it explicitly after the loop if not — guarantees the
+  // endpoint Beta-occupied + semantics + surface TSDF mass always lands.
   bool k_hit_visited = false;
 
   auto step = [&](const CoordT& c) -> bool {
@@ -349,12 +350,11 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
     return true;
   };
 
-  // RayIterator stops one step short of `k_far` (its for-bound is
-  // `i < maxc - 1`); follow up with one explicit visit so the last
+  // The walk excludes `k_far`; follow up with one explicit visit so the last
   // band voxel — and `k_hit` itself when trunc==0 — is always reached.
-  RayIterator(k0, k_far, step);
+  ExactRayIterator(start_pos.cast<double>(), k0, k_far, params_.resolution, step);
   step(k_far);
-  // Bresenham may have skipped k_hit; the lambda dedupes via k_hit_visited.
+  // See the k_hit_visited note above; the lambda dedupes.
   if (!k_hit_visited) step(k_hit);
 }
 
@@ -376,7 +376,8 @@ void Map::carve_free(const Eigen::Vector3f& origin, const Eigen::Vector3f& hit,
   // Per-voxel independence (see the no-traversal carve_free overload above).
   const float skip = params_.carve_skip_occ_threshold;
 
-  RayIterator(key_origin, key_end, [&](const CoordT& c) {
+  ExactRayIterator(origin.cast<double>(), key_origin, key_end,
+                   params_.resolution, [&](const CoordT& c) {
     if (c == key_end) return false;
 
     Voxel* v = acc_.value(c);
