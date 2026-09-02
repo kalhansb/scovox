@@ -172,6 +172,9 @@ def _launch_setup(context):
             "batch_free_carve":
                 context.launch_configurations.get(
                     "batch_free_carve", "true").lower() == "true",
+            "batch_hits":
+                context.launch_configurations.get(
+                    "batch_hits", "true").lower() == "true",
         }],
     )
 
@@ -239,6 +242,9 @@ def generate_launch_description():
         DeclareLaunchArgument("batch_free_carve", default_value="true",
                               description="Perf attribution: stage carves in a hash "
                                           "map and write once per voxel per scan."),
+        DeclareLaunchArgument("batch_hits", default_value="true",
+                              description="Stage surface hits and write once per "
+                                          "voxel per scan (strongest ray wins)."),
         DeclareLaunchArgument("map_mode", default_value="persistent",
                               description="E1: 'rolling' enables the ScovoxMapBinary "
                                           "publisher (a_occ/a_free/Dir snapshot capture); "

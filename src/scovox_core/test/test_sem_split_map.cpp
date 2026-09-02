@@ -45,8 +45,17 @@ scovox::SemSplitMap makeMap() {
 // ===========================================================================
 
 TEST(SplitVoxelLayout, Sizes) {
-  EXPECT_EQ(sizeof(scovox::BetaVoxel), 8u);
-  EXPECT_EQ(sizeof(scovox::DirVoxel),  16u);  // SemDirVoxel 20 B − 4 B FREE
+  // 8 B at float storage, 4 B under SCOVOX_BETA_U16; written from the counter
+  // width so either build is checked rather than skipped.
+  EXPECT_EQ(sizeof(scovox::BetaVoxel), 2u * sizeof(scovox::BetaCount));
+  EXPECT_EQ(sizeof(scovox::BetaCount), SCOVOX_BETA_U16 ? 2u : 4u);
+  // DirVoxel is 4 B fixed + 6 B per slot, plus 2 B per slot for each optional
+  // track. SCOVOX_TRACK_QMAX is on by default (evict_by_confidence reads it),
+  // so the shipped K_TOP=2 voxel is 20 B; the expression is written out so a
+  // build that turns a track off is still checked rather than skipped.
+  constexpr std::size_t slot = 6u + (SCOVOX_TRACK_QMAX ? 2u : 0u)
+                                  + (SCOVOX_TRACK_NHIT ? 2u : 0u);
+  EXPECT_EQ(sizeof(scovox::DirVoxel), ((4u + slot * scovox::K_TOP + 3u) / 4u) * 4u);
 }
 
 TEST(SplitVoxelLayout, ShippedBetaPriorIsSymmetricHalf) {
@@ -57,9 +66,16 @@ TEST(SplitVoxelLayout, ShippedBetaPriorIsSymmetricHalf) {
   EXPECT_NEAR(b.a_free, 1.0f, 1e-7f);
   EXPECT_NEAR(b.p_occ(), 0.5f, 1e-6f);
   // Ablation: the prior-agnostic factory still reproduces the calibrated
-  // Beta(C·α₀, α₀) → C/(C+1) marginal on explicit request.
-  auto calib = scovox::defaultBetaVoxel(kC * kAlpha, kAlpha);
-  EXPECT_NEAR(calib.p_occ(), float(kC) / float(kC + 1), 1e-5f);
+  // Beta(C·α₀, α₀) → C/(C+1) marginal on explicit request. Its parameters are
+  // α₀-scale (0.14 / 0.01), and no fixed-point lattice can hold both those and
+  // the thousands of units a long run accumulates — that spread needs a
+  // dynamic range of ~2e5 against uint16's 65535 — so under SCOVOX_BETA_U16
+  // the ablation is unavailable and the shipped Beta(1,1) prior above, which
+  // sits exactly on the lattice, is the only one offered.
+  if constexpr (SCOVOX_BETA_U16 == 0) {
+    auto calib = scovox::defaultBetaVoxel(kC * kAlpha, kAlpha);
+    EXPECT_NEAR(calib.p_occ(), float(kC) / float(kC + 1), 1e-5f);
+  }
 }
 
 TEST(SplitVoxelLayout, DirPriorIsSymmetricMinusFree) {
@@ -85,6 +101,90 @@ TEST(SplitVoxelLayout, ZeroInitialisedHasNoPrior) {
     EXPECT_EQ(d.cls[i], uint16_t(0));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Beta counter storage (BetaCount / SCOVOX_BETA_U16)
+// ---------------------------------------------------------------------------
+
+// Runs in BOTH builds. Every occupancy weight this repo ships sits on the 1/8
+// lattice, so a long accumulation must land on the exact analytic total under
+// fixed-point storage just as it does under float -- this is the invariant
+// SCOVOX_BETA_U16's scale is chosen to hold, so it is asserted unconditionally
+// rather than behind the flag.
+TEST(BetaCountStorage, ShippedWeightsAccumulateExactly) {
+  for (const float w : {1.0f, 1.5f, 6.0f, 0.5f, 0.125f}) {
+    scovox::BetaVoxel b = scovox::defaultBetaVoxel();
+    for (int i = 0; i < 200; ++i) b.a_occ += w;
+    EXPECT_FLOAT_EQ(b.a_occ, 1.0f + 200.0f * w) << "w = " << w;
+  }
+}
+
+TEST(BetaCountStorage, PriorAndPOccRoundTrip) {
+  scovox::BetaVoxel b = scovox::defaultBetaVoxel(scovox::kBetaOccPrior,
+                                                 scovox::kBetaFreePrior);
+  EXPECT_FLOAT_EQ(b.a_occ, 1.0f);
+  EXPECT_FLOAT_EQ(b.a_free, 1.0f);
+  EXPECT_FLOAT_EQ(b.p_occ(), 0.5f);
+  b.a_occ += 3.0f;                       // Beta(4, 1)
+  EXPECT_FLOAT_EQ(b.s_total(), 5.0f);
+  EXPECT_FLOAT_EQ(b.p_occ(), 0.8f);
+  b.a_occ  *= 0.5f;                      // the saturation rescale's operation
+  b.a_free *= 0.5f;
+  EXPECT_FLOAT_EQ(b.p_occ(), 0.8f);      // p_occ is preserved
+  EXPECT_FLOAT_EQ(b.s_total(), 2.5f);
+}
+
+#if SCOVOX_BETA_U16
+TEST(BetaCountStorage, StoresClampInsteadOfWrapping) {
+  scovox::BetaVoxel b{};
+  b.a_occ = 4.0f * scovox::BetaCount::kMax;
+  EXPECT_FLOAT_EQ(b.a_occ, scovox::BetaCount::kMax);
+  b.a_occ += 1000.0f;                    // already at the ceiling
+  EXPECT_FLOAT_EQ(b.a_occ, scovox::BetaCount::kMax);
+  b.a_free = -5.0f;                      // Beta parameters are non-negative
+  EXPECT_FLOAT_EQ(b.a_free, 0.0f);
+}
+
+TEST(BetaCountStorage, IncrementsBelowHalfACountVanish) {
+  // Documented cost of fixed point: a ray weaker than half the stored
+  // resolution rounds back to where it started.
+  const float res = scovox::BetaCount::kInv;
+  scovox::BetaVoxel b = scovox::defaultBetaVoxel();
+  for (int i = 0; i < 50; ++i) b.a_occ += 0.4f * res;
+  EXPECT_FLOAT_EQ(b.a_occ, 1.0f);
+  for (int i = 0; i < 4; ++i) b.a_occ += 0.6f * res;   // rounds up each time
+  EXPECT_FLOAT_EQ(b.a_occ, 1.0f + 4.0f * res);
+}
+
+TEST(BetaCountStorage, SaturationGuardKeepsCountersOffTheCeiling) {
+  // applyBetaSaturation's u16 guard is unconditional -- evidence_saturation is
+  // 0 here -- so a voxel observed far past the storage ceiling keeps taking
+  // evidence instead of pinning at BetaCount::kMax and going deaf. Halving is
+  // p_occ-preserving; that property is pinned by PriorAndPOccRoundTrip.
+  scovox::SemSplitMap::Params p;
+  p.resolution          = kRes;
+  p.w_occ               = 500.0f;   // ~16 hits to cross the high-water mark
+  p.w_free              = 0.5f;
+  p.kappa0              = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f;
+  p.evidence_saturation = 0.0f;
+  p.num_classes         = kC;
+  p.alpha_0             = kAlpha;
+  scovox::SemSplitMap m(p);
+
+  const Eigen::Vector3f pt(1.0f, 0, 0);
+  std::vector<float> probs(kC, 0.f);
+  probs[5] = 1.0f;
+  for (int i = 0; i < 60; ++i) {          // 30,001 units deposited, ceiling 8191.9
+    m.integrateHit(pt, pt, &probs, /*quality=*/1.0f);
+    auto b = m.getBetaVoxel(pt);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_LE(b->a_occ, 0.9f * scovox::BetaCount::kMax) << "hit " << i;
+    EXPECT_GT(b->a_occ, 0.0f) << "hit " << i;
+  }
+}
+
+#endif  // SCOVOX_BETA_U16
 
 // ===========================================================================
 // Integration / two-stream update
@@ -340,6 +440,130 @@ TEST(SemSplitMapBatched, ClearsStaleObstacleNoGuard) {
   EXPECT_GT(b->a_free, 1.0f) << "stale obstacle receives free evidence (guard-free)";
 }
 
+// ===========================================================================
+// Batched surface hits (SemSplitParams::batch_hits)
+// ===========================================================================
+
+TEST(SemSplitMapBatched, HitsCountOncePerFrame) {
+  // A depth image lands many rays in one surface voxel. Batched, the frame is
+  // ONE observation; un-batched, each ray is its own.
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  const int kRays = 7;
+
+  auto run = [&](bool batch) {
+    scovox::SemSplitMap::Params p;
+    p.resolution = kRes; p.w_occ = 1.0f; p.w_free = 0.5f; p.kappa0 = 1.0f;
+    p.dirichlet_min_p_occ = 0.5f; p.num_classes = kC; p.alpha_0 = kAlpha;
+    p.batch_hits = batch;
+    scovox::SemSplitMap m(p);
+    m.beginCarveFrame();
+    for (int i = 0; i < kRays; ++i)
+      m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+    m.flushCarveFrame();
+    auto b = m.getBetaVoxel(X);
+    EXPECT_TRUE(b.has_value());
+    return b->a_occ;
+  };
+
+  EXPECT_FLOAT_EQ(run(true),  scovox::kBetaOccPrior + 1.0f)
+      << "batched: one deposit for the whole frame";
+  EXPECT_FLOAT_EQ(run(false), scovox::kBetaOccPrior + kRays * 1.0f)
+      << "un-batched: a_occ counts rays, not observations";
+}
+
+TEST(SemSplitMapBatched, HitClassEvidenceAlsoCountsOncePerFrame) {
+  // Stream B is staged with Stream A, so `cnt` is bounded by the frame count
+  // too — the property the uint16 counter sizing rests on.
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  std::vector<float> probs(kC, 0.f);
+  probs[3] = 1.0f;
+
+  auto run = [&](bool batch) {
+    scovox::SemSplitMap::Params p;
+    p.resolution = kRes; p.w_occ = 1.0f; p.w_free = 0.5f; p.kappa0 = 1.0f;
+    p.dirichlet_min_p_occ = 0.5f; p.num_classes = kC; p.alpha_0 = kAlpha;
+    p.batch_hits = batch;
+    scovox::SemSplitMap m(p);
+    m.beginCarveFrame();
+    for (int i = 0; i < 5; ++i)
+      m.integrateHit(Eigen::Vector3f(0, 0, 0), X, &probs, 1.0f);
+    m.flushCarveFrame();
+    auto d = m.getDirVoxel(X);
+    EXPECT_TRUE(d.has_value());
+    return d->cnt[0];
+  };
+
+  EXPECT_LT(run(true), run(false)) << "batched class evidence is the smaller";
+  // One deposit is class_share = kappa0 * p_occ_post * quality on top of the
+  // per-dim prior; five deposits must land strictly more than one.
+  EXPECT_GT(run(true), kAlpha);
+}
+
+TEST(SemSplitMapBatched, StrongestRayOfTheFrameWins) {
+  // The staged hit mirrors the carve stage's per-voxel MAX rule, so a weaker
+  // ray arriving later must not displace a stronger one.
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  auto run = [&](float q_first, float q_second) {
+    auto m = makeMap();
+    m.beginCarveFrame();
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, q_first);
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, q_second);
+    m.flushCarveFrame();
+    return m.getBetaVoxel(X)->a_occ;
+  };
+  const float strong = scovox::kBetaOccPrior + 1.0f;   // w_occ 1.0 x q 1.0
+  EXPECT_FLOAT_EQ(run(1.0f, 0.25f), strong) << "weaker second ray is dropped";
+  EXPECT_FLOAT_EQ(run(0.25f, 1.0f), strong) << "stronger second ray supersedes";
+}
+
+TEST(SemSplitMapBatched, StagedHitStillWinsAgainstTheCarve) {
+  // Occupied-wins survives the deferral: the hit is written at flush BEFORE
+  // the staged carves, and the carve walk still skips the voxel.
+  auto m = makeMap();
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  m.beginCarveFrame();
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  // A second beam passing straight through the same voxel to a farther return.
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  m.flushCarveFrame();
+
+  auto b = m.getBetaVoxel(X);
+  ASSERT_TRUE(b.has_value());
+  EXPECT_FLOAT_EQ(b->a_free, scovox::kBetaFreePrior) << "no free evidence at a hit voxel";
+  EXPECT_GT(b->a_occ, scovox::kBetaOccPrior);
+}
+
+TEST(SemSplitMapBatched, RaySpreadKeepsTheImmediateWrite) {
+  // raySpreadDeposit reads the endpoint's Beta occupancy the instant Stream A
+  // lands, so a spread-carrying hit must not be deferred.
+  scovox::SemSplitMap::Params p;
+  p.resolution = kRes; p.w_occ = 1.0f; p.w_free = 0.5f; p.kappa0 = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f; p.num_classes = kC; p.alpha_0 = kAlpha;
+  p.ray_spread = 1;
+  scovox::SemSplitMap m(p);
+
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  m.beginCarveFrame();
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  auto mid = m.getBetaVoxel(X);
+  ASSERT_TRUE(mid.has_value()) << "spread-carrying hit writes during the ray loop";
+  EXPECT_FLOAT_EQ(mid->a_occ, scovox::kBetaOccPrior + 1.0f);
+  m.flushCarveFrame();
+  EXPECT_FLOAT_EQ(m.getBetaVoxel(X)->a_occ, scovox::kBetaOccPrior + 1.0f)
+      << "flush must not deposit a second time";
+}
+
+TEST(SemSplitMapBatched, ImmediateWhenNoFrameIsOpen) {
+  // Batching is a per-scan mechanism; a direct caller with no frame open keeps
+  // the write-in-place contract whatever the flag says.
+  auto m = makeMap();
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  auto b = m.getBetaVoxel(X);
+  ASSERT_TRUE(b.has_value());
+  EXPECT_FLOAT_EQ(b->a_occ, scovox::kBetaOccPrior + 1.0f);
+}
+
 TEST(SemSplitMapBatched, CanDisableFreeSpaceCarve) {
   // Turning off batched free-space carve suppresses staging entirely while
   // leaving hit updates intact.
@@ -580,4 +804,225 @@ TEST(SemSplitTransient, DecayLeavesPersistentUntouched) {
   ASSERT_TRUE(b.has_value());
   EXPECT_FLOAT_EQ(b->a_occ, persistent_a_occ);  // persistent never decays
   EXPECT_EQ(m.transientBetaVoxelCount(), 0u);   // transient gone
+}
+
+// ===========================================================================
+// E6 precondition — `inc_mode` conserves mass on all three paths
+//
+// NEW_EXPERIMENTS_PLAN.md E6 sweeps `inc_mode` as a candidate lever.  The
+// header claims all three modes conserve the strict invariant
+// `Δ(other + Σcnt) == class_share` (sem_split_map.hpp:194-195) and differ only
+// in how that mass is split.  Before the sweep prices the modes against each
+// other, that claim is checked rather than trusted: a mode that quietly LOSES
+// mass would show up in the sweep as a semantic effect, and E6 would promote a
+// leak.
+//
+// SOFT was already pinned (SemSplitMap.MassConservationPerGrid, one-hot,
+// single hit).  HARD and THRESH were not covered at all, and neither was any
+// mode on a softmax that is not one-hot -- which is the only input on which
+// the three modes take different branches.
+// ===========================================================================
+
+namespace {
+
+scovox::SemSplitMap makeMapMode(int inc_mode, float inc_thresh) {
+  scovox::SemSplitMap::Params p;
+  p.resolution          = kRes;
+  p.w_occ               = 1.0f;
+  p.w_free              = 0.5f;
+  p.kappa0              = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f;
+  p.evidence_saturation = 0.0f;
+  p.num_classes         = kC;
+  p.alpha_0             = kAlpha;
+  p.inc_mode            = inc_mode;
+  p.inc_thresh          = inc_thresh;
+  return scovox::SemSplitMap(p);
+}
+
+// Neither one-hot nor uniform, and straddling inc_thresh = 0.10 so the three
+// modes provably diverge: SOFT deposits four classes, THRESH three (class 9 at
+// 0.08 falls below), HARD one (the argmax).  Four distinct classes against
+// K_TOP = 2 also forces the evict/drop routing, which is where mass is most
+// at risk of going missing.
+std::vector<float> mixedSoftmax() {
+  std::vector<float> p(kC, 0.f);
+  p[1] = 0.50f;
+  p[2] = 0.30f;
+  p[7] = 0.12f;
+  p[9] = 0.08f;
+  return p;
+}
+
+// Deposit `n` hits and return the TOTAL `class_share` injected.  class_share
+// is `kappa0 · p_occ_post · quality` and p_occ_post climbs with every hit, so
+// it must be accumulated per hit rather than multiplied out.
+float injectAccumulatingShare(scovox::SemSplitMap& m,
+                              const Eigen::Vector3f& pos,
+                              const std::vector<float>* probs,
+                              float quality, int n) {
+  const auto coord = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  float total = 0.f;
+  for (int i = 0; i < n; ++i) {
+    m.applyHitUpdate(coord, probs, quality);
+    auto b = m.getBetaVoxel(pos);
+    EXPECT_TRUE(b.has_value());
+    // Below the gate Stream B deposits nothing, so counting a share there
+    // would make the test wrong rather than the code.
+    EXPECT_GE(b->p_occ(), 0.5f) << "hit " << i << " fell below the deposit gate";
+    total += 1.0f * b->p_occ() * quality;
+  }
+  return total;
+}
+
+}  // namespace
+
+TEST(IncMode, AllThreeModesConserveDirMassUnderEviction) {
+  const Eigen::Vector3f pos(2.0f, 0.f, 0.f);
+  const auto probs = mixedSoftmax();
+
+  for (const auto& mode : {std::make_pair(0, "SOFT"),
+                           std::make_pair(1, "HARD"),
+                           std::make_pair(2, "THRESH")}) {
+    auto  m     = makeMapMode(mode.first, 0.10f);
+    const float share = injectAccumulatingShare(m, pos, &probs, 1.0f, 6);
+
+    auto d = m.getDirVoxel(pos);
+    ASSERT_TRUE(d.has_value()) << mode.second;
+    // The whole invariant, exactly: prior + everything injected, nothing lost
+    // to a `continue` and nothing conjured by a rescale.
+    EXPECT_NEAR(d->s_class(), kC * kAlpha + share, 1e-4f)
+        << "inc_mode " << mode.second << " does not conserve Dir mass";
+    // And no slot may go negative on the way -- a clamped-at-zero eviction is
+    // still conserving only if the displaced mass reached OTHER.
+    for (int i = 0; i < scovox::K_TOP; ++i)
+      EXPECT_GE(d->cnt[i], 0.f) << mode.second << " slot " << i;
+    EXPECT_GE(d->other, 0.f) << mode.second;
+  }
+}
+
+TEST(IncMode, ThreshRoutesEverySubThresholdClassToOther) {
+  // inc_thresh above every class probability: the loop deposits nothing at
+  // all, and the residual line must send the ENTIRE class_share to OTHER.
+  // This is the branch where a `continue` most plausibly drops mass, because
+  // `deposited` stays 0 and the correction is a single subtraction.
+  const Eigen::Vector3f pos(3.0f, 0.f, 0.f);
+  const auto probs = mixedSoftmax();          // max is 0.50
+  auto  m     = makeMapMode(2, 0.90f);
+  const float share = injectAccumulatingShare(m, pos, &probs, 1.0f, 4);
+
+  auto d = m.getDirVoxel(pos);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_NEAR(d->s_class(), kC * kAlpha + share, 1e-4f)
+      << "THRESH lost mass when every class was below threshold";
+  EXPECT_NEAR(d->other, (kC - scovox::K_TOP) * kAlpha + share, 1e-4f)
+      << "sub-threshold mass must land in OTHER, not vanish";
+  for (int i = 0; i < scovox::K_TOP; ++i)
+    EXPECT_EQ(d->cls[i], uint16_t(0xFFFF)) << "no slot may be filled";
+}
+
+TEST(IncMode, TheThreeModesAreNotTheSameProgram) {
+  // Without this, the conservation test above could be passing on three
+  // identical execution paths -- the same failure `build_set.sh`'s md5
+  // uniqueness check exists to catch, in runtime clothing.  A conservation
+  // proof over one path restated three times is not a proof over three paths.
+  const Eigen::Vector3f pos(4.0f, 0.f, 0.f);
+  const auto probs = mixedSoftmax();
+
+  auto slots = [&](int mode) {
+    auto m = makeMapMode(mode, 0.10f);
+    injectAccumulatingShare(m, pos, &probs, 1.0f, 3);
+    auto d = m.getDirVoxel(pos);
+    EXPECT_TRUE(d.has_value());
+    // OTHER separates the modes even when the surviving slot labels agree.
+    return std::make_pair(std::make_pair(d->cls[0], d->cls[1]), d->other);
+  };
+
+  const auto soft   = slots(0);
+  const auto hard   = slots(1);
+
+  // HARD gives all mass to the argmax, so exactly one slot is ever filled.
+  EXPECT_EQ(hard.first.second, uint16_t(0xFFFF))
+      << "HARD must collapse to a single class";
+  EXPECT_NE(soft.first.second, uint16_t(0xFFFF))
+      << "SOFT must populate both slots from this softmax";
+  EXPECT_NE(hard.second, soft.second)
+      << "HARD and SOFT must route different amounts to OTHER";
+}
+
+// Only class 1 clears inc_thresh = 0.10, so under THRESH the second slot is
+// STARVED -- which is the regime in which THRESH is not merely SOFT under
+// another name.  Contrast with the test below.
+namespace {
+std::vector<float> starvingSoftmax() {
+  std::vector<float> p(kC, 0.f);
+  p[1] = 0.85f;
+  p[9] = 0.08f;
+  p[7] = 0.07f;
+  return p;
+}
+}  // namespace
+
+TEST(IncMode, ThreshDivergesFromSoftOnlyWhenItStarvesASlot) {
+  const Eigen::Vector3f pos(5.0f, 0.f, 0.f);
+  const auto probs = starvingSoftmax();
+
+  auto run = [&](int mode) {
+    auto m = makeMapMode(mode, 0.10f);
+    injectAccumulatingShare(m, pos, &probs, 1.0f, 3);
+    auto d = m.getDirVoxel(pos);
+    EXPECT_TRUE(d.has_value());
+    return *d;
+  };
+
+  const auto soft   = run(0);
+  const auto thresh = run(2);
+
+  // SOFT lets class 9 (0.08) take the free second slot; THRESH never deposits
+  // it, so the slot stays at its empty sentinel and the mass lands in OTHER.
+  EXPECT_NE(soft.cls[1], uint16_t(0xFFFF))
+      << "SOFT should fill the second slot with the sub-threshold class";
+  EXPECT_EQ(thresh.cls[1], uint16_t(0xFFFF))
+      << "THRESH must leave the second slot empty";
+  EXPECT_GT(thresh.other, soft.other)
+      << "the starved class's mass must show up in OTHER";
+}
+
+TEST(IncMode, ThreshEqualsSoftWhenTheSubThresholdClassWouldBeDroppedAnyway) {
+  // NOT a redundant restatement of the test above -- it pins the OPPOSITE
+  // regime, and it is the one E6 should expect to be in.
+  //
+  // On mixedSoftmax() four classes compete for K_TOP = 2 slots.  Classes 7
+  // (0.12) and 9 (0.08) lose to 1 and 2 under SOFT and are dropped to OTHER by
+  // the admit comparator; under THRESH class 9 is refused entry and its mass
+  // is routed to OTHER by the residual line.  Different code paths, same
+  // destination, same amount -- so the two modes leave the voxel in an
+  // IDENTICAL state.
+  //
+  // The consequence for E6 is a prediction, made here rather than discovered
+  // in the sweep: `inc_thresh` can only matter when it starves a slot that
+  // would otherwise have been filled.  At K_TOP = 2 the slots are contested
+  // almost everywhere (E0 measured 8.46% of argmax arrivals finding no slot at
+  // all), so a THRESH level that does not reach the SECOND-strongest class's
+  // probability is predicted inert -- and an "inert" verdict for it is then a
+  // statement about the level, not about the lever.
+  const Eigen::Vector3f pos(6.0f, 0.f, 0.f);
+  const auto probs = mixedSoftmax();
+
+  auto run = [&](int mode) {
+    auto m = makeMapMode(mode, 0.10f);
+    injectAccumulatingShare(m, pos, &probs, 1.0f, 3);
+    auto d = m.getDirVoxel(pos);
+    EXPECT_TRUE(d.has_value());
+    return *d;
+  };
+
+  const auto soft   = run(0);
+  const auto thresh = run(2);
+
+  EXPECT_EQ(thresh.cls[0], soft.cls[0]);
+  EXPECT_EQ(thresh.cls[1], soft.cls[1]);
+  EXPECT_NEAR(thresh.other,  soft.other,  1e-6f);
+  EXPECT_NEAR(thresh.cnt[0], soft.cnt[0], 1e-6f);
+  EXPECT_NEAR(thresh.cnt[1], soft.cnt[1], 1e-6f);
 }

@@ -287,8 +287,13 @@ class BinarySerializer {
         appendBytes(out, &q_occ,  sizeof(q_occ));
         appendBytes(out, &q_free, sizeof(q_free));
       } else {
-        appendBytes(out, &d.data.a_occ,  sizeof(float));
-        appendBytes(out, &d.data.a_free, sizeof(float));
+        // Widen through a float temporary: the wire is float32 regardless of
+        // how `BetaVoxel` stores its counters, so sender and receiver stay
+        // compatible across `SCOVOX_BETA_U16`.
+        const float f_occ  = d.data.a_occ;
+        const float f_free = d.data.a_free;
+        appendBytes(out, &f_occ,  sizeof(f_occ));
+        appendBytes(out, &f_free, sizeof(f_free));
       }
     });
 

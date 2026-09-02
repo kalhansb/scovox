@@ -442,10 +442,24 @@ class ScovoxMapSplit {
     if (k0 == k_far) {
       visit_one(k0);
     } else {
-      RayIterator(k0, k_far, [&](const CoordT& c) -> bool {
-        visit_one(c);
-        return true;
-      });
+      if (exact_ray_) {
+        // Exact walk: same include/exclude contract as the Bresenham sibling
+        // (k0 in, k_far out), so the explicit visit_one(k_far) below and the
+        // k_hit revisit guard are unchanged. The guard becomes a proven no-op
+        // here — an exact traversal cannot miss a voxel the segment crosses,
+        // and k_hit lies on [k0, k_far] by construction — but it is left in
+        // place so the two modes differ in ONE expression only.
+        ExactRayIterator(start_pos.cast<double>(), k0, k_far, res,
+                         [&](const CoordT& c) -> bool {
+                           visit_one(c);
+                           return true;
+                         });
+      } else {
+        RayIterator(k0, k_far, [&](const CoordT& c) -> bool {
+          visit_one(c);
+          return true;
+        });
+      }
       visit_one(k_far);
       if (!k_hit_visited && k_hit != k_far && k_hit != k0) {
         visit_one(k_hit);
@@ -860,6 +874,10 @@ class ScovoxMapSplit {
   bool        far_skip_disabled_ = envFarSkipDisabled();
   /// See envFarCarveDisabled() — same latch, for the far-voxel fast carve.
   bool        far_carve_disabled_ = envFarCarveDisabled();
+  /// A/B latch for the exact (Amanatides-Woo) ray traversal in the fused
+  /// walker. Same per-instance contract as the two kill-switches above;
+  /// SCOVOX_EXACT_RAY=1 selects it, default is the Bresenham RayIterator.
+  bool        exact_ray_ = envExactRay();
 
   // Fine TSDF band state (null / empty when fine_ratio_log2 == 0).
   std::unique_ptr<TsdfMap>    fine_tsdf_;

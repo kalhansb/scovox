@@ -116,6 +116,7 @@ public:
     SP.semsplit.kappa0                  = P.kappa0;
     SP.semsplit.carve_skip_occ_threshold = P.carve_skip_occ_threshold;
     SP.semsplit.batch_free_carve        = P.batch_free_carve;
+    SP.semsplit.batch_hits              = P.batch_hits;
     SP.semsplit.evidence_saturation     = static_cast<float>(P.evidence_saturation);
     SP.semsplit.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
     SP.semsplit.evict_by_confidence     = evict_by_confidence_;
@@ -359,6 +360,7 @@ private:
     P.semantic_occ_gate = dp("semantic_occ_gate", 0.5);
     P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.0);  // <=0 = guard off (trust recent scan)
     P.batch_free_carve = dp("batch_free_carve", true);
+    P.batch_hits = dp("batch_hits", true);
     {
       // uint16_t storage: an out-of-range request would otherwise wrap silently
       // (70000 → 4464, a far TIGHTER cap than asked for; -1 → 65535). Clamp to

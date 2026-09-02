@@ -11,6 +11,7 @@
 #include <limits>
 #include <utility>
 
+#include "scovox/e0_counters.hpp"
 #include "scovox/ray_iterator.hpp"
 
 namespace scovox {
@@ -102,6 +103,36 @@ void dirichletUpdate(DirVoxel*                 d,
     const uint16_t nb = (slot == 0xFF) ? uint16_t{0}
                       : (pre_cls[slot] == 0xFFFF ? uint16_t{0} : pre_nhit[slot]);
     g_deposit_trace(tx, ty, tz, c, p, inc, outcome, slot, cb, nb);
+    // E0 rides the trace's own outcome rather than recomputing it, so the two
+    // instruments can never disagree about which branch a deposit took.
+    SCOVOX_E0_ON_DEPOSIT(outcome, c,
+                         (outcome == 3 && slot != 0xFF) ? pre_cls[slot]
+                                                        : uint16_t{0xFFFF});
+  };
+#elif SCOVOX_E0_COUNTERS
+  // E0 instrumentation without the full deposit trace: the same branch code,
+  // but only the two fields the counters need, so an instrumented run costs a
+  // K_TOP-entry snapshot per deposit instead of a callback per deposit.
+  //
+  // OBSERVE-ONLY BY CONSTRUCTION: `outcome` is an out-parameter that
+  // `sparse_add_class` already writes for the trace build, nothing here is
+  // read back by the mapper, and the deposit call itself is the unchanged
+  // `sparse_add_class_traced`.  That is what makes E0's gate (a) — dumps
+  // byte-identical to the archived build's — a check rather than a hope.
+  auto trace_one = [&](uint16_t c, float p, float inc) {
+    uint16_t pre_cls[K_TOP];
+    for (int i = 0; i < K_TOP; ++i) pre_cls[i] = d->cls[i];
+    uint8_t outcome = 255;
+    sparse_add_class_traced(d, c, inc, alpha_0, p, evict_by_confidence, &outcome);
+    // On outcome 3 the arriving class now occupies exactly one slot — it
+    // matched none on entry (branch 1 runs first) and none was empty (branch
+    // 2), so the class that slot held before is the victim, unambiguously.
+    uint16_t victim = 0xFFFF;
+    if (outcome == 3) {
+      for (int i = 0; i < K_TOP; ++i)
+        if (d->cls[i] == c) { victim = pre_cls[i]; break; }
+    }
+    SCOVOX_E0_ON_DEPOSIT(outcome, c, victim);
   };
 #else
   (void)tx; (void)ty; (void)tz;
@@ -122,6 +153,29 @@ void dirichletUpdate(DirVoxel*                 d,
     return;
   }
   const float norm = (sum_p > 1.0f) ? (1.0f / sum_p) : 1.0f;
+
+#if SCOVOX_E0_COUNTERS
+  // CONTENTION, measured before this observation deposits anything, so the
+  // slot state tested is the one the arrival actually saw.
+  //
+  // The question is "was this observation's ARGMAX class held in no slot" —
+  // not "did the voxel ever see a (K+1)-th distinct class".  Under `soft`
+  // every class with p > 0 arrives on every ray, so the latter is true of
+  // nearly every voxel at K=2 after one ray and can never move; it would
+  // report a constant and read as a measurement (plan §1, §3).
+  {
+    size_t am = 0;
+    float  ap = -1.f;
+    for (size_t i = 0; i < obs.size(); ++i) if (obs[i] > ap) { ap = obs[i]; am = i; }
+    if (ap > 0.f) {
+      bool covered = false;
+      const uint16_t amc = static_cast<uint16_t>(am);
+      for (int i = 0; i < K_TOP; ++i)
+        if (d->cls[i] != 0xFFFF && d->cls[i] == amc) { covered = true; break; }
+      SCOVOX_E0_ON_ARGMAX(tx, ty, tz, covered);
+    }
+  }
+#endif
 
   // HARD: collapse the observation onto its argmax before depositing anything.
   // The same total mass moves, but it is not split — one class takes all of
@@ -342,10 +396,21 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
   const float w_inc  = w_free * quality;
   if (w_inc <= 0.f && !inclusive_endpoint) return;
 
-  RayIterator(k0, k_end, [&](const CoordT& c) -> bool {
+  const auto walk_body = [&](const CoordT& c) -> bool {
     if (c == k_end) return false;  // hit voxel handled separately for hits
     return applyCarveUpdate(c, quality, prof);
-  });
+  };
+  if (exact_ray_) {
+    // Both traversals already exclude k_end, so the c==k_end early-out above
+    // is belt-and-braces in either mode; it is kept so the two arms differ in
+    // the traversal alone. This is the carve most affected by the switch:
+    // Bresenham's skipped voxels are exactly the free-space evidence that
+    // never gets deposited.
+    ExactRayIterator(origin.cast<double>(), k0, k_end,
+                     params_.resolution, walk_body);
+  } else {
+    RayIterator(k0, k_end, walk_body);
+  }
 
   if (inclusive_endpoint) {
     (void)applyCarveUpdate(k_end, quality, prof);
@@ -400,6 +465,7 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
 void SemSplitMap::beginCarveFrame() {
   carve_stage_.beginFrame();  // retains all capacity → no per-scan realloc churn
   carve_hits_.clear();
+  hit_probs_.clear();         // capacity retained; see SemSplitParams::batch_hits
   carve_frame_open_ = true;
 }
 
@@ -414,6 +480,11 @@ std::size_t SemSplitMap::flushCarveFrame() {
   // Same-scan hit voxels are dropped inline (occupied-wins); a block whose
   // staged voxels are ALL hits is never written, so it allocates nothing —
   // exactly as when the retired path filtered before sorting.
+  // Staged surface hits first: a voxel this scan saw as a surface must carry
+  // its occupancy before the carve walk decides what to skip, exactly as on the
+  // immediate path where the hit wrote during the ray loop.
+  flushStagedHits();
+
   std::size_t n = 0;
   carve_stage_.forEachStagedBlockOrdered([&](const CoordT& c, float inc) {
     if (carve_hits_.count(c)) return;  // occupied-wins
@@ -433,6 +504,47 @@ std::size_t SemSplitMap::flushCarveFrame() {
 
   carve_frame_open_ = false;
   return n;
+}
+
+std::size_t SemSplitMap::flushStagedHits() {
+  hit_order_.clear();
+  for (const auto& kv : carve_hits_)
+    if (kv.second.staged) hit_order_.push_back(kv.first);
+  if (hit_order_.empty()) return 0;
+
+  // Leaf-block order, blocks ascending then voxels x-major within a block —
+  // the sequence CarveStage::forEachStagedBlockOrdered walks. Hits and carves
+  // then first-touch Beta root-map blocks in one consistent order, and the
+  // flush is reproducible run to run, which an unordered_map walk is not.
+  const int lb = static_cast<int>(params_.leaf_bits);
+  std::sort(hit_order_.begin(), hit_order_.end(),
+            [lb](const CoordT& a, const CoordT& b) {
+              const int32_t abx = a.x >> lb, bbx = b.x >> lb;
+              if (abx != bbx) return abx < bbx;
+              const int32_t aby = a.y >> lb, bby = b.y >> lb;
+              if (aby != bby) return aby < bby;
+              const int32_t abz = a.z >> lb, bbz = b.z >> lb;
+              if (abz != bbz) return abz < bbz;
+              if (a.x != b.x) return a.x < b.x;
+              if (a.y != b.y) return a.y < b.y;
+              return a.z < b.z;
+            });
+
+  for (const CoordT& c : hit_order_) {
+    const auto it = carve_hits_.find(c);
+    if (it == carve_hits_.end()) continue;
+    const HitStage& st = it->second;
+    const std::vector<float>* probs = nullptr;
+    if (st.probs_len != 0u) {
+      hit_probs_scratch_.assign(
+          hit_probs_.begin() + st.probs_off,
+          hit_probs_.begin() + st.probs_off + st.probs_len);
+      probs = &hit_probs_scratch_;
+    }
+    commitHit(c, probs, st.quality, st.w_occ_share, st.kappa0, st.min_p_occ,
+              beta_acc_, dir_acc_, &touched_beta_, &touched_dir_);
+  }
+  return hit_order_.size();
 }
 
 void SemSplitMap::applyHitUpdate(const CoordT&             c,
@@ -473,7 +585,48 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   // nullptr). A dynamic endpoint routes its occupancy to the transient grid and,
   // by the is_dynamic contract, the persistent grid stays free there, so it must
   // NOT suppress another ray's legitimate persistent free carve of that voxel.
-  if (carve_frame_open_ && touched_beta) carve_hits_.insert(c);
+  const bool kernel_ray = prof && prof->kernel_radius > 0.f;
+
+  if (carve_frame_open_ && touched_beta) {
+    HitStage& st = carve_hits_[c];
+
+    // Batched surface hit (SemSplitParams::batch_hits): keep the scan's
+    // strongest ray for this voxel and defer both streams to flushCarveFrame,
+    // so one scan is one observation however many pixels fell in the voxel.
+    // The three spread modes read Beta occupancy mid-scan and so cannot be
+    // deferred; they take the immediate write below.
+    const bool stageable = params_.batch_hits && !kernel_ray
+                        && params_.semantic_spread_radius <= 0.f
+                        && params_.ray_spread == 0;
+    if (stageable) {
+      const float w = (prof ? prof->w_occ : params_.w_occ) * quality;
+      // `!st.staged` admits the first ray even at w == 0 (a semantics-only
+      // source carries w_occ = 0 and still owns the class deposit).
+      if (!st.staged || w > st.w_occ_share) {
+        st.staged      = true;
+        st.w_occ_share = w;
+        st.quality     = quality;
+        st.kappa0      = prof ? prof->kappa0              : params_.kappa0;
+        st.min_p_occ   = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
+        if (sem_probs && !sem_probs->empty()) {
+          // Reuse this voxel's block whenever the length matches, so a run of
+          // ever-stronger rays overwrites in place instead of growing the pool.
+          const uint32_t n = static_cast<uint32_t>(sem_probs->size());
+          if (st.probs_off == kNoHitProbs || st.probs_len != n) {
+            st.probs_off = static_cast<uint32_t>(hit_probs_.size());
+            hit_probs_.resize(hit_probs_.size() + n);
+          }
+          std::copy(sem_probs->begin(), sem_probs->end(),
+                    hit_probs_.begin() + st.probs_off);
+          st.probs_len = n;
+        } else {
+          st.probs_off = kNoHitProbs;
+          st.probs_len = 0;
+        }
+      }
+      return;
+    }
+  }
 
   // RGB-D→LiDAR BKI spread: a semantics-only source with a kernel radius spreads
   // its class onto nearby LiDAR-occupied voxels instead of committing at the lone
@@ -481,7 +634,7 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   // Deposits only into the Dir grid `dacc`; reads LiDAR occupancy from the
   // PERSISTENT Beta grid inside the helper. A no-label point (sem_probs null)
   // contributes nothing — a semantics-only source must not touch geometry.
-  if (prof && prof->kernel_radius > 0.f) {
+  if (kernel_ray) {
     if (sem_probs && !sem_probs->empty())
       applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir,
                            prof->kernel_radius, prof->kappa0,
@@ -499,9 +652,25 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   const float kappa0    = prof ? prof->kappa0             : params_.kappa0;
   const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
 
+  commitHit(c, sem_probs, quality, w_occ * quality, kappa0, min_p_occ,
+            bacc, dacc, touched_beta, touched_dir);
+}
+
+// ---------------------------------------------------------------------------
+// The write itself — shared by the immediate path and the batched flush.
+// ---------------------------------------------------------------------------
+void SemSplitMap::commitHit(const CoordT&             c,
+                            const std::vector<float>* sem_probs,
+                            float                     quality,
+                            float                     w_occ_share,
+                            float                     kappa0,
+                            float                     min_p_occ,
+                            BetaGrid::Accessor&       bacc,
+                            DirGrid::Accessor&        dacc,
+                            std::vector<CoordT>*      touched_beta,
+                            std::vector<CoordT>*      touched_dir) {
   // ---- Stream A: occupancy (Beta grid), always. ----
   BetaVoxel* b = getOrAllocateBetaOn(bacc, c);
-  const float w_occ_share = w_occ * quality;
   if (w_occ_share > 0.f) b->a_occ += w_occ_share;
   applyBetaSaturation(b);
   if (touched_beta) touched_beta->push_back(c);
@@ -814,10 +983,23 @@ void SemSplitMap::decayTransient(float rate) {
   {
     const float ap = beta_occ_prior_;
     const float fp = beta_free_prior_;
+    // A geometric contraction only reaches its target if every step moves.
+    // Under fixed-point storage it stops moving once the residual drops under
+    // the storage resolution -- at scale 8, one count above the prior contracts
+    // to 1.0625, which rounds straight back to 1.125 -- and the voxel would
+    // then never satisfy the prune test below. Snapping a stalled residual to
+    // the prior keeps the decay terminating; with float counters the residual
+    // always moves, so the snap is inert.
+    const auto decayToward = [rate](BetaCount& x, float target) {
+      const float before = x;
+      x = target + (before - target) * rate;
+      if (rate < 1.f && static_cast<float>(x) == before && before != target)
+        x = target;
+    };
     std::vector<CoordT> prune;
     transient_beta_grid_.forEachCell([&](BetaVoxel& v, const CoordT& c) {
-      v.a_occ  = ap + (v.a_occ  - ap) * rate;
-      v.a_free = fp + (v.a_free - fp) * rate;
+      decayToward(v.a_occ,  ap);
+      decayToward(v.a_free, fp);
       if (std::fabs(v.a_occ - ap) < kPruneEps && std::fabs(v.a_free - fp) < kPruneEps)
         prune.push_back(c);
     });
@@ -888,6 +1070,20 @@ std::size_t SemSplitMap::transientDirVoxelCount() const {
 // ===========================================================================
 
 void SemSplitMap::applyBetaSaturation(BetaVoxel* b) const {
+#if SCOVOX_BETA_U16
+  // Storage ceiling. Fixed-point counters clamp rather than wrap, so a voxel
+  // that reaches BetaCount::kMax would stop accumulating on one side only and
+  // drag p_occ with it. Halving both parameters well short of the ceiling
+  // keeps p_occ exact and buys another full range; this runs unconditionally,
+  // before the (opt-in) evidence_saturation cap below.
+  // One halving always suffices: a store clamps at kMax, and kMax/2 is below
+  // the mark, so this cannot loop.
+  constexpr float kBetaU16HighWater = 0.9f * BetaCount::kMax;
+  if (b->a_occ > kBetaU16HighWater || b->a_free > kBetaU16HighWater) {
+    b->a_occ  *= 0.5f;
+    b->a_free *= 0.5f;
+  }
+#endif
   const float cap = params_.evidence_saturation;
   if (cap <= 0.f) return;
   const float s = b->s_total();

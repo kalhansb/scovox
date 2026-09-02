@@ -307,8 +307,13 @@ TEST(BinarySerializer, QuantizedRoundTripOnCompandedGrid) {
   for (std::size_t i = 0; i < 2; ++i) {
     const auto& in  = f.beta_deltas[i].data;
     const auto& out = g.beta_deltas[i].data;
-    EXPECT_FLOAT_EQ(out.a_occ,  q8(in.a_occ,  scovox::kBetaOccPrior));
-    EXPECT_FLOAT_EQ(out.a_free, q8(in.a_free, scovox::kBetaFreePrior));
+    // The wire is float32 in both storage builds; what differs is the voxel
+    // the value lands in. Under SCOVOX_BETA_U16 the dequantized value is
+    // re-rounded onto the storage lattice, so allow exactly that half-count.
+    constexpr float kStoreTol =
+        SCOVOX_BETA_U16 ? (0.5f / SCOVOX_BETA_U16_SCALE) : 0.0f;
+    EXPECT_NEAR(out.a_occ,  q8(in.a_occ,  scovox::kBetaOccPrior),  kStoreTol);
+    EXPECT_NEAR(out.a_free, q8(in.a_free, scovox::kBetaFreePrior), kStoreTol);
     // The companded error stays below the local step 2·√(step·e) + step.
     const float e_occ = in.a_occ - scovox::kBetaOccPrior;
     EXPECT_NEAR(out.a_occ, in.a_occ,
