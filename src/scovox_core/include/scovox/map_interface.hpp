@@ -88,6 +88,10 @@ struct Params {
   // accepts hit updates but stages no free-space evidence; immediate carve
   // calls are unchanged.
   bool batch_free_carve = true;
+  // Batched surface-hit toggle. When true (default) a voxel takes one
+  // occupancy + class deposit per scan — the scan's strongest ray — instead of
+  // one per pixel that landed in it. See SemSplitParams::batch_hits.
+  bool batch_hits = true;
 
   // -- Production knobs (load-bearing on Replica m2f mIoU) --
   // Together these restore OLD-pipeline mIoU within noise (verified by

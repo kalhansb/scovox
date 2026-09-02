@@ -34,10 +34,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "scovox/beta_voxel.hpp"
+#include "scovox/ray_iterator.hpp"
 #include "scovox/carve_stage.hpp"
 #include "scovox/dir_voxel.hpp"
 #include "scovox/semantics.hpp"  // SemanticMode
@@ -315,6 +317,28 @@ class SemSplitMap {
     /// writes no free-space evidence. Immediate applyCarveUpdate calls remain
     /// unchanged.
     bool    batch_free_carve           = true;
+    /// Batched surface hits: one occupancy + class deposit per voxel per scan,
+    /// staged like the free carve and applied by flushCarveFrame().
+    ///
+    /// A depth image lands hundreds of rays in the same surface voxel, and
+    /// un-batched each of them bumps `a_occ` and `cnt[]` again — so both
+    /// counters grow with sensor pixel density rather than with how many times
+    /// the surface was actually seen, and a voxel stared at for a whole
+    /// trajectory accumulates evidence without bound. Batched, the scan's
+    /// strongest ray wins the voxel (the same per-voxel MAX rule `CarveStage`
+    /// applies to `a_free`) and one scan contributes exactly one observation,
+    /// which bounds every counter by the frame count.
+    ///
+    /// Requires an open carve frame AND the persistent path. The BKI kernel
+    /// (`HitWeights::kernel_radius`), `semantic_spread_radius` and `ray_spread`
+    /// all read Beta occupancy mid-scan and so keep the immediate write; a hit
+    /// carrying any of them is applied in place regardless of this flag. The
+    /// transient/dynamic route is never staged either — it has no touched-set
+    /// and never reaches the wire.
+    ///
+    /// Both streams land at flush BEFORE the staged carves, so occupied-wins
+    /// holds exactly as on the immediate path.
+    bool    batch_hits                 = true;
     float   range_decay_length         = 50.0f;  ///< exp(-r/L); 0 disables (caller-applied)
 
     /// Dataset class count `C`. Sets the semantic OTHER prior `(C − K_TOP)·α₀`.
@@ -622,6 +646,9 @@ class SemSplitMap {
 
  private:
   Params               params_;
+  /// A/B latch for the exact (Amanatides-Woo) traversal in carveRay, read once
+  /// at construction. See scovox/ray_iterator.hpp.
+  bool                 exact_ray_ = envExactRay();
   BetaGrid             beta_grid_;
   DirGrid              dir_grid_;
   // Parallel transient substrate for dynamic-class endpoints. Same resolution /
@@ -656,8 +683,29 @@ class SemSplitMap {
   // `carve_hits_` holds voxels observed as a surface this scan so flush can
   // honour occupied-wins. Both retain capacity across beginCarveFrame, so
   // steady-state framing allocates nothing.
-  CarveStage                 carve_stage_;
-  std::unordered_set<CoordT> carve_hits_;
+  /// One scan's staged surface observation for a voxel (see `batch_hits`).
+  /// The per-source gains are carried per entry because the winning ray may
+  /// come from a different sensor than the previous one.
+  struct HitStage {
+    float    w_occ_share = 0.f;  ///< max `w_occ·quality` of the scan's rays here
+    float    quality     = 0.f;  ///< quality of the ray that set `w_occ_share`
+    float    kappa0      = 0.f;  ///< that ray's class gain
+    float    min_p_occ   = 0.f;  ///< that ray's Stream B admission gate
+    uint32_t probs_off   = kNoHitProbs;  ///< start of its softmax in hit_probs_
+    uint32_t probs_len   = 0;
+    bool     staged      = false;  ///< false => the hit was written immediately
+  };
+  static constexpr uint32_t kNoHitProbs = 0xFFFFFFFFu;
+
+  CarveStage                          carve_stage_;
+  std::unordered_map<CoordT, HitStage> carve_hits_;
+  /// Flat pool of staged softmaxes, one contiguous `probs_len` block per staged
+  /// voxel. A voxel's block is overwritten in place when a stronger ray
+  /// supersedes it, so the pool is bounded by the staged voxel count, not by
+  /// the ray count. Retains capacity across beginCarveFrame.
+  std::vector<float>                  hit_probs_;
+  std::vector<float>                  hit_probs_scratch_;  ///< flush-time view
+  std::vector<CoordT>                 hit_order_;          ///< flush-time sort
   bool                       carve_frame_open_ = false;
 
   /// Symmetric Beta(1,1) occupancy prior (kBetaOccPrior/kBetaFreePrior) →
@@ -678,6 +726,26 @@ class SemSplitMap {
   // share one implementation of the Stream A/B hit update and the prior-enforcing
   // first-touch allocation (the persistent grids pass their touched-sets; the
   // transient grids pass nullptr).
+  /// Write one surface observation: Stream A into `bacc`, then the gated
+  /// Stream B into `dacc`. Shared by the immediate path and the batched flush,
+  /// which differ only in WHEN they call it — the per-source gains arrive as
+  /// plain floats so a staged entry can replay a ray whose `HitWeights` is
+  /// long gone.
+  void       commitHit(const CoordT&             c,
+                       const std::vector<float>* sem_probs,
+                       float                     quality,
+                       float                     w_occ_share,
+                       float                     kappa0,
+                       float                     min_p_occ,
+                       BetaGrid::Accessor&       bacc,
+                       DirGrid::Accessor&        dacc,
+                       std::vector<CoordT>*      touched_beta,
+                       std::vector<CoordT>*      touched_dir);
+
+  /// Apply this scan's staged hits, leaf-block-ordered. Called by
+  /// flushCarveFrame() before the carve walk.
+  std::size_t flushStagedHits();
+
   BetaVoxel* getOrAllocateBetaOn(BetaGrid::Accessor& acc, const CoordT& c);
   DirVoxel*  getOrAllocateDirOn(DirGrid::Accessor& acc, const CoordT& c);
   void       applyHitUpdateOn(const CoordT&             c,

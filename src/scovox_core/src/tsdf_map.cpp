@@ -109,11 +109,22 @@ void TsdfMap::integrateRayImpl(const Eigen::Vector3f& origin,
   // SCovox row's geometry parity with itself across the refactor).
   bool k_hit_visited = false;
 
-  RayIterator(k0, k_far, [&](const CoordT& c) -> bool {
+  const auto walk_body = [&](const CoordT& c) -> bool {
     if (c == k_hit) k_hit_visited = true;
     visit(c, origin, endpoint, h, trunc, weight_fn);
     return true;
-  });
+  };
+  if (exact_ray_) {
+    // Closes the acknowledged parity gap in §1.1: SLIM-VDB walks with
+    // openvdb::math::DDA, which is the same Amanatides-Woo traversal this
+    // selects. Same start-included / end-excluded contract as the Bresenham
+    // sibling, so the two fix-ups below are untouched — and the k_hit revisit
+    // becomes dead here, since an exact walk cannot miss the endpoint voxel.
+    ExactRayIterator(start_pos.cast<double>(), k0, k_far,
+                     params_.resolution, walk_body);
+  } else {
+    RayIterator(k0, k_far, walk_body);
+  }
 
   // RayIterator stops one step short of `key_end`; visit explicitly.
   if (k_far != k0) visit(k_far, origin, endpoint, h, trunc, weight_fn);

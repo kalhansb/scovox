@@ -57,8 +57,13 @@
 /// `cls[]`, so a `SCOVOX_TRACK_QMAX=1` sender stays wire-compatible with a
 /// `=0` receiver. The comparator only changes *which* class wins a slot, and
 /// that outcome is already fully visible in the `cls`/`cnt` that do go out.
+/// ON by default: `SemSplitParams::evict_by_confidence` reads `qmax[]`, and
+/// `sparse_add_class_traced` passes a null `qmax` when this track is absent,
+/// which collapses `use_q` to false and makes that runtime flag a silent
+/// no-op. Build with `-DSCOVOX_TRACK_QMAX=0` to recover the 16 B DirVoxel,
+/// which also disables `evict_by_confidence`.
 #ifndef SCOVOX_TRACK_QMAX
-#define SCOVOX_TRACK_QMAX 0
+#define SCOVOX_TRACK_QMAX 1
 #endif
 
 // Per-slot DEPOSIT COUNT. `cnt[i]` is accumulated mass, not a tally: one
@@ -79,6 +84,16 @@
 /// search at run time rather than reading uninitialised memory.
 #ifndef SCOVOX_VICTIM_MEAN
 #define SCOVOX_VICTIM_MEAN 0
+#endif
+
+/// VICTIM axis, build-time only (`-DSCOVOX_VICTIM_QMAX=1`), off by default.
+/// Selects the victim slot by lowest best-ever deposit confidence `qmax[i]`
+/// rather than by least accumulated evidence, and is read only when
+/// `evict_by_confidence` is also set at run time. Declared here so the guard
+/// below is a legal expression in every build; the `#elif` at the victim
+/// search would otherwise be the only place the name appears.
+#ifndef SCOVOX_VICTIM_QMAX
+#define SCOVOX_VICTIM_QMAX 0
 #endif
 
 /// ADMIT axis, build-time only (`-DSCOVOX_ADMIT_NORM=1`), off by default.
@@ -163,6 +178,8 @@ static_assert(!SCOVOX_VICTIM_MEAN || SCOVOX_TRACK_NHIT,
     "SCOVOX_VICTIM_MEAN reads nhit[]; build with -DSCOVOX_TRACK_NHIT=1.");
 static_assert(!SCOVOX_ADMIT_NORM || SCOVOX_TRACK_NHIT,
     "SCOVOX_ADMIT_NORM reads nhit[]; build with -DSCOVOX_TRACK_NHIT=1.");
+static_assert(!SCOVOX_VICTIM_QMAX || SCOVOX_TRACK_QMAX,
+    "SCOVOX_VICTIM_QMAX dereferences qmax[]; build with -DSCOVOX_TRACK_QMAX=1.");
 static_assert(std::is_trivial_v<DirVoxel>,
     "DirVoxel must be trivial for Bonxai's pool allocator (zero-init).");
 static_assert(std::is_standard_layout_v<DirVoxel>,

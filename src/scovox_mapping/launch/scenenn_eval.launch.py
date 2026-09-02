@@ -152,6 +152,7 @@ def _launch_setup(context):
             "carve_band": float(cfg.get("carve_band", "-1.0")),
             "sdf_trunc_voxels": int(cfg.get("sdf_trunc_voxels", "3")),
             "batch_free_carve": flag("batch_free_carve", "true"),
+            "batch_hits": flag("batch_hits", "true"),
             # Bonxai block geometry. Coordinates are a pure function of
             # `resolution` (VoxelGrid::posToCoord), so these change only how
             # voxels are packed into leaf/inner nodes -- never a voxel's
@@ -213,6 +214,7 @@ def generate_launch_description():
         DeclareLaunchArgument("carve_band", default_value="-1.0"),
         DeclareLaunchArgument("sdf_trunc_voxels", default_value="3"),
         DeclareLaunchArgument("batch_free_carve", default_value="true"),
+        DeclareLaunchArgument("batch_hits", default_value="true"),
         DeclareLaunchArgument("log_level", default_value="info"),
         DeclareLaunchArgument("leaf_bits", default_value="3"),
         DeclareLaunchArgument("inner_bits", default_value="2"),

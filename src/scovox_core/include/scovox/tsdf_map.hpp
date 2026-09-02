@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "scovox/tsdf_voxel.hpp"
+#include "scovox/ray_iterator.hpp"
 
 namespace scovox {
 
@@ -203,6 +204,10 @@ class TsdfMap {
 
  private:
   Params              params_;
+  /// A/B latch for the exact (Amanatides-Woo) traversal, read once at
+  /// construction. SLIM-VDB walks with openvdb::math::DDA, so exact_ray_=true
+  /// is the configuration that actually matches the class this file ports.
+  bool                exact_ray_ = envExactRay();
   Grid                grid_;
   Grid::Accessor      acc_;
   std::vector<CoordT> touched_;
