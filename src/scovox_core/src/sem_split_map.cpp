@@ -400,17 +400,11 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
     if (c == k_end) return false;  // hit voxel handled separately for hits
     return applyCarveUpdate(c, quality, prof);
   };
-  if (exact_ray_) {
-    // Both traversals already exclude k_end, so the c==k_end early-out above
-    // is belt-and-braces in either mode; it is kept so the two arms differ in
-    // the traversal alone. This is the carve most affected by the switch:
-    // Bresenham's skipped voxels are exactly the free-space evidence that
-    // never gets deposited.
-    ExactRayIterator(origin.cast<double>(), k0, k_end,
-                     params_.resolution, walk_body);
-  } else {
-    RayIterator(k0, k_end, walk_body);
-  }
+  // The walk already excludes k_end, so the c==k_end early-out above is
+  // belt-and-braces; it is kept because `inclusive_endpoint` below is the one
+  // path allowed to touch that voxel.
+  ExactRayIterator(origin.cast<double>(), k0, k_end,
+                   params_.resolution, walk_body);
 
   if (inclusive_endpoint) {
     (void)applyCarveUpdate(k_end, quality, prof);

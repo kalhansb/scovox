@@ -605,6 +605,8 @@ sustained-rate cell (needs the RAM loader, E7.2) · payload/bandwidth on ARM ·
 **full-state cross-platform determinism check** — partial evidence only: the
 far-skip A/B (`det1` vs `SCOVOX_DISABLE_FAR_SKIP=1`) is bit-identical across all 13
 npz fields on aarch64, which tests *that change*, not Orin-vs-x86 agreement.
+(Since 2026-09-02 that A/B is driven by `Params::far_voxel_fast_paths=false`;
+the env var was removed and now has no effect.)
 
 Harness: `experiments/scovox_eval/scripts/scenenn_e7_embedded.sh` (voxel size via
 `RES=`, default 0.05) + `scenenn_e7_report.py`; raw logs/telemetry in

@@ -53,10 +53,10 @@ class ScovoxMapSplit {
     TsdfMap::Params     tsdf;
     SemSplitMap::Params semsplit;
 
-    /// Fused ray walker. When true, `integrateHit` runs a single Bresenham
-    /// DDA over the union range and feeds per-voxel updates into both the
-    /// TSDF and the semantic substrate. When false, falls back to the
-    /// two-DDA split path. Default true.
+    /// Fused ray walker. When true, `integrateHit` runs a single exact DDA
+    /// over the union range and feeds per-voxel updates into both the TSDF and
+    /// the semantic substrate. When false, falls back to the two-DDA split
+    /// path. Default true.
     bool fused_walker = true;
 
     /// When false, the fused walker skips every TSDF band write, so the TsdfMap
@@ -66,6 +66,20 @@ class ScovoxMapSplit {
     /// is never read. Default true → TSDF integrates exactly as before. The
     /// occupancy (Beta) and semantic (Dir) substrates are unaffected either way.
     bool tsdf_enabled = true;
+
+    /// Far-voxel fast paths in the fused walker (the skip and the fast carve
+    /// documented at their gates in integrateHitFused). Both are shortcuts
+    /// AROUND the exact per-voxel body, not reimplementations of it: false
+    /// simply declines to take them and every voxel runs the same float body
+    /// the near voxels always run.
+    ///
+    /// The shortcuts' correctness is a claim of BIT identity with that body,
+    /// and this flag is how it is checked — the differential tests build one
+    /// map with it false and one with it true, feed both the same rays, and
+    /// compare all three grids byte-for-byte. Nothing in production sets it
+    /// false; it is here rather than behind an environment variable so the
+    /// switch is visible in the params the node prints.
+    bool far_voxel_fast_paths = true;
 
     // ---- Fine TSDF band (localized two-lattice refinement) ----
     // docs/design/fine_tsdf_band_dbh_2026_07_30.md. 0 = off (default —
@@ -101,6 +115,7 @@ class ScovoxMapSplit {
       , resolution_(p.resolution)
       , fused_walker_(p.fused_walker)
       , tsdf_enabled_(p.tsdf_enabled)
+      , far_voxel_fast_paths_(p.far_voxel_fast_paths)
       , sem_band_(semsplit_.params().semantic_band_length)
       , fine_ratio_log2_(p.fine_ratio_log2)
       , fine_region_margin_(p.fine_region_margin)
@@ -163,7 +178,7 @@ class ScovoxMapSplit {
     }
   }
 
-  /// Fused walker — one Bresenham DDA, per-voxel SDF computed once and
+  /// Fused walker — one exact DDA, per-voxel SDF computed once and
   /// dispatched into both `TsdfMap::applyBandUpdate` and (in the carve zone)
   /// the semantic substrate's `applyCarveUpdate`/`applyHitUpdate`.
   void integrateHitFused(const Eigen::Vector3f&    origin,
@@ -250,12 +265,14 @@ class ScovoxMapSplit {
     //   - semantic band: |sdf| <= sem_band_ fails beyond the threshold.
     //   - carve: the no-op above, which also returns true, so carve_blocked
     //     latches identically with or without the skip.
-    // The threshold is Chebyshev distance in COORD units because the DDA and
-    // the voxel-centre geometry are max-norm; +1 is a guard ring absorbing
-    // float rounding at the gate boundaries (endpoint-inside-voxel offset is
-    // < h·√3 < res). Computed in double and clamped BEFORE the int cast so an
-    // absurd sdf_trunc cannot overflow the cast into "skip everything".
-    const bool far_skip = !far_skip_disabled_
+    // The threshold is Chebyshev distance in COORD units, which is a LOWER
+    // bound on the Euclidean voxel distance — so "Chebyshev beyond far_thr"
+    // implies "metrically beyond the band" whatever path the traversal took,
+    // and the test errs toward running the exact body. +1 is a guard ring
+    // absorbing float rounding at the gate boundaries (endpoint-inside-voxel
+    // offset is < h·√3 < res). Computed in double and clamped BEFORE the int
+    // cast so an absurd sdf_trunc cannot overflow it into "skip everything".
+    const bool far_skip = far_voxel_fast_paths_
                        && !tparams.space_carving
                        && semsplit_.carveFrameOpen()
                        && !semsplit_.params().batch_free_carve;
@@ -300,9 +317,7 @@ class ScovoxMapSplit {
     // computes proj < 0). The map frame must keep |world coord|/res ≲ 8×10⁷
     // and ray length/res ≲ 3×10⁷; local/odometry frames sit 3–4 orders of
     // magnitude inside both.
-    // Kill-switch: SCOVOX_DISABLE_FAR_CARVE, latched per instance at
-    // construction exactly like the skip's.
-    const bool far_carve = !far_carve_disabled_
+    const bool far_carve = far_voxel_fast_paths_
                         && !tparams.space_carving
                         && semsplit_.carveFrameOpen()
                         && semsplit_.params().batch_free_carve
@@ -340,7 +355,10 @@ class ScovoxMapSplit {
         if (dx > far_thr || -dx > far_thr ||
             dy > far_thr || -dy > far_thr ||
             dz > far_thr || -dz > far_thr) {
-          if (far_skip) return;  // carve OFF: provably no observable write
+          if (far_skip) {
+            ++far_skipped_voxels_;  // carve OFF: provably no observable write
+            return;
+          }
           // far_carve: only the carve branch can fire out here — take it
           // directly unless inside the origin guard ring, whose voxels fall
           // through to the exact body (see the arming comment).
@@ -354,6 +372,7 @@ class ScovoxMapSplit {
                 carve_blocked = true;
               }
             }
+            ++far_carved_voxels_;
             return;
           }
         }
@@ -442,24 +461,14 @@ class ScovoxMapSplit {
     if (k0 == k_far) {
       visit_one(k0);
     } else {
-      if (exact_ray_) {
-        // Exact walk: same include/exclude contract as the Bresenham sibling
-        // (k0 in, k_far out), so the explicit visit_one(k_far) below and the
-        // k_hit revisit guard are unchanged. The guard becomes a proven no-op
-        // here — an exact traversal cannot miss a voxel the segment crosses,
-        // and k_hit lies on [k0, k_far] by construction — but it is left in
-        // place so the two modes differ in ONE expression only.
-        ExactRayIterator(start_pos.cast<double>(), k0, k_far, res,
-                         [&](const CoordT& c) -> bool {
-                           visit_one(c);
-                           return true;
-                         });
-      } else {
-        RayIterator(k0, k_far, [&](const CoordT& c) -> bool {
-          visit_one(c);
-          return true;
-        });
-      }
+      // k0 in, k_far out — hence the explicit visit_one(k_far) below. The
+      // k_hit guard after it covers the near-endpoint deviation the walk's
+      // centre-aiming caveat allows.
+      ExactRayIterator(start_pos.cast<double>(), k0, k_far, res,
+                       [&](const CoordT& c) -> bool {
+                         visit_one(c);
+                         return true;
+                       });
       visit_one(k_far);
       if (!k_hit_visited && k_hit != k_far && k_hit != k0) {
         visit_one(k_hit);
@@ -482,7 +491,7 @@ class ScovoxMapSplit {
     // ONE per-voxel loop, so wall-clock cannot be cleanly attributed per
     // substrate without bracketing every applyBandUpdate vs semHit/semCarve with
     // a clock read — two steady_clock::now() calls per voxel would dominate and
-    // distort the very cost being measured in this hot Bresenham loop. We
+    // distort the very cost being measured in this hot walk. We
     // therefore report the COMBINED TSDF+semantic time under tsdf_ns_ and leave
     // sem_ns_ untouched on the fused path (it reads 0). For a true per-substrate
     // split, run the non-fused integrateHitSplit walker, which times the two
@@ -519,7 +528,9 @@ class ScovoxMapSplit {
     // Dynamic rays write no persistent TSDF (no ghost surface); the carve inside
     // semsplit_.integrateHit stays persistent, only the endpoint routes. A
     // geometry-off source (RGB-D overlay) also writes no TSDF — geometry stays
-    // LiDAR-only (parity with the fused walker's line-185 gate).
+    // LiDAR-only (parity with the fused walker's band-write gate). That gate
+    // also tests tsdf_enabled_ and this one does not; see §2.3 of
+    // docs/design/removed_and_untested_2026_09_02.md.
     if (!is_dynamic && !(prof && prof->geometry_off)) tsdf_.integrateRay(origin, endpoint);
     const auto t1 = clk::now();
     semsplit_.integrateHit(origin, endpoint, sem_probs, quality, is_dynamic, prof);
@@ -737,33 +748,20 @@ class ScovoxMapSplit {
 
   double resolution() const { return resolution_; }
 
-  /// Test canaries for the per-instance A/B kill-switch latches (see
-  /// envFarSkipDisabled() / envFarCarveDisabled() below). The identity tests
-  /// assert the latch actually SPLIT their two instances — without that, a
-  /// broken latch (env-name typo, lost member init) would silently turn a
-  /// full-vs-fast comparison into fast-vs-fast and stay green.
-  bool farSkipDisabled()  const noexcept { return far_skip_disabled_;  }
-  bool farCarveDisabled() const noexcept { return far_carve_disabled_; }
+  /// Reads back Params::far_voxel_fast_paths. The differential tests assert on
+  /// it so that dropping the flag from either gate's conjunction turns them
+  /// red: without the check they would silently become fast-vs-fast and pass.
+  bool farVoxelFastPaths() const noexcept { return far_voxel_fast_paths_; }
+
+  /// Voxels each far-voxel fast path has removed from the exact float body
+  /// since construction. Zero whenever far_voxel_fast_paths is false, and zero
+  /// on any config that disarms the paths. The differential tests read these to
+  /// prove the shortcut actually EXECUTED: identity alone is the absence of a
+  /// difference, which a fast path that never armed also produces.
+  std::uint64_t farSkippedVoxels() const noexcept { return far_skipped_voxels_; }
+  std::uint64_t farCarvedVoxels()  const noexcept { return far_carved_voxels_; }
 
  private:
-  /// A/B kill-switch for the far-voxel skip in integrateHitFused. Latched from
-  /// the environment ONCE, at construction, PER INSTANCE — not per process —
-  /// so one binary (or one test process) can host a full-walk map and a
-  /// skipping map side by side: set SCOVOX_DISABLE_FAR_SKIP before
-  /// constructing the first, unset it before constructing the second.
-  static bool envFarSkipDisabled() noexcept {
-    const char* e = std::getenv("SCOVOX_DISABLE_FAR_SKIP");
-    return e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-  }
-
-  /// A/B kill-switch for the far-voxel fast CARVE (the batch_free_carve=true
-  /// counterpart of the skip above). Same per-instance latch contract as
-  /// envFarSkipDisabled().
-  static bool envFarCarveDisabled() noexcept {
-    const char* e = std::getenv("SCOVOX_DISABLE_FAR_CARVE");
-    return e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
-  }
-
   // -------------------------------------------------------------------
   // Fine-band internals
   // -------------------------------------------------------------------
@@ -865,19 +863,11 @@ class ScovoxMapSplit {
   double      resolution_;
   bool        fused_walker_;
   bool        tsdf_enabled_;
+  bool        far_voxel_fast_paths_;
   /// Cached from semsplit_.params() AFTER sanitise(), so a config that sets
   /// both band and spread reads 0 here and the walker's band branch stays cold.
   /// Declared after semsplit_ so the ctor's member-init order is valid.
   float       sem_band_;
-  /// See envFarSkipDisabled() — per-instance A/B kill-switch, read here at
-  /// construction time.
-  bool        far_skip_disabled_ = envFarSkipDisabled();
-  /// See envFarCarveDisabled() — same latch, for the far-voxel fast carve.
-  bool        far_carve_disabled_ = envFarCarveDisabled();
-  /// A/B latch for the exact (Amanatides-Woo) ray traversal in the fused
-  /// walker. Same per-instance contract as the two kill-switches above;
-  /// SCOVOX_EXACT_RAY=1 selects it, default is the Bresenham RayIterator.
-  bool        exact_ray_ = envExactRay();
 
   // Fine TSDF band state (null / empty when fine_ratio_log2 == 0).
   std::unique_ptr<TsdfMap>    fine_tsdf_;
@@ -894,6 +884,15 @@ class ScovoxMapSplit {
 
   std::int64_t tsdf_ns_ = 0;
   std::int64_t sem_ns_  = 0;
+
+  /// Voxels each far-voxel fast path has actually removed from the exact float
+  /// body, cumulative since construction. They exist because bit identity is
+  /// the ABSENCE of a difference: with far_thr mis-sized so that no voxel ever
+  /// qualified, every differential test would still pass green while the
+  /// shortcuts did nothing at all. Plain counters, like tsdf_ns_ above — one
+  /// integrating thread per map.
+  std::uint64_t far_skipped_voxels_ = 0;
+  std::uint64_t far_carved_voxels_  = 0;
 };
 
 }  // namespace scovox

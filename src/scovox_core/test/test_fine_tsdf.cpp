@@ -286,12 +286,18 @@ TEST(FineTsdf, CleanOrbitDbhWithinBudget) {
   EXPECT_NEAR(fit.cx, 2.0f, 0.01f);
   EXPECT_NEAR(fit.cy, 0.0f, 0.01f);
   EXPECT_GE(fit.arc_coverage, 0.9f);
-  // The clean-orbit RMS floor on this synthetic geometry is ~0.022: the
+  // The clean-orbit RMS floor on this synthetic geometry is ~0.0255: the
   // ±60° scan arcs put oblique rays into the band whose projective bias
-  // survives tent-weighting at the band's inner edge. Well under the 0.03
-  // model-refresh gate, and the drift test asserts the anchored map beats
-  // the smeared one on this same metric.
-  EXPECT_LT(fit.rms, 0.025f);
+  // survives tent-weighting at the band's inner edge. It was ~0.022 under the
+  // approximate Bresenham traversal, which skipped a share of those very
+  // voxels; the exact DDA visits all of them, so more biased band-edge samples
+  // enter the fit. The fitted geometry did not degrade with it — radius error
+  // fell 4.09 mm -> 0.95 mm, cy improved, cx moved within tolerance and arc
+  // coverage stayed at 1.0. Only the residual scatter grew.
+  // This bound is a regression tripwire just above that floor, not the
+  // engineering requirement: the model-refresh gate is 0.03, and the drift
+  // test asserts the anchored map beats the smeared one on this same metric.
+  EXPECT_LT(fit.rms, 0.027f);
 }
 
 TEST(FineTsdf, ExternalModelRefreshViaReAdd) {

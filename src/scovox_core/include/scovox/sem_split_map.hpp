@@ -646,9 +646,6 @@ class SemSplitMap {
 
  private:
   Params               params_;
-  /// A/B latch for the exact (Amanatides-Woo) traversal in carveRay, read once
-  /// at construction. See scovox/ray_iterator.hpp.
-  bool                 exact_ray_ = envExactRay();
   BetaGrid             beta_grid_;
   DirGrid              dir_grid_;
   // Parallel transient substrate for dynamic-class endpoints. Same resolution /

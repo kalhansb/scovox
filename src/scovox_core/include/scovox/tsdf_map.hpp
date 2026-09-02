@@ -80,9 +80,10 @@ class TsdfMap {
   /// Curless–Levoy update along the truncation band of one ray.
   ///
   /// `origin`, `endpoint` are world-space positions in metres. The voxel-set
-  /// touched is identical to SLIM-VDB's openvdb DDA range up to the
-  /// acknowledged `RayIterator` parity gaps documented in §1.1 of
-  /// `docs/design/slimvdb_like_tsdf_mapping_plan.md`.
+  /// touched is identical to SLIM-VDB's openvdb DDA range: both are Amanatides
+  /// & Woo, which closed the traversal parity gap §1.1 of
+  /// `docs/design/slimvdb_like_tsdf_mapping_plan.md` acknowledged while this
+  /// walked an integer Bresenham line.
   ///
   /// Per-voxel update inside the band:
   ///     sdf       = sign((vc - origin) · (endpoint - vc)) · ‖endpoint - vc‖
@@ -204,10 +205,6 @@ class TsdfMap {
 
  private:
   Params              params_;
-  /// A/B latch for the exact (Amanatides-Woo) traversal, read once at
-  /// construction. SLIM-VDB walks with openvdb::math::DDA, so exact_ray_=true
-  /// is the configuration that actually matches the class this file ports.
-  bool                exact_ray_ = envExactRay();
   Grid                grid_;
   Grid::Accessor      acc_;
   std::vector<CoordT> touched_;
@@ -216,8 +213,8 @@ class TsdfMap {
   std::vector<CoordT> scratch_;
 
   /// The actual integration body. Translates origin/endpoint into Bonxai
-  /// coords, runs the DDA (matching SLIM-VDB's range setup modulo the
-  /// `RayIterator` parity gaps in §1.1 of the design doc), and applies the
+  /// coords, runs the exact DDA (the same Amanatides & Woo traversal, and the
+  /// same range setup, that SLIM-VDB uses), and applies the
   /// Curless–Levoy update at every visited voxel inside the truncation band.
   void integrateRayImpl(const Eigen::Vector3f& origin,
                         const Eigen::Vector3f& endpoint,

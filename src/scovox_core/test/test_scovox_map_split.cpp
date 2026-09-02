@@ -123,9 +123,9 @@ TEST(ScovoxMapSplit, DrainTouchedSplitsByGrid) {
 // ===========================================================================
 //
 // The fused walker (`Params::fused_walker = true`, default) runs one
-// Bresenham DDA over the TSDF band [Hp - sdf_trunc·û, Hp + sdf_trunc·û]
+// exact DDA over the TSDF band [Hp - sdf_trunc·û, Hp + sdf_trunc·û]
 // and dispatches per-voxel into both grids. The split walker runs two
-// independent DDAs. For axis-aligned rays Bresenham reduces to integer
+// independent DDAs. For axis-aligned rays the DDA reduces to unit
 // stepping along the major axis and both walkers must produce
 // bit-identical TsdfMap state. SemBeta state must also match exactly:
 // the carve subset is `0 < sdf <= carve_band, c != k_hit`, which selects
@@ -157,7 +157,7 @@ Eigen::Vector3f truncateOrigin(const Eigen::Vector3f& O,
 }  // namespace
 
 TEST(ScovoxMapSplitFusedWalker, AxisAlignedParityWithSplitWalker) {
-  // Axis-aligned ray: Bresenham picks deterministic voxels — fused and
+  // Axis-aligned ray: the DDA picks deterministic voxels — fused and
   // split must produce identical TsdfMap voxel sets and identical
   // SemBeta {a_occ, a_free, sem_cnt} state for the same ray.
   auto p_fused = splitParams(); p_fused.fused_walker = true;
@@ -180,7 +180,7 @@ TEST(ScovoxMapSplitFusedWalker, AxisAlignedParityWithSplitWalker) {
   EXPECT_EQ(m_fused.tsdfGridBytes(),   m_split.tsdfGridBytes());
 
   // SemBeta voxel counts match for an axis-aligned ray — the carve
-  // subset {0 < sdf <= carve_band} selects exactly the voxels Bresenham
+  // subset {0 < sdf <= carve_band} selects exactly the voxels the DDA
   // would pick walking [co, Hp).
   EXPECT_EQ(m_fused.semdirVoxelCount(), m_split.semdirVoxelCount());
 
@@ -226,7 +226,7 @@ TEST(ScovoxMapSplitFusedWalker, MissPathUnchanged) {
 TEST(ScovoxMapSplitFusedWalker, MultiRayBandIdentity) {
   // 27-ray fan around an axis-aligned hit endpoint. Even with the small
   // off-axis offsets, every ray in this set is close enough to one major
-  // axis that Bresenham walks the same voxel sequence under both walkers.
+  // axis that the DDA walks the same voxel sequence under both walkers.
   // After integrating all 27 rays the TsdfMap state must be bit-identical.
   auto p_fused = splitParams(); p_fused.fused_walker = true;
   auto p_split = splitParams(); p_split.fused_walker = false;
@@ -248,10 +248,12 @@ TEST(ScovoxMapSplitFusedWalker, MultiRayBandIdentity) {
   EXPECT_EQ(m_fused.tsdfVoxelCount(), m_split.tsdfVoxelCount());
   EXPECT_EQ(m_fused.tsdfGridBytes(),  m_split.tsdfGridBytes());
 
-  // SemDir carve sets agree up to per-ray Bresenham boundary jitter:
-  // the fused walker starts its DDA at `Hp − walk_back·û` while the split
-  // walker starts at `Hp − carve_band·û`, so for oblique rays the two
-  // pick-sequences may pick different voxels at sub-voxel boundaries.
+  // SemDir carve sets agree up to per-ray boundary jitter: the fused
+  // walker starts its DDA at `Hp − walk_back·û` while the split walker
+  // starts at `Hp − carve_band·û`, so the two walks enter the shared span
+  // with different `t_max` phases. Where an oblique ray passes near a
+  // voxel corner the two orderings break the tie differently and pick
+  // different voxels at sub-voxel boundaries.
   // For axis-aligned rays the sets are bit-identical (see the test
   // above); for the 27-ray off-axis fan with 0.05 m offsets we accept
   // up to 20 % asymmetric difference, dominated by ±1 voxel/ray jitter
@@ -400,27 +402,25 @@ TEST(ScovoxMapSplitDynamic, DecayTransientPassthrough) {
 }
 
 // ===========================================================================
-// Far-voxel skip — bit-identity vs the full walk (SCOVOX_DISABLE_FAR_SKIP)
+// Far-voxel skip — bit-identity vs the full walk
 // ===========================================================================
 //
 // When a carve frame is open and batch_free_carve=false, applyCarveUpdate is a
 // guaranteed no-op, so integrateHitFused's far-voxel skip may early-return any
 // voxel whose Chebyshev coord distance to the hit exceeds the band threshold.
-// The claim is BIT identity, not approximate parity: a full-walk map (skip
-// disabled via the per-instance env latch) and a skipping map fed identical
-// rays must agree byte-for-byte on the TSDF/Beta/Dir grids and produce the
-// same touched-lists, every scan.
+// The claim is BIT identity, not approximate parity: a full-walk map
+// (far_voxel_fast_paths=false) and a skipping map fed identical rays must
+// agree byte-for-byte on the TSDF/Beta/Dir grids and produce the same
+// touched-lists, every scan.
 
 namespace {
 
-/// RAII guard for the per-instance construction-time env latch.
-struct ScopedEnv {
-  explicit ScopedEnv(const char* key, const char* value) : key_(key) {
-    ::setenv(key_, value, /*overwrite=*/1);
-  }
-  ~ScopedEnv() { ::unsetenv(key_); }
-  const char* key_;
-};
+/// Same config with both far-voxel shortcuts declined, so every voxel runs the
+/// exact float body — the reference the shortcuts claim bit identity with.
+scovox::ScovoxMapSplit::Params fullWalk(scovox::ScovoxMapSplit::Params p) {
+  p.far_voxel_fast_paths = false;
+  return p;
+}
 
 void appendBytes(std::vector<uint8_t>& out, const void* p, std::size_t n) {
   const auto* b = static_cast<const uint8_t*>(p);
@@ -553,18 +553,14 @@ void fireScanRays(FireFn&& fire, int scan, uint32_t& s) {
 
 void runFarSkipIdentity(float band) {
   const auto p = farSkipParams(band);
-  std::unique_ptr<scovox::ScovoxMapSplit> full;  // skip disabled (full walk)
-  {
-    ScopedEnv disable("SCOVOX_DISABLE_FAR_SKIP", "1");
-    full = std::make_unique<scovox::ScovoxMapSplit>(p);
-  }
+  auto full = std::make_unique<scovox::ScovoxMapSplit>(fullWalk(p));
   auto skip = std::make_unique<scovox::ScovoxMapSplit>(p);
 
-  // Latch canary: the env kill-switch must have SPLIT the two instances. A
-  // broken latch (env-name typo, lost member init) would otherwise turn the
+  // Canary: the flag must have SPLIT the two instances. A lost member init, or
+  // the flag dropped from far_skip's conjunction, would otherwise turn the
   // comparison below into skip-vs-skip and stay silently green.
-  ASSERT_TRUE(full->farSkipDisabled());
-  ASSERT_FALSE(skip->farSkipDisabled());
+  ASSERT_FALSE(full->farVoxelFastPaths());
+  ASSERT_TRUE(skip->farVoxelFastPaths());
 
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
@@ -604,6 +600,14 @@ void runFarSkipIdentity(float band) {
   EXPECT_GT(full->tsdfVoxelCount(), 0u);
   EXPECT_GT(full->betaVoxelCount(), 0u);
   EXPECT_GT(full->dirVoxelCount(),  0u);
+
+  // Execution proof. See the matching note in runFarCarveIdentity: identity is
+  // the absence of a difference and would stay green on a skip that never
+  // armed, so assert that it removed voxels and that the reference did not.
+  EXPECT_GT(skip->farSkippedVoxels(), 0u)
+      << "far skip never armed — the identity above proves nothing, band " << band;
+  EXPECT_EQ(full->farSkippedVoxels(), 0u) << "reference arm took the far skip";
+  EXPECT_EQ(skip->farCarvedVoxels(),  0u) << "fast carve armed on an unbatched config";
 }
 
 // The skip must be INERT unless ALL THREE of its preconditions hold. Each
@@ -632,11 +636,7 @@ void runFarSkipInert(const char* label,
   p.tsdf.space_carving        = space_carving;
   p.semsplit.batch_free_carve = batch_free_carve;
 
-  std::unique_ptr<scovox::ScovoxMapSplit> full;  // skip disabled (full walk)
-  {
-    ScopedEnv disable("SCOVOX_DISABLE_FAR_SKIP", "1");
-    full = std::make_unique<scovox::ScovoxMapSplit>(p);
-  }
+  auto full = std::make_unique<scovox::ScovoxMapSplit>(fullWalk(p));
   auto skip = std::make_unique<scovox::ScovoxMapSplit>(p);
 
   const std::string l_tsdf = std::string(label) + " tsdf";
@@ -685,24 +685,30 @@ void runFarSkipInert(const char* label,
   // and the mutant would have nothing to break.
   EXPECT_GT(full->betaVoxelCount(), 0u) << label << ": no carve happened";
   EXPECT_GT(full->tsdfVoxelCount(), 0u) << label << ": no TSDF written";
+
+  // Execution proof of the inertness: the skip must not merely be harmless
+  // here, it must never have fired. Only far_skip is asserted — on the
+  // "production" arm the mutually-exclusive fast CARVE legitimately arms, and
+  // FarCarveBitIdenticalToFullWalk is where that path is under test.
+  EXPECT_EQ(skip->farSkippedVoxels(), 0u) << label << ": far skip armed";
 }
 
 // ===========================================================================
-// Far-voxel fast carve — bit-identity vs the full walk (SCOVOX_DISABLE_FAR_CARVE)
+// Far-voxel fast carve — bit-identity vs the full walk
 // ===========================================================================
 //
 // The batch_free_carve=true counterpart of the skip above: on the SHIPPED
 // batched config, a voxel beyond far_thr can only take the carve branch — the
 // TSDF and semantic-band gates provably fail out there — so integrateHitFused
 // carves it directly with integer-only tests and skips the float body. The
-// claim is the same BIT identity: a full-walk map (fast carve disabled via the
-// per-instance env latch) and a fast-carving map fed identical rays must agree
-// byte-for-byte on all three grids, the touched-lists, and the flush count.
+// claim is the same BIT identity: a full-walk map (far_voxel_fast_paths=false)
+// and a fast-carving map fed identical rays must agree byte-for-byte on all
+// three grids, the touched-lists, and the flush count.
 //
-// Like the far-skip identity, this cannot prove IN-PROCESS that the fast path
-// actually armed (identity is exactly the absence of a difference); execution
-// proof is the batched perf/digest pass (band_perf), mirroring how the skip's
-// arming was proven on real KITTI.
+// Identity on its own is exactly the absence of a difference, which a fast
+// path that never armed produces just as reliably as one that armed and was
+// correct. farCarvedVoxels()/farSkippedVoxels() close that: the arming is now
+// proven IN-PROCESS, not deferred to an out-of-tree perf harness.
 
 void runFarCarveIdentity(float band) {
   auto p = farSkipParams(band);
@@ -711,18 +717,14 @@ void runFarCarveIdentity(float band) {
   // construction, so exactly one fast path is under test here).
   p.semsplit.batch_free_carve = true;
 
-  std::unique_ptr<scovox::ScovoxMapSplit> full;  // fast carve disabled
-  {
-    ScopedEnv disable("SCOVOX_DISABLE_FAR_CARVE", "1");
-    full = std::make_unique<scovox::ScovoxMapSplit>(p);
-  }
+  auto full = std::make_unique<scovox::ScovoxMapSplit>(fullWalk(p));
   auto fast = std::make_unique<scovox::ScovoxMapSplit>(p);
 
-  // Latch canary: the env kill-switch must have SPLIT the two instances. A
-  // broken latch (env-name typo, lost member init) would otherwise turn the
+  // Canary: the flag must have SPLIT the two instances. A lost member init, or
+  // the flag dropped from far_carve's conjunction, would otherwise turn the
   // comparison below into fast-vs-fast and stay silently green.
-  ASSERT_TRUE(full->farCarveDisabled());
-  ASSERT_FALSE(fast->farCarveDisabled());
+  ASSERT_FALSE(full->farVoxelFastPaths());
+  ASSERT_TRUE(fast->farVoxelFastPaths());
 
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
@@ -790,6 +792,16 @@ void runFarCarveIdentity(float band) {
   EXPECT_GT(full->tsdfVoxelCount(), 0u);
   EXPECT_GT(full->betaVoxelCount(), 0u);
   EXPECT_GT(full->dirVoxelCount(),  0u);
+
+  // Execution proof. Bit identity is the ABSENCE of a difference, so it passes
+  // exactly as green when far_thr is mis-sized and no voxel ever qualifies —
+  // the fast path would then be dead code with a full suite behind it. These
+  // say it actually replaced the float body, that the reference arm never did,
+  // and that the mutually-exclusive SKIP stayed off on this batched config.
+  EXPECT_GT(fast->farCarvedVoxels(), 0u)
+      << "fast carve never armed — the identity above proves nothing, band " << band;
+  EXPECT_EQ(full->farCarvedVoxels(),  0u) << "reference arm took the fast carve";
+  EXPECT_EQ(fast->farSkippedVoxels(), 0u) << "far skip armed on a batched config";
 }
 
 // The fast carve must be INERT when space_carving=true — the ONE arming
@@ -809,11 +821,7 @@ void runFarCarveInertWhenSpaceCarving() {
   p.semsplit.batch_free_carve = true;
   p.tsdf.space_carving        = true;
 
-  std::unique_ptr<scovox::ScovoxMapSplit> full;  // fast carve disabled
-  {
-    ScopedEnv disable("SCOVOX_DISABLE_FAR_CARVE", "1");
-    full = std::make_unique<scovox::ScovoxMapSplit>(p);
-  }
+  auto full = std::make_unique<scovox::ScovoxMapSplit>(fullWalk(p));
   auto fast = std::make_unique<scovox::ScovoxMapSplit>(p);
 
   uint32_t s = 0xC0FFEEu;
@@ -851,6 +859,13 @@ void runFarCarveInertWhenSpaceCarving() {
 
   EXPECT_GT(full->tsdfVoxelCount(), 0u) << "spacecarving: no TSDF written";
   EXPECT_GT(full->betaVoxelCount(), 0u) << "spacecarving: no carve happened";
+
+  // Execution proof of the inertness itself. Grid agreement alone cannot tell
+  // "the fast path stayed off" from "the fast path armed and happened to write
+  // the same bytes"; these counters can, and they are what makes this test
+  // non-tautological.
+  EXPECT_EQ(fast->farCarvedVoxels(),  0u) << "spacecarving: fast carve armed";
+  EXPECT_EQ(fast->farSkippedVoxels(), 0u) << "spacecarving: far skip armed";
 }
 
 }  // namespace
@@ -900,8 +915,9 @@ TEST(ScovoxMapSplitFarCarve, InertWhenSpaceCarving) {
 // anywhere convenient.
 //
 // Axis-aligned rays only — off-axis, the fused walker's longer walk-back gives
-// Bresenham a different start and the two may legitimately pick different
-// voxels at sub-voxel boundaries (see MultiRayBandIdentity's 20% tolerance).
+// the DDA a different start (and so a different `t_max` phase), and the two may
+// legitimately pick different voxels at sub-voxel boundaries (see
+// MultiRayBandIdentity's 20% tolerance).
 
 TEST(ScovoxMapSplitFusedWalker, AxisAlignedTsdfValuesBitIdenticalToSplitWalker) {
   auto p_fused = splitParams(); p_fused.fused_walker = true;
