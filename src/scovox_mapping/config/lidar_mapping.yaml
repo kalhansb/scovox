@@ -61,8 +61,8 @@
     # --- Range gating ----------------------------------------------------
     min_range: 1.0                  # discard returns closer than this [m]
     max_range: 50.0                 # discard returns farther than this [m]
-    range_decay_length: -1.0        # <=0 disables exponential range weighting
-    grazing_angle_threshold: -1.0   # <=0 disables (not used for LiDAR)
+    range_decay_length: -1.0        # >0 gates the min/max range cull only
+    grazing_angle_threshold: -1.0   # unused; kept so existing configs still load
 
     # --- Frames ----------------------------------------------------------
     base_frame:        "base_link"  # sensor / robot base frame

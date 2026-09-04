@@ -34,7 +34,7 @@ TEST(ScovoxMapSplit, IntegrateHitTouchesBothGrids) {
 
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
-                 &probs, /*quality=*/1.0f);
+                 &probs);
 
   EXPECT_GT(m.tsdfVoxelCount(),    0u);
   EXPECT_GT(m.semdirVoxelCount(), 0u);
@@ -43,8 +43,7 @@ TEST(ScovoxMapSplit, IntegrateHitTouchesBothGrids) {
 TEST(ScovoxMapSplit, IntegrateMissCarvesOccupancyOnly) {
   auto m = makeMap();
   m.integrateMiss(Eigen::Vector3f(0, 0, 0),
-                  Eigen::Vector3f(0.50f, 0, 0),
-                  /*quality=*/1.0f);
+                  Eigen::Vector3f(0.50f, 0, 0));
 
   EXPECT_EQ(m.tsdfVoxelCount(),  0u) << "miss must NOT allocate TSDF voxels";
   // SPLIT substrate: a no-return ray carves the full-ray Beta (occupancy)
@@ -65,7 +64,7 @@ TEST(ScovoxMapSplit, ExtractMeshHasConsistentLabelArray) {
   for (int dy = -1; dy <= 1; ++dy)
   for (int dz = -1; dz <= 1; ++dz) {
     Eigen::Vector3f ep(0.50f + 0.05f * dx, 0.05f * dy, 0.05f * dz);
-    m.integrateHit(Eigen::Vector3f(0, 0, 0), ep, &probs, /*quality=*/1.0f);
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), ep, &probs);
   }
   // Geometry may or may not produce triangles depending on band coverage,
   // but the mesh must always be self-consistent: |tri_labels| == |triangles|.
@@ -78,7 +77,7 @@ TEST(ScovoxMapSplit, ExtractPointCloudUsesCentre) {
   for (int i = 0; i < 3; ++i) {
     m.integrateHit(Eigen::Vector3f(0, 0, 0),
                    Eigen::Vector3f(0.50f, 0, 0),
-                   nullptr, /*quality=*/1.0f);
+                   nullptr);
   }
   auto [positions, labels] = m.extractPointCloud(/*min_weight=*/1.0f);
   EXPECT_GT(positions.size(), 0u);
@@ -89,7 +88,7 @@ TEST(ScovoxMapSplit, MemoryAccountingSplitsCleanly) {
   auto m = makeMap();
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
-                 nullptr, 1.0f);
+                 nullptr);
   // The full-ray occupancy (Beta) grid should always have at least as many
   // voxels as the band-only TSDF grid (full-ray carve vs band).
   EXPECT_GE(m.betaVoxelCount(), m.tsdfVoxelCount());
@@ -105,7 +104,7 @@ TEST(ScovoxMapSplit, DrainTouchedSplitsByGrid) {
   auto m = makeMap();
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
-                 nullptr, 1.0f);
+                 nullptr);
   auto t = m.drainTouchedTsdf();
   auto sb = m.drainTouchedBeta();
   auto sd = m.drainTouchedDir();
@@ -171,8 +170,8 @@ TEST(ScovoxMapSplitFusedWalker, AxisAlignedParityWithSplitWalker) {
   const float carve_band = 0.10f;
   const Eigen::Vector3f co = truncateOrigin(O, Hp, carve_band);
 
-  m_fused.integrateHit(co, Hp, &probs, /*quality=*/1.0f);
-  m_split.integrateHit(co, Hp, &probs, /*quality=*/1.0f);
+  m_fused.integrateHit(co, Hp, &probs);
+  m_split.integrateHit(co, Hp, &probs);
 
   // TsdfMap voxel counts and total grid bytes match — the fused walker
   // walks the same band and runs the same Curless–Levoy update.
@@ -198,7 +197,7 @@ TEST(ScovoxMapSplitFusedWalker, AxisAlignedParityWithSplitWalker) {
   auto d_s = m_split.semsplit().getDirVoxel(Hp);
   ASSERT_TRUE(d_f.has_value());
   ASSERT_TRUE(d_s.has_value());
-  EXPECT_FLOAT_EQ(d_f->other, d_s->other);
+  EXPECT_FLOAT_EQ(d_f->other(), d_s->other());
   for (int i = 0; i < scovox::K_TOP; ++i) {
     EXPECT_FLOAT_EQ(d_f->cnt[i], d_s->cnt[i]);
     EXPECT_EQ(d_f->cls[i],       d_s->cls[i]);
@@ -214,9 +213,9 @@ TEST(ScovoxMapSplitFusedWalker, MissPathUnchanged) {
   scovox::ScovoxMapSplit m_split(p_split);
 
   m_fused.integrateMiss(Eigen::Vector3f(0, 0, 0),
-                        Eigen::Vector3f(0.50f, 0, 0), 1.0f);
+                        Eigen::Vector3f(0.50f, 0, 0));
   m_split.integrateMiss(Eigen::Vector3f(0, 0, 0),
-                        Eigen::Vector3f(0.50f, 0, 0), 1.0f);
+                        Eigen::Vector3f(0.50f, 0, 0));
 
   EXPECT_EQ(m_fused.tsdfVoxelCount(),    0u);
   EXPECT_EQ(m_split.tsdfVoxelCount(),    0u);
@@ -240,8 +239,8 @@ TEST(ScovoxMapSplitFusedWalker, MultiRayBandIdentity) {
   for (int dz = -1; dz <= 1; ++dz) {
     Eigen::Vector3f Hp(0.50f + 0.05f * dx, 0.05f * dy, 0.05f * dz);
     Eigen::Vector3f co = truncateOrigin(Eigen::Vector3f::Zero(), Hp, carve_band);
-    m_fused.integrateHit(co, Hp, &probs, /*quality=*/1.0f);
-    m_split.integrateHit(co, Hp, &probs, /*quality=*/1.0f);
+    m_fused.integrateHit(co, Hp, &probs);
+    m_split.integrateHit(co, Hp, &probs);
   }
 
   // For axis-aligned-ish rays the TSDF voxel sets are exactly equal.
@@ -297,7 +296,7 @@ TEST(ScovoxMapSplitSubstrate, IntegrateHitTouchesAllThreeGrids) {
   std::vector<float> probs{0.f, 1.f, 0.f, 0.f};  // class 1
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
-                 &probs, /*quality=*/1.0f);
+                 &probs);
 
   EXPECT_GT(m.tsdfVoxelCount(), 0u);
   EXPECT_GT(m.betaVoxelCount(), 0u);
@@ -309,8 +308,7 @@ TEST(ScovoxMapSplitSubstrate, IntegrateHitTouchesAllThreeGrids) {
 TEST(ScovoxMapSplitSubstrate, MissAllocatesBetaButNoDir) {
   auto m = makeSplitMap();
   m.integrateMiss(Eigen::Vector3f(0, 0, 0),
-                  Eigen::Vector3f(0.50f, 0, 0),
-                  /*quality=*/1.0f);
+                  Eigen::Vector3f(0.50f, 0, 0));
   EXPECT_EQ(m.tsdfVoxelCount(), 0u) << "miss must NOT allocate TSDF voxels";
   EXPECT_GT(m.betaVoxelCount(), 0u);
   EXPECT_EQ(m.dirVoxelCount(),  0u) << "miss must NOT allocate Dir voxels";
@@ -323,7 +321,7 @@ TEST(ScovoxMapSplitSubstrate, MeshAndPointCloudLabelArraysConsistent) {
   for (int dy = -1; dy <= 1; ++dy)
   for (int dz = -1; dz <= 1; ++dz) {
     Eigen::Vector3f ep(0.50f + 0.05f * dx, 0.05f * dy, 0.05f * dz);
-    m.integrateHit(Eigen::Vector3f(0, 0, 0), ep, &probs, /*quality=*/1.0f);
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), ep, &probs);
   }
   auto mesh = m.extractMesh(/*min_weight=*/0.5f);
   EXPECT_EQ(mesh.tri_labels.size(), mesh.triangles.size());
@@ -337,7 +335,7 @@ TEST(ScovoxMapSplitSubstrate, DrainTouchedPerGrid) {
   std::vector<float> probs{0.f, 1.f, 0.f, 0.f};
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(0.50f, 0, 0),
-                 &probs, 1.0f);
+                 &probs);
   auto tb = m.drainTouchedBeta();
   auto td = m.drainTouchedDir();
   EXPECT_GT(tb.size(), td.size()) << "Beta full-ray vs Dir hit-only";
@@ -359,7 +357,7 @@ static void checkDynamicHitRouting(bool fused) {
   std::vector<float> probs(14, 0.f); probs[3] = 1.0f;  // class 3
   const Eigen::Vector3f Hp(0.50f, 0, 0);
 
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Hp, &probs, /*quality=*/1.0f,
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Hp, &probs,
                  /*is_dynamic=*/true);
 
   EXPECT_EQ(m.tsdfVoxelCount(), 0u) << "dynamic hit must leave NO persistent TSDF";
@@ -381,7 +379,7 @@ TEST(ScovoxMapSplitDynamic, NonDynamicDefaultUnchanged) {
   auto m = makeSplitMap();
   std::vector<float> probs(14, 0.f); probs[3] = 1.0f;
   m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(0.50f, 0, 0),
-                 &probs, /*quality=*/1.0f);  // no is_dynamic arg
+                 &probs);  // no is_dynamic arg
 
   EXPECT_GT(m.tsdfVoxelCount(), 0u);
   EXPECT_GT(m.dirVoxelCount(),  0u);
@@ -393,7 +391,7 @@ TEST(ScovoxMapSplitDynamic, DecayTransientPassthrough) {
   auto m = makeSplitMap();
   std::vector<float> probs(14, 0.f); probs[3] = 1.0f;
   m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(0.50f, 0, 0),
-                 &probs, 1.0f, /*is_dynamic=*/true);
+                 &probs, /*is_dynamic=*/true);
   ASSERT_GT(m.semsplit().transientBetaVoxelCount(), 0u);
 
   m.decayTransient(0.0f);  // collapse to prior → prune via the composer
@@ -438,7 +436,11 @@ void serialiseCell(std::vector<uint8_t>& out, const scovox::BetaVoxel& v) {
   appendBytes(out, &v.a_free, sizeof v.a_free);
 }
 void serialiseCell(std::vector<uint8_t>& out, const scovox::DirVoxel& v) {
-  appendBytes(out, &v.other, sizeof v.other);
+  // The STORED word, not the derived `other()`. Hashing `other()` would let
+  // two voxels with different `s_total` compare equal whenever the difference
+  // is below the ulp of the subtraction, which is exactly the divergence these
+  // bit-identity tests exist to catch.
+  appendBytes(out, &v.s_total, sizeof v.s_total);
   for (int i = 0; i < scovox::K_TOP; ++i) {
     appendBytes(out, &v.cnt[i], sizeof v.cnt[i]);
     appendBytes(out, &v.cls[i], sizeof v.cls[i]);
@@ -528,8 +530,7 @@ void fireScanRays(FireFn&& fire, int scan, uint32_t& s) {
     const Eigen::Vector3f Hp = O + dir * uf(0.4f, 3.0f);
     std::vector<float> probs(14, 0.f);
     probs[lcg() % 14] = 1.f;
-    const float q = uf(0.5f, 1.f);
-    fire(O, Hp, &probs, q, /*dyn=*/(r % 7) == 3);
+    fire(O, Hp, &probs, /*dyn=*/(r % 7) == 3);
   }
 
   // Exact gate-boundary geometry: axis-aligned rays whose endpoints step in
@@ -543,11 +544,11 @@ void fireScanRays(FireFn&& fire, int scan, uint32_t& s) {
     for (int i = 0; i < 12; ++i) {
       const float x = 0.500f + 0.0125f * static_cast<float>(i);
       fire(Eigen::Vector3f(-1.5f, 0.025f, 0.025f),
-           Eigen::Vector3f(x, 0.025f, 0.025f), &probs, 1.0f, false);
+           Eigen::Vector3f(x, 0.025f, 0.025f), &probs, false);
     }
     // Degenerate ray: the early-return path, no state on either side.
     fire(Eigen::Vector3f(0.2f, 0.2f, 0.2f),
-         Eigen::Vector3f(0.2f, 0.2f, 0.2f), &probs, 1.0f, false);
+         Eigen::Vector3f(0.2f, 0.2f, 0.2f), &probs, false);
   }
 }
 
@@ -564,9 +565,9 @@ void runFarSkipIdentity(float band) {
 
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
-                  const std::vector<float>* probs, float q, bool dyn) {
-    full->integrateHit(O, Hp, probs, q, dyn);
-    skip->integrateHit(O, Hp, probs, q, dyn);
+                  const std::vector<float>* probs, bool dyn) {
+    full->integrateHit(O, Hp, probs, dyn);
+    skip->integrateHit(O, Hp, probs, dyn);
   };
 
   for (int scan = 0; scan < 5; ++scan) {
@@ -645,9 +646,9 @@ void runFarSkipInert(const char* label,
 
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
-                  const std::vector<float>* probs, float q, bool dyn) {
-    full->integrateHit(O, Hp, probs, q, dyn);
-    skip->integrateHit(O, Hp, probs, q, dyn);
+                  const std::vector<float>* probs, bool dyn) {
+    full->integrateHit(O, Hp, probs, dyn);
+    skip->integrateHit(O, Hp, probs, dyn);
   };
 
   for (int scan = 0; scan < 3; ++scan) {
@@ -728,9 +729,9 @@ void runFarCarveIdentity(float band) {
 
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
-                  const std::vector<float>* probs, float q, bool dyn) {
-    full->integrateHit(O, Hp, probs, q, dyn);
-    fast->integrateHit(O, Hp, probs, q, dyn);
+                  const std::vector<float>* probs, bool dyn) {
+    full->integrateHit(O, Hp, probs, dyn);
+    fast->integrateHit(O, Hp, probs, dyn);
   };
 
   for (int scan = 0; scan < 5; ++scan) {
@@ -763,7 +764,7 @@ void runFarCarveIdentity(float band) {
         dir.normalize();
         const float len = uf(0.05f, 0.25f);
         const Eigen::Vector3f Hp = O + dir * len;
-        fire(O, Hp, &probs, 0.9f, /*dyn=*/false);
+        fire(O, Hp, &probs, /*dyn=*/false);
       }
     }
 
@@ -826,9 +827,9 @@ void runFarCarveInertWhenSpaceCarving() {
 
   uint32_t s = 0xC0FFEEu;
   auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
-                  const std::vector<float>* probs, float q, bool dyn) {
-    full->integrateHit(O, Hp, probs, q, dyn);
-    fast->integrateHit(O, Hp, probs, q, dyn);
+                  const std::vector<float>* probs, bool dyn) {
+    full->integrateHit(O, Hp, probs, dyn);
+    fast->integrateHit(O, Hp, probs, dyn);
   };
 
   for (int scan = 0; scan < 3; ++scan) {
@@ -960,8 +961,8 @@ TEST(ScovoxMapSplitFusedWalker, AxisAlignedTsdfValuesBitIdenticalToSplitWalker) 
   const Eigen::Vector3f O(0.000f, 0.025f, 0.025f);
   const Eigen::Vector3f Hp(0.325f, 0.025f, 0.025f);
   const Eigen::Vector3f co = truncateOrigin(O, Hp, /*carve_band=*/0.10f);
-  m_fused.integrateHit(co, Hp, &probs, /*quality=*/1.0f);
-  m_split.integrateHit(co, Hp, &probs, /*quality=*/1.0f);
+  m_fused.integrateHit(co, Hp, &probs);
+  m_split.integrateHit(co, Hp, &probs);
 
   const auto df = dumpGrid(m_fused.tsdf().grid());
   const auto ds = dumpGrid(m_split.tsdf().grid());

@@ -89,17 +89,12 @@ def _launch_setup(context):
             # it off: full per-point path, the config every capture ran.
             "downsample_voxel_size": 0.0,
 
-            # Map model. leaf_bits was 1 ("2×2×2 blocks for sparse outdoor
-            # LiDAR") until 2026-08-21, when reserved decision ⑤ was taken:
-            # leaf_bits = 3. E8.2 stage 2 (90/90 cells) measured 1 as the
-            # SLOWEST of the five values and the second-most memory-hungry,
-            # while map state is bit-identical across all arms on 18/18 units —
-            # so the sparse-LiDAR rationale was buying nothing. Moving to 3
-            # cuts frame p50 −31.81 ms (0/5, t = −11.02) and RSS −69.38 MB
-            # (0/5, t = −5.68). See experiments/results/e82/E82_RESULT.md.
-            # ⚠ Timing/RSS numbers published from this launch BEFORE this date
-            # describe leaf_bits = 1; accuracy numbers are unaffected (the map
-            # is bit-identical).
+            # Map model. leaf_bits sets the sparse grid's block size. It moves
+            # no bits of map state — every value stores the same map — so it is
+            # a pure speed/memory axis. A small leaf was once chosen here on
+            # the theory that sparse outdoor LiDAR wastes less memory in a
+            # 2×2×2 block; per-block overhead dominates instead, which makes
+            # the small leaf both slower and larger.
             "resolution": resolution,
             "inner_bits": 2,
             "leaf_bits": 3,

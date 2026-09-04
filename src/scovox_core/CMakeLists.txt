@@ -93,7 +93,7 @@ target_link_libraries(test_uncertainty scovox_core Eigen3::Eigen)
 scovox_add_gtest(test_sparse_add test/test_sparse_add.cpp)
 target_link_libraries(test_sparse_add scovox_core Eigen3::Eigen)
 
-# Step-1 gate of the split-grid refactor (see docs/design/slimvdb_like_tsdf_mapping_plan.md):
+# Step-1 gate of the split-grid refactor:
 # forces tsdf_voxel.hpp and sembeta_voxel.hpp through the compiler so the
 # header-side static_asserts on layout / sizes / triviality fire.
 scovox_add_gtest(test_voxel_layouts test/test_voxel_layouts.cpp)
@@ -121,7 +121,7 @@ target_link_libraries(test_sem_split_map scovox_core Eigen3::Eigen)
 
 # Batched-carve staging substrate (CarveStage): differential gate vs the
 # retired unordered_map + per-scan-sort staging — identical staged set /
-# max weights / block visit order (efficiency_audit_2026_08_26.md item 1).
+# max weights / block visit order.
 scovox_add_gtest(test_carve_stage test/test_carve_stage.cpp)
 target_link_libraries(test_carve_stage scovox_core Eigen3::Eigen)
 
@@ -135,7 +135,7 @@ target_link_libraries(test_binary_serializer scovox_core Eigen3::Eigen)
 scovox_add_gtest(test_consensus_merge test/test_consensus_merge.cpp)
 target_link_libraries(test_consensus_merge scovox_core Eigen3::Eigen)
 
-# Fine TSDF band (fine_tsdf_band_dbh_2026_07_30.md): region registry gate,
+# Fine TSDF band: region registry gate,
 # gated two-lattice integration, per-scan anchor re-registration (drift
 # absorption), raw-return fine-only path (refineHit), rev-7 fine wire
 # stream + merge. Uses the DBH circle fit (dbh_fit.hpp, a post-processing

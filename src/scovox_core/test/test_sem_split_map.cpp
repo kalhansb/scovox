@@ -41,6 +41,128 @@ scovox::SemSplitMap makeMap() {
 }  // namespace
 
 // ===========================================================================
+// The count identity
+// ===========================================================================
+//
+// With no per-observation confidence factor the accumulated Beta parameters
+// are a pure function of two integer counts. These assert that exactly, under
+// whichever storage the build selected.
+
+TEST(BetaCountIdentity, ShippedWeightsLandOnTheStorageLattice) {
+  // The identity holds only while every increment is exactly representable.
+  // Both the core-test weights and the promoted candidate's must qualify.
+  for (float w : {1.0f, 0.5f, 1.5f, 2.0f}) {
+    EXPECT_TRUE(scovox::beta_lattice_exact(w)) << "w = " << w;
+  }
+  EXPECT_TRUE(scovox::beta_lattice_exact(scovox::kBetaOccPrior));
+  EXPECT_TRUE(scovox::beta_lattice_exact(scovox::kBetaFreePrior));
+}
+
+TEST(BetaCountIdentity, FusionProfileWeightsAreSnappedToo) {
+  // `HitWeights` is the second way a weight reaches applyBetaUpdate, and it
+  // does NOT pass through SemSplitMap::sanitise. Regression for a gap where
+  // the identity held on the single-sensor path and failed on the fusion path.
+  scovox::HitWeights h{};
+  h.w_occ  = 1.3f;    // not a whole eighth
+  h.w_free = -2.0f;   // negative: a weight can only add evidence
+  scovox::sanitise(h);
+  EXPECT_TRUE(scovox::beta_lattice_exact(h.w_occ)) << "w_occ off lattice";
+  EXPECT_TRUE(scovox::beta_lattice_exact(h.w_free)) << "w_free off lattice";
+  EXPECT_FLOAT_EQ(h.w_occ, 1.25f);
+  EXPECT_FLOAT_EQ(h.w_free, 0.0f);
+}
+
+TEST(BetaCountIdentity, HeadroomMatchesTheStorageMode) {
+  // The published headroom figure, asserted rather than asserted-in-prose.
+  const double n = scovox::beta_max_increments(1.5f, scovox::kBetaOccPrior);
+#if SCOVOX_BETA_U16
+  // kMax = 65535/8 = 8191.875; (8191.875 - 1.0) / 1.5 = 5460.583...
+  EXPECT_GT(n, 5460.0);
+  EXPECT_LT(n, 5461.0);
+#else
+  EXPECT_TRUE(std::isinf(n)) << "float storage has no accumulation ceiling";
+#endif
+  // Distinct from the "admits nothing" answer, which a single 0 sentinel
+  // used to conflate with "unbounded".
+  EXPECT_EQ(scovox::beta_max_increments(0.0f, scovox::kBetaOccPrior), 0.0);
+}
+
+TEST(BetaCountIdentity, AOccIsExactlyPriorPlusNTimesWOcc) {
+  // N hits on one voxel must reproduce `prior + N*w_occ` to the bit -- not
+  // approximately. Under fixed point this is the whole point of the lattice;
+  // under float it confirms no stray factor survives on the hit path.
+  auto m = makeMap();                       // w_occ = 1.0
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  const int N = 64;
+  for (int i = 0; i < N; ++i)
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
+  const float expected = scovox::kBetaOccPrior + 1.0f * float(N);
+  const auto v = m.getBetaVoxel(X);
+  ASSERT_TRUE(v.has_value());
+  EXPECT_FLOAT_EQ(v->a_occ, expected);
+}
+
+TEST(BetaCountIdentity, AFreeIsExactlyPriorPlusNTimesWFree) {
+  // Same claim on the carve side, where w_free = 0.5 is a half-unit increment.
+  auto m = makeMap();                       // w_free = 0.5
+  const Eigen::Vector3f mid(0.5f, 0, 0);
+  const int N = 64;
+  for (int i = 0; i < N; ++i)
+    m.integrateMiss(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0));
+  const float expected = scovox::kBetaFreePrior + 0.5f * float(N);
+  const auto v = m.getBetaVoxel(mid);
+  ASSERT_TRUE(v.has_value());
+  EXPECT_FLOAT_EQ(v->a_free, expected);
+}
+
+TEST(BetaCountIdentity, HitCountIsRecoverableFromAOcc) {
+  // The identity inverted: given the weights, the observation count is read
+  // back out of storage. This is what makes the parameters "counts" rather
+  // than an opaque accumulation.
+  auto m = makeMap();
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  const int N = 37;
+  for (int i = 0; i < N; ++i)
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
+  const auto v = m.getBetaVoxel(X);
+  ASSERT_TRUE(v.has_value());
+  const float a = v->a_occ;
+  const float n = (a - scovox::kBetaOccPrior) / 1.0f;   // / w_occ
+  EXPECT_FLOAT_EQ(n, float(N));
+}
+
+TEST(BetaCountIdentity, OffLatticeWeightIsSnappedNotAccumulatedCrooked) {
+  // 1.3 is off the lattice in BOTH storage modes -- fixed point rounds it, and
+  // binary float has no exact representation for it either, so accumulating it
+  // drifts. sanitise() snaps it at construction, and the identity then holds
+  // with the snapped weight rather than failing quietly against the requested
+  // one.
+  scovox::SemSplitMap::Params p;
+  p.resolution          = kRes;
+  p.w_occ               = 1.3f;    // not a whole eighth
+  p.w_free              = 0.5f;
+  p.kappa0              = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f;
+  p.evidence_saturation = 0.0f;
+  p.num_classes         = kC;
+  p.alpha_0             = kAlpha;
+  scovox::SemSplitMap m(p);
+
+  const float w = m.params().w_occ;
+  EXPECT_TRUE(scovox::beta_lattice_exact(w)) << "sanitise must land on lattice";
+  EXPECT_FALSE(scovox::beta_lattice_exact(1.3f)) << "1.3 is off-lattice";
+  EXPECT_FLOAT_EQ(w, 1.25f) << "nearest eighth below 1.3";
+
+  const Eigen::Vector3f X(0.5f, 0, 0);
+  const int N = 40;
+  for (int i = 0; i < N; ++i)
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
+  const auto v = m.getBetaVoxel(X);
+  ASSERT_TRUE(v.has_value());
+  EXPECT_FLOAT_EQ(v->a_occ, scovox::kBetaOccPrior + w * float(N));
+}
+
+// ===========================================================================
 // Layout / prior invariants
 // ===========================================================================
 
@@ -60,7 +182,7 @@ TEST(SplitVoxelLayout, Sizes) {
 
 TEST(SplitVoxelLayout, ShippedBetaPriorIsSymmetricHalf) {
   // Shipped split-path occupancy prior is symmetric Beta(1,1) → p_occ = 0.5
-  // (docs/occupancy_prior.md), decoupled from the semantic (C, α₀).
+  // decoupled from the semantic (C, α₀).
   auto b = scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
   EXPECT_NEAR(b.a_occ,  1.0f, 1e-7f);
   EXPECT_NEAR(b.a_free, 1.0f, 1e-7f);
@@ -80,7 +202,7 @@ TEST(SplitVoxelLayout, ShippedBetaPriorIsSymmetricHalf) {
 
 TEST(SplitVoxelLayout, DirPriorIsSymmetricMinusFree) {
   auto d = scovox::defaultDirVoxel(kC, kAlpha);
-  EXPECT_NEAR(d.other, (kC - scovox::K_TOP) * kAlpha, 1e-7f);  // (C−K)·α₀
+  EXPECT_NEAR(d.other(), (kC - scovox::K_TOP) * kAlpha, 1e-7f);  // (C−K)·α₀
   for (int i = 0; i < scovox::K_TOP; ++i) {
     EXPECT_EQ(d.cls[i], uint16_t(0xFFFF));
     EXPECT_NEAR(d.cnt[i], kAlpha, 1e-7f);
@@ -95,7 +217,7 @@ TEST(SplitVoxelLayout, ZeroInitialisedHasNoPrior) {
   EXPECT_EQ(b.a_occ, 0.0f);
   EXPECT_EQ(b.a_free, 0.0f);
   scovox::DirVoxel d{};
-  EXPECT_EQ(d.other, 0.0f);
+  EXPECT_EQ(d.other(), 0.0f);
   for (int i = 0; i < scovox::K_TOP; ++i) {
     EXPECT_EQ(d.cnt[i], 0.0f);
     EXPECT_EQ(d.cls[i], uint16_t(0));
@@ -176,7 +298,7 @@ TEST(BetaCountStorage, SaturationGuardKeepsCountersOffTheCeiling) {
   std::vector<float> probs(kC, 0.f);
   probs[5] = 1.0f;
   for (int i = 0; i < 60; ++i) {          // 30,001 units deposited, ceiling 8191.9
-    m.integrateHit(pt, pt, &probs, /*quality=*/1.0f);
+    m.integrateHit(pt, pt, &probs);
     auto b = m.getBetaVoxel(pt);
     ASSERT_TRUE(b.has_value());
     EXPECT_LE(b->a_occ, 0.9f * scovox::BetaCount::kMax) << "hit " << i;
@@ -197,7 +319,7 @@ TEST(SemSplitMap, FirstHitTwoStreamMatchesAnalytic) {
   // Same-voxel "ray" → no carve, just the hit update.
   m.integrateHit(Eigen::Vector3f(1.0f, 0, 0),
                  Eigen::Vector3f(1.0f, 0, 0),
-                 &probs, /*quality=*/1.0f);
+                 &probs);
 
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
   auto d = m.getDirVoxel(Eigen::Vector3f(1.0f, 0, 0));
@@ -218,7 +340,7 @@ TEST(SemSplitMap, FirstHitTwoStreamMatchesAnalytic) {
   EXPECT_NEAR(d->cnt[0], kAlpha + class_share, 1e-5f);  // one-hot → all to slot 0
   EXPECT_EQ(d->cls[1], uint16_t(0xFFFF));
   EXPECT_NEAR(d->cnt[1], kAlpha, 1e-5f);
-  EXPECT_NEAR(d->other, (kC - scovox::K_TOP) * kAlpha, 1e-5f);  // covered=1 → no spill
+  EXPECT_NEAR(d->other(), (kC - scovox::K_TOP) * kAlpha, 1e-5f);  // covered=1 → no spill
   EXPECT_EQ(m.dominantClassAt(Eigen::Vector3f(1.0f, 0, 0)), uint16_t(5));
 }
 
@@ -230,7 +352,7 @@ TEST(SemSplitMap, MassConservationStrictPerGrid) {
   probs[3] = 1.0f;
   m.integrateHit(Eigen::Vector3f(1.0f, 0, 0),
                  Eigen::Vector3f(1.0f, 0, 0),
-                 &probs, /*quality=*/1.0f);
+                 &probs);
 
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
   auto d = m.getDirVoxel(Eigen::Vector3f(1.0f, 0, 0));
@@ -259,13 +381,13 @@ TEST(SemSplitMap, EvictionConservesMassToOther) {
   auto m = makeMap();
   auto coord = m.betaGrid().posToCoord(2.0f, 0.f, 0.f);
   // Drive p_occ above the gate first.
-  m.applyHitUpdate(coord, nullptr, 1.0f);   // Stream A only (nullptr probs)
+  m.applyHitUpdate(coord, nullptr);   // Stream A only (nullptr probs)
 
   auto inject = [&](int cls, float strength) {
     std::vector<float> probs(kC, 0.f);
     probs[cls] = 1.0f;
-    // quality scales class_share; use repeated hits to build distinct evidence.
-    for (int i = 0; i < (int)strength; ++i) m.applyHitUpdate(coord, &probs, 1.0f);
+    // one hit is one class_share; use repeated hits to build distinct evidence.
+    for (int i = 0; i < (int)strength; ++i) m.applyHitUpdate(coord, &probs);
   };
   inject(1, 5);   // strong
   inject(2, 3);   // medium
@@ -281,7 +403,7 @@ TEST(SemSplitMap, EvictionConservesMassToOther) {
   EXPECT_TRUE(has2);
   EXPECT_FALSE(has7) << "weakest class must not occupy a slot";
   // Mass is conserved regardless of eviction routing (no negative, no loss).
-  EXPECT_GT(d->other, (kC - scovox::K_TOP) * kAlpha)
+  EXPECT_GT(d->other(), (kC - scovox::K_TOP) * kAlpha)
       << "evicted/dropped evidence must accumulate in OTHER";
   EXPECT_GT(d->s_class(), kC * kAlpha);
 }
@@ -298,7 +420,7 @@ TEST(SemSplitMap, CarveAllocatesBetaButNoDirVoxels) {
   probs[4] = 1.0f;
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(1.0f, 0, 0),  // ~20 voxels at res 0.05
-                 &probs, /*quality=*/1.0f);
+                 &probs);
 
   EXPECT_GT(m.betaVoxelCount(), 2u) << "carve must allocate Beta voxels along the ray";
   EXPECT_EQ(m.dirVoxelCount(), 1u)  << "only the hit voxel commits a class → 1 DirVoxel";
@@ -307,8 +429,7 @@ TEST(SemSplitMap, CarveAllocatesBetaButNoDirVoxels) {
 TEST(SemSplitMap, MissDrivesOccupancyDownAndAllocatesNoDir) {
   auto m = makeMap();
   m.integrateMiss(Eigen::Vector3f(0, 0, 0),
-                  Eigen::Vector3f(1.0f, 0, 0),
-                  /*quality=*/1.0f);
+                  Eigen::Vector3f(1.0f, 0, 0));
   auto b = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));
   ASSERT_TRUE(b.has_value());
   EXPECT_LT(b->p_occ(), 0.5f)
@@ -327,7 +448,7 @@ TEST(SemSplitMap, BelowGateCommitsNoClassAndNoDirVoxel) {
     acc.setValue(coord, pre);
   }
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(coord, &probs, /*quality=*/1.0f);
+  m.applyHitUpdate(coord, &probs);
 
   // Occupancy evidence still landed in Beta...
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
@@ -363,7 +484,7 @@ TEST(SemSplitMap, WallGuardOptInStopsCarving) {
   scovox::SemSplitMap m(p);
 
   plantWall(m, Eigen::Vector3f(0.5f, 0, 0));
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr);
 
   EXPECT_FALSE(m.getBetaVoxel(Eigen::Vector3f(0.75f, 0, 0)).has_value())
       << "guard on: carve stops at the wall — voxels past it are never touched";
@@ -379,7 +500,7 @@ TEST(SemSplitMap, TrustRecentScanCarvesThroughStaleObstacleByDefault) {
   // (clears over time) and voxels past it are carved. Immediate path.
   auto m = makeMap();  // guard off (default)
   plantWall(m, Eigen::Vector3f(0.5f, 0, 0));
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr);
 
   auto obst = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));
   ASSERT_TRUE(obst.has_value());
@@ -399,13 +520,13 @@ TEST(SemSplitMapBatched, WritesOncePerVoxelAcrossRays) {
   auto m = makeMap();  // w_free = 0.5
   m.beginCarveFrame();
   for (int i = 0; i < 5; ++i)
-    m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr);
   const std::size_t written = m.flushCarveFrame();
   EXPECT_GT(written, 0u);
 
   auto b = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));  // interior, crossed by all 5
   ASSERT_TRUE(b.has_value());
-  // One w_free*quality (=0.5) applied, not 5× (which would give prior + 2.5).
+  // One w_free (=0.5) applied, not 5× (which would give prior + 2.5).
   EXPECT_NEAR(b->a_free, scovox::kBetaFreePrior + 0.5f, 1e-5f);
 }
 
@@ -415,8 +536,8 @@ TEST(SemSplitMapBatched, OccupiedWinsSkipsSameScanHitVoxel) {
   auto m = makeMap();
   const Eigen::Vector3f X(0.5f, 0, 0);
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);                      // hit at X
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);  // grazes X
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);                      // hit at X
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr);  // grazes X
   m.flushCarveFrame();
 
   auto b = m.getBetaVoxel(X);
@@ -432,7 +553,7 @@ TEST(SemSplitMapBatched, ClearsStaleObstacleNoGuard) {
   auto m = makeMap();
   plantWall(m, Eigen::Vector3f(0.5f, 0, 0));
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr);
   m.flushCarveFrame();
 
   auto b = m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0));
@@ -458,7 +579,7 @@ TEST(SemSplitMapBatched, HitsCountOncePerFrame) {
     scovox::SemSplitMap m(p);
     m.beginCarveFrame();
     for (int i = 0; i < kRays; ++i)
-      m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+      m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
     m.flushCarveFrame();
     auto b = m.getBetaVoxel(X);
     EXPECT_TRUE(b.has_value());
@@ -486,7 +607,7 @@ TEST(SemSplitMapBatched, HitClassEvidenceAlsoCountsOncePerFrame) {
     scovox::SemSplitMap m(p);
     m.beginCarveFrame();
     for (int i = 0; i < 5; ++i)
-      m.integrateHit(Eigen::Vector3f(0, 0, 0), X, &probs, 1.0f);
+      m.integrateHit(Eigen::Vector3f(0, 0, 0), X, &probs);
     m.flushCarveFrame();
     auto d = m.getDirVoxel(X);
     EXPECT_TRUE(d.has_value());
@@ -494,24 +615,36 @@ TEST(SemSplitMapBatched, HitClassEvidenceAlsoCountsOncePerFrame) {
   };
 
   EXPECT_LT(run(true), run(false)) << "batched class evidence is the smaller";
-  // One deposit is class_share = kappa0 * p_occ_post * quality on top of the
+  // One deposit is class_share = kappa0 * p_occ_post on top of the
   // per-dim prior; five deposits must land strictly more than one.
   EXPECT_GT(run(true), kAlpha);
 }
 
 TEST(SemSplitMapBatched, StrongestRayOfTheFrameWins) {
   // The staged hit mirrors the carve stage's per-voxel MAX rule, so a weaker
-  // ray arriving later must not displace a stronger one.
+  // ray arriving later must not displace a stronger one. Per-ray occupancy
+  // strength is the source profile's `w_occ` — with the per-observation count
+  // fixed, the HitWeights profile is the only thing that still varies it.
   const Eigen::Vector3f X(0.5f, 0, 0);
-  auto run = [&](float q_first, float q_second) {
+  auto srcProf = [](float w_occ) {
+    scovox::HitWeights h{};
+    h.w_occ               = w_occ;
+    h.w_free              = 0.5f;
+    h.kappa0              = 1.0f;
+    h.dirichlet_min_p_occ = 0.5f;
+    return h;
+  };
+  auto run = [&](float w_first, float w_second) {
     auto m = makeMap();
+    const auto p1 = srcProf(w_first);
+    const auto p2 = srcProf(w_second);
     m.beginCarveFrame();
-    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, q_first);
-    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, q_second);
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, &p1);
+    m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, &p2);
     m.flushCarveFrame();
     return m.getBetaVoxel(X)->a_occ;
   };
-  const float strong = scovox::kBetaOccPrior + 1.0f;   // w_occ 1.0 x q 1.0
+  const float strong = scovox::kBetaOccPrior + 1.0f;   // the stronger w_occ
   EXPECT_FLOAT_EQ(run(1.0f, 0.25f), strong) << "weaker second ray is dropped";
   EXPECT_FLOAT_EQ(run(0.25f, 1.0f), strong) << "stronger second ray supersedes";
 }
@@ -522,9 +655,9 @@ TEST(SemSplitMapBatched, StagedHitStillWinsAgainstTheCarve) {
   auto m = makeMap();
   const Eigen::Vector3f X(0.5f, 0, 0);
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
   // A second beam passing straight through the same voxel to a farther return.
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr);
   m.flushCarveFrame();
 
   auto b = m.getBetaVoxel(X);
@@ -544,7 +677,7 @@ TEST(SemSplitMapBatched, RaySpreadKeepsTheImmediateWrite) {
 
   const Eigen::Vector3f X(0.5f, 0, 0);
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
   auto mid = m.getBetaVoxel(X);
   ASSERT_TRUE(mid.has_value()) << "spread-carrying hit writes during the ray loop";
   EXPECT_FLOAT_EQ(mid->a_occ, scovox::kBetaOccPrior + 1.0f);
@@ -558,7 +691,7 @@ TEST(SemSplitMapBatched, ImmediateWhenNoFrameIsOpen) {
   // the write-in-place contract whatever the flag says.
   auto m = makeMap();
   const Eigen::Vector3f X(0.5f, 0, 0);
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
   auto b = m.getBetaVoxel(X);
   ASSERT_TRUE(b.has_value());
   EXPECT_FLOAT_EQ(b->a_occ, scovox::kBetaOccPrior + 1.0f);
@@ -575,7 +708,7 @@ TEST(SemSplitMapBatched, CanDisableFreeSpaceCarve) {
 
   const Eigen::Vector3f X(1.0f, 0, 0);
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr, 1.0f);
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, nullptr);
   EXPECT_EQ(m.flushCarveFrame(), 0u) << "batch-free carve disabled: nothing stages";
 
   EXPECT_FALSE(m.getBetaVoxel(Eigen::Vector3f(0.5f, 0, 0)).has_value())
@@ -594,8 +727,8 @@ TEST(SemSplitMapBatched, DynamicHitDoesNotSuppressPersistentCarve) {
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, &probs, 1.0f, /*is_dynamic=*/true);       // dynamic hit at X
-  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr, 1.0f); // persistent carve through X
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), X, &probs, /*is_dynamic=*/true);       // dynamic hit at X
+  m.integrateHit(Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1.0f, 0, 0), nullptr); // persistent carve through X
   m.flushCarveFrame();
 
   // Persistent free carve at X is NOT suppressed by the same-scan dynamic hit.
@@ -622,7 +755,7 @@ TEST(SemSplitMap, EvidenceSaturationCapsEachGrid) {
 
   std::vector<float> probs(kC, 0.f); probs[2] = 1.0f;
   for (int i = 0; i < 100; ++i) {
-    m.applyHitUpdate(m.betaGrid().posToCoord(1.0f, 0.f, 0.f), &probs, 1.0f);
+    m.applyHitUpdate(m.betaGrid().posToCoord(1.0f, 0.f, 0.f), &probs);
   }
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
   auto d = m.getDirVoxel(Eigen::Vector3f(1.0f, 0, 0));
@@ -637,7 +770,7 @@ TEST(SemSplitMap, DrainTouchedPerGrid) {
   std::vector<float> probs(kC, 0.f); probs[1] = 1.0f;
   m.integrateHit(Eigen::Vector3f(0, 0, 0),
                  Eigen::Vector3f(1.0f, 0, 0),
-                 &probs, 1.0f);
+                 &probs);
   EXPECT_GT(m.touchedBetaCount(), m.touchedDirCount())
       << "Beta is full-ray; Dir is hit-only";
   EXPECT_EQ(m.touchedDirCount(), 1u);
@@ -659,7 +792,7 @@ TEST(SemSplitTransient, DynamicHitRoutesToTransientNotPersistent) {
   const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  m.applyHitUpdate(c, &probs, /*quality=*/1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
 
   // Nothing in the persistent grids.
   EXPECT_FALSE(m.getBetaVoxel(pos).has_value());
@@ -679,7 +812,7 @@ TEST(SemSplitTransient, DynamicHitRecordsNoTouchedSet) {
   auto m = makeMap();
   const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
   // Transient is local-only: never enters the fusion-wire touched-sets.
   EXPECT_EQ(m.touchedBetaCount(), 0u);
   EXPECT_EQ(m.touchedDirCount(), 0u);
@@ -691,8 +824,8 @@ TEST(SemSplitTransient, NonDynamicOverloadMatchesThreeArg) {
   const auto c = ma.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  ma.applyHitUpdate(c, &probs, 1.0f);                        // 3-arg
-  mb.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/false);  // 4-arg, persistent
+  ma.applyHitUpdate(c, &probs);                        // 3-arg
+  mb.applyHitUpdate(c, &probs, /*is_dynamic=*/false);  // 4-arg, persistent
 
   const Eigen::Vector3f pos(1.0f, 0, 0);
   auto ba = ma.getBetaVoxel(pos); auto bb = mb.getBetaVoxel(pos);
@@ -713,8 +846,8 @@ TEST(SemSplitTransient, TransientHitUsesSameTwoStreamMath) {
   const auto c = md.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  md.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
-  mp.applyHitUpdate(c, &probs, 1.0f);
+  md.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  mp.applyHitUpdate(c, &probs);
 
   auto td = md.getTransientBetaVoxel(pos);
   auto tp = mp.getBetaVoxel(pos);
@@ -730,7 +863,7 @@ TEST(SemSplitTransient, DecayMovesEvidenceTowardPrior) {
   const Eigen::Vector3f pos(1.0f, 0, 0);
   const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
 
   m.decayTransient(0.5f);
   auto b = m.getTransientBetaVoxel(pos);
@@ -747,7 +880,7 @@ TEST(SemSplitTransient, DecayRateOneIsNoOp) {
   const Eigen::Vector3f pos(1.0f, 0, 0);
   const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
   const float a_occ_before = m.getTransientBetaVoxel(pos)->a_occ;
 
   m.decayTransient(1.0f);  // clamp-safe no-op
@@ -762,7 +895,7 @@ TEST(SemSplitTransient, DecayRateZeroClearsTransient) {
   auto m = makeMap();
   const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
   ASSERT_EQ(m.transientBetaVoxelCount(), 1u);
 
   m.decayTransient(0.0f);        // collapse to prior → prune
@@ -778,7 +911,7 @@ TEST(SemSplitTransient, RepeatedDecayPrunesTransientGrids) {
   auto m = makeMap();
   const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, 1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
 
   // 0.5^n falls below the 1e-3 prune epsilon after ~11 frames.
   for (int i = 0; i < 20; ++i) m.decayTransient(0.5f);
@@ -794,8 +927,8 @@ TEST(SemSplitTransient, DecayLeavesPersistentUntouched) {
   const auto cd = m.betaGrid().posToCoord(pos_d.x(), pos_d.y(), pos_d.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  m.applyHitUpdate(cp, &probs, 1.0f, /*is_dynamic=*/false);
-  m.applyHitUpdate(cd, &probs, 1.0f, /*is_dynamic=*/true);
+  m.applyHitUpdate(cp, &probs, /*is_dynamic=*/false);
+  m.applyHitUpdate(cd, &probs, /*is_dynamic=*/true);
   const float persistent_a_occ = m.getBetaVoxel(pos_p)->a_occ;
 
   for (int i = 0; i < 20; ++i) m.decayTransient(0.5f);
@@ -807,15 +940,14 @@ TEST(SemSplitTransient, DecayLeavesPersistentUntouched) {
 }
 
 // ===========================================================================
-// E6 precondition — `inc_mode` conserves mass on all three paths
+// Precondition — `inc_mode` conserves mass on all three paths
 //
-// NEW_EXPERIMENTS_PLAN.md E6 sweeps `inc_mode` as a candidate lever.  The
-// header claims all three modes conserve the strict invariant
+// `inc_mode` is a candidate lever, so it gets swept against its alternatives.
+// The header claims all three modes conserve the strict invariant
 // `Δ(other + Σcnt) == class_share` (sem_split_map.hpp:194-195) and differ only
-// in how that mass is split.  Before the sweep prices the modes against each
+// in how that mass is split.  Before any sweep prices the modes against each
 // other, that claim is checked rather than trusted: a mode that quietly LOSES
-// mass would show up in the sweep as a semantic effect, and E6 would promote a
-// leak.
+// mass would show up as a semantic effect, and the sweep would promote a leak.
 //
 // SOFT was already pinned (SemSplitMap.MassConservationPerGrid, one-hot,
 // single hit).  HARD and THRESH were not covered at all, and neither was any
@@ -855,22 +987,22 @@ std::vector<float> mixedSoftmax() {
 }
 
 // Deposit `n` hits and return the TOTAL `class_share` injected.  class_share
-// is `kappa0 · p_occ_post · quality` and p_occ_post climbs with every hit, so
+// is `kappa0 · p_occ_post` and p_occ_post climbs with every hit, so
 // it must be accumulated per hit rather than multiplied out.
 float injectAccumulatingShare(scovox::SemSplitMap& m,
                               const Eigen::Vector3f& pos,
                               const std::vector<float>* probs,
-                              float quality, int n) {
+                              int n) {
   const auto coord = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   float total = 0.f;
   for (int i = 0; i < n; ++i) {
-    m.applyHitUpdate(coord, probs, quality);
+    m.applyHitUpdate(coord, probs);
     auto b = m.getBetaVoxel(pos);
     EXPECT_TRUE(b.has_value());
     // Below the gate Stream B deposits nothing, so counting a share there
     // would make the test wrong rather than the code.
     EXPECT_GE(b->p_occ(), 0.5f) << "hit " << i << " fell below the deposit gate";
-    total += 1.0f * b->p_occ() * quality;
+    total += 1.0f * b->p_occ();
   }
   return total;
 }
@@ -885,7 +1017,7 @@ TEST(IncMode, AllThreeModesConserveDirMassUnderEviction) {
                            std::make_pair(1, "HARD"),
                            std::make_pair(2, "THRESH")}) {
     auto  m     = makeMapMode(mode.first, 0.10f);
-    const float share = injectAccumulatingShare(m, pos, &probs, 1.0f, 6);
+    const float share = injectAccumulatingShare(m, pos, &probs, 6);
 
     auto d = m.getDirVoxel(pos);
     ASSERT_TRUE(d.has_value()) << mode.second;
@@ -897,8 +1029,46 @@ TEST(IncMode, AllThreeModesConserveDirMassUnderEviction) {
     // still conserving only if the displaced mass reached OTHER.
     for (int i = 0; i < scovox::K_TOP; ++i)
       EXPECT_GE(d->cnt[i], 0.f) << mode.second << " slot " << i;
-    EXPECT_GE(d->other, 0.f) << mode.second;
+    EXPECT_GE(d->other(), 0.f) << mode.second;
   }
+}
+
+// The exactness claim that motivates storing the total rather than deriving
+// it.  Under `--hit-share flat`
+// every admitted look deposits exactly `kappa0`, so `s_class() - C*alpha0` IS
+// the number of looks -- an integer -- and must stay one at the look counts a
+// busy voxel reaches over a scene.  Deriving the total as `other + sum(cnt)`
+// from three separately accumulated floats does not hold it: at this many looks
+// that basis drifts orders of magnitude past the 0.05 bound below, so this test
+// fails if anyone reintroduces a second accumulator alongside
+// dirichletUpdate's single `s_total += class_share`.
+TEST(DirTotalBasis, FlatShareKeepsTheLookCountExactAtSceneScale) {
+  const Eigen::Vector3f pos(4.0f, 0.f, 0.f);
+  const auto            probs = mixedSoftmax();
+
+  scovox::SemSplitMap::Params p;
+  p.resolution          = kRes;
+  p.w_occ               = 1.0f;
+  p.w_free              = 0.5f;
+  p.kappa0              = 1.0f;
+  p.dirichlet_min_p_occ = 0.5f;
+  p.evidence_saturation = 0.0f;   // no rescale: the count must be untouched
+  p.num_classes         = kC;
+  p.alpha_0             = kAlpha;
+  p.inc_mode            = 0;      // SOFT: spreads across slots AND `other`
+  p.inc_thresh          = 0.10f;
+  p.hit_flat_share      = true;   // the whole point: one look, one unit
+  scovox::SemSplitMap m(p);
+
+  const auto coord = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
+  const int  kLooks = 330000;
+  for (int i = 0; i < kLooks; ++i) m.applyHitUpdate(coord, &probs);
+
+  auto d = m.getDirVoxel(pos);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_NEAR(d->s_class() - kC * kAlpha, static_cast<float>(kLooks), 0.05f)
+      << "s_total no longer recovers the look count; a second accumulator has "
+         "been reintroduced, or class_share is not flat";
 }
 
 TEST(IncMode, ThreshRoutesEverySubThresholdClassToOther) {
@@ -909,13 +1079,13 @@ TEST(IncMode, ThreshRoutesEverySubThresholdClassToOther) {
   const Eigen::Vector3f pos(3.0f, 0.f, 0.f);
   const auto probs = mixedSoftmax();          // max is 0.50
   auto  m     = makeMapMode(2, 0.90f);
-  const float share = injectAccumulatingShare(m, pos, &probs, 1.0f, 4);
+  const float share = injectAccumulatingShare(m, pos, &probs, 4);
 
   auto d = m.getDirVoxel(pos);
   ASSERT_TRUE(d.has_value());
   EXPECT_NEAR(d->s_class(), kC * kAlpha + share, 1e-4f)
       << "THRESH lost mass when every class was below threshold";
-  EXPECT_NEAR(d->other, (kC - scovox::K_TOP) * kAlpha + share, 1e-4f)
+  EXPECT_NEAR(d->other(), (kC - scovox::K_TOP) * kAlpha + share, 1e-4f)
       << "sub-threshold mass must land in OTHER, not vanish";
   for (int i = 0; i < scovox::K_TOP; ++i)
     EXPECT_EQ(d->cls[i], uint16_t(0xFFFF)) << "no slot may be filled";
@@ -931,11 +1101,11 @@ TEST(IncMode, TheThreeModesAreNotTheSameProgram) {
 
   auto slots = [&](int mode) {
     auto m = makeMapMode(mode, 0.10f);
-    injectAccumulatingShare(m, pos, &probs, 1.0f, 3);
+    injectAccumulatingShare(m, pos, &probs, 3);
     auto d = m.getDirVoxel(pos);
     EXPECT_TRUE(d.has_value());
     // OTHER separates the modes even when the surviving slot labels agree.
-    return std::make_pair(std::make_pair(d->cls[0], d->cls[1]), d->other);
+    return std::make_pair(std::make_pair(d->cls[0], d->cls[1]), d->other());
   };
 
   const auto soft   = slots(0);
@@ -969,7 +1139,7 @@ TEST(IncMode, ThreshDivergesFromSoftOnlyWhenItStarvesASlot) {
 
   auto run = [&](int mode) {
     auto m = makeMapMode(mode, 0.10f);
-    injectAccumulatingShare(m, pos, &probs, 1.0f, 3);
+    injectAccumulatingShare(m, pos, &probs, 3);
     auto d = m.getDirVoxel(pos);
     EXPECT_TRUE(d.has_value());
     return *d;
@@ -984,7 +1154,7 @@ TEST(IncMode, ThreshDivergesFromSoftOnlyWhenItStarvesASlot) {
       << "SOFT should fill the second slot with the sub-threshold class";
   EXPECT_EQ(thresh.cls[1], uint16_t(0xFFFF))
       << "THRESH must leave the second slot empty";
-  EXPECT_GT(thresh.other, soft.other)
+  EXPECT_GT(thresh.other(), soft.other())
       << "the starved class's mass must show up in OTHER";
 }
 
@@ -1011,7 +1181,7 @@ TEST(IncMode, ThreshEqualsSoftWhenTheSubThresholdClassWouldBeDroppedAnyway) {
 
   auto run = [&](int mode) {
     auto m = makeMapMode(mode, 0.10f);
-    injectAccumulatingShare(m, pos, &probs, 1.0f, 3);
+    injectAccumulatingShare(m, pos, &probs, 3);
     auto d = m.getDirVoxel(pos);
     EXPECT_TRUE(d.has_value());
     return *d;
@@ -1022,7 +1192,7 @@ TEST(IncMode, ThreshEqualsSoftWhenTheSubThresholdClassWouldBeDroppedAnyway) {
 
   EXPECT_EQ(thresh.cls[0], soft.cls[0]);
   EXPECT_EQ(thresh.cls[1], soft.cls[1]);
-  EXPECT_NEAR(thresh.other,  soft.other,  1e-6f);
+  EXPECT_NEAR(thresh.other(),  soft.other(),  1e-6f);
   EXPECT_NEAR(thresh.cnt[0], soft.cnt[0], 1e-6f);
   EXPECT_NEAR(thresh.cnt[1], soft.cnt[1], 1e-6f);
 }

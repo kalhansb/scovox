@@ -41,20 +41,20 @@ public:
                     const Eigen::Vector3f& hit,
                     bool is_dynamic = false,
                     const std::vector<float>* class_probs = nullptr,
-                    float quality = 1.f, float range_w = 1.f, float angle_w = 1.f);
+                    float range_w = 1.f, float angle_w = 1.f);
 
   void integrateRay(const Eigen::Vector3f& origin,
                     const Eigen::Vector3f& hit,
                     std::vector<CoordT>& updated_coords,
                     bool is_dynamic = false,
                     const std::vector<float>* class_probs = nullptr,
-                    float quality = 1.f, float range_w = 1.f, float angle_w = 1.f);
+                    float range_w = 1.f, float angle_w = 1.f);
 
   /// Update only the endpoint (occupancy + semantics), no free-space carving.
   void integrateEndpointOnly(const Eigen::Vector3f& hit,
                              bool is_dynamic = false,
                              const std::vector<float>* class_probs = nullptr,
-                             float quality = 1.f, float range_w = 1.f, float angle_w = 1.f);
+                             float range_w = 1.f, float angle_w = 1.f);
 
   // -----------------------------------------------------------------
   // Query — single-voxel access
@@ -137,11 +137,11 @@ private:
 
   void update_endpoint(const CoordT& c,
                        const std::vector<float>* class_probs,
-                       float quality, float range_w, float angle_w);
+                       float range_w, float angle_w);
 
   void update_endpoint_on(Grid::Accessor& target_acc, const CoordT& c,
                           const std::vector<float>* class_probs,
-                          float quality, float range_w, float angle_w);
+                          float range_w, float angle_w);
 
   /// Single fused DDA walk for non-dynamic rays:
   ///   origin → posToCoord(hit + sdf_trunc * u)
@@ -152,12 +152,11 @@ private:
                                   const Eigen::Vector3f& hit,
                                   std::vector<CoordT>* updated_coords,
                                   const std::vector<float>* class_probs,
-                                  float quality, float range_w, float angle_w);
+                                  float range_w, float angle_w);
 
   void beta_update_occupied(Voxel* v, float range_w, float angle_w) const;
   void beta_update_free(Voxel* v, float range_w) const;
-  void apply_semantics(Voxel* v, const std::vector<float>* class_probs,
-                       float quality) const;
+  void apply_semantics(Voxel* v, const std::vector<float>* class_probs) const;
   void apply_evidence_saturation(Voxel* v) const;
 
   inline CoordT posToCoord(const Eigen::Vector3f& p) const {

@@ -269,31 +269,6 @@ TEST(DirichletUpdate, A0DeltaTracksTotal) {
   EXPECT_NEAR(v.a0(), sum_named + v.a_unk, 0.01f);
 }
 
-TEST(DirichletUpdate, QualityScalesEvidence) {
-  auto map1 = makeSemanticMap();
-  auto map2 = makeSemanticMap();
-  Eigen::Vector3f hit1 = prepareOccupied(map1);
-  Eigen::Vector3f hit2 = prepareOccupied(map2);
-  Eigen::Vector3f origin(0, 0, 0);
-
-  std::vector<float> probs(10, 0.0f);
-  probs[1] = 0.9f;
-
-  // quality=1.0 vs quality=0.5
-  map1.integrateRay(origin, hit1, false, &probs, /*quality=*/1.0f);
-  map2.integrateRay(origin, hit2, false, &probs, /*quality=*/0.5f);
-
-  Voxel v1 = defaultVoxel(), v2 = defaultVoxel();
-  ASSERT_TRUE(map1.getVoxel(hit1, v1));
-  ASSERT_TRUE(map2.getVoxel(hit2, v2));
-
-  float cnt1 = 0.f, cnt2 = 0.f;
-  for (int si = 0; si < K_TOP; ++si) if (v1.sem_cls[si] == 1) cnt1 = v1.sem_cnt[si];
-  for (int si = 0; si < K_TOP; ++si) if (v2.sem_cls[si] == 1) cnt2 = v2.sem_cnt[si];
-
-  EXPECT_GT(cnt1, cnt2) << "Higher quality should produce more evidence";
-}
-
 // =====================================================================
 // 6. Semantic mode variants (ablation baselines)
 // =====================================================================
@@ -381,30 +356,25 @@ TEST(SemanticMode, MajorityVoteAccumulates) {
   EXPECT_NEAR(cnt4, 10.0f, 0.1f);
 }
 
-TEST(SemanticMode, MajorityVoteIgnoresQuality) {
-  auto map1 = makeMajorityMap();
-  auto map2 = makeMajorityMap();
-  Eigen::Vector3f hit1 = prepareOccupied(map1);
-  Eigen::Vector3f hit2 = prepareOccupied(map2);
+TEST(SemanticMode, MajorityVoteAddsExactlyOneVote) {
+  auto map = makeMajorityMap();
+  Eigen::Vector3f hit = prepareOccupied(map);
   Eigen::Vector3f origin(0, 0, 0);
 
   std::vector<float> probs(10, 0.0f);
   probs[1] = 0.9f;
 
-  // quality=1.0 vs quality=0.1 — majority vote ignores both
-  map1.integrateRay(origin, hit1, false, &probs, 1.0f);
-  map2.integrateRay(origin, hit2, false, &probs, 0.1f);
+  map.integrateRay(origin, hit, false, &probs);
 
-  Voxel v1 = defaultVoxel(), v2 = defaultVoxel();
-  ASSERT_TRUE(map1.getVoxel(hit1, v1));
-  ASSERT_TRUE(map2.getVoxel(hit2, v2));
+  Voxel v = defaultVoxel();
+  ASSERT_TRUE(map.getVoxel(hit, v));
 
-  float cnt1 = 0.f, cnt2 = 0.f;
-  for (int si = 0; si < K_TOP; ++si) if (v1.sem_cls[si] == 1) cnt1 = v1.sem_cnt[si];
-  for (int si = 0; si < K_TOP; ++si) if (v2.sem_cls[si] == 1) cnt2 = v2.sem_cnt[si];
+  float cnt = 0.f;
+  for (int si = 0; si < K_TOP; ++si) if (v.sem_cls[si] == 1) cnt = v.sem_cnt[si];
 
-  // Both should add exactly 1
-  EXPECT_FLOAT_EQ(cnt1, cnt2);
+  // One admitted observation is one vote, whatever the softmax mass on the
+  // winning class was.
+  EXPECT_FLOAT_EQ(cnt, 1.0f);
 }
 
 TEST(SemanticMode, MajorityVoteDominantClassWins) {

@@ -39,13 +39,13 @@ static constexpr float kPriorSlop = 1e-4f;
 
 /// BetaVoxel "is at prior" check for the split consensus refold. A voxel
 /// is at prior iff a_occ ≈ kBetaOccPrior and a_free ≈ kBetaFreePrior (the
-/// symmetric Beta(1,1) occupancy prior; see docs/occupancy_prior.md). `slop`
+/// symmetric Beta(1,1) occupancy prior). `slop`
 /// matches isPriorDir's one-quantum tolerance.
 inline bool isPriorBeta(const scovox::BetaVoxel& v,
                         uint16_t num_classes, float alpha_0) {
   (void)num_classes; (void)alpha_0;  // occupancy prior is the symmetric constant
   // Shipped occupancy prior is symmetric Beta(1,1) (kBetaOccPrior=kBetaFreePrior
-  // =1, p_occ=0.5) — decoupled from (num_classes, α₀); see docs/occupancy_prior.md.
+  // =1, p_occ=0.5) — decoupled from (num_classes, α₀).
   // slop = kPriorSlop (1e-4) matches the sender's at-prior emit gate so a
   // barely-observed Beta voxel the sender put on the wire is not dropped on refold.
   const float slop = kPriorSlop;
@@ -58,14 +58,14 @@ inline bool isPriorDir(const scovox::DirVoxel& v,
                        uint16_t num_classes, float alpha_0) {
   // Clamp residual_dims at 0 to match defaultDirVoxel: for num_classes <= K_TOP
   // the OTHER prior is 0, not (C-K)*alpha_0 < 0. A negative other_prior would
-  // make `v.other > other_prior + slop` true for genuine prior voxels and so
+  // make `v.other() > other_prior + slop` true for genuine prior voxels and so
   // misclassify them as observed.
   const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
   const float other_prior =
       (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
   // Match the sender's at-prior emit gate (kPriorSlop = 1e-4). See kPriorSlop.
   const float slop = kPriorSlop;
-  if (v.other > other_prior + slop) return false;
+  if (v.other() > other_prior + slop) return false;
   for (int i = 0; i < scovox::K_TOP; ++i)
     if (v.cls[i] != 0xFFFF) return false;
   return true;
@@ -86,13 +86,13 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
     // (clamped at 0 for C<=K_TOP, matching defaultDirVoxel) just as the RPC
     // projectBetaDirToVoxel does. argmaxClassConfidence / effectiveResidual /
     // semanticVariance all assume a_unk holds raw evicted mass with no prior;
-    // leaving the prior in (out.a_unk = d->other) inflated the confidence
+    // leaving the prior in (out.a_unk = d->other()) inflated the confidence
     // denominator by (C-K)*alpha_0 and made the published semantic_confidence
     // disagree with the GetRegion RPC for the identical voxel.
     const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
     const float other_prior =
         (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
-    out.a_unk = std::max(0.f, d->other - other_prior);
+    out.a_unk = std::max(0.f, d->other() - other_prior);
     for (int i = 0; i < scovox::K_TOP; ++i) {
       out.sem_cnt[i] = std::max(0.f, d->cnt[i] - alpha_0);
       out.sem_cls[i] = d->cls[i];
@@ -124,7 +124,7 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
 /// (defaultVoxel). So there is no longer a prior-induced p_occ / variance / EIG /
 /// SSMI gap vs the fused Voxel at the prior. (Historically the split path used a calibrated
 /// Beta(C·α_0, α_0) prior, p_occ = C/(C+1) ≈ 0.933; that was switched to
-/// Beta(1,1) — see docs/occupancy_prior.md.)
+/// Beta(1,1).)
 inline scovox::Voxel projectBetaDirToVoxel(
     const scovox::BetaVoxel& b, const scovox::DirVoxel* d,
     uint16_t num_classes, float alpha_0) {
@@ -135,12 +135,12 @@ inline scovox::Voxel projectBetaDirToVoxel(
     // Clamp residual_dims at 0 to mirror defaultDirVoxel: when num_classes <=
     // K_TOP there are no residual classes, so the OTHER prior is 0 (defaultDir
     // stored other=0). An unclamped (C-K)*alpha_0 < 0 would make the subtraction
-    // d->other - other_prior = d->other + |prior| ADD a phantom alpha_0 of
+    // d->other() - other_prior = d->other() + |prior| ADD a phantom alpha_0 of
     // unknown mass, skewing every projected voxel's entropy/EIG/argmax.
     const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
     const float other_prior =
         (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
-    out.a_unk = std::max(0.f, d->other - other_prior);
+    out.a_unk = std::max(0.f, d->other() - other_prior);
     for (int i = 0; i < scovox::K_TOP; ++i) {
       out.sem_cnt[i] = std::max(0.f, d->cnt[i] - alpha_0);
       out.sem_cls[i] = d->cls[i];

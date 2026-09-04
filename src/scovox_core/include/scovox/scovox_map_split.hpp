@@ -82,7 +82,7 @@ class ScovoxMapSplit {
     bool far_voxel_fast_paths = true;
 
     // ---- Fine TSDF band (localized two-lattice refinement) ----
-    // docs/design/fine_tsdf_band_dbh_2026_07_30.md. 0 = off (default —
+    // 0 = off (default —
     // byte-identical behaviour, no fine grid allocated). k > 0 adds a second
     // sparse TSDF-only lattice at res_fine = resolution / 2^k, written only
     // inside registered refinement cylinders (addRefinementRegion), in a
@@ -161,7 +161,6 @@ class ScovoxMapSplit {
   void integrateHit(const Eigen::Vector3f&         origin,
                     const Eigen::Vector3f&         endpoint,
                     const std::vector<float>*      sem_probs,
-                    float                          quality,
                     bool                           is_dynamic = false,
                     const HitWeights*              prof = nullptr) {
     // Fine TSDF band routing — walker-independent, so the fused and split
@@ -172,9 +171,9 @@ class ScovoxMapSplit {
       stageFineHit(origin, endpoint);
     }
     if (fused_walker_) {
-      integrateHitFused(origin, endpoint, sem_probs, quality, is_dynamic, prof);
+      integrateHitFused(origin, endpoint, sem_probs, is_dynamic, prof);
     } else {
-      integrateHitSplit(origin, endpoint, sem_probs, quality, is_dynamic, prof);
+      integrateHitSplit(origin, endpoint, sem_probs, is_dynamic, prof);
     }
   }
 
@@ -184,7 +183,6 @@ class ScovoxMapSplit {
   void integrateHitFused(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
-                         float                     quality,
                          bool                      is_dynamic = false,
                          const HitWeights*         prof = nullptr) {
     // A geometry-off source (RGB-D semantics overlay) writes NO TSDF band this
@@ -323,6 +321,7 @@ class ScovoxMapSplit {
                         && semsplit_.params().batch_free_carve
                         && depth >= trunc;
     int64_t far_thr = 0;
+    int64_t far_thr_sq = 0;
     if (far_skip || far_carve) {
       const double thr_vox =
           (std::max(static_cast<double>(trunc) + h,
@@ -330,6 +329,18 @@ class ScovoxMapSplit {
       far_thr = (thr_vox >= static_cast<double>(std::numeric_limits<int64_t>::max()))
           ? std::numeric_limits<int64_t>::max()
           : static_cast<int64_t>(thr_vox);
+      // The gate below tests the EUCLIDEAN coord distance, which is what the
+      // derivations above are actually written in — Chebyshev appears there
+      // only as a lower bound on it ("the test errs toward running the exact
+      // body"). Testing the distance itself is sound by the same argument and
+      // strictly tighter: every voxel the Chebyshev form classified as far is
+      // still far, plus the corners of the cube that lie outside the sphere.
+      // Saturated at a cap that keeps 3·far_thr² inside int64; above the cap
+      // the per-axis tests can never fire either, so the gate is inert exactly
+      // as it was before.
+      constexpr int64_t kSqCap = int64_t(1) << 30;
+      far_thr_sq = (far_thr >= kSqCap) ? std::numeric_limits<int64_t>::max()
+                                       : far_thr * far_thr;
     }
     // Origin voxel for the fast-carve guard ring (see above). k_hit when the
     // fast carve is off: never read, but keeps the value initialized.
@@ -342,42 +353,21 @@ class ScovoxMapSplit {
     // per-voxel std::function indirect call (weight_fn(sdf) ≡ 1.0f here).
     constexpr float tsdf_weight = 1.0f;
     bool carve_blocked = false;
+    // Latched once the walk is provably clear of the origin guard ring
+    // for the rest of THIS ray; see the latch site below.
+    bool ring_left = false;
     bool k_hit_visited = false;
 
-    auto visit_one = [&](const CoordT& c) {
-      // A few integer subtractions replace the whole float body on far
-      // voxels (see the derivations above). The hit voxel is at distance 0,
-      // so k_hit can never take a fast path and the flag below stays correct.
-      if (far_skip || far_carve) {
-        const int64_t dx = static_cast<int64_t>(c.x) - k_hit.x;
-        const int64_t dy = static_cast<int64_t>(c.y) - k_hit.y;
-        const int64_t dz = static_cast<int64_t>(c.z) - k_hit.z;
-        if (dx > far_thr || -dx > far_thr ||
-            dy > far_thr || -dy > far_thr ||
-            dz > far_thr || -dz > far_thr) {
-          if (far_skip) {
-            ++far_skipped_voxels_;  // carve OFF: provably no observable write
-            return;
-          }
-          // far_carve: only the carve branch can fire out here — take it
-          // directly unless inside the origin guard ring, whose voxels fall
-          // through to the exact body (see the arming comment).
-          const int64_t ox = static_cast<int64_t>(c.x) - k_origin.x;
-          const int64_t oy = static_cast<int64_t>(c.y) - k_origin.y;
-          const int64_t oz = static_cast<int64_t>(c.z) - k_origin.z;
-          if (ox > 2 || -ox > 2 || oy > 2 || -oy > 2 ||
-              oz > 2 || -oz > 2) {
-            if (!carve_blocked) {
-              if (!semCarve(c, quality, prof)) {
-                carve_blocked = true;
-              }
-            }
-            ++far_carved_voxels_;
-            return;
-          }
-        }
-      }
-
+    // The exact float body is held OUT OF LINE from the DDA lambda below.
+    // With it inline the loop's register allocation is sized for the float
+    // case, so the integer far path -- 63% of the voxels this walker steps
+    // through -- pays for a frame it never uses. Out of line, the hot path's
+    // frame is small enough to stay in registers. Same arithmetic, same
+    // evaluation order, same iterator over the same segment: this is a codegen
+    // change only and the dumps are byte-identical, which is the acceptance
+    // test it was held to (REVIEW_LOG E-W5).
+    auto exact_body = [&](const CoordT& c) __attribute__((noinline)) {
+      ++exact_body_voxels_;
       if (c == k_hit) k_hit_visited = true;
 
       // Inlined grid.coordToPos(c): identical double multiply (`res` is the
@@ -405,7 +395,7 @@ class ScovoxMapSplit {
       // applies the hit unconditionally. The TSDF band update below may still
       // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
       if (c == k_hit) {
-        semHit(c, sem_probs, quality, is_dynamic, prof);
+        semHit(c, sem_probs, is_dynamic, prof);
       }
 
       if (std::fabs(proj) < 1e-12f) return;
@@ -447,15 +437,81 @@ class ScovoxMapSplit {
       // mid-scan and the two orders coincide — but they must not diverge
       // between paths, so the order is pinned here rather than left to luck.
       if (band_active && c != k_hit && sdf > -sem_band_ && sdf <= sem_band_) {
-        semBand(c, sem_probs, quality, prof);
+        semBand(c, sem_probs, prof);
       }
 
       // (2) semantic carve (interior of carve band, not the hit voxel).
       if (c != k_hit && !carve_blocked && sdf > 0.f && sdf <= carve_band) {
-        if (!semCarve(c, quality, prof)) {
+        if (!semCarve(c, prof)) {
           carve_blocked = true;
         }
       }
+    };
+
+    auto visit_one = [&](const CoordT& c) {
+      // A few integer subtractions replace the whole float body on far
+      // voxels (see the derivations above). The hit voxel is at distance 0,
+      // so k_hit can never take a fast path and the flag below stays correct.
+      if (far_skip || far_carve) {
+        const int64_t dx = static_cast<int64_t>(c.x) - k_hit.x;
+        const int64_t dy = static_cast<int64_t>(c.y) - k_hit.y;
+        const int64_t dz = static_cast<int64_t>(c.z) - k_hit.z;
+        // The six per-axis comparisons come FIRST and unchanged, so the
+        // common far voxel still leaves after one or two of them with no
+        // arithmetic at all. Only a voxel inside the cube reaches the
+        // squared term, and reaching it proves every |d| <= far_thr, which
+        // bounds the sum at 3·far_thr² so the squares cannot overflow.
+        // The term catches the cube corners that lie outside the sphere.
+        if (dx > far_thr || -dx > far_thr ||
+            dy > far_thr || -dy > far_thr ||
+            dz > far_thr || -dz > far_thr ||
+            dx * dx + dy * dy + dz * dz > far_thr_sq) {
+          if (far_skip) {
+            ++far_skipped_voxels_;  // carve OFF: provably no observable write
+            return;
+          }
+          // far_carve: only the carve branch can fire out here — take it
+          // directly unless inside the origin guard ring, whose voxels fall
+          // through to the exact body (see the arming comment).
+          bool outside_ring = ring_left;
+          if (!outside_ring) {
+            const int64_t ox = static_cast<int64_t>(c.x) - k_origin.x;
+            const int64_t oy = static_cast<int64_t>(c.y) - k_origin.y;
+            const int64_t oz = static_cast<int64_t>(c.z) - k_origin.z;
+            outside_ring = ox > 2 || -ox > 2 || oy > 2 || -oy > 2 ||
+                           oz > 2 || -oz > 2;
+            if (outside_ring) {
+              // Latch it. The walk leaves the ring once and never re-enters:
+              // the iterator steps one axis at a time, always in the direction
+              // of travel, so every |c.i − k0.i| is non-decreasing and so is
+              // their max. k0 sits within 2 voxels of k_origin (start_pos =
+              // endpoint − depth·u reconstructs the origin to ~2 ulp, which is
+              // sub-voxel across the operating envelope above; 2 is a doubled
+              // margin), so Chebyshev(c, k0) ≥ 5 puts Chebyshev(c, k_origin)
+              // ≥ 3 — outside the ring — for the whole remainder of the ray.
+              // k_hit is revisited out of order after the walk, but it sits at
+              // distance 0 from itself and never reaches this branch, so the
+              // latch is never consulted out of order.
+              const int64_t bx = static_cast<int64_t>(c.x) - k0.x;
+              const int64_t by = static_cast<int64_t>(c.y) - k0.y;
+              const int64_t bz = static_cast<int64_t>(c.z) - k0.z;
+              ring_left = bx >= 5 || -bx >= 5 || by >= 5 || -by >= 5 ||
+                          bz >= 5 || -bz >= 5;
+            }
+          }
+          if (outside_ring) {
+            if (!carve_blocked) {
+              if (!semCarve(c, prof)) {
+                carve_blocked = true;
+              }
+            }
+            ++far_carved_voxels_;
+            return;
+          }
+        }
+      }
+
+      exact_body(c);
     };
 
     if (k0 == k_far) {
@@ -482,7 +538,7 @@ class ScovoxMapSplit {
     // applyHitUpdate. Dynamic endpoints route to the transient substrate and
     // must not smear persistent neighbours (same rule as the TSDF gate).
     if (semsplit_.params().ray_spread != 0 && !is_dynamic) {
-      semsplit_.raySpreadDeposit(origin, endpoint, k_hit, sem_probs, quality,
+      semsplit_.raySpreadDeposit(origin, endpoint, k_hit, sem_probs,
                                  prof);
     }
 
@@ -497,14 +553,13 @@ class ScovoxMapSplit {
     // split, run the non-fused integrateHitSplit walker, which times the two
     // DDAs separately. See tsdfTimeUs()/semdirTimeUs() docs.
     //
-    // This bracket is PER RAY, deliberately. A cheaper once-per-scan bracket in
-    // beginCarveFrame/flushCarveFrame was tried and reverted: it also swallows
-    // the caller's per-pixel deproject/label/normal work, which silently
-    // redefines tsdf_ms from "the walker" to "the whole scan loop" under an
-    // unchanged log token (~+12 ms on SceneNN — several times larger than the
-    // ~2.1 ms of clock overhead it saves) and double-counts on the non-fused
-    // path, whose own brackets sit inside it. Scope comparability with
-    // SLIM-VDB's Integrate+Prune column depends on this staying per-walker.
+    // This bracket is PER RAY, deliberately. A once-per-scan bracket in
+    // beginCarveFrame/flushCarveFrame would be cheaper in clock calls but also
+    // swallows the caller's per-pixel deproject/label/normal work, silently
+    // redefining tsdf_ms from "the walker" to "the whole scan loop" under an
+    // unchanged log token, and double-counts on the non-fused path, whose own
+    // brackets sit inside it. Scope comparability with SLIM-VDB's
+    // Integrate+Prune column depends on this staying per-walker.
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
 
@@ -520,7 +575,6 @@ class ScovoxMapSplit {
   void integrateHitSplit(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
-                         float                     quality,
                          bool                      is_dynamic = false,
                          const HitWeights*         prof = nullptr) {
     using clk = std::chrono::steady_clock;
@@ -529,11 +583,10 @@ class ScovoxMapSplit {
     // semsplit_.integrateHit stays persistent, only the endpoint routes. A
     // geometry-off source (RGB-D overlay) also writes no TSDF — geometry stays
     // LiDAR-only (parity with the fused walker's band-write gate). That gate
-    // also tests tsdf_enabled_ and this one does not; see §2.3 of
-    // docs/design/removed_and_untested_2026_09_02.md.
+    // also tests tsdf_enabled_ and this one does not.
     if (!is_dynamic && !(prof && prof->geometry_off)) tsdf_.integrateRay(origin, endpoint);
     const auto t1 = clk::now();
-    semsplit_.integrateHit(origin, endpoint, sem_probs, quality, is_dynamic, prof);
+    semsplit_.integrateHit(origin, endpoint, sem_probs, is_dynamic, prof);
     const auto t2 = clk::now();
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     sem_ns_  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
@@ -542,11 +595,10 @@ class ScovoxMapSplit {
   /// No-return: semantic carve only; no TSDF update.
   void integrateMiss(const Eigen::Vector3f& origin,
                      const Eigen::Vector3f& endpoint,
-                     float                  quality,
                      const HitWeights*      prof = nullptr) {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
-    semsplit_.integrateMiss(origin, endpoint, quality, prof);
+    semsplit_.integrateMiss(origin, endpoint, prof);
     const auto t1 = clk::now();
     sem_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
@@ -587,7 +639,6 @@ class ScovoxMapSplit {
 
   // -------------------------------------------------------------------
   // Fine TSDF band — localized two-lattice refinement
-  // (docs/design/fine_tsdf_band_dbh_2026_07_30.md)
   // -------------------------------------------------------------------
 
   bool fineEnabled() const noexcept { return fine_tsdf_ != nullptr; }
@@ -760,6 +811,14 @@ class ScovoxMapSplit {
   /// difference, which a fast path that never armed also produces.
   std::uint64_t farSkippedVoxels() const noexcept { return far_skipped_voxels_; }
   std::uint64_t farCarvedVoxels()  const noexcept { return far_carved_voxels_; }
+  /// Voxels that ran the full float body (vc/dist/proj + the gates below it),
+  /// as opposed to leaving through one of the far-voxel integer paths above.
+  /// Fused walker only; the split walker never runs this body.
+  std::uint64_t exactBodyVoxels()  const noexcept { return exact_body_voxels_; }
+  /// Split-walker walk lengths, one counter per DDA, so the two structures can
+  /// be compared per voxel rather than per ray.
+  std::uint64_t carveWalkVoxels()  const noexcept { return semsplit_.carveVoxels(); }
+  std::uint64_t bandWalkVoxels()   const noexcept { return tsdf_.bandVoxels(); }
 
  private:
   // -------------------------------------------------------------------
@@ -843,19 +902,19 @@ class ScovoxMapSplit {
 
   /// Per-voxel semantic carve dispatch (SPLIT substrate). `prof` carries the
   /// per-source w_free (null => global params_).
-  bool semCarve(const CoordT& c, float quality, const HitWeights* prof = nullptr) {
-    return semsplit_.applyCarveUpdate(c, quality, prof);
+  bool semCarve(const CoordT& c, const HitWeights* prof = nullptr) {
+    return semsplit_.applyCarveUpdate(c, prof);
   }
   /// Per-voxel semantic hit dispatch (SPLIT substrate). `is_dynamic` routes the
   /// endpoint to the transient grids (see SemSplitMap::applyHitUpdate). `prof`
   /// carries the per-source w_occ/kappa0/min_p_occ (null => global params_).
-  void semHit(const CoordT& c, const std::vector<float>* sem_probs, float quality,
+  void semHit(const CoordT& c, const std::vector<float>* sem_probs,
               bool is_dynamic, const HitWeights* prof = nullptr) {
-    semsplit_.applyHitUpdate(c, sem_probs, quality, is_dynamic, prof);
+    semsplit_.applyHitUpdate(c, sem_probs, is_dynamic, prof);
   }
-  void semBand(const CoordT& c, const std::vector<float>* sem_probs, float quality,
+  void semBand(const CoordT& c, const std::vector<float>* sem_probs,
                const HitWeights* prof = nullptr) {
-    semsplit_.applyBandSemantic(c, sem_probs, quality, prof);
+    semsplit_.applyBandSemantic(c, sem_probs, prof);
   }
 
   TsdfMap     tsdf_;       ///< TSDF surface (band-only)
@@ -893,6 +952,7 @@ class ScovoxMapSplit {
   /// integrating thread per map.
   std::uint64_t far_skipped_voxels_ = 0;
   std::uint64_t far_carved_voxels_  = 0;
+  std::uint64_t exact_body_voxels_  = 0;
 };
 
 }  // namespace scovox

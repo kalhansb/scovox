@@ -7,8 +7,7 @@
 # subscribes to). Doubles as the KNOWN-GOOD reference when a mapper is NOT
 # publishing scovox_bin: if the topic flows HERE but not in your setup, the
 # difference is your config (almost always
-# mode != rolling, or a namespace/node-name mismatch). See
-# docs/scovox_bin_manual_bringup.md for the full step-by-step diagnosis.
+# mode != rolling, or a namespace/node-name mismatch).
 #
 # This launch provides ONLY the scovox side. YOU supply, in the same ROS graph
 # (same ROS_DOMAIN_ID / container network):

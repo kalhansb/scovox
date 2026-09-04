@@ -6,9 +6,9 @@
 # in a UNIQUE integration frame; a single dscovox merger subscribes to EVERY
 # robot's bin stream and reconstructs the fused, multi-robot `dscovox` map on
 # `/dscovox_mapping/pointcloud`. This is the on-one-host replay analog of the
-# real distributed fleet in docs/distributed_mapping_lidar.md.
+# real distributed fleet.
 #
-# The two rules that make fusion work (see docs/distributed_mapping_lidar.md):
+# The two rules that make fusion work:
 #   1. Each robot maps in a UNIQUE frame (bunker_map, curt_map, ...), bridged to
 #      `map` by an identity static TF (published here). The bin stream is tagged
 #      with this frame and the merger keys each source by it. Two robots sharing
@@ -17,7 +17,7 @@
 #      is open — a mapper with no subscriber drains its deltas and emits nothing.
 #
 # This launch provides ONLY the scovox side. YOU supply, in the SAME ROS graph,
-# for EACH robot (see docs/dscovox_multi_robot_run.md):
+# for EACH robot:
 #   * the sensor stream  — cloud on <cloud_topic> (+ IMU on <imu_topic>)
 #   * a COMPLETE TF tree — map -> <robot>/odom -> <robot base> -> <base_frame>
 #     from a per-robot hmr_localisation NDT stack localizing against the SAME
@@ -156,7 +156,7 @@ def launch_setup(context, *args, **kwargs):
                 # scovox_lidar_geometric.yaml disables all three ("NDT owns
                 # map->odom, no SLAM jump to guard against") — do NOT copy that
                 # here. Both robots' NDT self-localizes from a near-origin seed
-                # (docs/dscovox_multi_robot_run.md), so the first convergence is
+                # rather than from a surveyed pose, so the first convergence is
                 # a LARGE pose jump that the startup gate should absorb rather
                 # than integrate; and 1.0 m frame-to-frame sits well above real
                 # ground-robot motion (~0.1-0.15 m at 10 Hz), so the runtime
@@ -195,8 +195,8 @@ def launch_setup(context, *args, **kwargs):
             "pointcloud_topic": "/dscovox_mapping/pointcloud",
             "share_roi_z_min": float(g["share_roi_z_min"]),   # keep in sync with senders
             "share_roi_z_max": float(g["share_roi_z_max"]),
-            # Fused ~/scovox (planner input) cadence — pinned to the code default
-            # so it matches docs/user_manual.md ch.6 rather than relying on it.
+            # Fused ~/scovox (planner input) cadence — set explicitly to the code
+            # default rather than relying on that default continuing to hold.
             # (semantic_top_k is deliberately NOT set: the per-voxel top-K width
             #  is the compile-time K_TOP in scovox_core/voxel.hpp.)
             "publish_rate_hz": 1.0,

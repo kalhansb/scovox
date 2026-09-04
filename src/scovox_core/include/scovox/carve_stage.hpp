@@ -3,7 +3,7 @@
 /// @file carve_stage.hpp
 /// @brief Per-scan batched-carve accumulator keyed by Beta leaf block —
 /// the sort-free replacement for `SemSplitMap`'s `unordered_map<CoordT,float>`
-/// staging (efficiency_audit_2026_08_26.md, item 1).
+/// staging.
 ///
 /// The batched carve path stages the strongest free vote per voxel during the
 /// scan walk and writes each voxel once at flush, leaf-block-ordered so the
@@ -16,7 +16,7 @@
 ///     own block key) into a small open-addressed index (Teschner-prime hash,
 ///     linear probe, load <= 1/2, grown by doubling);
 ///   - each block owns one dense SLOT in a reused pool: `2^(3·leaf_bits)`
-///     floats (max `w_free·quality` per cell) plus an occupancy bitmask, so
+///     floats (max `w_free` per cell) plus an occupancy bitmask, so
 ///     staging a voxel is a bit-set + max — no node allocation, no rehash of
 ///     voxel keys;
 ///   - flush sorts only the BLOCK keys (thousands, not hundreds of thousands)

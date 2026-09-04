@@ -21,10 +21,14 @@ config/             Param sets: raw-cloud smear cure, fused LiDAR+RGB-D, robot-s
 scripts/            Launch helper for the raw-cloud config (see below)
 
 docs/
-  design/unified_dirichlet_design_2026_05_13.md   Unified per-voxel Dirichlet design
-  design/fine_tsdf_band_dbh_2026_07_30.md         Fine-resolution TSDF band near trees for DBH
-  design/comms_design_2026_07_30.md               Wire compaction and the significance gate
-  occupancy_prior.md                              Why the symmetric Beta(1,1) occupancy prior
+  scovox_code_structure.md   Map of the source tree: what each file owns
+  code/                      Code reviews
+  papers/                    Experiment plan and literature reviews
+  archive/                   Run-books and superseded design notes, including:
+    design/unified_dirichlet_design_2026_05_13.md   Unified per-voxel Dirichlet design
+    design/fine_tsdf_band_dbh_2026_07_30.md         Fine-resolution TSDF band near trees for DBH
+    design/comms_design_2026_07_30.md               Wire compaction and the significance gate
+    design/occupancy_prior.md                       Why the symmetric Beta(1,1) occupancy prior
 ```
 
 ## Build
@@ -120,7 +124,7 @@ for the problem this solves.
 
 > Start-to-finish real-robot runbook (single robot and two robots, incl.
 > localizer bring-up, verification, and troubleshooting):
-> [`docs/distributed_mapping.md`](docs/distributed_mapping.md).
+> [`docs/archive/distributed_mapping.md`](docs/archive/distributed_mapping.md).
 
 One `scovox_mapping_node` per robot (`mode: rolling`, namespaced) publishes an
 LZ4 `ScovoxMapBinary` delta stream on `/<robot>/scovox_node/scovox_bin`; every
@@ -178,7 +182,7 @@ wires the same topology (edit its `robots` list / `input_topics`). To drive the
 `~/scovox_bin` delta stream straight from a recorded rosbag's LiDAR (and why it
 stays silent by default — persistent mode, subscriber-gating, and the bag having
 no `map`/`odom` TF), see
-[`docs/publish_scovox_bin_from_bag.md`](docs/publish_scovox_bin_from_bag.md).
+[`docs/archive/publish_scovox_bin_from_bag.md`](docs/archive/publish_scovox_bin_from_bag.md).
 
 ### Exploration experiment (HMR_Explo)
 

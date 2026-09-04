@@ -196,15 +196,17 @@ TEST(HeartbeatReemit, DirBinarizeStyleVetoPerVoxel) {
   Bonxai::VoxelGrid<DirVoxel> gate{kRes, kInnerBits, kLeafBits};
   Bonxai::VoxelGrid<double> stamps{kRes, kInnerBits, kLeafBits};
 
+  // set_other() after the slots: it derives the stored total from cnt[], so a
+  // later cnt[] write would move other() by the same amount.
   DirVoxel labelled{};
-  labelled.other = 0.1f;
   labelled.cnt[0] = 5.f;
   labelled.cls[0] = 3;
   for (int i = 1; i < scovox::K_TOP; ++i) labelled.cls[i] = 0xFFFF;
+  labelled.set_other(0.1f);
 
   DirVoxel unlabelled{};
-  unlabelled.other = 0.1f;
   for (int i = 0; i < scovox::K_TOP; ++i) unlabelled.cls[i] = 0xFFFF;
+  unlabelled.set_other(0.1f);
 
   const CoordT ca{0, 0, 0};  // labelled → emits
   const CoordT cb{1, 0, 0};  // sentinel-dominant → vetoed

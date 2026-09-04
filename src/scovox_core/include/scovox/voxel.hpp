@@ -12,12 +12,11 @@ namespace scovox {
 /// production configuration; every default build is byte-identical to the
 /// hard-coded constant this replaced.
 ///
-/// Overridable at *build* time only (`-DSCOVOX_K_TOP=n`), for the S1
-/// sufficiency sweep (experiments/PLAN.md §3 S) which needs K ∈ {1,2,3,full}
-/// as four separate builds. It is a struct-layout constant: every translation
-/// unit in the workspace must see the same value, so a sweep build must pass
-/// the flag to `colcon build` as a whole and install into its own base — never
-/// mix objects across values.
+/// Overridable at *build* time only (`-DSCOVOX_K_TOP=n`), for the sufficiency
+/// sweep, which needs K ∈ {1,2,3,full} as four separate builds. It is a
+/// struct-layout constant: every translation unit in the workspace must see
+/// the same value, so a sweep build must pass the flag to `colcon build` as a
+/// whole and install into its own base — never mix objects across values.
 #ifndef SCOVOX_K_TOP
 #define SCOVOX_K_TOP 2
 #endif
