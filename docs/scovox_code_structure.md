@@ -605,7 +605,8 @@ defaults), `lidar_mapping.yaml`, `dscovox_params.yaml`, `scovox_bin_min.yaml`.
 `scovox_core` (11 binaries): `test_carve_stage`, `test_mesh_labelling`,
 `test_fine_tsdf`, `test_binary_serializer`, `test_consensus_merge`,
 `test_tsdf_map`, `test_voxel_layouts`, `test_scovox_map_split` (incl. the
-far-path bit-identity suite `ScovoxMapSplitFarCarve`), `test_sparse_add`,
+far-path bit-identity suite `ScovoxMapSplitFarCarve` and the
+`ScovoxMapSplitTsdfDisabled` pair that guards the `tsdf_enabled=0` walk), `test_sparse_add`,
 `test_uncertainty`, `test_sem_split_map`. `scovox_mapping` (8):
 `test_beta_update`, `test_consensus`, `test_topk_provider`, `test_tsdf_band`,
 `test_marching_cubes`, `test_semantic_audit`, `test_dirichlet_update`,
@@ -773,9 +774,10 @@ in the consumer.
 - `evidence_saturation` caps Beta and, through `class_evidence_saturation
   = −1`, Dir as well; the node exposes only the shared value.
 - One known failing test, `FarCarveBitIdenticalToFullWalk`. Re-measured on the
-  full `./dev.sh ros-test` gate: **323 tests, 2 failures**, which is this one
+  full `./dev.sh ros-test` gate: **325 tests, 2 failures**, which is this one
   failure counted twice (colcon reports the gtest case and the package's CTest
-  aggregate). It is still the only one.
+  aggregate). It is still the only one. The count rose from 323 with the two
+  `ScovoxMapSplitTsdfDisabled` cases added for review items H3 and L7.
 - The numbers in §1.5 predate three commits to the deposit path and no longer
   describe this code. See the box in §1.5 and `code_review_2026_09_04.md` §H4;
   re-basing them is a re-run of the ablation ring, not a doc edit.
@@ -813,6 +815,6 @@ is bridgeable by loading `config/scovox_best_method.yaml`, with the node's
 Two caveats on "the library is the best method". First, "best method" here means
 the configuration the campaign selected, which is not the same as the
 configuration the published numbers were measured under: see the box in §1.5.
-Second, the storage state is verified by `./dev.sh ros-test` (323 cases), not by
+Second, the storage state is verified by `./dev.sh ros-test` (325 cases), not by
 `./dev.sh test` — the 182-case core suite cannot see `scovox_mapping`, and a
 storage change graded only by it will pass while broken.
