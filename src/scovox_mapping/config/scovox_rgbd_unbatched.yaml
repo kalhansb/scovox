@@ -1,0 +1,83 @@
+# =======================================================================
+# SCovox — RGB-D, pixel-unit (un-batched) operating point
+# =======================================================================
+# One of three recorded points on a SINGLE axis. `batch_hits` and `w_occ`
+# are not independent knobs: batching decides whether a unit of evidence
+# is an observation or a depth pixel, and `w_occ` scales that unit. Move
+# one without the other and the voxel reaches the fixed
+# `dirichlet_min_p_occ` gate at a different rate, which is what actually
+# changes the map. The three files are:
+#
+#   scovox_best_method.yaml    batch_hits true,  w_occ 1.5  <- promoted
+#   scovox_rgbd_complete.yaml  batch_hits true,  w_occ 6.0
+#   scovox_rgbd_unbatched.yaml batch_hits false, w_occ 1.5  <- this file
+#
+# Here `a_occ` and the class counts accumulate one deposit per depth
+# PIXEL that lands in the voxel, so a 640x480 frame can put hundreds of
+# deposits into one surface voxel. `w_occ` 1.5 is the weight that was
+# swept under exactly this unit, which is why this file pairs 1.5 with
+# batching off and `scovox_rgbd_complete.yaml` pairs 6.0 with it on.
+# Pairing 1.5 with batching ON is the promoted point and is a third,
+# deliberate choice -- not an oversight in this file.
+#
+# COST. Un-batched deposits scale with pixels per voxel, not with rays,
+# so this is the slowest of the three by a margin that grows with
+# resolution and with how close the sensor sits to the surface. It is
+# also the only one of the three whose deposit count is not bounded by
+# the traversal, which matters for worst-case timing on a robot.
+#
+# Load via:
+#   ros2 run scovox_mapping scovox_mapping_node \
+#       --ros-args --params-file <path>/scovox_rgbd_unbatched.yaml
+#
+# VERIFYING IT TOOK. The node logs the sanitised parameter set read back
+# out of the constructed map, never the launch argument. A binary
+# predating a knob accepts the parameter and ignores it. Grep the log
+# for the deposit-rule line and the "promoted config" line, not for the
+# argument you passed. `batch_hits` is the knob most worth confirming
+# here, because a binary that ignores it silently gives you the
+# promoted configuration instead.
+# =======================================================================
+
+/**:
+  ros__parameters:
+
+    # ---- Lattice -------------------------------------------------------
+    resolution: 0.05
+
+    # ---- Occupancy (Stream A) ------------------------------------------
+    w_occ:  1.5
+    w_free: 1.0
+
+    # ---- Semantics (Stream B) ------------------------------------------
+    kappa0: 1.0
+    num_classes: 14
+    max_semantic_classes: 14
+    semantic_mode: "dirichlet"
+    dirichlet_min_p_occ: 0.5
+    evidence_saturation: 0
+    semantic_evict_by_confidence: true
+    semantic_band_length: 0.10
+    semantic_band_require_occ: false
+    semantic_spread_radius: 0.0
+
+    # ---- Geometry integration ------------------------------------------
+    enable_tsdf: false
+    fused_walker: true
+    stride: 2
+    min_depth: 0.4
+    max_depth: 4.0
+    min_range: 0.4
+    max_range: 4.0
+    trace_no_return_rays: true
+
+    # THE ONE LINE THAT DIFFERS FROM scovox_best_method.yaml.
+    # One deposit per depth pixel, not one per voxel per frame.
+    batch_hits: false
+
+    # ---- Knobs deliberately left at their library defaults --------------
+    # inc_mode 0, hit_flat_share false, inc_thresh 0.10,
+    # class_evidence_saturation -1, ray_spread 0 -- identical to
+    # scovox_best_method.yaml, including the caveat that
+    # class_evidence_saturation -1 resolves to "uncapped" only because
+    # evidence_saturation is 0 above. Raising it caps BOTH channels.
