@@ -123,10 +123,33 @@ MATERIAL 0.001): intersection mIoU **+0.0290** (material, 8/8), precision
 interleaved, so that figure is not admissible as a timing result and needs an
 interleaved re-run.
 
-So batching trades a large recall loss and an unresolved headline for ~11 % speed
-and better-labelled surviving voxels. It is on by default in all three places.
-Whether that trade is wanted is a decision, not a defect, and it is **not** made
-in this document; the default has not been changed.
+**Batching is a reparameterization of `w_occ`, not an independent knob.** The
+paragraph above framed this as a trade; a follow-up sweep shows it is a units
+change that was never compensated. `w_occ` 1.5 and the fixed `p_occ >= 0.5` gate
+were swept while `a_occ` counted pixels; batching changed the unit to
+observations without re-tuning either. Sweeping `w_occ` in {3.0, 6.0, 12.0,
+24.0} batched, on the same binary, 3 scenes (mean):
+
+| | ship w1.5 | w3.0 | **w6.0** | w12.0 | w24.0 | un-batched w1.5 |
+|---|---|---|---|---|---|---|
+| union mIoU | 0.3362 | 0.3708 | **0.3797** | 0.3747 | 0.3656 | 0.3800 |
+| occupancy IoU | 0.4504 | 0.5022 | **0.5176** | 0.5118 | 0.4981 | 0.5177 |
+| recall | 0.5607 | 0.6780 | 0.7592 | 0.8143 | 0.8527 | 0.7572 |
+
+Batched `w_occ` 6.0 reproduces the un-batched arm to four decimals on all three,
+with voxel counts within ~1 %. The factor is ~4x rather than the 10-100x a
+pixel-footprint argument suggests, because the carve is staged too
+(`CarveStage`, per-voxel MAX): `a_occ` and `b_free` shrink together and only the
+per-voxel hit:carve imbalance moves.
+
+That collapses the trade. Traversal volume is byte-identical across all arms
+(scene 016: 6 493 044 570 voxels on each), so batching's ~11 % is entirely
+deposit-side — the cost of the ~10 900 voxels it declines to write — and buying
+them back through `w_occ` costs the time back (0.233-0.245 s/frame batched at
+6.0 against 0.234-0.237 un-batched). Batching and `w_occ` are two dials on one
+speed/completeness axis, and no setting of the pair is simultaneously faster and
+equal on mIoU. Which point on that axis to ship is a decision, not a defect, and
+it is **not** made in this document; the defaults have not been changed.
 
 **Fix.** Re-run the ablation ring on the current binary; this is a re-run, not
 an edit to `RESULTS.md`. `RESULTS.md` carries a provenance banner stating all of
