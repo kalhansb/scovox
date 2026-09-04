@@ -138,7 +138,7 @@ serialization, so the apples-to-apples figure from this run is
 | Desktop reference (full 300 fr, n=13 mean) | 0.327 ± 0.037 |         — |                — |                   — |
 
 Reference desktop mean comes from
-[project_scenenet_first_batch_2026_05_12.md](../../../../.claude/projects/-home-kalhan-projects-HMR-Exploration-Experiment-hmr-exploration-ws/memory/project_scenenet_first_batch_2026_05_12.md)
+`project_scenenet_first_batch_2026_05_12.md`
 (13 random val trajectories, full 300-frame single-robot, mean ± SE).
 
 Per-class IoU on the Jetson dscovox fused map (the 7 non-empty classes
@@ -170,7 +170,7 @@ fused_walker=true, K_TOP=2, res=0.05). The per-trajectory record for
 | **dscovox fused** |              **0.3036** |         **0.4945** |          **+0.191** |
 
 solo_a is within the documented ±0.05 single-cell variance from
-[project_replica_room0_runtorun_variance.md](../../../../.claude/projects/-home-kalhan-projects-HMR-Exploration-Experiment-hmr-exploration-ws/memory/project_replica_room0_runtorun_variance.md).
+`project_replica_room0_runtorun_variance.md`.
 But the **fused map differs by +0.191 mIoU** between the two runs — well
 outside cell-variance.
 
@@ -240,7 +240,7 @@ Two consequences:
 
 **Implication for the paper's Phase 3 numbers.** The n=13 mean Δ +0.071
 mIoU reported in
-[project_step8_complete_2026_05_14.md](../../../../.claude/projects/-home-kalhan-projects-HMR-Exploration-Experiment-hmr-exploration-ws/memory/project_step8_complete_2026_05_14.md)
+`project_step8_complete_2026_05_14.md`
 is **confirmed to be an underestimate on at least one cell** (0_223:
 published +0.0979, actually +0.1266 = +29% relative). Per-cell drop
 rates from the Phase 3 launch logs:
@@ -317,7 +317,7 @@ port. The throughput numbers below are therefore on **different hardware
 tiers** (Orin Ampere ~ 40 TOPS NPU + modern Cortex-A78AE vs Nano Maxwell
 ~ 0.5 TOPS + Cortex-A57). The comparable-hardware quality comparison
 remains the desktop head-to-head from
-[project_scenenet_head_to_head_2026_05_13.md](../../../../.claude/projects/-home-kalhan-projects-HMR-Exploration-Experiment-hmr-exploration-ws/memory/project_scenenet_head_to_head_2026_05_13.md)
+`project_scenenet_head_to_head_2026_05_13.md`
 (+0.088 mIoU, 13/13 wins).
 
 | Method   | Edge platform    | FPS (sustained) | Notes                                                                          |
@@ -434,7 +434,7 @@ What this experiment **doesn't** establish (because n=1):
 The next experiment that would close this loop is the same configuration
 across the remaining 12 trajectories at 0.25 Hz, producing per-traj
 paired (scovox_a, dscovox) mIoUs comparable to the
-[head-to-head memo](../../../../.claude/projects/-home-kalhan-projects-HMR-Exploration-Experiment-hmr-exploration-ws/memory/project_scenenet_head_to_head_2026_05_13.md).
+head-to-head memo.
 Wall time at 0.25 Hz: 12 trajectories × ~13 min each + ~3 min teardown
 per cell ≈ **3.5 hr** unattended.
 
