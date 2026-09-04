@@ -121,7 +121,13 @@ TSDF truncation 3 fine voxels when the fine band is on (it is off here).
    `other()` (`SCOVOX_EVICT_INHERIT=0`).
 6. **Band voxels, Stream B only** (`applyBandSemantic` `:844-892`): with
    `band_require_occ=false` a flat `kappa0` deposit with no Beta read, so a
-   band voxel can hold a class before it holds occupancy evidence.
+   band voxel can hold a class before it holds occupancy evidence. **Not
+   batched** — `batch_hits` stages the endpoint only (`:606-608`), and this is
+   an immediate write from inside the walk, so a band voxel takes one deposit
+   per depth pixel passing it while the hit voxel takes one per frame. `s_total`
+   therefore grows far faster off the surface than on it; harmless for mIoU (the
+   scorer excludes Dir-only voxels by `state`) and material for anything reading
+   `s_total` as a Dirichlet concentration. See M9 in `code/code_review_2026_09_04.md`.
 7. **Carved voxels**: `a_free += w_free` per voxel, written once per voxel per
    scan at `flushCarveFrame` (`:476-519`), block-ordered; occupied hits win
    over carves in the same scan.

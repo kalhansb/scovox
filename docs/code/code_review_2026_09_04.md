@@ -35,6 +35,7 @@ static read could not have produced: an 8-scene re-score on the current binary.
 | M6 | Medium | Wire block runs hard-code `leaf_bits = 3` | open |
 | M7 | Medium | `evidence_saturation` is one knob for two caps | **partly resolved** — trap documented at the point of use |
 | M8 | Medium | Experiment write-ups still print the demoted build flag | **resolved** — plus a second error found in the same block |
+| M9 | Medium | `batch_hits` stages the endpoint only; the semantic band is un-batched | open — mIoU unaffected, but it inverts any confidence read |
 | L1 | Low | Stale byte-size and type-name comments | open |
 | L2 | Low | In-code references to moved or nonexistent documents | **partly resolved** — code swept; `scovox_slot_rules/scripts/` not |
 | L3 | Low | README document index broken by the archive move | **resolved** |
@@ -513,6 +514,43 @@ scenes, which is what a change confined to the class histogram should look like.
 Two counts in that section were already inconsistent before this correction and
 were **left alone rather than guessed at**: the prose says "six parts" and "six
 levels" where the ablation ring has five rows and declares family m = 5.
+
+---
+
+### M9 — `batch_hits` stages the endpoint only; the semantic band is un-batched
+
+`stageable = batch_hits && !kernel_ray && semantic_spread_radius <= 0 && ray_spread == 0`
+(`sem_split_map.cpp:606-608`) governs the **endpoint** deposit. The band deposit
+is a separate immediate write issued from inside the walk
+(`ScovoxMapSplit::integrateHitFused` `:439-441` → `applyBandSemantic`
+`sem_split_map.cpp:844-892`), which staging never sees. Per frame:
+
+| | deposits per voxel | weight |
+|---|---|---|
+| endpoint | 1 — the frame's strongest ray | `kappa0 · p_occ_post`, gated `p_occ >= min_p_occ` |
+| band voxel | one per depth pixel whose ray passes it | flat `kappa0`, no Beta read |
+
+At `fx` 544.47, stride 2, `resolution` 0.05, a fronto-parallel surface puts
+~46 rays through one voxel column at 2 m and ~185 at 1 m — all of which band the
+voxels either side of the surface, while the surface voxel takes one deposit.
+`s_total` in a band voxel therefore grows one to two orders of magnitude faster
+than in the voxel actually observed, scaling as 1/d². Geometric estimate, not
+measured.
+
+**mIoU is unaffected** and no published number moves: a Dir-only voxel dumps as
+`state=1` with `p_occ` set to the Beta prior, and the scorer's occupied set is
+`p_occ >= 0.5 && (state == 0 || state == 2)` (`replay_scenenn.cpp:636,663-664`),
+which excludes it. The exposure is C3 / E3.1 / E3.2 in `docs/papers/experiment_plan.md`:
+read as a Dirichlet concentration, `s_total` is a count of correlated looks in
+band voxels, so vacuity is understated there and understated *most* where the
+sensor was closest. `semantic_band_require_occ: false` compounds it — the band is
+the only path that deposits class evidence with no occupancy gate, so a band
+voxel can hold a sharp class posterior on no occupancy evidence at all.
+
+Not acted on. Batching the band, weighting it by `p_occ`, or dividing `kappa0` by
+the span would each change the deposited field and so every mIoU number; none is
+a free correction, and the band's mIoU value was measured in its present form.
+The near-term fix for an uncertainty consumer is to read `state`, not `p_occ`.
 
 ---
 
