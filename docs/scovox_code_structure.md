@@ -150,6 +150,20 @@ along-ray offset (step 3 above). For one ray a band is a line segment; the shell
 around the surface that the name suggests is the union of those segments over
 many rays.
 
+The radial measure is inherited, not invented: `exact_body`'s `sdf` is SLIM-VDB's
+`ComputeSDF` (`slim-vdb/src/slimvdb/slimvdb/VDBVolume.cpp:57-66`) transcribed —
+same `v_voxel_origin` / `v_point_voxel` / `dist` / `proj` decomposition, same
+sign convention. scovox computes it in float rather than double, and guards
+`proj == 0` explicitly where the original divides `0/0` and is rescued only by
+`NaN > -sdf_trunc` being false. **`semantic_band_length` 0.10 is SLIM-VDB's own
+`sdf_trunc`** (`examples/cpp/config/scenenet.yaml`, alongside `voxel_size` 0.05,
+`space_carving` False, `min_weight` 20.0): the band was set to that value so the
+two mappers deposit semantics over the same footprint, which is what makes
+`band_require_occ=false` a mirror of `alpha[label] += 1` rather than an
+approximation of it. Where the two genuinely part is the ray range — SLIM-VDB
+walks `[depth − sdf_trunc, depth + sdf_trunc]` and so never enters free space,
+while scovox always walks from the sensor origin and carves it.
+
 Four mechanisms involve a voxel's neighbours, and exactly one is promoted:
 
 | mechanism | shape | site | promoted |
