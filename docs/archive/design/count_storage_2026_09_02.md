@@ -200,6 +200,17 @@ threshold — identical, which is a stronger and more useful statement: there is
 no accuracy question to trade off against the memory saving, because there is
 no accuracy difference to measure.
 
+Scope: this is **six of the suite's eight scenes**. 011 and 273 were not run and
+the table should not be read as 8/8. They are absent for cost, not because they
+were run and excluded — they are the suite's two longest scenes and each needs a
+run on both storage arms. The gap is closable at any time: the float arm still
+builds with `EXTRA=-DSCOVOX_BETA_U16=0`. The gap matters
+less here than it would for a statistical claim: this is an arithmetic identity,
+not an average, so six scenes at 0/254 differing fields either demonstrate it or
+the identity is wrong in a way a seventh would not rescue. Anything that
+*breaks* it — an off-lattice weight — breaks it everywhere, which is exactly
+what the off-lattice test in the ros-test suite is for.
+
 Two things follow.
 
 - The saving is free at these weights. `BetaVoxel` goes 8 B → 4 B; on the
