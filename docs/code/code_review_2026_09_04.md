@@ -127,20 +127,33 @@ interleaved re-run.
 paragraph above framed this as a trade; a follow-up sweep shows it is a units
 change that was never compensated. `w_occ` 1.5 and the fixed `p_occ >= 0.5` gate
 were swept while `a_occ` counted pixels; batching changed the unit to
-observations without re-tuning either. Sweeping `w_occ` in {3.0, 6.0, 12.0,
-24.0} batched, on the same binary, 3 scenes (mean):
+observations without re-tuning either. A `w_occ` sweep in {3.0, 6.0, 12.0, 24.0}
+batched located the compensating weight at 6.0; the 8-scene arm at that weight
+grades **ambiguous on all six metrics** against un-batched `w_occ` 1.5, with
+every mean small and the union mean *below* MATERIAL:
 
-| | ship w1.5 | w3.0 | **w6.0** | w12.0 | w24.0 | un-batched w1.5 |
-|---|---|---|---|---|---|---|
-| union mIoU | 0.3362 | 0.3708 | **0.3797** | 0.3747 | 0.3656 | 0.3800 |
-| occupancy IoU | 0.4504 | 0.5022 | **0.5176** | 0.5118 | 0.4981 | 0.5177 |
-| recall | 0.5607 | 0.6780 | 0.7592 | 0.8143 | 0.8527 | 0.7572 |
+| vs un-batched w1.5 | mean Δ | 95 % CI | p_exact | sign |
+|---|---|---|---|---|
+| union mIoU | **+0.0008** | [−0.0032, +0.0049] | 0.4609 | 5+/3− |
+| intersection mIoU | +0.0050 | [−0.0054, +0.0153] | 0.3828 | 6+/2− |
+| occupancy IoU | −0.0001 | [−0.0099, +0.0098] | 0.7422 | 4+/4− |
+| precision | +0.0032 | [−0.0087, +0.0151] | 0.5469 | 5+/3− |
+| recall | −0.0098 | [−0.0241, +0.0046] | 0.1484 | 2+/6− |
+| `n_pred_occupied` | −850 | [−2081, +381] | 0.1094 | 1+/7− |
 
-Batched `w_occ` 6.0 reproduces the un-batched arm to four decimals on all three,
-with voxel counts within ~1 %. The factor is ~4x rather than the 10-100x a
+Ambiguous, not inert: the union SE is ~0.0021 against the 0.00042 an inert
+verdict needs. The claim is "no material difference detected at n = 8", not
+"identical". The compensating factor is ~4x rather than the 10-100x a
 pixel-footprint argument suggests, because the carve is staged too
 (`CarveStage`, per-voxel MAX): `a_occ` and `b_free` shrink together and only the
 per-voxel hit:carve imbalance moves.
+
+Against the *shipped* batched point, `w_occ` 6.0 is a trade and not an upgrade:
+occupancy IoU +0.0380 (material, 6+/2−), recall +0.1647 (material, 8/8) and
+`n_pred_occupied` +10 053 (material, 8/8), against precision −0.0631 (material,
+8/8) and intersection mIoU −0.0241 (material, 8/8) — the mirror of the +0.0290
+batching bought. Union, the deciding metric, is **+0.0192 ambiguous (5+/3−)** and
+does not separate.
 
 That collapses the trade. Traversal volume is byte-identical across all arms
 (scene 016: 6 493 044 570 voxels on each), so batching's ~11 % is entirely

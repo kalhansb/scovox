@@ -170,14 +170,18 @@ baseline loses it 8/8).
 > did not cost the numbers; batching moved them.
 >
 > Batching is a **reparameterization**, not a separate optimization: sweeping
-> `w_occ` batched recovers the un-batched result exactly. Batched `w_occ` 6.0
-> matches un-batched `w_occ` 1.5 to four decimals on union mIoU (0.3797 vs
-> 0.3800), occupancy IoU (0.5176 vs 0.5177) and recall (0.7592 vs 0.7572), with
-> voxel counts within ~1 %. The ~4x factor is small because the carve is staged
-> as well, so `a_occ` and `b_free` shrink together. Traversal volume is
-> byte-identical across every arm, so batching's speed edge is the ~10 900
-> voxels it declines to write, and re-tuning `w_occ` costs it back:
-> `batch_hits` and `w_occ` are two dials on one speed/completeness axis.
+> `w_occ` batched recovers the un-batched result. Batched `w_occ` 6.0 against
+> un-batched `w_occ` 1.5 grades **ambiguous on all six metrics at n = 8**, union
+> mIoU +0.0008 (below MATERIAL), occupancy IoU −0.0001, recall −0.0098 — no
+> material difference detected, though the intervals are too wide for *inert*.
+> The ~4x factor is small because the carve is staged as well, so `a_occ` and
+> `b_free` shrink together. Traversal volume is byte-identical across every arm,
+> so batching's speed edge is the ~10 900 voxels it declines to write, and
+> re-tuning `w_occ` costs it back: `batch_hits` and `w_occ` are two dials on one
+> speed/completeness axis, and there is no free direction along it — only a
+> precise sparse map (shipped: union 0.2790, precision 0.5926, recall 0.5422) or
+> a complete imprecise one (w6.0: 0.2982 / 0.5295 / 0.7068), with union
+> ambiguous between them.
 >
 > Rankings are unaffected: every arm inside a published comparison ran on one
 > binary. Absolute values are stale until the ablation ring is re-run. Full
