@@ -35,7 +35,7 @@ static read could not have produced: an 8-scene re-score on the current binary.
 | M6 | Medium | Wire block runs hard-code `leaf_bits = 3` | open |
 | M7 | Medium | `evidence_saturation` is one knob for two caps | **partly resolved** — trap documented at the point of use |
 | M8 | Medium | Experiment write-ups still print the demoted build flag | **resolved** — plus a second error found in the same block |
-| M9 | Medium | `batch_hits` stages the endpoint only; the semantic band is un-batched | open — mIoU unaffected, but it inverts any confidence read |
+| M9 | Medium | `batch_hits` stages the endpoint only; the semantic band is un-batched | open — mIoU unaffected, but it inverts any confidence read; **deferred action plan recorded, run on request** |
 | L1 | Low | Stale byte-size and type-name comments | open |
 | L2 | Low | In-code references to moved or nonexistent documents | **partly resolved** — code swept; `scovox_slot_rules/scripts/` not |
 | L3 | Low | README document index broken by the archive move | **resolved** |
@@ -551,6 +551,33 @@ Not acted on. Batching the band, weighting it by `p_occ`, or dividing `kappa0` b
 the span would each change the deposited field and so every mIoU number; none is
 a free correction, and the band's mIoU value was measured in its present form.
 The near-term fix for an uncertainty consumer is to read `state`, not `p_occ`.
+
+**DEFERRED ACTION — run on request, do not start unprompted.** Three candidate
+corrections, cheapest first. All three are arms, not fixes: each must be graded
+before any of it is adopted.
+
+| # | arm | change | new knob |
+|---|---|---|---|
+| 1 | `band_batch` | stage the band deposit per (voxel, frame) as the endpoint already is — one deposit per band voxel per scan, strongest ray | `SemSplitParams::batch_band` |
+| 2 | `band_pocc` | deposit `kappa0 · p_occ` in the band instead of flat `kappa0`, i.e. `semantic_band_require_occ` without the hard gate | reuse `hit_flat_share`'s shape |
+| 3 | `band_norm` | divide `kappa0` by the band's voxel span so one measurement contributes one unit total | none — derived from `semantic_band_length / resolution` |
+
+Arm 1 is the one that targets the defect directly; 2 and 3 attack the
+correlation from the weight side and would also change the endpoint/band
+balance. They are not composable — grade separately before any pair.
+
+Protocol, unchanged from the rest of the suite: all 8 scenes, per-scene
+`--max-frames`, frame order untouched, ONE binary shared with a freshly-run
+control arm, graded by `scripts/paired_stats.py` `verdict(deltas, material=0.001)`
+on union mIoU and occupancy IoU. Log the result in `REVIEW_LOG.md` whichever way
+it lands.
+
+The catch worth stating up front: **mIoU cannot adjudicate this.** The defect is
+in a quantity no metric in the suite reads, and the scorer already excludes the
+affected voxels. An arm that leaves mIoU ambiguous has not thereby passed — it
+has only shown it costs nothing, and the benefit needs the calibration readout
+E3.1 / E3.2 in `docs/papers/experiment_plan.md`, which does not exist yet. Build
+that first or the ranking has no dependent variable.
 
 ---
 
