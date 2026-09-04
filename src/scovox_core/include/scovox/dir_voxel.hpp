@@ -225,10 +225,13 @@ struct DirVoxel {
   }
 };
 
-// Layout invariants. K_TOP=2 (production / paper default):
-//   sizeof == 4 (s_total) + 4·K_TOP (cnt) + 2·K_TOP (cls) = 4 + 12 = 16.
-// General K_TOP: 4 + 6·K_TOP, rounded up to 4-byte alignment for the trailing
-// uint16_t pair.
+// Layout invariants. The SHIPPED build is K_TOP=2 with SCOVOX_TRACK_QMAX=1 and
+// SCOVOX_TRACK_NHIT=0, which is 20 B: 4 (s_total) + 4·K_TOP (cnt) + 2·K_TOP
+// (cls) + 2·K_TOP (qmax). The 16 B figure below is the QMAX-off reference arm,
+// not the default — its assert is short-circuited in any shipped compile, so do
+// not read it as describing the production layout.
+// General K_TOP: 4 + kDirSlotBytes·K_TOP, rounded up to 4-byte alignment for
+// the trailing uint16_t pairs.
 /// 6 B per slot (4 cnt + 2 cls), or 8 B when the qmax confidence track is
 /// compiled in.
 constexpr std::size_t kDirSlotBytes =
@@ -239,10 +242,12 @@ static_assert(sizeof(DirVoxel) == kDirExpectedSize,
     "DirVoxel size mismatch — layout is 4 B fixed + 6 B per K_TOP slot "
     "(8 B with SCOVOX_TRACK_QMAX) rounded up to 4-byte alignment.");
 static_assert(SCOVOX_TRACK_QMAX || SCOVOX_TRACK_NHIT || K_TOP != 2 || sizeof(DirVoxel) == 16,
-    "Production K_TOP=2 invariant: DirVoxel must be exactly 16 B "
-    "(SemDirVoxel 20 B minus the 4 B FREE dimension moved to BetaVoxel).");
+    "K_TOP=2 reference arm (QMAX and NHIT both off): DirVoxel must be exactly "
+    "16 B (SemDirVoxel 20 B minus the 4 B FREE dimension moved to BetaVoxel). "
+    "This is NOT the shipped configuration; see the next assert.");
 static_assert(!SCOVOX_TRACK_QMAX || SCOVOX_TRACK_NHIT || K_TOP != 2 || sizeof(DirVoxel) == 20,
-    "K_TOP=2 with SCOVOX_TRACK_QMAX: 16 B + 2 B per slot confidence = 20 B.");
+    "SHIPPED layout — K_TOP=2 with SCOVOX_TRACK_QMAX: "
+    "16 B + 2 B per slot confidence = 20 B.");
 static_assert(std::is_trivial_v<DirVoxel>,
     "DirVoxel must be trivial for Bonxai's pool allocator (zero-init).");
 static_assert(std::is_standard_layout_v<DirVoxel>,
