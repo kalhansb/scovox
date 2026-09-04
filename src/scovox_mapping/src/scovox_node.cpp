@@ -306,6 +306,20 @@ public:
           : (sp.semantic_spread_radius > 0.f ? "SPREAD" : "endpoint"),
         sp.semantic_band_length, (int)sp.semantic_band_require_occ,
         sp.semantic_spread_radius);
+      // The rest of the deposit configuration, read back the same way and for
+      // the same reason. The node's own defaults are shared with the LiDAR
+      // deployments and are NOT the configuration the RGB-D results describe;
+      // config/scovox_best_method.yaml is. This line is what tells a reader
+      // which of the two actually ran, without diffing a launch file against
+      // a params file against a binary.
+      RCLCPP_INFO(get_logger(),
+        "deposit config: res=%.3f m w_occ=%.2f w_free=%.2f kappa0=%.2f "
+        "min_p_occ=%.2f evid_sat=%.1f cls_evid_sat=%.1f evict_by_conf=%d "
+        "num_classes=%u",
+        sp.resolution, sp.w_occ, sp.w_free, sp.kappa0,
+        sp.dirichlet_min_p_occ, sp.evidence_saturation,
+        sp.class_evidence_saturation, (int)sp.evict_by_confidence,
+        (unsigned)sp.num_classes);
     }
   }
   ~SCovoxNode() override {

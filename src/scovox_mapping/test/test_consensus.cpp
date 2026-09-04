@@ -404,10 +404,22 @@ TEST(SplitRefold, DirRefoldDependsOnSourceOrderAtThreeSources) {
 // Beta carries no truncation, so it is order-free semantically — but float
 // addition is not associative, so it is NOT bit-exact across fold orders. The
 // node folds Beta in unordered_map order (unsorted, unlike Dir), which is safe
-// precisely because the spread is rounding-scale: measured at ≤2 ULP
-// (relative ~1.5e-7) over 200k random 4-source draws in all 24 orders.
-// EXPECT_FLOAT_EQ's 4-ULP tolerance is the right assertion here; EXPECT_EQ on
-// the bits would be wrong and would flake.
+// precisely because the spread is rounding-scale: a few ULP, far under any
+// threshold the fused map is read through. EXPECT_FLOAT_EQ's 4-ULP tolerance is
+// the right assertion here; EXPECT_EQ on the bits would be wrong and would
+// flake.
+//
+// The fixture feeds one deliberately OFF-LATTICE parameter (1.2 is not a whole
+// multiple of `kBetaLatticeStep`), which the two storage modes hold
+// differently: float keeps it, fixed point rounds it to the nearest step. Both
+// are correct storage — the count identity in beta_voxel.hpp only promises
+// exactness for values ON the lattice, and a source arriving over the wire from
+// a peer with a different weight configuration is exactly how an off-lattice
+// parameter reaches a refold. So the sum assertion reads the parameters back
+// out of the sources rather than restating the constructor literals: the claim
+// under test is that the refold is ADDITIVE with one prior removed per extra
+// source, which holds in both modes, not that any particular float survives
+// storage, which does not.
 TEST(SplitRefold, BetaRefoldOrderInvariantToFloatTolerance) {
   scovox::BetaVoxel a{4.0f, 1.5f}, b{2.0f, 3.0f}, c{1.2f, 6.0f};
   const auto abc = scovox::refoldBeta({&a, &b, &c}, kC, kAlpha);
@@ -417,8 +429,11 @@ TEST(SplitRefold, BetaRefoldOrderInvariantToFloatTolerance) {
   EXPECT_FLOAT_EQ(abc.a_occ,  bca.a_occ);
   EXPECT_FLOAT_EQ(abc.a_free, cab.a_free);
   EXPECT_FLOAT_EQ(abc.a_free, bca.a_free);
-  // Additive with one prior removed per extra source: 4.0+2.0+1.2 − 2·prior.
-  EXPECT_FLOAT_EQ(abc.a_occ, 7.2f - 2.0f * scovox::kBetaOccPrior);
+  // Additive with one prior removed per extra source.
+  const float sum_occ  = float(a.a_occ)  + float(b.a_occ)  + float(c.a_occ);
+  const float sum_free = float(a.a_free) + float(b.a_free) + float(c.a_free);
+  EXPECT_FLOAT_EQ(abc.a_occ,  sum_occ  - 2.0f * scovox::kBetaOccPrior);
+  EXPECT_FLOAT_EQ(abc.a_free, sum_free - 2.0f * scovox::kBetaFreePrior);
 }
 
 // Finding 20 (at-prior skip path): a source sitting AT PRIOR contributes nothing

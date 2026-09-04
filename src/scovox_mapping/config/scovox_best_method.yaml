@@ -1,0 +1,96 @@
+# =======================================================================
+# SCovox — the promoted RGB-D configuration
+# =======================================================================
+# This file is the ROS-side transcription of the configuration that every
+# published SCovox number describes. Its authority is the replay harness:
+# `scovox_slot_rules/scovox_scenenn/src/replay_scenenn.cpp`, whose `Args`
+# defaults ARE the promoted configuration. Each value below is the same
+# value that struct carries.
+#
+# It exists because the node's own `dp()` defaults are NOT this
+# configuration and must not become it. Those defaults are shared with the
+# LiDAR deployments, which deliberately run a coarser, more confident
+# sensor model (`lidar_mapping.yaml` sets w_occ 8.0 from prob_hit ~ 0.9,
+# resolution 0.10). Moving the node defaults to the values below would
+# silently re-tune every LiDAR robot in the tree. So the promoted
+# configuration is a file you load, not a default you inherit.
+#
+# Load via:
+#   ros2 run scovox_mapping scovox_mapping_node \
+#       --ros-args --params-file <path>/scovox_best_method.yaml
+#
+# VERIFYING IT TOOK. The node logs the sanitised parameter set read back
+# out of the constructed map, never the launch argument -- one line for
+# the deposit rule and one "promoted config" line for the knobs below. A
+# binary predating a knob accepts the parameter and ignores it, which is
+# how a run silently measures a different mapper than the one it claims.
+# Grep the log for those two lines, not for the argument you passed.
+#
+# The `/**` wildcard makes this file apply regardless of the node's
+# namespace / name.
+# =======================================================================
+
+/**:
+  ros__parameters:
+
+    # ---- Lattice -------------------------------------------------------
+    resolution: 0.05
+
+    # ---- Occupancy (Stream A) ------------------------------------------
+    # w_occ 1.5 / w_free 1.0 is the RGB-D sensor model. The ratio matters
+    # more than the scale; this pair is the one that was swept.
+    w_occ:  1.5
+    w_free: 1.0
+
+    # ---- Semantics (Stream B) ------------------------------------------
+    kappa0: 1.0
+    num_classes: 14
+    max_semantic_classes: 14
+    semantic_mode: "dirichlet"
+    # Gate class evidence on the voxel already being believed occupied.
+    dirichlet_min_p_occ: 0.5
+    # 0 disables the saturation cap. The cap is shared between the Beta and
+    # Dirichlet grids, so capping semantics also caps occupancy; off is the
+    # configuration that was measured.
+    evidence_saturation: 0
+    # Admit on confidence rather than raw evidence when a slot is contested.
+    semantic_evict_by_confidence: true
+    # Deposit along the surface band rather than at the ray endpoint alone.
+    # require_occ false is the SLIM-VDB-style band: it deposits across the
+    # whole |sdf| <= band span without a per-voxel occupancy precondition.
+    semantic_band_length: 0.10
+    semantic_band_require_occ: false
+    semantic_spread_radius: 0.0
+
+    # ---- Geometry integration ------------------------------------------
+    # TSDF off: sdf_trunc collapses to 0, which is the tsdf_enabled = 0 the
+    # promoted runs used. Occupancy and semantics do not read the TSDF.
+    enable_tsdf: false
+    fused_walker: true
+    stride: 2
+    min_depth: 0.4
+    max_depth: 4.0
+    min_range: 0.4
+    max_range: 4.0
+    # Carve along rays that returned no depth, instead of dropping them.
+    trace_no_return_rays: true
+
+    # ---- Knobs deliberately left at their library defaults --------------
+    # inc_mode 0, hit_flat_share false, inc_thresh 0.10,
+    # class_evidence_saturation -1 (follow the shared cap), ray_spread 0.
+    # These five have no ROS parameter, and the promoted configuration wants
+    # exactly the value `SemSplitMap::Params` already declares for each, so
+    # this file does not need them. That is a property of THIS config, not a
+    # general one: a sweep that moves any of the five cannot be expressed
+    # here and has to go through the replay harness.
+    #
+    # One of the five is only conditionally at its promoted value. The replay
+    # that produced the promoted run passed `--class-evidence-saturation 0`
+    # explicitly; the library default is -1, which means "share whatever
+    # `evidence_saturation` is". Those agree here ONLY because
+    # `evidence_saturation` is 0 above, so both resolve to an uncapped class
+    # channel. Raising `evidence_saturation` in this file therefore does not
+    # cap one channel -- it caps BOTH, silently, and the class cap is the one
+    # that moves semantics. Cap occupancy alone by adding an explicit
+    # `class_evidence_saturation: 0` here first, which needs the parameter to
+    # be exposed on the node.
