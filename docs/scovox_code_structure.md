@@ -85,13 +85,30 @@ TSDF truncation 3 fine voxels when the fine band is on (it is off here).
 
 1. **Ray setup.** Origin `O`, endpoint `E`, direction `u`, depth `d`. The fused
    walker runs one exact DDA over `[E − max(d, trunc)·u, E + max(trunc, band)·u]`
-   (`scovox_map_split.hpp:183-565`). `tsdf_enabled=0` does **not** make `trunc`
+   (`scovox_map_split.hpp:183-582`). `tsdf_enabled=0` does **not** make `trunc`
    0: the node passes `sdf_trunc = 0` but `TsdfMap::sanitise` (`tsdf_map.cpp:25`)
    clamps any `<= 0` back to 0.15 m, and the walker reads the sanitised value.
-   So the far end is `max(0.15, 0.10) = 0.15 m`, not the band's 0.10 m. Nothing
-   reads the deepest 0.05 m — the band gate is `sdf > −0.10`, the carve gate is
-   `sdf > 0`, and the TSDF write is off — so those voxels are traversed and
-   discarded, roughly one per ray. Never measured as a saving.
+   So `back_reach` (`:255`) is `max(0.15, 0.10) = 0.15 m`, not the band's 0.10 m,
+   and the segment handed to the DDA is the full 0.15 m even in the promoted
+   configuration.
+
+   That far end is **also the DDA's aim point**, which is why it is not simply
+   shortened. `ExactRayIterator` steers at the *centre* of `coord_to`
+   (`ray_iterator.hpp:29-57`), so `k_far` sets the direction of the whole
+   segment rather than only where it stops: moving it rotates the walk and
+   changes which voxels are crossed **in front of** the surface too, where every
+   write happens. A shortened `back_reach` changes the dumped map.
+
+   The dead tail is dropped by **ending the walk early** instead (`:280-282`,
+   `:449-456`). When the TSDF cannot write — `!tsdf_enabled_`, a dynamic source,
+   or `geometry_off` — the semantic band is the only surviving behind-surface
+   write, so `useful_back = sem_band_` (0 with the band off). Inside
+   `exact_body`, a voxel behind the surface whose exact along-ray offset
+   `t = −(v_point_voxel · u)` has reached `useful_back` latches `stop_walk` and
+   the DDA callback returns `false`. `t` is non-decreasing along the walk (each
+   DDA step adds `res·|u_i| ≥ 0`) and `dist ≥ t` always, so every remaining
+   voxel is decided: the carve needs `sdf > 0`, the band needs `dist ≤ sem_band_`.
+   Verified as **byte identity** of the dumped map, not as equal mIoU.
 2. **Far voxels** (further than `trunc + h` before the hit) take the far-skip
    or far-carve shortcut (`:273-276`, `:318-322`): carve staged into
    `CarveStage`, no per-voxel float body. Both shortcuts are asserted

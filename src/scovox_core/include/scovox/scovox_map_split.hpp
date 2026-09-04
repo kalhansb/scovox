@@ -243,7 +243,44 @@ class ScovoxMapSplit {
     // KITTI — this is the old expression exactly and costs no extra steps.
     // Voxels gained beyond trunc have sdf ≤ −trunc, which applyBandUpdate drops
     // and the semCarve gate (sdf > 0) never sees, so TSDF/occupancy are unmoved.
+    //
+    // This is also the DDA's aim point, and that is why it is not trimmed when
+    // part of it is dead. ExactRayIterator steers at the CENTRE of `coord_to`
+    // (see its caveat), so `k_far` sets the direction of the whole segment, not
+    // just where it ends: shortening it rotates the walk and changes which
+    // voxels are crossed IN FRONT of the surface too, where every write
+    // actually happens. Measured rather than argued — a shortened `k_far`
+    // changes the dump. The dead tail is dropped by ending the walk early
+    // instead; see `trim_tail` below.
     const float back_reach = band_active ? std::max(trunc, sem_band_) : trunc;
+
+    // Behind-surface tail trim. `TsdfMap::sanitise` re-clamps a non-positive
+    // `sdf_trunc` back to 0.15 m, so a ray integrated with the TSDF switched
+    // off still carries a positive `trunc` into `back_reach` and walks past the
+    // surface for a band that reaches nowhere near as deep — at trunc 0.15,
+    // band 0.10, res 0.05 that is the deepest 0.05 m of every ray, and the
+    // exact DDA crosses ~1.8 voxels per voxel of extent.
+    //
+    // Armed only when the TSDF cannot write this ray, which makes the semantic
+    // band the ONLY surviving behind-surface write and `useful_back` exactly
+    // its reach. The reduction is then exact. Behind the hit the carve gate
+    // (sdf > 0) cannot fire and the band gate needs `dist < sem_band_`; the
+    // stop is taken on the ALONG-RAY offset `t` past the hit, which satisfies
+    // `dist >= t` and is non-decreasing along the walk (the iterator steps one
+    // axis at a time and always in the direction of travel, so each step adds
+    // `res·|u_i| >= 0` to it). So the first voxel with `t >= useful_back`
+    // proves every later voxel is outside the band as well.
+    //
+    // `t` is measured, not bounded from `dist`. Bounding it costs a squared
+    // compare instead of a dot product and is wrong here: the bound needs the
+    // voxel centre's offset from the TRUE ray, while the half-voxel-diagonal
+    // guarantee is against the AIMED segment, and the two differ by up to
+    // another half diagonal. Using the tighter bound stops the walk one voxel
+    // early on the rays where those two deviations add, and the dump says so.
+    const bool  tsdf_writes = tsdf_enabled_ && !is_dynamic && !geometry_off;
+    const float useful_back = band_active ? sem_band_ : 0.f;
+    const bool  trim_tail   = !tsdf_writes && useful_back < back_reach;
+
     const Eigen::Vector3f start_pos = endpoint - walk_back * u;
     const Eigen::Vector3f end_pos   = endpoint + back_reach * u;
 
@@ -353,6 +390,9 @@ class ScovoxMapSplit {
     // per-voxel std::function indirect call (weight_fn(sdf) ≡ 1.0f here).
     constexpr float tsdf_weight = 1.0f;
     bool carve_blocked = false;
+    // Set by the behind-surface tail trim; ends the DDA loop, never the
+    // explicit visit_one(k_far)/visit_one(k_hit) that follow it.
+    bool stop_walk = false;
     // Latched once the walk is provably clear of the origin guard ring
     // for the rest of THIS ray; see the latch site below.
     bool ring_left = false;
@@ -401,6 +441,20 @@ class ScovoxMapSplit {
       if (std::fabs(proj) < 1e-12f) return;
       const float sign = (proj > 0.f) ? 1.f : -1.f;
       const float sdf  = sign * dist;
+
+      // Behind-surface tail trim (armed above, and only when the TSDF cannot
+      // write). The `sdf < 0` test keeps the dot product off the front of the
+      // ray, which is all but a few voxels of it. Every gate below is already
+      // decided for this voxel: the carve needs sdf > 0, the band needs
+      // dist < sem_band_ = useful_back and dist >= t — so returning here drops
+      // nothing, and latching the stop drops nothing for the rest of the walk.
+      if (trim_tail && sdf < 0.f) {
+        const float t_back = -v_point_voxel.dot(u);  // offset past the hit
+        if (t_back >= useful_back) {
+          stop_walk = true;
+          return;
+        }
+      }
 
       // (1) TSDF band update — gate + clamp + Curless–Levoy. The fused walker
       // always walks back to the origin (walk_back = max(depth, trunc)), so the
@@ -523,7 +577,7 @@ class ScovoxMapSplit {
       ExactRayIterator(start_pos.cast<double>(), k0, k_far, res,
                        [&](const CoordT& c) -> bool {
                          visit_one(c);
-                         return true;
+                         return !stop_walk;
                        });
       visit_one(k_far);
       if (!k_hit_visited && k_hit != k_far && k_hit != k0) {
@@ -582,9 +636,17 @@ class ScovoxMapSplit {
     // Dynamic rays write no persistent TSDF (no ghost surface); the carve inside
     // semsplit_.integrateHit stays persistent, only the endpoint routes. A
     // geometry-off source (RGB-D overlay) also writes no TSDF — geometry stays
-    // LiDAR-only (parity with the fused walker's band-write gate). That gate
-    // also tests tsdf_enabled_ and this one does not.
-    if (!is_dynamic && !(prof && prof->geometry_off)) tsdf_.integrateRay(origin, endpoint);
+    // LiDAR-only (parity with the fused walker's band-write gate).
+    //
+    // `tsdf_enabled_` is tested here for the same reason, so the flag means one
+    // thing on both walkers. It did not use to be: this path ran the whole
+    // `TsdfMap::integrateRay` DDA — a second traversal of its own, not a few
+    // voxels tacked onto a shared one — and filled a grid the flag declares
+    // unread. A split-path run therefore paid in full for a TSDF it had
+    // switched off, and any fused-vs-split comparison taken with the flag off
+    // had one walker doing that work and one not.
+    if (tsdf_enabled_ && !is_dynamic && !(prof && prof->geometry_off))
+      tsdf_.integrateRay(origin, endpoint);
     const auto t1 = clk::now();
     semsplit_.integrateHit(origin, endpoint, sem_probs, is_dynamic, prof);
     const auto t2 = clk::now();
