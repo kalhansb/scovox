@@ -75,6 +75,18 @@
     # Carve along rays that returned no depth, instead of dropping them.
     trace_no_return_rays: true
 
+    # One deposit per voxel per frame -- the frame's strongest ray -- rather than
+    # one per depth pixel that landed in the voxel. This sets what a unit of
+    # evidence MEANS: batched, `a_occ` and the class counts accumulate
+    # observations; un-batched, they accumulate pixels, and a 640x480 frame puts
+    # hundreds of pixels into one surface voxel. The two therefore reach the
+    # `p_occ` gate at completely different rates, so this is not a performance
+    # knob -- flipping it makes every occupancy and mIoU number incomparable.
+    # It is true here, true in `SemSplitParams`, and true at the node default;
+    # it is listed explicitly because it is the knob most likely to be changed
+    # by someone who thinks it only affects speed.
+    batch_hits: true
+
     # ---- Knobs deliberately left at their library defaults --------------
     # inc_mode 0, hit_flat_share false, inc_thresh 0.10,
     # class_evidence_saturation -1 (follow the shared cap), ray_spread 0.

@@ -7,10 +7,11 @@ This document has two halves that deliberately do not agree with each other.
   comes from. It is defined by the offline replay driver in the sibling
   repository (`scovox_slot_rules/scovox_scenenn/src/replay_scenenn.cpp`) and
   by the archived write-up `docs/archive/design/best_method.md`.
-- **§2 The current code** is the working tree of this repository as of
-  2026-09-04: commit `d5da6a8` plus 31 uncommitted source files (the
-  `DirVoxel` total-basis change, `nhit` removal, `SCOVOX_BETA_U16` default
-  flip and the matching test edits are all uncommitted — see `git status`).
+- **§2 The current code** is this repository at commit `33aa576`. The
+  `DirVoxel` total-basis change, the `nhit` removal and the `SCOVOX_BETA_U16`
+  default flip were committed in `1101e53`; the promoted-configuration file and
+  an off-lattice test fix in `33aa576`. They were uncommitted when this
+  document was first written.
 - **§3 The gap** lists every place where the code has not been brought up to
   the best method. The library defaults and the replay already match; the
   ROS node, its launch files and its config files do not.
@@ -141,9 +142,40 @@ byte-identical without `nhit`. 20 B is the shipped size.
 | throughput | 6.2–6.7 fps |
 
 Union mIoU is the number to use for cross-mapper comparison (the SLIM-VDB
-baseline loses it 8/8). The `RESULTS.md` deliverable block at line 31 still
-prints `SCOVOX_EVICT_INHERIT=3`; that is stale — `i3` was demoted and `i0`
-promoted, and the code now refuses `i3` at compile time.
+baseline loses it 8/8).
+
+> **These scores do not describe the code in §2.** They were produced by
+> `.build/e5/k2_i0_evid/replay_scenenn`, md5 `60e17da907d0`, built
+> **2026-08-30**. Three commits since then change what the deposit path does:
+> `e316f07` (hit batching default-on, `uint16` Beta), `d5da6a8` (the exact walk
+> replaces Bresenham) and `1101e53` (count storage). Re-running the promoted arm
+> on the current binary, same CLI and same frames, moves occupancy IoU by −0.029
+> on scene 016 and −0.062 on 015: `n_pred_occupied` falls ~26 %, precision
+> rises, recall falls, intersection mIoU rises, union mIoU falls. Ray counts are
+> byte-identical between the two, so the input is the same and the difference is
+> in what the walk deposits.
+>
+> The cause is **hit batching** (§1.3 step 4), not traversal — now measured, not
+> inferred. Batched, `a_occ` counts observations; un-batched it counted pixels,
+> and a 640×480 frame puts hundreds of pixels in one surface voxel, so the two
+> reach the fixed `p_occ ≥ 0.5` gate at completely different rates. The
+> `--batch-hits 0|1` A/B on one binary, 8 scenes, attributes **91–96 % of every
+> component** of the shift to batching: `n_pred_occupied` −10 903 of −11 566,
+> recall −0.1744 of −0.1850, precision +0.0663 of +0.0690, intersection mIoU
+> +0.0290 of +0.0318, union mIoU −0.0184 of −0.0191.
+>
+> The residual — exact DDA plus count storage together — is small and, on
+> semantics, **immaterial**: union mIoU −0.00070, below the 0.001 threshold in
+> magnitude; occupancy IoU −0.0018; recall −0.011. The traversal correctness fix
+> did not cost the numbers; batching moved them.
+>
+> Rankings are unaffected: every arm inside a published comparison ran on one
+> binary. Absolute values are stale until the ablation ring is re-run. Full
+> finding: `docs/code/code_review_2026_09_04.md` §H4.
+
+The `RESULTS.md` deliverable block at line 31 has been corrected to
+`SCOVOX_EVICT_INHERIT=0`, along with the headline table, which had been
+reporting the demoted `i3` arm.
 
 ---
 
@@ -290,8 +322,10 @@ Curless–Levoy over `TsdfVoxel`; `Params::sdf_trunc` 0.15 clamped positive,
 per-voxel tail the fused walker calls), weighting factories `constant` /
 `linear` / `exponential` / `rangeDecay`, `drainTouched` / `clearTouched`,
 `forEachVoxel` (centres, not corners). The header still names the
-deleted `SemBetaMap` (`:15-17`, `:49`) and cites a nonexistent
-`feedback_slimvdb_memory_measurement.md` (`:151`).
+deleted `SemBetaMap` (`:15-17`, `:49`). The nonexistent
+`feedback_slimvdb_memory_measurement.md` citation was removed in `1101e53`;
+what remains near `:162` are pointers to `slimvdb_pipelines/*.cpp`, which are
+source files, not documents.
 
 #### Wire format (`binary_serializer.hpp`, `lz4_codec.hpp`)
 
@@ -537,6 +571,27 @@ before it. Anyone launching `scovox_mapping_node` without a params file gets a
 band-off, evict-by-evidence, `w_occ` 2.0 mapper that no published number
 describes.
 
+**Addressed in `33aa576`, without moving these defaults.** They are shared with
+the LiDAR deployments, which run a coarser, more confident sensor model on
+purpose (`lidar_mapping.yaml` derives `w_occ: 8.0` from `prob_hit ≈ 0.9` at
+resolution 0.10), so re-tuning them here would silently re-tune those. The
+promoted RGB-D configuration is a file you load instead:
+
+```
+ros2 run scovox_mapping scovox_mapping_node --ros-args \
+    --params-file src/scovox_mapping/config/scovox_best_method.yaml
+```
+
+Every value in it was transcribed from the replay `Args` and checked against
+that struct line by line. The table above therefore still describes the *bare*
+node and is still the reason the config file has to exist — it is not stale.
+
+To verify the file took effect, read the node's log rather than the launch
+arguments: `scovox_node.cpp:309-322` prints a `deposit config:` line beside the
+existing TSDF line at `:288`, both read out of the **constructed map**. A binary
+that predates a knob accepts the parameter and ignores it, and only the readback
+shows that.
+
 ### 3.2 Knobs the node cannot set at all
 
 `hit_flat_share`, `inc_mode`, `inc_thresh`, `class_evidence_saturation`,
@@ -545,6 +600,14 @@ describes.
 to equal the best method, so the node is correct by accident; none of the
 ablation arms behind them can be reproduced through ROS. The node prints
 `far_voxel_fast_paths` (`:288`) as if it were configurable.
+
+`class_evidence_saturation` is the one that bites. Its default is −1, meaning
+"share whatever `evidence_saturation` is", while the promoted replay passed 0
+explicitly. Those agree **only** while `evidence_saturation` is 0 — so raising
+`evidence_saturation` in `scovox_best_method.yaml` does not cap one channel, it
+caps both, and the class cap is the one that moves semantics. Capping occupancy
+alone requires exposing the parameter first. The trap is written into the yaml
+at the line where someone would spring it.
 
 ### 3.3 No readout policy in the node
 
@@ -570,6 +633,16 @@ in the consumer.
 - The LiDAR configs (`w_occ` 8, `w_free` 4, res 0.10) are a different
   operating point by design, not a gap; they are listed so nobody reads them
   as the best method.
+- `scovox_best_method.yaml` (added `33aa576`) is the promoted RGB-D
+  configuration, under a `/**:` wildcard so it applies at any node namespace or
+  name. The launch files above still do **not** load it — passing
+  `--params-file` is manual for now, and wiring it into the RGB-D launch files
+  is the remaining half of §3.1.
+- The yaml lists `batch_hits: true` explicitly even though it is already the
+  default in all three places (library, node, replay). It is spelled out because
+  it is the largest single lever on the numbers in §1.5 and the one most likely
+  to be flipped by someone who reads it as a speed knob: it sets whether a unit
+  of evidence is an observation or a pixel.
 
 ### 3.5 Code defects that touch the method
 
@@ -581,8 +654,13 @@ in the consumer.
   therefore not a measurement.
 - `evidence_saturation` caps Beta and, through `class_evidence_saturation
   = −1`, Dir as well; the node exposes only the shared value.
-- One known failing test (`FarCarveBitIdenticalToFullWalk`, 180/181 in the
-  last recorded run).
+- One known failing test, `FarCarveBitIdenticalToFullWalk`. Re-measured on the
+  full `./dev.sh ros-test` gate: **323 tests, 2 failures**, which is this one
+  failure counted twice (colcon reports the gtest case and the package's CTest
+  aggregate). It is still the only one.
+- The numbers in §1.5 predate three commits to the deposit path and no longer
+  describe this code. See the box in §1.5 and `code_review_2026_09_04.md` §H4;
+  re-basing them is a re-run of the ablation ring, not a doc edit.
 
 ### 3.6 Stale text inside the code
 
@@ -591,9 +669,16 @@ in the consumer.
 "16 B at K_TOP=2" — corrected further down at `:96`); `beta_voxel.hpp:17-20`
 ("16 B DirVoxel"); `tsdf_voxel.hpp:11` (`SemBetaVoxel`);
 `binary_serializer.hpp:182-183` (u16 quantisation); `wire_study.py:1-12` (v5
-layout, 28 B Dir records). In-code links to documents that moved to
-`docs/archive/` or never existed are listed in
-`docs/code/code_review_2026_09_04.md` §L2.
+layout, 28 B Dir records).
+
+The `.md` citations are a separate matter and are **done inside this
+repository**: `1101e53` swept `src`, `config` and `README.md` under the standing
+rule that code comments cite no document paths and carry no experiment results —
+those live in memory and `REVIEW_LOG.md`. Roughly 50 citations remain in
+`scovox_slot_rules/scripts/*.py|*.sh` and are audited but not edited:
+`DESIGN.md` ×12 (never existed in either repo's history — deletion may be the
+right fix, not a repoint), `FINDINGS.md` ×9 and `PLAN.md` ×5 (simple
+`archive/` prefix edits). See `docs/code/code_review_2026_09_04.md` §L2.
 
 ### 3.7 What already matches
 
@@ -603,4 +688,13 @@ defaults, `batch_hits` / `batch_free_carve`, `dir_leaf_bits` 2, `alpha_0`
 0.01, `dirichlet_min_p_occ` 0.5, `num_classes` 14, `semantic_mode`
 Dirichlet, the exact DDA as the only traversal, the `DirVoxel` total basis,
 and every replay `Args` default. The library, built as-is, is the best
-method; only the ROS surface around it is behind.
+method; only the ROS surface around it is behind — and since `33aa576` that gap
+is bridgeable by loading `config/scovox_best_method.yaml`, with the node's
+`deposit config:` readback (`:309-322`) to prove it took.
+
+Two caveats on "the library is the best method". First, "best method" here means
+the configuration the campaign selected, which is not the same as the
+configuration the published numbers were measured under: see the box in §1.5.
+Second, the storage state is verified by `./dev.sh ros-test` (323 cases), not by
+`./dev.sh test` — the 182-case core suite cannot see `scovox_mapping`, and a
+storage change graded only by it will pass while broken.

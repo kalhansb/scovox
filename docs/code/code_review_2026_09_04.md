@@ -12,31 +12,127 @@ predates the split-grid refactor and is superseded in full.
 `file:line`; line numbers are working-tree numbers on 2026-09-04. Companion
 document: `docs/scovox_code_structure.md` (best method vs current code).
 
+**Status — updated 2026-09-04, later the same day.** The review was read-only,
+but the work it prompted is not, so each finding now carries a status and the
+resolved ones say what was done and where. Line numbers in a finding are the
+ones it was written against; where a fix moved them, the resolution note gives
+the new location. One finding (H4) was added after the review, from evidence a
+static read could not have produced: an 8-scene re-score on the current binary.
+
 ## Summary
 
-| id | severity | finding |
-|---|---|---|
-| H1 | High | `scovox_node` defaults are not the promoted configuration |
-| H2 | High | The promoted state is uncommitted (31 files since `d5da6a8`) |
-| H3 | High | `integrateHitSplit` ignores `tsdf_enabled` |
-| M1 | Medium | Four parameter structs with four sets of defaults |
-| M2 | Medium | Six library knobs have no ROS parameter |
-| M3 | Medium | `range_decay_length` is dead in the split path but still documented as a weight |
-| M4 | Medium | One known failing test, `FarCarveBitIdenticalToFullWalk` |
-| M5 | Medium | `dscovox` fused grids ignore `dir_leaf_bits`; first pose wins; fold order matters |
-| M6 | Medium | Wire block runs hard-code `leaf_bits = 3` |
-| M7 | Medium | `evidence_saturation` is one knob for two caps |
-| M8 | Medium | Experiment write-ups still print the demoted build flag |
-| L1 | Low | Stale byte-size and type-name comments |
-| L2 | Low | In-code references to moved or nonexistent documents |
-| L3 | Low | README document index broken by the archive move |
-| L4 | Low | Legacy voxel / map types still compiled and tested |
-| L5 | Low | Stale tool and comment text around the wire format |
-| L6 | Low | `downsample_voxel_size` default described two ways |
+| id | severity | finding | status |
+|---|---|---|---|
+| H4 | **High** | **The published numbers do not describe the code in the tree** | **open — needs a re-run, not an edit** |
+| H1 | High | `scovox_node` defaults are not the promoted configuration | **resolved** — `config/scovox_best_method.yaml`, commit `33aa576` |
+| H2 | High | The promoted state is uncommitted (31 files since `d5da6a8`) | **resolved** — `1101e53`, `33aa576` |
+| H3 | High | `integrateHitSplit` ignores `tsdf_enabled` | open |
+| M1 | Medium | Four parameter structs with four sets of defaults | open |
+| M2 | Medium | Six library knobs have no ROS parameter | open — now cross-referenced from the yaml |
+| M3 | Medium | `range_decay_length` is dead in the split path but still documented as a weight | open |
+| M4 | Medium | One known failing test, `FarCarveBitIdenticalToFullWalk` | open — but re-measured, and a second failure found and fixed |
+| M5 | Medium | `dscovox` fused grids ignore `dir_leaf_bits`; first pose wins; fold order matters | open |
+| M6 | Medium | Wire block runs hard-code `leaf_bits = 3` | open |
+| M7 | Medium | `evidence_saturation` is one knob for two caps | **partly resolved** — trap documented at the point of use |
+| M8 | Medium | Experiment write-ups still print the demoted build flag | **resolved** — plus a second error found in the same block |
+| L1 | Low | Stale byte-size and type-name comments | open |
+| L2 | Low | In-code references to moved or nonexistent documents | **partly resolved** — code swept; `scovox_slot_rules/scripts/` not |
+| L3 | Low | README document index broken by the archive move | **resolved** |
+| L4 | Low | Legacy voxel / map types still compiled and tested | open |
+| L5 | Low | Stale tool and comment text around the wire format | open |
+| L6 | Low | `downsample_voxel_size` default described two ways | open |
 
 ---
 
 ## High
+
+### H4 — The published numbers do not describe the code in the tree
+
+*Added 2026-09-04 after the review, from an 8-scene re-score. A static read
+could not have found this one.*
+
+**Where.** `scovox_slot_rules/results_*/scenes/*.json` (every published scene
+JSON) against the current `sem_split_map.cpp` / `ray_iterator.hpp`.
+
+**Evidence.** Every baseline in `results_e9` was produced by
+`.build/e5/k2_i0_evid/replay_scenenn`, md5 `60e17da907d0`, built
+**2026-08-30 04:48**. Three commits after that change what the deposit path
+does: `e316f07` (hit batching default-on, `uint16` Beta), `d5da6a8` (the exact
+Amanatides & Woo walk replaces Bresenham unconditionally) and `1101e53` (the
+count-storage promotion). Re-running the promoted arm on the current binary —
+same CLI, same frames, same trajectory — does not reproduce the published
+numbers:
+
+| scene 016 | published | current binary |
+|---|---|---|
+| `n_pred_occupied` | 20 230 | 14 939 |
+| precision | 0.6754 | 0.7587 |
+| recall | 0.8178 | 0.6784 |
+| occupancy IoU | 0.5870 | 0.5580 |
+| intersection mIoU | 0.5907 | 0.6070 |
+| union mIoU | 0.38293 | 0.38069 |
+
+Scene 015 moves further: union −0.0381, occupancy IoU −0.0618, intersection
++0.0166. Both arms fire byte-identical ray counts (016: 87 197 891 hits,
+12 641 878 no-return carves), so the input is identical and the difference is
+in what the walk deposits.
+
+**Leading cause: hit batching, not traversal.** `sem_split_map.cpp:606-614`
+stages a surface hit and keeps only the frame's strongest ray for that voxel
+(`if (!st.staged || w > st.w_occ_share)`), flushing one deposit per scan. A
+640×480 frame puts hundreds of rays into one surface voxel, so un-batched
+`a_occ` and `cnt[]` counted *pixels* and batched they count *observations*.
+Against a fixed `p_occ >= 0.5` gate that is a large, direct reduction in voxels
+called occupied — precision up, recall down, which is the signature measured.
+The storage-basis change is excluded by magnitude: it is ≤ 1 ULP on the wire
+round trip, and 1 ULP cannot produce −0.038 mIoU.
+
+**Impact.** Two things, of different kinds. The published *rankings* survive —
+every arm inside a comparison ran on one binary, so no promotion decision is
+invalidated. The published *absolute values* do not describe the shipped
+mapper, and, more sharply, **any A/B grading a post-2026-08-30 change against
+these baselines is confounded**, which retires the cheapest available
+regression gate.
+
+**Attribution, measured.** The `--batch-hits 0|1` A/B was run on one binary,
+8 scenes, same CLI and frames. **Batching accounts for 91-96 % of every
+component of the delta**, and the residual left for traversal plus storage is
+small:
+
+| metric | total | batching alone | residual | batching's share |
+|---|---|---|---|---|
+| `n_pred_occupied` | −11 566 | −10 903 | −663 | 94 % |
+| recall | −0.1850 | −0.1744 | −0.0106 | 94 % |
+| precision | +0.0690 | +0.0663 | +0.0027 | 96 % |
+| intersection mIoU | +0.0318 | +0.0290 | +0.0028 | 91 % |
+| occupancy IoU | −0.0399 | −0.0381 | −0.0018 | 95 % |
+| union mIoU | −0.0191 | −0.0184 | −0.00070 | 96 % |
+
+The exact-DDA switch is therefore close to free on semantics: its whole residual
+on union mIoU is −0.00070, **below the 0.001 material threshold in magnitude**.
+It costs ~663 voxels and 0.011 recall per scene — consistent 8/8 in sign, but an
+order of magnitude under batching. The correctness fix did not buy a numbers
+problem; batching did.
+
+**What batching itself does** (one binary, no confound, `paired_stats` at
+MATERIAL 0.001): intersection mIoU **+0.0290** (material, 8/8), precision
+**+0.0663** (material, 8/8), recall **−0.1744** (material, 8/8), union mIoU
+−0.0184 (**ambiguous**, 4+/4−, dragged by scene 061 at −0.097), occupancy IoU
+−0.0381 (ambiguous, 2+/6−). Per-frame wall time is 8.4-13.5 % lower batched,
+8/8 — *suggestive only*: the two arms ran in consecutive sessions rather than
+interleaved, so that figure is not admissible as a timing result and needs an
+interleaved re-run.
+
+So batching trades a large recall loss and an unresolved headline for ~11 % speed
+and better-labelled surviving voxels. It is on by default in all three places.
+Whether that trade is wanted is a decision, not a defect, and it is **not** made
+in this document; the default has not been changed.
+
+**Fix.** Re-run the ablation ring on the current binary; this is a re-run, not
+an edit to `RESULTS.md`. `RESULTS.md` carries a provenance banner stating all of
+this until the re-run lands. Note that "ambiguous" here is not "inert": at n = 8
+an inert verdict needs SE < 0.00042, and these intervals are two orders of
+magnitude wider, so the shipped headline is **unknown**, not unchanged.
 
 ### H1 — `scovox_node` defaults are not the promoted configuration
 
@@ -67,6 +163,35 @@ a `config/scovox_best_method.yaml` and make every RGB-D launch file load it.
 Either way, print the effective `SemSplitMap::Params` at startup (the node
 already prints the TSDF line at `:288`) so a divergence is visible in the log.
 
+**Resolved (`33aa576`) — second option taken, deliberately.** Moving the twelve
+`dp()` defaults would have re-tuned the LiDAR deployments that share them:
+`config/lidar_mapping.yaml` derives `w_occ: 8.0` from `prob_hit ≈ 0.9` and runs
+at resolution 0.10 on purpose, so the "wrong" defaults are right for that
+sensor. The promoted RGB-D configuration is therefore a file you load, not a
+default you inherit: `config/scovox_best_method.yaml`, every value transcribed
+from the replay `Args` and checked line by line against it rather than copied
+from a summary.
+
+The readback half of the fix was taken too: `scovox_node.cpp:309-322` now logs
+a `deposit config:` line read out of the *constructed map*, next to the existing
+TSDF line, so a binary that predates a knob is visible in the log instead of
+silently ignoring the parameter. That check earned itself immediately — the
+first rebuild skipped `scovox_node.cpp` on a same-second timestamp, and grepping
+the linked binary for the new format string was what caught it. The exit code
+and the test count both looked green.
+
+Transcription surfaced one trap worth more than the copy itself, recorded at the
+point of use in the yaml: `class_evidence_saturation` has no ROS parameter and
+defaults to −1, "share whatever `evidence_saturation` is". The promoted replay
+passed 0 explicitly. Those agree **only** while `evidence_saturation` is 0, so
+raising it in this file caps both channels, not one — and the class cap is the
+one that moves semantics. See M7.
+
+One knob was added to the yaml that the review did not flag, because H4 later
+showed it to be the largest single lever in the file: `batch_hits: true`. It is
+already the default in all three places, so nothing changes by writing it down —
+it is listed so that someone who thinks it is a speed knob reads why it is not.
+
 ### H2 — The promoted state is uncommitted
 
 **Where.** `git status`: 31 modified tracked source files, 1 086 insertions /
@@ -90,6 +215,18 @@ has no commit hash. A `git stash` or a fresh clone silently reverts to the
 **Fix.** Commit the working tree as one or two reviewed commits (storage
 defaults; total basis + nhit removal) before any further experiment, and
 record the hash in `RESULTS.md`'s MANIFEST lines.
+
+**Resolved.** `1101e53` ("Promote the count-storage design; take doc pointers
+and results out of code") carries the total basis, the `nhit` removal and the
+`SCOVOX_BETA_U16` default flip; `33aa576` carries the config file and a test
+fix. The archived design notes are committed with them.
+
+Two things the fix taught, both recorded rather than assumed. `./dev.sh test`
+runs 182 core cases and **cannot see `scovox_mapping` at all** — a storage
+change has to be graded by `./dev.sh ros-test` (323 cases), and doing so found a
+real failure the core suite was structurally blind to (M4). And the promoted
+state is now reachable by hash, which is what makes H4 diagnosable at all: the
+published binary predates three of these commits.
 
 ### H3 — `integrateHitSplit` ignores `tsdf_enabled`
 
@@ -202,6 +339,33 @@ passes, "bit-identical" is a claim, not a result. The replay's
 the `band=0.30` arm exercises the `max(trunc, sem_band)` far end and is the
 likely culprit given the total-basis rewrite of `dirichletUpdate`.
 
+**Re-measured, and a second failure found.** The full `./dev.sh ros-test` gate
+now reports **323 tests, 2 failures**. The two are not two bugs: colcon
+double-counts, since each gtest failure also lands in that package's CTest
+`Testing/<date>/Test.xml` aggregate. Two reported failures is **one** distinct
+gtest failure — `FarCarveBitIdenticalToFullWalk`, still open, still as described
+above.
+
+Running the wider suite for the first time did find a genuinely new failure,
+since fixed: `scovox_mapping/test/test_consensus.cpp`,
+`SplitRefold.BetaRefoldOrderInvariantToFloatTolerance`. It was **not**
+pre-existing — the `SCOVOX_BETA_U16` default flip caused it. The fixture builds
+`BetaVoxel c{1.2f, 6.0f}`, and 1.2 is off the 1/8 storage lattice, so fixed
+point rounds it to 1.25 and the hand-computed `7.2f − 2·prior` stopped
+describing the sum. None of the four order-invariance assertions moved; only the
+literal did.
+
+That is worth more than the one test. The byte-identity result behind the
+`BETA_U16` promotion was measured on replay, where every parameter is
+`prior + w·n` and therefore *on* the lattice by construction. It does not extend
+to a value arriving from elsewhere — and a peer with a different weight
+configuration handing a refold an off-lattice parameter over the wire is exactly
+how that happens. This fixture was, unintentionally, the only test in either
+suite covering that case. The assertion now reads the parameters back out of the
+source voxels instead of restating the constructor literals, so it tests the
+claim that actually holds in both storage modes: the refold is additive with one
+prior removed per extra source.
+
 ### M5 — `dscovox` fused grids ignore `dir_leaf_bits`; first pose wins; fold order matters
 
 **Where.** `src/scovox_mapping/src/dscovox_node.cpp:90-105` (`SourceGrid`),
@@ -257,6 +421,14 @@ way to keep u8 companding with an uncapped map.
 **Fix.** Separate `wire_evidence_scale` from `evidence_saturation`, and
 expose `class_evidence_saturation`.
 
+**Partly resolved — documented, not fixed.** Neither knob was separated; the
+coupling is real and still there. What changed is that it is now written down at
+the one place a person will meet it, in `config/scovox_best_method.yaml` beside
+`evidence_saturation: 0`, stating that the two caps agree here *only* because
+the value is 0 and that raising it silently caps semantics as well as occupancy.
+The structural fix (a separate `wire_evidence_scale`, plus a
+`class_evidence_saturation` ROS parameter) is unchanged and still wanted.
+
 ### M8 — Experiment write-ups still print the demoted build flag
 
 **Where.** `scovox_slot_rules/RESULTS.md:31` (deliverable block:
@@ -274,6 +446,36 @@ deliverable will not compile.
 **Fix.** Rewrite the `RESULTS.md` deliverable block to the §1.1 flags of the
 structure doc; add a one-line "20 B as shipped" correction to `best_method.md`
 or its successor.
+
+**Resolved, and the block held a second error.** The deliverable block now reads
+`SCOVOX_EVICT_INHERIT=0   no carry-over on eviction (i3 measured, demoted)`, so
+it compiles.
+
+Fixing it exposed a defect of a different kind: the block was not the only place
+describing the wrong arm. The **headline table** reported the `cand` (i3) numbers
+while the same document demotes i3 fifty lines further down, and the attribution
+paragraph named `e5/k2_i3_evid` as the candidate build. Recomputed from the
+stored per-scene JSONs with `scripts/paired_stats.py`:
+
+| block | quoted (i3, demoted) | shipped (i0) |
+|---|---|---|
+| union mIoU | 0.29893, +0.02921 | **0.29809, +0.02837** |
+| `with_unknown` mIoU | 0.58702, +0.05396 | **0.58532, +0.05226** |
+| occupancy IoU | 0.43926, +0.01682 | **identical** |
+
+Both stay `material` at p = 0.0078, 8/8, so no conclusion turns — the headline
+simply overstated the shipped pipeline by 0.00084 union and 0.00170
+intersection. Two details are worth keeping. The shipped arm and E4's
+`off_evid_i0` attribution control ran on the *same* binary (md5
+`60e17da907d0`), which makes that control stronger than it was written to be.
+And dropping i3 costs nothing on occupancy in the strongest available sense:
+**every field** of the occupancy block — predicted count, intersection,
+precision, recall, IoU, phantoms — is identical between the arms on all 8
+scenes, which is what a change confined to the class histogram should look like.
+
+Two counts in that section were already inconsistent before this correction and
+were **left alone rather than guessed at**: the prose says "six parts" and "six
+levels" where the ablation ring has five rows and declares family m = 5.
 
 ---
 
@@ -328,6 +530,18 @@ prefix; the four design docs now sit under `docs/archive/design/`):
 `e0_counters.hpp` also cites `scovox_node.cpp:860-863` for the eviction CSV,
 which is now `logEvictionDelta` at `:869-879`.
 
+**Partly resolved.** The sweep ran across `src`, `config` and `README.md`: the
+24 remaining `.md` references in code were removed or repointed in `1101e53`,
+under the standing rule that **code comments cite no document paths and carry no
+experiment results** — those live in memory and in `REVIEW_LOG.md`.
+
+**Not swept: `scovox_slot_rules/scripts/*.py|*.sh`**, ~50 references, audited and
+deliberately left for a decision. `DESIGN.md` ×12 — the target has never existed
+in either repo's git history, so there is nothing to repoint to and the right fix
+may be deletion. `FINDINGS.md` ×9 → `archive/FINDINGS.md` and `PLAN.md` ×5 →
+`archive/PLAN.md` are simple prefix edits. `a.md` ×3 is a false positive from
+`args.md` attribute access.
+
 ### L3 — README document index broken by the archive move
 
 `README.md:24-27` lists four design docs by their old paths, and `:123`,
@@ -336,6 +550,9 @@ which is now `logEvictionDelta` at `:869-879`.
 `docs/archive/`. The README was deliberately left untouched in this session;
 the fix is a six-line path edit plus links to
 `docs/scovox_code_structure.md` and this file.
+
+**Resolved** in `1101e53`: the six paths were corrected and the index now links
+`docs/scovox_code_structure.md` and this document.
 
 ### L4 — Legacy voxel / map types still compiled and tested
 
