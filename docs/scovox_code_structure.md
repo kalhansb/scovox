@@ -85,8 +85,13 @@ TSDF truncation 3 fine voxels when the fine band is on (it is off here).
 
 1. **Ray setup.** Origin `O`, endpoint `E`, direction `u`, depth `d`. The fused
    walker runs one exact DDA over `[E − max(d, trunc)·u, E + max(trunc, band)·u]`
-   (`scovox_map_split.hpp:183-565`). With `tsdf_enabled=0` the far end of the
-   range is the semantic band, 0.10 m past the hit.
+   (`scovox_map_split.hpp:183-565`). `tsdf_enabled=0` does **not** make `trunc`
+   0: the node passes `sdf_trunc = 0` but `TsdfMap::sanitise` (`tsdf_map.cpp:25`)
+   clamps any `<= 0` back to 0.15 m, and the walker reads the sanitised value.
+   So the far end is `max(0.15, 0.10) = 0.15 m`, not the band's 0.10 m. Nothing
+   reads the deepest 0.05 m — the band gate is `sdf > −0.10`, the carve gate is
+   `sdf > 0`, and the TSDF write is off — so those voxels are traversed and
+   discarded, roughly one per ray. Never measured as a saving.
 2. **Far voxels** (further than `trunc + h` before the hit) take the far-skip
    or far-carve shortcut (`:273-276`, `:318-322`): carve staged into
    `CarveStage`, no per-voxel float body. Both shortcuts are asserted
@@ -117,6 +122,34 @@ TSDF truncation 3 fine voxels when the fine band is on (it is off here).
    of `BetaCount::kMax` (≈ 5 460 hits at `w_occ` 1.5) is the only ceiling.
 9. **Readout** (replay dump, not the library): argmax over the K slots plus
    `other()`; voxels with `p_occ < 0.5` are written as unknown.
+
+#### Two things called "band", and four called "neighbour"
+
+Two lengths share the word *band* and are routinely conflated:
+
+| | knob | value | what it sets | active? |
+|---|---|---|---|---|
+| TSDF truncation band | `sdf_trunc` | 0.15 m | the shell around the surface where a TSDF value would be stored, and — because `back_reach = max(trunc, sem_band)` — how far past the hit the DDA walks | TSDF **writes off**; the length still sets the walk |
+| semantic band | `semantic_band_length` | 0.10 m | how far along the ray the class is deposited | **on** |
+
+They are independent numbers on the same axis. The semantic band borrows the
+TSDF band's *shape* (it is SLIM-VDB's `alpha[label] += 1` over `sdf > −trunc`)
+but writes into the Dirichlet grid, and is gated separately.
+
+Four mechanisms involve a voxel's neighbours, and exactly one is promoted:
+
+| mechanism | shape | site | promoted |
+|---|---|---|---|
+| semantic band | a segment of the ray | `applyBandSemantic` (`sem_split_map.cpp:844-892`) | **yes**, 0.10 m |
+| BKI ball | a sphere | `applyHitUpdateKernel` (`:711-717`) | no — `semantic_spread_radius` 0 |
+| three-voxel ray spread | ±1 voxel along the ray | `raySpreadDeposit` (`:759-829`) | no — `ray_spread` 0 |
+| spatial readout | 6-connected relaxation | `scripts/slot_readout.py`, scoring time | no |
+
+The first three are mutually exclusive by construction (`sem_split_map.cpp:279-288`):
+a non-zero spread radius zeroes the band length, and either zeroes `ray_spread`.
+Only the fourth is a *vote* in the literal sense — a voxel reading its
+neighbours' state; the other three are one measurement written to several
+voxels, and no voxel ever reads another.
 
 ### 1.4 Storage
 

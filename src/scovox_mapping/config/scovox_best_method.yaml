@@ -63,8 +63,17 @@
     semantic_spread_radius: 0.0
 
     # ---- Geometry integration ------------------------------------------
-    # TSDF off: sdf_trunc collapses to 0, which is the tsdf_enabled = 0 the
-    # promoted runs used. Occupancy and semantics do not read the TSDF.
+    # TSDF off. The node turns this into `sdf_trunc = 0` at launch, which is
+    # the `--tsdf-enabled 0` the promoted runs used: the TsdfMap grid is never
+    # written and never read, and neither occupancy nor semantics consults it.
+    #
+    # `sdf_trunc` does NOT become 0 inside the map, though, and the difference
+    # is visible. `TsdfMap::sanitise` clamps any <= 0 back to 0.15 m, and the
+    # fused walker reads that sanitised value, so the ray's far end is
+    # `max(sdf_trunc, semantic_band_length) = max(0.15, 0.10) = 0.15 m`. The
+    # band writes only to 0.10, the carve only where sdf > 0, and the TSDF
+    # write is gated off -- so the deepest 0.05 m is traversed and does
+    # nothing. Roughly one voxel per ray, unread.
     enable_tsdf: false
     fused_walker: true
     stride: 2

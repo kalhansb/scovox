@@ -41,6 +41,7 @@ static read could not have produced: an 8-scene re-score on the current binary.
 | L4 | Low | Legacy voxel / map types still compiled and tested | open |
 | L5 | Low | Stale tool and comment text around the wire format | open |
 | L6 | Low | `downsample_voxel_size` default described two ways | open |
+| L7 | Low | `sdf_trunc` does not become 0 when the TSDF is off, and two files said it did | **partly resolved** — both descriptions fixed; the ~1 unread voxel/ray left alone |
 
 ---
 
@@ -616,6 +617,29 @@ says "0.5 is also the in-code default" (correct);
 `dscovox_multi_robot.launch.py` passes 0.1 explicitly (`:144`) and its
 surrounding comment reads as if 0.0 were the default. Harmless today, but the
 comment should quote `:754`.
+
+### L7 — `sdf_trunc` does not become 0 when the TSDF is off, and two files said it did
+
+`enable_tsdf: false` makes the node pass `sdf_trunc = 0` (`scovox_node.cpp:381-382`),
+but `TsdfMap::sanitise` clamps any `<= 0` back to **0.15 m** (`tsdf_map.cpp:25`)
+and the fused walker reads the sanitised value (`scovox_map_split.hpp:213`). The
+node documents this correctly at `:100-107`. Two derived descriptions did not:
+`config/scovox_best_method.yaml` said "sdf_trunc collapses to 0", and
+`scovox_code_structure.md` §1.3 said the walk's far end with `tsdf_enabled=0`
+is the semantic band's 0.10 m. Both **fixed**.
+
+The behavioural consequence is small but real. `back_reach = max(trunc, sem_band_)`
+(`scovox_map_split.hpp:246`) is `max(0.15, 0.10) = 0.15 m`, while every consumer
+of those voxels stops earlier: the band gate is `sdf > −0.10` (`:439`), the carve
+gate is `sdf > 0` (`:444`), and the TSDF write is gated off (`:421`). Voxels with
+`sdf ∈ [−0.15, −0.10)` are therefore visited by the exact DDA and produce no
+write — roughly one voxel per ray at `resolution` 0.05.
+
+Not acted on. Closing it means either passing an explicit `sdf_trunc` below the
+band or teaching `back_reach` that a disabled TSDF contributes no reach, and
+both change the walked set, so neither is a comment fix. The saving has not been
+measured and no mIoU claim depends on it — the extra voxels write nothing, so
+every published map is unaffected either way.
 
 ---
 
