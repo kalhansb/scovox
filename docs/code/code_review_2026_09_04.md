@@ -294,8 +294,11 @@ flags plus `--sem-band 0 --fused-walker 0` (the band is refused on the split
 walker), before and after: both dumps `6a53b84c404e`. Byte-identical, so the
 whole second traversal is removed at no cost to the map.
 
-Still outstanding from the original fix note: the `ScovoxMapSplit` test does not
-yet assert the TSDF grid stays empty on both walkers when the flag is off.
+**Guarded.** `ScovoxMapSplitTsdfDisabled.GridStaysEmptyOnBothWalkers`
+(`test/test_scovox_map_split.cpp`) integrates a hit and a miss on both walkers
+with the flag off and asserts `tsdfVoxelCount() == 0` on each, plus Beta/Dir
+grid byte-equality between the two. Before the fix it failed on the split arm
+only.
 
 ---
 
@@ -556,6 +559,11 @@ band voxels, so vacuity is understated there and understated *most* where the
 sensor was closest. `semantic_band_require_occ: false` compounds it — the band is
 the only path that deposits class evidence with no occupancy gate, so a band
 voxel can hold a sharp class posterior on no occupancy evidence at all.
+
+The E10 α₀ calibration study does **not** bear on this. It scores the same set
+the mIoU scorer does — `p_occ >= 0.5 && state ∈ {0,2}` intersected with GT — and
+a Dir-only band voxel dumps as `state=1`, so every voxel this finding is about
+was excluded from it. M9 remains open and unmeasured.
 
 Not acted on. Batching the band, weighting it by `p_occ`, or dividing `kappa0` by
 the span would each change the deposited field and so every mIoU number; none is
