@@ -96,10 +96,18 @@ TSDF truncation 3 fine voxels when the fine band is on (it is off here).
    or far-carve shortcut (`:273-276`, `:318-322`): carve staged into
    `CarveStage`, no per-voxel float body. Both shortcuts are asserted
    bit-identical to the exact body by `test_scovox_map_split`.
-3. **Near voxels** run `exact_body` (`:369-449`): signed distance `sdf`;
-   TSDF write skipped (`tsdf_enabled=0`, gate at `:421`); if the voxel is not
-   the hit voxel and `−band < sdf ≤ band`, a **band deposit** is staged
-   (`:439-441`); otherwise the voxel is **carved** (`:444-448`).
+3. **Near voxels** run `exact_body` (`:369-449`). `sdf` is **not** the along-ray
+   offset and **not** a true signed distance: `dist = |endpoint − voxel_centre|`
+   with the sign taken from `(voxel_centre − origin)·(endpoint − voxel_centre)`
+   (`:386-402`), so it is the straight-line distance from the voxel centre to
+   *this ray's hit point*, positive between camera and surface. Every `|sdf| ≤ L`
+   gate is therefore a sphere of radius `L` about the hit, intersected with the
+   walked voxels — and because a walked voxel's centre sits up to half a voxel
+   diagonal off the ray line (0.043 m at res 0.05), that offset counts toward
+   `dist` and closes the band marginally early at both ends. TSDF write skipped
+   (`tsdf_enabled=0`, gate at `:421`); if the voxel is not the hit voxel and
+   `−band < sdf ≤ band`, a **band deposit** is staged (`:439-441`); otherwise
+   the voxel is **carved** (`:444-448`).
 4. **Hit voxel, Stream A** (`SemSplitMap::commitHit`, `sem_split_map.cpp:669-738`):
    `a_occ += w_occ` (1.5 → 12 lattice units). Under `batch_hits` only the
    strongest ray per voxel per scan reaches here (`flushStagedHits` `:521-560`).
@@ -135,6 +143,12 @@ Two lengths share the word *band* and are routinely conflated:
 They are independent numbers on the same axis. The semantic band borrows the
 TSDF band's *shape* (it is SLIM-VDB's `alpha[label] += 1` over `sdf > −trunc`)
 but writes into the Dirichlet grid, and is gated separately.
+
+Both are written **along the ray** — only voxels the DDA steps through — while
+the length each one compares against is **radial from the hit point**, not an
+along-ray offset (step 3 above). For one ray a band is a line segment; the shell
+around the surface that the name suggests is the union of those segments over
+many rays.
 
 Four mechanisms involve a voxel's neighbours, and exactly one is promoted:
 
