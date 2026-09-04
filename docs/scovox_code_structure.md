@@ -657,6 +657,26 @@ in the consumer.
   it is the largest single lever on the numbers in §1.5 and the one most likely
   to be flipped by someone who reads it as a speed knob: it sets whether a unit
   of evidence is an observation or a pixel.
+- **Three RGB-D operating points are recorded, not one.** `batch_hits` and
+  `w_occ` are a single axis, so the pair is fixed together in each file, and the
+  three differ from one another in exactly one key each (asserted by comparing
+  the parsed parameter maps — the key *sets* are identical):
+
+  | file | `batch_hits` | `w_occ` | evidence unit |
+  |---|---|---|---|
+  | `scovox_best_method.yaml` | true | 1.5 | observation, uncompensated — promoted |
+  | `scovox_rgbd_complete.yaml` | true | 6.0 | observation, compensated |
+  | `scovox_rgbd_unbatched.yaml` | false | 1.5 | depth pixel |
+
+  The promoted file is unchanged and remains the default answer; the other two
+  exist because §1.5 shows the axis has no free direction, so the choice is an
+  application decision rather than a tuning result. `w_occ` 6.0 is a whole
+  eighth, which is required — `beta_lattice_snap` silently moves anything else
+  and the uint16 and float builds then diverge.
+- `scovox_node` logs `batch_hits` in its `deposit config` line. Without it the
+  un-batched file — which differs from the promoted one in that key alone —
+  produces log output identical to the promoted configuration, so a binary that
+  ignored the parameter would be indistinguishable from one that honoured it.
 
 ### 3.5 Code defects that touch the method
 

@@ -308,15 +308,26 @@ public:
         sp.semantic_spread_radius);
       // The rest of the deposit configuration, read back the same way and for
       // the same reason. The node's own defaults are shared with the LiDAR
-      // deployments and are NOT the configuration the RGB-D results describe;
-      // config/scovox_best_method.yaml is. This line is what tells a reader
-      // which of the two actually ran, without diffing a launch file against
-      // a params file against a binary.
+      // deployments and are NOT any of the RGB-D configurations. Three are
+      // recorded, differing from each other in exactly one key:
+      //   config/scovox_best_method.yaml     batch_hits 1, w_occ 1.5 (promoted)
+      //   config/scovox_rgbd_complete.yaml   batch_hits 1, w_occ 6.0
+      //   config/scovox_rgbd_unbatched.yaml  batch_hits 0, w_occ 1.5
+      // batch_hits and w_occ are one axis, not two knobs -- batching sets
+      // whether a unit of evidence is an observation or a depth pixel, and
+      // w_occ scales that unit, so the pair must move together. This line and
+      // the deposit-rule line above are what tell a reader which of the four
+      // actually ran, without diffing a launch file against a params file
+      // against a binary.
+      // batch_hits is logged next to w_occ because the two are one axis and
+      // because it is otherwise invisible: scovox_rgbd_unbatched.yaml differs
+      // from the promoted config in this key ALONE, so without it in the log
+      // an ignored parameter and a working one produce the same output.
       RCLCPP_INFO(get_logger(),
-        "deposit config: res=%.3f m w_occ=%.2f w_free=%.2f kappa0=%.2f "
-        "min_p_occ=%.2f evid_sat=%.1f cls_evid_sat=%.1f evict_by_conf=%d "
-        "num_classes=%u",
-        sp.resolution, sp.w_occ, sp.w_free, sp.kappa0,
+        "deposit config: res=%.3f m w_occ=%.2f w_free=%.2f batch_hits=%d "
+        "kappa0=%.2f min_p_occ=%.2f evid_sat=%.1f cls_evid_sat=%.1f "
+        "evict_by_conf=%d num_classes=%u",
+        sp.resolution, sp.w_occ, sp.w_free, (int)sp.batch_hits, sp.kappa0,
         sp.dirichlet_min_p_occ, sp.evidence_saturation,
         sp.class_evidence_saturation, (int)sp.evict_by_confidence,
         (unsigned)sp.num_classes);
