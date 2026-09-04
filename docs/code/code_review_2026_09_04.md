@@ -26,7 +26,7 @@ static read could not have produced: an 8-scene re-score on the current binary.
 | H4 | **High** | **The published numbers do not describe the code in the tree** | **open — needs a re-run, not an edit** |
 | H1 | High | `scovox_node` defaults are not the promoted configuration | **resolved** — `config/scovox_best_method.yaml`, commit `33aa576` |
 | H2 | High | The promoted state is uncommitted (31 files since `d5da6a8`) | **resolved** — `1101e53`, `33aa576` |
-| H3 | High | `integrateHitSplit` ignores `tsdf_enabled` | open |
+| H3 | High | `integrateHitSplit` ignores `tsdf_enabled` | **resolved** — gated; dump byte-identical, a whole redundant DDA removed |
 | M1 | Medium | Four parameter structs with four sets of defaults | open |
 | M2 | Medium | Six library knobs have no ROS parameter | open — now cross-referenced from the yaml |
 | M3 | Medium | `range_decay_length` is dead in the split path but still documented as a weight | open |
@@ -42,7 +42,7 @@ static read could not have produced: an 8-scene re-score on the current binary.
 | L4 | Low | Legacy voxel / map types still compiled and tested | open |
 | L5 | Low | Stale tool and comment text around the wire format | open |
 | L6 | Low | `downsample_voxel_size` default described two ways | open |
-| L7 | Low | `sdf_trunc` does not become 0 when the TSDF is off, and two files said it did | **partly resolved** — both descriptions fixed; the ~1 unread voxel/ray left alone |
+| L7 | Low | `sdf_trunc` does not become 0 when the TSDF is off, and two files said it did | **resolved** — descriptions fixed and the dead tail trimmed by early DDA termination, byte-identical |
 
 ---
 
@@ -283,9 +283,19 @@ only" against "semantics plus a full TSDF DDA". The 10–18 % "fused is slower"
 timing result was collected with `--tsdf-enabled 1` for that reason; a reader
 of the flag alone will not know that.
 
-**Fix.** Add `tsdf_enabled_ &&` to the condition at `:587`, and extend the
-`ScovoxMapSplit` timing test to assert the TSDF grid stays empty on both
-walkers when disabled.
+**Fixed** (`:648`). The condition now reads
+`tsdf_enabled_ && !is_dynamic && !(prof && prof->geometry_off)`, so the flag
+means one thing on both walkers.
+
+This was not a few voxels tacked onto a shared traversal — `TsdfMap::integrateRay`
+is a second full DDA of its own, and a split-path run at `tsdf_enabled=0` paid
+for it in full to fill a grid the flag declares unread. Scene 016, promoted
+flags plus `--sem-band 0 --fused-walker 0` (the band is refused on the split
+walker), before and after: both dumps `6a53b84c404e`. Byte-identical, so the
+whole second traversal is removed at no cost to the map.
+
+Still outstanding from the original fix note: the `ScovoxMapSplit` test does not
+yet assert the TSDF grid stays empty on both walkers when the flag is off.
 
 ---
 
@@ -700,11 +710,38 @@ gate is `sdf > 0` (`:444`), and the TSDF write is gated off (`:421`). Voxels wit
 `sdf ∈ [−0.15, −0.10)` are therefore visited by the exact DDA and produce no
 write — roughly one voxel per ray at `resolution` 0.05.
 
-Not acted on. Closing it means either passing an explicit `sdf_trunc` below the
-band or teaching `back_reach` that a disabled TSDF contributes no reach, and
-both change the walked set, so neither is a comment fix. The saving has not been
-measured and no mIoU claim depends on it — the extra voxels write nothing, so
-every published map is unaffected either way.
+**Fixed** — but not the way the sentence above suggests, and the reason is a
+property of the DDA that was not recorded anywhere before.
+
+`back_reach` is not only where the walk stops, it is the point the DDA **aims
+at**. `ExactRayIterator` steers at the *centre* of `coord_to`
+(`ray_iterator.hpp:29-57`, `:55-57`), so shortening `back_reach` rotates the
+whole segment and changes which voxels are crossed **in front of** the surface,
+where every write actually happens. Tried and refuted by measurement, not by
+argument: scene 016 with `back_reach` trimmed to the band gives
+`e7f872b6d8e1` against the reference `a76dd502bb5b`. The `back_reach`
+expression is therefore left verbatim, with a comment saying why.
+
+The tail is dropped by **early termination** instead (`:280-282`, `:449-456`,
+`:580`). `trim_tail = !tsdf_writes && useful_back < back_reach` arms it, where
+`tsdf_writes = tsdf_enabled_ && !is_dynamic && !geometry_off` and
+`useful_back = band_active ? sem_band_ : 0`. Inside `exact_body`, a voxel with
+`sdf < 0` whose exact along-ray offset `t = −(v_point_voxel · u)` has reached
+`useful_back` latches `stop_walk` and the iterator callback returns `false`.
+Every gate below that point is already decided — the carve needs `sdf > 0`, the
+band needs `dist ≤ sem_band_` and `dist ≥ t` — so returning drops nothing, and
+`t` is non-decreasing along the walk (each DDA step adds `res·|u_i| ≥ 0`), so
+latching drops nothing for the rest of the ray either.
+
+One intermediate version was also wrong and is worth recording: stopping on the
+bound `dist² ≥ useful² + 3h²` (half a voxel diagonal) gives `7c3c6d08b560`, not
+the reference. The half-diagonal guarantee is against the *aimed* segment while
+the test needs the offset from the *true* ray, and the two deviations add. The
+offset has to be measured with the dot product, not bounded.
+
+Acceptance was **byte identity of the dumped map**, not equal mIoU: the change
+removes work and must therefore remove nothing else. Scene 016 fused, before and
+after: both `a76dd502bb5b`.
 
 ---
 

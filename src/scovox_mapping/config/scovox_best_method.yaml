@@ -67,13 +67,17 @@
     # the `--tsdf-enabled 0` the promoted runs used: the TsdfMap grid is never
     # written and never read, and neither occupancy nor semantics consults it.
     #
-    # `sdf_trunc` does NOT become 0 inside the map, though, and the difference
-    # is visible. `TsdfMap::sanitise` clamps any <= 0 back to 0.15 m, and the
-    # fused walker reads that sanitised value, so the ray's far end is
-    # `max(sdf_trunc, semantic_band_length) = max(0.15, 0.10) = 0.15 m`. The
-    # band writes only to 0.10, the carve only where sdf > 0, and the TSDF
-    # write is gated off -- so the deepest 0.05 m is traversed and does
-    # nothing. Roughly one voxel per ray, unread.
+    # `sdf_trunc` does NOT become 0 inside the map, though. `TsdfMap::sanitise`
+    # clamps any <= 0 back to 0.15 m, and the fused walker reads that sanitised
+    # value, so the segment handed to the DDA still ends at
+    # `max(sdf_trunc, semantic_band_length) = max(0.15, 0.10) = 0.15 m` while the
+    # band writes only to 0.10 and the carve only where sdf > 0.
+    #
+    # That end point is also the DDA's aim point, so it cannot just be shortened.
+    # The walker instead ENDS the walk at 0.10 m past the hit whenever the TSDF
+    # cannot write, which is this configuration. The deepest 0.05 m is no longer
+    # traversed and the map is unchanged to the byte. Turning `enable_tsdf` back
+    # on restores the full 0.15 m walk, because then those voxels are read.
     enable_tsdf: false
     fused_walker: true
     stride: 2

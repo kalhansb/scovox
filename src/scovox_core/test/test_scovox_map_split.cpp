@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -970,4 +971,102 @@ TEST(ScovoxMapSplitFusedWalker, AxisAlignedTsdfValuesBitIdenticalToSplitWalker) 
   EXPECT_TRUE(df == ds)
       << "fused TSDF state diverged from the coordToPos reference "
       << "(fused=" << df.size() << " split=" << ds.size() << " voxels)";
+}
+
+// ===========================================================================
+// tsdf_enabled=false — the flag means the same thing on both walkers, and
+// turning it off does not move the semantic/occupancy map
+// ===========================================================================
+//
+// Two separate properties, one per test below.
+//
+// (1) The flag is honoured on BOTH walkers. The split path used to call
+//     `tsdf_.integrateRay` unconditionally, so `--tsdf-enabled 0` silently
+//     meant "off on the fused walker, on on the split walker" and any
+//     fused-vs-split comparison taken at that flag was measuring two
+//     different amounts of work.
+//
+// (2) When the TSDF cannot write, the walker stops the DDA at
+//     `semantic_band_length` past the hit instead of running to
+//     `max(sdf_trunc, semantic_band_length)`. The voxels between the two are
+//     read by nothing: the band gate is `sdf > -sem_band`, and the carve gate
+//     is `sdf > 0`. So the trim must leave the SemBeta and Dir grids
+//     byte-identical while emptying the TSDF grid.
+
+TEST(ScovoxMapSplitTsdfDisabled, GridStaysEmptyOnBothWalkers) {
+  // Band off, so the split walker's fused_walker precondition is satisfied.
+  auto p_fused = splitParams(); p_fused.fused_walker = true;
+  auto p_split = splitParams(); p_split.fused_walker = false;
+  p_fused.tsdf_enabled = false;
+  p_split.tsdf_enabled = false;
+  scovox::ScovoxMapSplit m_fused(p_fused);
+  scovox::ScovoxMapSplit m_split(p_split);
+
+  std::vector<float> probs{0.f, 1.f, 0.f, 0.f};  // class 1
+  const Eigen::Vector3f O(0.f, 0.025f, 0.025f);
+  const Eigen::Vector3f Hp(0.325f, 0.025f, 0.025f);
+  const Eigen::Vector3f co = truncateOrigin(O, Hp, /*carve_band=*/0.10f);
+
+  m_fused.integrateHit(co, Hp, &probs);
+  m_split.integrateHit(co, Hp, &probs);
+  m_fused.integrateMiss(O, Eigen::Vector3f(0.f, 0.5f, 0.025f));
+  m_split.integrateMiss(O, Eigen::Vector3f(0.f, 0.5f, 0.025f));
+
+  EXPECT_EQ(m_fused.tsdfVoxelCount(), 0u) << "fused walker wrote TSDF with the flag off";
+  EXPECT_EQ(m_split.tsdfVoxelCount(), 0u) << "split walker wrote TSDF with the flag off";
+
+  // Non-vacuity: the ray did land, it just landed nowhere near the TSDF.
+  ASSERT_GT(m_fused.semdirVoxelCount(), 0u) << "vacuous: no SemBeta voxels written";
+
+  EXPECT_TRUE(dumpGrid(m_fused.semsplit().betaGrid()) ==
+              dumpGrid(m_split.semsplit().betaGrid()));
+  EXPECT_TRUE(dumpGrid(m_fused.semsplit().dirGrid()) ==
+              dumpGrid(m_split.semsplit().dirGrid()));
+}
+
+TEST(ScovoxMapSplitTsdfDisabled, TrimmedTailIsDeadForSemBeta) {
+  // The shipped geometry: trunc 0.15, band 0.10, res 0.05. Along +x from a
+  // hit at coord 6 (centre 0.325 exactly), the behind-surface voxels are
+  //   coord 7  sdf -0.05  band writes it   (-0.05 > -0.10)
+  //   coord 8  sdf -0.10  band does NOT    (-0.10 > -0.10 is false)
+  //   coord 9  sdf -0.15  band does NOT
+  // so coords 8 and 9 exist in the walk only to feed the TSDF. With the TSDF
+  // off the walk ends at coord 8 and those two are never visited.
+  auto p_on  = splitParams();
+  p_on.fused_walker                       = true;
+  p_on.semsplit.semantic_band_length      = 0.10f;
+  p_on.tsdf_enabled                       = true;
+  auto p_off = p_on;
+  p_off.tsdf_enabled                      = false;
+
+  scovox::ScovoxMapSplit m_on(p_on);
+  scovox::ScovoxMapSplit m_off(p_off);
+
+  std::vector<float> probs{0.f, 1.f, 0.f, 0.f};
+  const Eigen::Vector3f O(0.f, 0.025f, 0.025f);
+  const Eigen::Vector3f Hp(0.325f, 0.025f, 0.025f);
+  const Eigen::Vector3f co = truncateOrigin(O, Hp, /*carve_band=*/0.10f);
+  m_on.integrateHit(co, Hp, &probs);
+  m_off.integrateHit(co, Hp, &probs);
+
+  // Non-vacuity, three ways. The band must have survived `sanitise()` (it
+  // zeroes `semantic_band_length` whenever `semantic_spread_radius` is set),
+  // the band must have written something, and the full walk must actually
+  // have reached past the band -- without all three the byte comparison
+  // below passes for a walker that never went anywhere.
+  ASSERT_FLOAT_EQ(m_on.semsplit().params().semantic_band_length, 0.10f);
+  ASSERT_GT(m_on.semdirVoxelCount(), 0u) << "vacuous: no SemBeta voxels written";
+  int max_x = std::numeric_limits<int>::min();
+  for (const auto& d : dumpGrid(m_on.tsdf().grid())) max_x = std::max(max_x, d.c.x);
+  ASSERT_GE(max_x, 8) << "vacuous: the full walk never reached the trimmed tail";
+
+  EXPECT_EQ(m_off.tsdfVoxelCount(), 0u);
+
+  // The trim removed traversal and nothing else.
+  EXPECT_TRUE(dumpGrid(m_on.semsplit().betaGrid()) ==
+              dumpGrid(m_off.semsplit().betaGrid()))
+      << "trimming the dead tail moved Beta state";
+  EXPECT_TRUE(dumpGrid(m_on.semsplit().dirGrid()) ==
+              dumpGrid(m_off.semsplit().dirGrid()))
+      << "trimming the dead tail moved Dir state";
 }
