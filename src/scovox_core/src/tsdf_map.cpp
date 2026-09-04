@@ -113,6 +113,7 @@ void TsdfMap::integrateRayImpl(const Eigen::Vector3f& origin,
   bool k_hit_visited = false;
 
   const auto walk_body = [&](const CoordT& c) -> bool {
+    ++band_voxels_;
     if (c == k_hit) k_hit_visited = true;
     visit(c, origin, endpoint, h, trunc, weight_fn);
     return true;

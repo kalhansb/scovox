@@ -31,8 +31,7 @@
 // voxels at pre-loop-closure positions and missing voxels at the new positions.
 // Before turning c-slam back on, refactor SourceGrid to store evidence in
 // source-frame coords + reproject on each carried-pose change, with a
-// per-source "pose changed → reproject" handler. See ablation entry C5 in
-// docs/issues/ablations_punch_list.md for the design.
+// per-source "pose changed → reproject" handler.
 //
 // On every binary we incrementally update the fused grid by, for each touched
 // map-frame coord, resetting fused[c] to the prior and re-folding the current
@@ -97,8 +96,7 @@ struct SourceGrid {
   // Cached static source->map transform. Taken from the first update's carried
   // map_from_source pose and never refreshed — this assumes TFs are static
   // (c-slam disabled). Under c-slam, loop closures change this transform and the
-  // cache becomes a correctness bug. See the file-header banner and C5 in
-  // ablations_punch_list.md.
+  // cache becomes a correctness bug. See the file-header banner.
   Eigen::Isometry3d T_map_source{Eigen::Isometry3d::Identity()};
   bool pose_cached{false};
 };
@@ -308,7 +306,7 @@ private:
   // split Beta(+Dir) grids into a transient scovox::Voxel via a
   // substrate-agnostic templated core. The SEMANTIC query math uses the
   // raw-evidence convention; the OCCUPANCY math uses the symmetric Beta(1,1)
-  // prior (p_occ=0.5) — see projectBetaDirToVoxel / docs/occupancy_prior.md.
+  // prior (p_occ=0.5) — see projectBetaDirToVoxel.
   // Occupancy-only services (GetOccupancyGrid) read just the Beta grid;
   // GetRegion joins the Dir grid for per-class evidence.
   // ==================================================================
@@ -660,7 +658,7 @@ private:
       // (Gating on isPriorBeta rather than a p_occ threshold keeps this correct
       // for any prior: the old calibrated prior p_occ ≈ 0.933 exceeded the 0.7
       // threshold and would publish as phantom occupied; the prior is now
-      // Beta(1,1)/0.5. See docs/occupancy_prior.md.) Mirror the RPC walkers' gate.
+      // Beta(1,1)/0.5.) Mirror the RPC walkers' gate.
       if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
       if (v.p_occ() >= ot) pc_scratch.emplace_back(co, v);
     });

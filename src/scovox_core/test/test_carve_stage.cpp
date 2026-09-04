@@ -2,7 +2,7 @@
 /// @brief Differential gate for CarveStage (carve_stage.hpp) — the
 /// leaf-block-keyed batched-carve accumulator that replaced the
 /// `unordered_map<CoordT,float>` + per-scan `std::sort` staging in
-/// `SemSplitMap` (efficiency_audit_2026_08_26.md, item 1).
+/// `SemSplitMap`.
 ///
 /// Pinned invariants (what flushCarveFrame relies on):
 ///   - per-voxel value = MAX staged weight (order-independent);

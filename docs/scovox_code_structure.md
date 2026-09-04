@@ -1,406 +1,606 @@
-# SCovox code structure — navigation and reuse guide
+# SCovox code structure — best method and current code (2026-09-04)
 
-**Date:** 2026-08-26 (line anchors are approximate as of this date — refresh
-them with the grep commands given inline before editing).
-**Audience:** developers and code agents that need to locate, modify, or
-extract parts of the mapping stack quickly, without reading 3000-line files
-end to end.
-**Companion docs:** [user_manual.md](user_manual.md) (running the system),
-[design/](design/) (per-feature design docs),
-[design/efficiency_audit_2026_08_26.md](design/efficiency_audit_2026_08_26.md)
-(known hot spots — read before touching any hot path).
+This document has two halves that deliberately do not agree with each other.
+
+- **§1 The best method** is the promoted configuration `e5/k2_i0_evid` — the
+  mapper the experiments campaign selected and the one every published number
+  comes from. It is defined by the offline replay driver in the sibling
+  repository (`scovox_slot_rules/scovox_scenenn/src/replay_scenenn.cpp`) and
+  by the archived write-up `docs/archive/design/best_method.md`.
+- **§2 The current code** is the working tree of this repository as of
+  2026-09-04: commit `d5da6a8` plus 31 uncommitted source files (the
+  `DirVoxel` total-basis change, `nhit` removal, `SCOVOX_BETA_U16` default
+  flip and the matching test edits are all uncommitted — see `git status`).
+- **§3 The gap** lists every place where the code has not been brought up to
+  the best method. The library defaults and the replay already match; the
+  ROS node, its launch files and its config files do not.
+
+Everything in §2 and §3 was read from source, not from older docs. Line
+numbers are working-tree line numbers on 2026-09-04 and will drift; the
+function names will not. The previous version of this document is at
+`docs/archive/scovox_code_structure.md` and describes the pre-`d5da6a8` tree.
 
 ---
 
-## 1. Orientation in 60 seconds
+## 1. The best method (`e5/k2_i0_evid`)
 
-SCovox is a **sparse metric-semantic voxel mapping system** for ROS 2. Per
-voxel it maintains three kinds of state, held in **three parallel sparse
-grids** (this split is the central architectural fact — almost every file
-below is explained by it):
-
-| Grid | Voxel type | Size | Touched by | Holds |
-|---|---|---|---|---|
-| TSDF | `TsdfVoxel` | 8 B | band only (~2·trunc per ray) | Curless–Levoy distance + weight |
-| Beta (occupancy) | `BetaVoxel` | 8 B | **full ray** (every carved voxel) | Beta(α_occ, α_free) posterior |
-| Dir (semantics) | `DirVoxel` | 16 B | **hit only** | top-K sparse Dirichlet class counts |
-
-All three are `Bonxai::VoxelGrid<T>` instances (vendored sparse hierarchical
-grid, see §3.1). One fused ray walker (`ScovoxMapSplit::integrateHitFused`)
-updates all three in a single DDA pass per ray.
-
-Two ROS nodes:
-
-- **`scovox_mapping_node`** ([scovox_node.cpp](../src/scovox_mapping/src/scovox_node.cpp))
-  — the per-robot mapper. Sensors in (RGB-D pair or LiDAR cloud + optional
-  soft-probability blobs), maps out (full-map message, LZ4 delta wire stream,
-  point clouds, 2-D planning grid, mesh service).
-- **`dscovox_mapping_node`** ([dscovox_node.cpp](../src/scovox_mapping/src/dscovox_node.cpp))
-  — the multi-robot merger. Ingests each robot's delta wire stream into
-  per-source grids and folds them into a fused map by Bayesian consensus.
-
-The wire between them is `ScovoxMapBinary`: a custom binary codec
-(rev-8, block-run coordinates, u8-companded evidence) + LZ4, carrying only
-voxels whose values changed ("touched sets" + change gates).
-
-**Dependency direction (never violated):**
-`bonxai` → voxel types → substrates (`TsdfMap`, `SemSplitMap`) → walker
-(`ScovoxMapSplit`) → ROS nodes. `scovox_core` has **zero ROS dependencies**
-(Eigen + LZ4 only) — that is what makes it reusable outside ROS.
-
-## 2. Workspace layout — what to read, what to ignore
+### 1.1 Build
 
 ```
-scovox/                     ← the colcon workspace root (build from HERE)
-├── src/
-│   ├── scovox_core/        ← the reusable, ROS-free mapping library (§3)
-│   ├── scovox_mapping/     ← the two ROS nodes + launch/config (§4)
-│   ├── scovox_msgs/        ← message/service definitions (§5)
-│   └── seg_pipeline/       ← Python RGB-D segmentation front-end (§6)
-├── docs/                   ← this file, user manual, design docs
-├── config/, docker/, scripts/   ← deployment glue, not mapping logic
-├── experiments/            ← evaluation campaign (scorers, results, paper) — NOT runtime code
-├── build*/ install*/ log/  ← colcon output. NEVER edit; see gotcha §9.8
-└── README.md, compose.yaml
+-O3 -DSCOVOX_K_TOP=2 -DSCOVOX_EVICT_INHERIT=0 -DSCOVOX_TRACK_QMAX=1 -DSCOVOX_E0_COUNTERS=1
 ```
 
-**Ignore for mapping work:** everything under `build*`, `install*`, `log`, and
-`experiments/`. They contain copies of the source that are *not* the live code;
-a grep that lands there wastes your edit.
+`SCOVOX_TRACK_NHIT` is no longer set (the counter was write-only; the dump is
+byte-identical with or without it). `SCOVOX_BETA_U16` is on by default in the
+headers and needs no flag. All four values are already the header defaults
+except `E0_COUNTERS`, which is a diagnostics-only counter set. Any build that
+sets `SCOVOX_EVICT_INHERIT` to a non-zero value, or any of the removed
+`SCOVOX_VICTIM_MEAN` / `SCOVOX_VICTIM_QMAX` / `SCOVOX_ADMIT_NORM` flags, is
+refused at compile time by `#error` traps in
+`src/scovox_core/include/scovox/dir_voxel.hpp:133-144`.
 
-## 3. `scovox_core` — the reusable library
+### 1.2 Run configuration
 
-Header-heavy; only three `.cpp` files. Builds one static/shared library
-target `scovox_core` (links Eigen + LZ4). Everything is under
-`include/scovox/` unless noted. Listed bottom-up by layer.
+The replay's `Args` defaults **are** the best method; the command line only
+needs the dataset paths. Written out in full, with the field each flag lands
+in:
 
-### 3.1 Foundation
+| replay flag | value | lands in | note |
+|---|---|---|---|
+| `--resolution` | 0.05 | `ScovoxMapSplit::Params::resolution` (and `semsplit.resolution`) | voxel edge, metres |
+| `--stride` | 2 | replay only | depth subsample; must match the stored top-k payload |
+| `--min-depth` / `--max-depth` | 0.4 / 4.0 | replay only | Asus Xtion usable band |
+| `--num-classes` | 14 | `semsplit.num_classes` | sets the OTHER bucket as `C − K_TOP` |
+| `--alpha0` | 0.01 | `semsplit.alpha_0` | Dirichlet prior per class |
+| `--w-occ` | **1.5** | `semsplit.w_occ` | Stream A hit weight; on the ⅛ lattice |
+| `--w-free` | 1.0 | `semsplit.w_free` | full-ray carve weight |
+| `--kappa0` | 1.0 | `semsplit.kappa0` | Stream B deposit scale |
+| `--min-p-occ` | 0.5 | `semsplit.dirichlet_min_p_occ` | Stream B gate on posterior occupancy |
+| `--evict-by-confidence` | **on** | `semsplit.evict_by_confidence` | needs `SCOVOX_TRACK_QMAX=1`; replay refuses otherwise |
+| `--sem-band` | **0.10** | `semsplit.semantic_band_length` | metres of along-ray deposit around the hit |
+| `--band-require-occ` | **false** | `semsplit.semantic_band_require_occ` | flat `kappa0` band deposit, no Beta read |
+| `--evidence-saturation` | 0 | `semsplit.evidence_saturation` | off (Beta u16 still halves at 90 % of its ceiling) |
+| `--class-evidence-saturation` | −1 | `semsplit.class_evidence_saturation` | −1 = share the global cap |
+| `--inc-mode` / `--inc-thresh` | 0 / 0.10 | `semsplit.inc_mode` / `inc_thresh` | soft deposit over the softmax |
+| `--hit-share` | pocc (`hit_flat_share=false`) | `semsplit.hit_flat_share` | endpoint share = `kappa0 · p_occ_post` |
+| `--ray-spread` | 0 | `semsplit.ray_spread` | surface voxel only |
+| `--spread-radius` | 0 | `semsplit.semantic_spread_radius` | no BKI kernel |
+| `--semantic-mode` | 0 (Dirichlet) | `semsplit.semantic_mode` | |
+| `--range-decay-length` | 50 | `semsplit.range_decay_length` | **written, never read** in the split path |
+| `--batch-hits` | 1 | `semsplit.batch_hits` | strongest ray per voxel per scan |
+| carve-no-return | on (`--no-carve-no-return` to disable) | replay only | carves free space along no-return pixels |
+| `--fused-walker` | 1 | `ScovoxMapSplit::Params::fused_walker` | the band exists only here |
+| `--tsdf-enabled` | 0 | `ScovoxMapSplit::Params::tsdf_enabled` | no mesh in the replay; Beta/Dir unaffected |
+| `--far-fast-paths` | 1 | `ScovoxMapSplit::Params::far_voxel_fast_paths` | bit-identical shortcuts around the exact body |
+| `--dump-label-gate` | 0.5 | replay dump only | readout gate on `p_occ` |
+| `--dump-below-gate-as-unknown` | on | replay dump only | below-gate voxels scored as unknown, not dropped |
 
-- [third_party/bonxai/bonxai/](../src/scovox_core/include/third_party/bonxai/bonxai/)
-  — vendored **Bonxai** sparse voxel grid (MPL-2.0): `bonxai.hpp` (the grid:
-  root `unordered_map` → inner grid → pooled leaf blocks), `grid_coord.hpp`,
-  `mask.hpp`, `grid_allocator.hpp`, `serialization.hpp`. Self-contained,
-  header-only, no Eigen required internally. **Key API:** `VoxelGrid<T>`,
-  `createAccessor()` / `createConstAccessor()` (cached, see gotcha §9.1),
-  `posToCoord`/`coordToPos`, `forEachCell`, `activeCellsCount()`. New leaf
-  blocks are **zero-initialised** — every voxel type uses "all-zero =
-  unobserved" as its sentinel (gotcha §9.2).
-- [version.hpp](../src/scovox_core/include/scovox/version.hpp) — version
-  constants only.
+Library-side constants that are part of the method but not flags: `leaf_bits`
+3, `inner_bits` 2, `dir_leaf_bits` 2, `batch_free_carve` true, `carve_skip`
+0, Beta prior `Beta(1,1)`, Beta lattice step ⅛ (`SCOVOX_BETA_U16_SCALE` 8),
+TSDF truncation 3 fine voxels when the fine band is on (it is off here).
 
-### 3.2 Voxel types (plain structs, layout is load-bearing)
+### 1.3 Per-ray algorithm (what one depth pixel does)
 
-- [tsdf_voxel.hpp](../src/scovox_core/include/scovox/tsdf_voxel.hpp) —
-  `TsdfVoxel {float distance; float weight}` (8 B). `weight == 0` =
-  unobserved. Sign convention: positive in front of the surface
-  (SLIM-VDB/VDBFusion-compatible).
-- [beta_voxel.hpp](../src/scovox_core/include/scovox/beta_voxel.hpp) —
-  `BetaVoxel {float a_occ; float a_free}` (8 B) + the symmetric Beta(1,1)
-  prior constants `kBetaOccPrior`/`kBetaFreePrior`. The header's comment
-  explains *why* occupancy is a separate grid — read it before proposing to
-  re-unify anything.
-- [dir_voxel.hpp](../src/scovox_core/include/scovox/dir_voxel.hpp) —
-  `DirVoxel` (16 B): K_TOP sparse Dirichlet slots (class id + count) +
-  OTHER/unknown mass, with Space-Saving eviction. Hit-only grid.
-- [voxel.hpp](../src/scovox_core/include/scovox/voxel.hpp) — the **legacy
-  unified** `Voxel` (Beta + Dirichlet + bookkeeping in one struct), plus two
-  symbols that are still canonical for everyone: **`K_TOP` (compile-time,
-  = 2)** and **`sparse_add()`** (the Space-Saving top-K update, strict `>`
-  eviction). Layout `static_assert`s live here.
-- [sembeta_voxel.hpp](../src/scovox_core/include/scovox/sembeta_voxel.hpp) —
-  `SemBetaVoxel` (24 B, Beta + Dirichlet without TSDF): the intermediate
-  combined type; used by mesh labelling and the merger's fused projection.
+1. **Ray setup.** Origin `O`, endpoint `E`, direction `u`, depth `d`. The fused
+   walker runs one exact DDA over `[E − max(d, trunc)·u, E + max(trunc, band)·u]`
+   (`scovox_map_split.hpp:183-565`). With `tsdf_enabled=0` the far end of the
+   range is the semantic band, 0.10 m past the hit.
+2. **Far voxels** (further than `trunc + h` before the hit) take the far-skip
+   or far-carve shortcut (`:273-276`, `:318-322`): carve staged into
+   `CarveStage`, no per-voxel float body. Both shortcuts are asserted
+   bit-identical to the exact body by `test_scovox_map_split`.
+3. **Near voxels** run `exact_body` (`:369-449`): signed distance `sdf`;
+   TSDF write skipped (`tsdf_enabled=0`, gate at `:421`); if the voxel is not
+   the hit voxel and `−band < sdf ≤ band`, a **band deposit** is staged
+   (`:439-441`); otherwise the voxel is **carved** (`:444-448`).
+4. **Hit voxel, Stream A** (`SemSplitMap::commitHit`, `sem_split_map.cpp:669-738`):
+   `a_occ += w_occ` (1.5 → 12 lattice units). Under `batch_hits` only the
+   strongest ray per voxel per scan reaches here (`flushStagedHits` `:521-560`).
+5. **Hit voxel, Stream B**: gate `p_occ_post ≥ 0.5`; deposit
+   `class_share = kappa0 · p_occ_post` into the `DirVoxel` through
+   `dirichletUpdate` (`:60-231`): `s_total += class_share` once, then the
+   softmax is spread over the K=2 slots by `sparse_add_class`
+   (`dir_voxel.hpp:306-445`) with outcomes match / fill / evict / drop.
+   Eviction compares the arrival's confidence against the weakest slot's
+   `qmax`; an evicted slot's evidence falls back into the derived
+   `other()` (`SCOVOX_EVICT_INHERIT=0`).
+6. **Band voxels, Stream B only** (`applyBandSemantic` `:844-892`): with
+   `band_require_occ=false` a flat `kappa0` deposit with no Beta read, so a
+   band voxel can hold a class before it holds occupancy evidence.
+7. **Carved voxels**: `a_free += w_free` per voxel, written once per voxel per
+   scan at `flushCarveFrame` (`:476-519`), block-ordered; occupied hits win
+   over carves in the same scan.
+8. **Saturation** (`applyBetaSaturation` `:1088-1111`, `applyDirSaturation`
+   `:1112-1143`): the opt-in cap is off; the unconditional u16 halving at 90 %
+   of `BetaCount::kMax` (≈ 5 460 hits at `w_occ` 1.5) is the only ceiling.
+9. **Readout** (replay dump, not the library): argmax over the K slots plus
+   `other()`; voxels with `p_occ < 0.5` are written as unknown.
 
-**Layout warning:** the wire codec and the tests `reinterpret_cast` /
-`static_assert` these exact sizes. Changing any field is a **wire-format and
-paper-claim change**, not a refactor (gotcha §9.3).
+### 1.4 Storage
 
-### 3.3 Pure math (no grid, no ROS — smallest reusable units)
+| grid | voxel | bytes | fields |
+|---|---|---|---|
+| occupancy | `BetaVoxel` | **4** (`SCOVOX_BETA_U16=1`) | `a_occ`, `a_free` as `BetaCountU16` (⅛ lattice, ceiling 8191.875) |
+| semantics | `DirVoxel` | **20** (K=2, `TRACK_QMAX=1`, `TRACK_NHIT=0`) | `s_total` f32, `cnt[2]` f32, `cls[2]` u16, `qmax[2]` u16; `other()` derived |
+| geometry | `TsdfVoxel` | 8 | `distance`, `weight` — grid stays empty at `tsdf_enabled=0` |
 
-- [semantics.hpp](../src/scovox_core/include/scovox/semantics.hpp) —
-  `SemanticMode` enum + the Bayesian-soft Dirichlet update
-  (`kappa0 · p_occ · quality` weighting; no hard occupancy gate).
-- [uncertainty.hpp](../src/scovox_core/include/scovox/uncertainty.hpp) /
-  [uncertainty.cpp](../src/scovox_core/src/uncertainty.cpp) — `digamma`,
-  `variance`, `entropy`, `expectedInformationGain`, `semanticEntropy`,
-  `betaKL`, for both `Voxel` and `SemBetaVoxel`. Note: EIG ≈ 3 digamma + 2
-  log per call — expensive per-voxel (see efficiency audit item 3).
-- [consensus_merge.hpp](../src/scovox_core/include/scovox/consensus_merge.hpp)
-  — the multi-robot merge rules: Beta merge (`a_fused = a_A + a_B − prior`),
-  the slot-reconciling Dirichlet merge (union → sum coinciding → re-truncate
-  to K_TOP, remainder → OTHER), Curless–Levoy TSDF merge. Pure functions;
-  the header comment is the authoritative spec of the math.
+`best_method.md` §5 still says "24 bytes ... nhit[2]"; that describes the
+build that produced the E9 numbers, and the doc's own caveat says the dump is
+byte-identical without `nhit`. 20 B is the shipped size.
 
-### 3.4 Integration substrates
+### 1.5 Scores (SceneNN, 8 scenes, from `best_method.md` / `RESULTS.md`)
 
-- [ray_iterator.hpp](../src/scovox_core/include/scovox/ray_iterator.hpp)
-  (40 lines) — integer Bresenham/DDA over grid coords. Visits ~max|Δ| voxels,
-  stops one short of the endpoint. Shared by every integration path.
-- [tsdf_map.hpp](../src/scovox_core/include/scovox/tsdf_map.hpp) /
-  [tsdf_map.cpp](../src/scovox_core/src/tsdf_map.cpp) — `TsdfMap`: band-only
-  TSDF integration (SLIM-VDB-equivalent), coarse + optional fine lattice,
-  **touched-set** recording (`touched_.push_back` per band write;
-  `drainTouchedTsdf()` = sort+unique+move-out vs `clearTouchedTsdf()` = drop;
-  see gotcha §9.4).
-- [sem_split_map.hpp](../src/scovox_core/include/scovox/sem_split_map.hpp) /
-  [sem_split_map.cpp](../src/scovox_core/src/sem_split_map.cpp) —
-  `SemSplitMap`: owns the Beta + Dir grids **plus transient grids for
-  dynamic classes**, the batched free-space carve
-  (`carve_stage_`/`carve_hits_` staging, `flushCarveFrame()` block-sorted by
-  leaf), the semantic hit update with optional BKI/spread kernel
-  (`applyHitUpdateKernel`), evidence saturation, and its own touched
-  sets/drains. `Params` (w_occ, w_free, kappa0, num_classes,
-  `batch_free_carve`, …) is the behavior switchboard.
-- [refinement_regions.hpp](../src/scovox_core/include/scovox/refinement_regions.hpp)
-  — registry of vertical-cylinder fine-TSDF regions (O(1) point-in-region
-  via 2-D spatial hash — it runs per ray hit) + the IRLS anchor-shift fit
-  that keeps a fine lattice drift-free relative to its tree.
-
-### 3.5 The fused walker (the hot path)
-
-- [scovox_map_split.hpp](../src/scovox_core/include/scovox/scovox_map_split.hpp)
-  — `ScovoxMapSplit`: composes one `TsdfMap` + one `SemSplitMap` and
-  implements **`integrateHitFused`**, the single-DDA-per-ray walker that
-  updates TSDF band, Beta carve, and Dir hit in one pass. Contains the
-  far-voxel skip (Chebyshev far test + guard ring; arms only when carving is
-  batched OFF), the inlined bit-exact `coordToPos`, and deliberate per-ray
-  timing brackets. **This file is verification-sensitive:** changes here are
-  expected to reproduce byte-identical maps (see gotcha §9.5). Read its long
-  comments before editing; they encode the invariants.
-
-### 3.6 Wire codec
-
-- [binary_serializer.hpp](../src/scovox_core/include/scovox/binary_serializer.hpp)
-  — the rev-8 delta codec: per-stream records (Beta / Dir / TSDF / fine),
-  block-run coordinate encoding (64 B bitmask or index list per leaf),
-  u8 sqrt-companded evidence, u8 class ids, deterministic block sort,
-  DoS-guarded deserialization. `serialize*` take touched-coord lists;
-  `deserialize*` return decoded records for the merger.
-- [lz4_codec.hpp](../src/scovox_core/include/scovox/lz4_codec.hpp) —
-  `compressLZ4`/`decompressLZ4` with a 4-byte big-endian size header and a
-  256 MB sanity cap. (Struct is named `ScovoxBinarySerializer` for historical
-  call-site compatibility.)
-
-### 3.7 Offline / analysis utilities
-
-- [marching_cubes.hpp](../src/scovox_core/include/scovox/marching_cubes.hpp)
-  — TSDF mesh extraction (`extractMesh`, `extractZeroCrossing`), PLY writer
-  (ASCII), backs the `ExtractMesh` service and the TSDF cloud publisher.
-- [mesh_labelling.hpp](../src/scovox_core/include/scovox/mesh_labelling.hpp)
-  — `labelMesh` / `labelPointCloud`: attach semantics to extracted geometry
-  by cross-grid lookup. Missing semantic voxel → sentinel class `0xFFFF`
-  ("unknown") — consumers must filter it.
-- [dbh_fit.hpp](../src/scovox_core/include/scovox/dbh_fit.hpp) —
-  post-processing robust circle fit for trunk DBH on the fine TSDF lattice.
-  **Nothing in the runtime calls it**; it lives here so map consumers can
-  link one library.
-- [map_interface.hpp](../src/scovox_core/include/scovox/map_interface.hpp) —
-  legacy `Params` + one-stop re-export header (`voxel.hpp`, `uncertainty.hpp`,
-  `semantics.hpp`, `ray_iterator.hpp`). Include this to get the unified-voxel
-  toolkit in one line.
-
-### 3.8 Tests and tools
-
-`test/` — gtest suites, one per unit (`test_tsdf_map`, `test_sem_split_map`,
-`test_scovox_map_split`, `test_binary_serializer`, `test_consensus_merge`,
-`test_sparse_add`, `test_voxel_layouts`, `test_uncertainty`,
-`test_mesh_labelling`, `test_fine_tsdf`). **Read the tests as the behavioral
-spec** — they encode contracts (merge algebra, codec round-trips, layout
-asserts) that the headers only summarise. `tools/split_memory_demo.cpp` is a
-standalone memory-footprint demo.
-
-## 4. `scovox_mapping` — the ROS layer
-
-Builds library `scovoxmap` (the legacy unified `Map`) + two node executables
-(`scovox_mapping_node`, `dscovox_mapping_node`), all linking `scovox_core`,
-Eigen, LZ4, and the usual ROS 2 stack (tf2, message_filters, …).
-
-### 4.1 [scovox_node.cpp](../src/scovox_mapping/src/scovox_node.cpp) — the mapper (~3100 lines)
-
-Single class, single file. **Region map** (anchors approximate; refresh with
-`grep -n "publishScovoxMap\|publishBinaryMap\|publishPlanningMap\|publishPointCloud\|publishTSDFPointCloud\|int main" src/scovox_mapping/src/scovox_node.cpp`):
-
-| Lines ≈ | Region | Notes for editing |
-|---|---|---|
-| 40–230 | Constructor: TF buffer (600 s cache, L54), map construction, 1 Hz publish timer (163–178, holds one `shared_lock` across all publishers), `ExtractMesh` service (157), fine-region subscription (210) | Timer callbacks run on the **same thread** as sensor callbacks |
-| 138–148 | `GateBeta`/`GateDir` change-gate structs | Wire-delta semantics — comparison values must stay exact |
-| ~400–830 | `declare_parameter` block — **every runtime knob is declared here**, grouped by feature | To find any parameter's default: grep `declare_parameter` |
-| 813–900 | Subscriptions + publishers: DiagnosticArray status, LiDAR cloud, IMU, CameraInfo, dataset-mode depth/seg image subs (857–862, `KeepLast(1000)` reliable), `ScovoxMap`/`ScovoxMapBinary`/cloud/planning publishers (879–898). Topic names come from parameters, not literals | Grep the parameter name (e.g. `input_pc_topic`) to trace a topic |
-| ~1050–1350 | RGB-D path: ApproximateTime depth+seg sync, per-pixel back-projection, optional top-K soft-prob overlay via `TopkProvider` | |
-| ~1450–1790 | LiDAR path: medoid downsample, deskew, per-ray `integrateHitFused` loop, `flushCarveFrame`, per-frame diag log + `/proc` RSS read (1766–1781) | The per-frame log tokens (`frame_ms`, `tsdf_ms`, …) are **parsed by experiment tooling** — do not rename/re-scope them |
-| 1956–1990 | `publishScovoxMap` — full-map `ScovoxMap` message (subscriber- + `sm_dirty_`-gated) | Ships all active Beta cells incl. free space |
-| 2056–2310 | `publishBinaryMap` — drains touched sets, applies change gates, rev-8 serialize + LZ4, chunked emit with byte budget + deferral FIFO | Zero-subscriber path currently drains-and-discards (audit item 2) |
-| 2316–2500 | Gate helpers (`gateTauEff`, heartbeat walk), snapshot emit paths | |
-| 2496–2601 | `publishPlanningMap` — 2-D occupancy/terrain grid for nav (called per scan, 1763) | Full-grid walk; audit item 4 |
-| 2608–2745 | `publishPointCloud` — semantic cloud + per-voxel variance/EIG fields, reuses `pc_scratch_` | |
-| 2749–2900 | `publishTSDFPointCloud` / fine cloud → `extractZeroCrossing` | |
-| 3026–3060 | Gate-grid allocation (rolling-mode setup) | |
-| 3104 | `main` — **`rclcpp::spin` on a SingleThreadedExecutor** | All callbacks serialize on one thread |
-
-### 4.2 [dscovox_node.cpp](../src/scovox_mapping/src/dscovox_node.cpp) — the merger (~900 lines)
-
-| Lines ≈ | Region | Notes |
-|---|---|---|
-| 60–190 | Includes, params, per-source grid bookkeeping | Includes `scovoxmap.hpp` only for the core re-exports |
-| 194–230 | Publishers (fused cloud, fused `ScovoxMap` latched transient-local), one `ScovoxMapBinary` subscription per robot, `GetRegion`/`GetOccupancyGrid` services | |
-| 256–263 | Diagnostics: `activeCellsCount` over all grids per tick (5 s-throttled log) | |
-| ~380–560 | Binary ingest: LZ4 → deserialize → per-source grid write with `map_from_source` transform (per-binary INFO at 524–528) | The transform rides in the message — the merger needs **no TF tree** |
-| ~560–608 | Delta-proportional **reset-then-refold consensus**: only cells whose source contribution changed are re-folded, via allocation-free scratch (`refold_beta_src_`/`refold_dir_src_`). The per-cell math lives in `dscovox_consensus.hpp` | The well-designed core — protect it |
-| 609–688 | `publishPointCloud` — fused viz cloud (two full-grid walks; audit item 5) | |
-| 694–787 | `regionOnGrid`/`fillRegion`/`publishFusedMap` — box queries + full fused-map message | |
-| 794–902 | Service handlers, occupancy-grid projection, `main` | |
-
-### 4.3 Headers ([include/scovox/](../src/scovox_mapping/include/scovox/))
-
-- [node_utils.hpp](../src/scovox_mapping/include/scovox/node_utils.hpp) —
-  shared node helpers: semantic color palette generation (10 fixed +
-  golden-angle HSV), small formatting utilities. No node state.
-- [scovoxmap.hpp](../src/scovox_mapping/include/scovox/scovoxmap.hpp) /
-  [scovoxmap.cpp](../src/scovox_mapping/src/scovoxmap.cpp) — the **legacy
-  unified `scovox::Map`** (single grid of `Voxel`, main + transient). The
-  live mapper uses the split substrate instead; this class survives for the
-  older tests and as the simplest self-contained example of the update math
-  (`integrateRay` in ~500 lines). Good starting point for a minimal port.
-- [topk_provider.hpp](../src/scovox_mapping/include/scovox/topk_provider.hpp)
-  — file-backed loader/cache for per-frame soft-probability `.topk` blobs
-  (binary layouts documented in the header). Only ROS dependency is the
-  injected logger/clock.
-- [dscovox_consensus.hpp](../src/scovox_mapping/include/scovox/dscovox_consensus.hpp)
-  — **pure** receiver-side consensus helpers (at-prior tests, Beta+Dir →
-  fused `SemBetaVoxel` projection, per-cell refold core). No ROS/Bonxai/Eigen.
-  The node and its tests run the *same* code through this header.
-
-### 4.4 Launch and config
-
-| Launch file | Runs |
+| metric | value |
 |---|---|
-| `scovox_single_robot.launch.py` / `scovox_multi_robot.launch.py` | mapper(s), live sensors |
-| `dscovox_single_robot.launch.py` / `dscovox_multi_robot.launch.py` | mapper(s) + merger, wire sharing on |
-| `lidar_mapping.launch.py` | LiDAR profile |
-| `scenenn_eval.launch.py`, `scenenet_eval.launch.py`, `scenenet_eval_fusion.launch.py`, `semantickitti_eval.launch.py` | dataset-replay evaluation profiles |
+| intersection mIoU | 0.5853 |
+| union mIoU | 0.2981 |
+| occupancy IoU | 0.4393 |
+| precision / recall | 0.5236 / 0.7272 |
+| phantom voxels | 16 005 |
+| throughput | 6.2–6.7 fps |
 
-Config YAMLs in [config/](../src/scovox_mapping/config/): `default_params.yaml`,
-`lidar_mapping.yaml`, `dscovox_params.yaml`, `scovox_bin_min.yaml` (minimal
-wire profile). Parameter **defaults** live in the node's `declare_parameter`
-block; YAMLs override them per profile — check both when tracing a value.
+Union mIoU is the number to use for cross-mapper comparison (the SLIM-VDB
+baseline loses it 8/8). The `RESULTS.md` deliverable block at line 31 still
+prints `SCOVOX_EVICT_INHERIT=3`; that is stale — `i3` was demoted and `i0`
+promoted, and the code now refuses `i3` at compile time.
 
-### 4.5 Tests
+---
 
-`test/`: `test_beta_update`, `test_dirichlet_update`, `test_tsdf_band`,
-`test_semantic_audit`, `test_consensus`, `test_marching_cubes`,
-`test_topk_provider` — these exercise the legacy `Map` and node-level helper
-contracts; the split-substrate suites live in `scovox_core/test/`.
+## 2. The current code
 
-## 5. `scovox_msgs` — interface definitions
+### 2.1 Repository layout
 
-- **`ScovoxMapBinary.msg`** — the wire: `version`, `little_endian`,
-  `map_from_source` (`geometry_msgs/Transform`, captured at publish so the
-  merger needs no TF), `uint8[] data` (LZ4 blob). `header.frame_id` = source
-  robot's integration frame — the merger keys per-source grids by it.
-- **`ScovoxMap.msg`** — full-map snapshot: resolution, origin, thresholds,
-  `ScovoxVoxel[]`.
-- **`ScovoxVoxel.msg`** — position + `a_occ`/`a_free` + `a_unk` +
-  `ScovoxSemanticEvidence[]` (class id + fractional count). Consumers derive
-  p_occ and best-class themselves.
-- **`RefinementRegion.msg`** — register/unregister a fine-TSDF trunk
-  cylinder; field-compatible with the planner's TreeTarget.
-- **Services:** `ExtractMesh` (min_weight + output path → PLY),
-  `GetRegion` (AABB → `ScovoxMap` of that box), `GetOccupancyGrid`
-  (z-range → `nav_msgs/OccupancyGrid`). All three served by the nodes as
-  noted in §4.
+```
+scovox/
+├── compose.yaml              persistent dev container (ROS 2 Jazzy, GPU passthrough)
+├── docker/
+│   ├── Dockerfile            osrf/ros:jazzy-desktop + rosdep over the manifests
+│   └── build_and_test.sh     one-shot colcon build + test in a throwaway container
+├── scripts/
+│   ├── launch_scovox.sh      in-container launcher for the raw-Ouster LiDAR path
+│   └── wire_study/           offline scovox_bin re-encoding studies (header is stale, v5)
+├── config/                   run configs for the real robot (LiDAR, fused, share, fine band)
+├── docs/                     this file, docs/code/, docs/archive/, docs/img/, docs/papers/
+└── src/
+    ├── scovox_core/          zero-ROS mapping library + 11 gtest binaries + split_memory_demo
+    ├── scovox_msgs/          5 msgs, 3 srvs
+    ├── scovox_mapping/       scovox_node, dscovox_node, scovoxmap lib, 9 launch files, 8 gtests
+    └── seg_pipeline/         Python Mask2Former (Mapillary) → 14 outdoor classes
+```
 
-## 6. `seg_pipeline` — segmentation front-end (Python)
+Line counts (working tree): `scovox_node.cpp` 3396, `sem_split_map.cpp`
+1213, `dscovox_node.cpp` 994, `scovox_map_split.hpp` 959, `sem_split_map.hpp`
+829, `binary_serializer.hpp` 701, `dir_voxel.hpp` 470. Bonxai is vendored at
+`src/scovox_core/include/third_party/bonxai/`.
 
-[seg_node.py](../src/seg_pipeline/seg_pipeline/seg_node.py) — runs an outdoor
-semantic segmentation model on the color stream and republishes seg + depth +
-CameraInfo **all stamped with the depth frame's timestamp and a body
-`frame_id`**, which is what makes the mapper's 0.05 s ApproximateTime sync
-robust. `outdoor_palette.py` holds the class palette. Runs in Docker
-(`compose.yaml`). Replaceable by anything that publishes the same three
-topics with the same stamping contract.
+### 2.2 Build and run
 
-## 7. Data flow (follow a measurement through the system)
+- **Docker (the supported path).** `docker/build_and_test.sh` builds the
+  image `scovox:jazzy` and runs `colcon build && colcon test` with the repo
+  bind-mounted at `/scovox`. `compose.yaml` gives the same image as a
+  persistent container (`docker compose up -d`, `docker compose exec scovox
+  bash`). No build artefacts exist in the working tree right now.
+- **Standalone `scovox_core`.** `src/scovox_core/CMakeLists.txt` builds
+  without ament (commit `b13ca55`); tests register through `ament_add_gtest`
+  under ROS or plain `add_executable` otherwise (`:82-84`).
+- **The replay** in `scovox_slot_rules/` compiles `scovox_core` from this
+  checkout with `-DSCOVOX_SRC=<this repo>` (its `CMakeLists.txt:34-39`) and is
+  run through `scovox_slot_rules/docker/dev.sh`. That is where the best method
+  is actually exercised; nothing in this repository runs it end to end.
+- **Real robot.** `scripts/launch_scovox.sh raw` →
+  `lidar_mapping.launch.py` with `config/scovox_lidar_raw_deskew.yaml`.
 
-**Single robot:**
-sensor msg → node callback (§4.1) → pose from TF → per-ray
-`ScovoxMapSplit::integrateHitFused` (TSDF band + Beta carve staging + Dir
-hit) → `flushCarveFrame` (batched, leaf-sorted) → touched sets accumulate →
-1 Hz timer → `publishBinaryMap`: drain touched → change gates → rev-8
-serialize → LZ4 → `ScovoxMapBinary` out (+ `ScovoxMap`, clouds, planning
-grid, each behind its own subscriber/dirty gate).
+### 2.3 `scovox_core` — the library
 
-**Multi-robot:**
-each robot's `ScovoxMapBinary` → merger ingest (§4.2): LZ4 → deserialize →
-transform by `map_from_source` → per-source grid → delta-proportional refold
-(`dscovox_consensus.hpp` math, `consensus_merge.hpp` algebra) → fused grids →
-fused cloud / `ScovoxMap` / region services.
+#### Compile-time flags
 
-## 8. Reuse recipes — minimal file sets for other projects
-
-`scovox_core` is deliberately ROS-free: everything below needs only a C++17
-compiler, Eigen (for the walker/substrates), and liblz4 (wire only).
-Bonxai is MPL-2.0 (file-level copyleft — keep its license header).
-
-| You want | Take | Plus |
+| macro | default | effect |
 |---|---|---|
-| A sparse voxel grid, nothing else | `include/third_party/bonxai/` | — (header-only, self-contained) |
-| TSDF fusion (SLIM-VDB-style) | `tsdf_map.hpp/.cpp`, `tsdf_voxel.hpp`, `ray_iterator.hpp` | bonxai, Eigen |
-| Bayesian occupancy + top-K semantics | `sem_split_map.hpp/.cpp`, `beta_voxel.hpp`, `dir_voxel.hpp`, `voxel.hpp` (for `K_TOP`/`sparse_add`), `semantics.hpp` | bonxai, Eigen |
-| The full fused mapper (all three grids, one walker) | `scovox_map_split.hpp` | both rows above |
-| The delta wire codec | `binary_serializer.hpp`, `lz4_codec.hpp` | voxel types, liblz4 |
-| Multi-robot map merging (math only) | `consensus_merge.hpp`, `scovox_mapping/include/scovox/dscovox_consensus.hpp` | voxel types only — both are pure |
-| Uncertainty measures (EIG, entropy, KL) | `uncertainty.hpp/.cpp` | `voxel.hpp`, `sembeta_voxel.hpp` |
-| TSDF → mesh (+ labels) | `marching_cubes.hpp`, `mesh_labelling.hpp` | tsdf/sembeta voxels, bonxai, Eigen |
-| Trunk DBH from a fine lattice | `dbh_fit.hpp`, `refinement_regions.hpp` | tsdf types, Eigen |
-| Simplest possible reference implementation | `scovox_mapping`'s legacy `scovoxmap.hpp/.cpp` + `map_interface.hpp` | bonxai, Eigen — one class, ~500 lines, whole update math |
-| A ROS node skeleton around any of the above | crib from `scovox_node.cpp` regions in §4.1 rather than copying the file | — |
+| `SCOVOX_K_TOP` | 2 | slots per `DirVoxel` (`voxel.hpp:21-24`) |
+| `SCOVOX_TRACK_QMAX` | 1 | per-slot confidence `qmax[]`; +4 B; required by evict-by-confidence (`dir_voxel.hpp:108-109`) |
+| `SCOVOX_TRACK_NHIT` | 0 | per-slot deposit counter; write-only; +4 B (`dir_voxel.hpp:118-119`) |
+| `SCOVOX_BETA_U16` | 1 | 2×u16 fixed-point Beta counters (`beta_voxel.hpp:68-69`) — **uncommitted default flip** |
+| `SCOVOX_BETA_U16_SCALE` | 8 | lattice step ⅛ (`beta_voxel.hpp:78-79`) |
+| `SCOVOX_E0_COUNTERS` | unset | admission/eviction counters (`e0_counters.hpp`) |
+| `SCOVOX_EVICT_INHERIT` | must be 0 | any other value → `#error` (`dir_voxel.hpp:142-144`) |
+| `SCOVOX_VICTIM_MEAN`, `SCOVOX_VICTIM_QMAX`, `SCOVOX_ADMIT_NORM` | removed | `#error` (`dir_voxel.hpp:133-141`) |
 
-## 9. Conventions and gotchas (read before editing)
+Size invariants are `static_assert`ed: `DirVoxel` 20 B at K=2 with QMAX
+(`dir_voxel.hpp:245-246`), 16 B without; `BetaVoxel` 4 B under u16, 8 B float
+(`beta_voxel.hpp:273-276`); `TsdfVoxel` 8 B (`tsdf_voxel.hpp:31`).
 
-1. **Accessor discipline.** Never call `grid.createAccessor()` per voxel —
-   create once per loop/scan and reuse; the accessor caches the last leaf so
-   same-leaf access is ~2 mask ops. `ConstAccessor` caches *null* leaves too:
-   for read-modify-write use `setValue`/mutable accessor, or a stale null
-   cache will hide the write.
-2. **Zero = unobserved.** Bonxai zero-initialises new leaves; every voxel
-   type treats all-zero as its unobserved sentinel (`weight == 0`,
-   `a_occ == a_free == 0`, empty Dir slots). Never give a voxel type a
-   default state that isn't all-zero.
-3. **Voxel layouts are frozen by the wire.** 8/16/24 B sizes are
-   `static_assert`ed and `reinterpret_cast` by the serializer and tests.
-   A field change = codec revision bump + merger compatibility + published
-   figures. Treat as an interface change with its own design doc.
-4. **`drainTouched*` vs `clearTouched*`.** Drain = sort + unique + move-out
-   (expensive, returns coords for the wire); clear = drop. If you consume a
-   drain's result, you own emitting those voxels — the change gates assume
-   every drained coord was considered.
-5. **The hot walker is verification-gated.** Changes to
-   `scovox_map_split.hpp` / the carve path are expected to reproduce
-   **byte-identical** map digests across configs (this harness exists and has
-   been used — see the design docs). Do not land hot-path changes without it.
-6. **Timing tokens are an interface.** Per-frame log fields (`frame_ms`,
-   `tsdf_ms`, per-ray brackets) are parsed by experiment tooling, and the
-   bracket *scope* is deliberate — a past attempt to re-scope per-scan was
-   reverted as a defect. Never rename, re-scope, or re-cadence them without
-   checking `experiments/`.
-7. **Parameters live in two places.** Defaults in the node's
-   `declare_parameter` block; per-profile overrides in
-   `config/*.yaml` + launch arguments. Grep both when tracing behavior.
-8. **Build from the workspace root** (`scovox/`):
-   `colcon build --packages-select scovox_core scovox_mapping`. Building from
-   any other directory creates a stray `build/` and your binaries silently
-   don't update. The install trees use **symlink-install for launch/config**
-   (verified: `install/.../launch/*.py` are symlinks into `src/`) — editing a
-   launch or YAML in `src/` immediately changes every install tree that links
-   it, including pinned experiment installs (`install_*`). C++ changes, by
-   contrast, reach nothing until the matching build tree is rebuilt.
-9. **Multiple pinned build/install trees exist** (`build_*`/`install_*`) for
-   past experiment configurations. Do not assume any of them matches git
-   HEAD. The live development pair is `build/` + `install/`.
-10. **Class-id conventions.** Slot/class 0 = unknown/unlabeled in the top-K
-    blobs; `0xFFFF` = "no semantic voxel" sentinel from mesh/point labelling;
-    `num_classes` is runtime (node default 14), `K_TOP` is compile-time (2).
-11. **Hot-spot map.** Before optimising anything, read
-    [design/efficiency_audit_2026_08_26.md](design/efficiency_audit_2026_08_26.md)
-    — it ranks the known costs and lists the fixes already deemed
-    out-of-bounds.
+#### Voxel types
+
+| header | type | status |
+|---|---|---|
+| `tsdf_voxel.hpp` | `TsdfVoxel` 8 B | live (TSDF grid) |
+| `beta_voxel.hpp` | `BetaVoxel`, `BetaCountU16`, lattice helpers `beta_lattice_snap` / `beta_max_increments`, priors `kBetaOccPrior = kBetaFreePrior = 1` | live (occupancy grid) |
+| `dir_voxel.hpp` | `DirVoxel` (total basis: `s_total`, derived `other()`, `set_other()`), `sparse_add_class`, `dominantClass` | live (semantic grid) |
+| `voxel.hpp` | legacy unified `Voxel` (`a_occ,a_free,a_unk,sem_cnt[K],sem_cls[K]`), `sparse_add`, the four `g_sparse_*_count` atomics | legacy: still the projection type for `ScovoxMap` messages and the substrate of `scovox::Map` |
+| `sembeta_voxel.hpp` | `SemBetaVoxel` 24 B | legacy: viz/projection only |
+| `semantics.hpp` | naive / majority-vote updaters | legacy ablation modes, still selectable via `semantic_mode` |
+
+#### `ScovoxMapSplit` (`scovox_map_split.hpp`) — the three-grid façade
+
+- **Params** (`:40-104`): `resolution`, `inner_bits`, `leaf_bits`,
+  `dir_leaf_bits`, nested `tsdf` (`TsdfMap::Params`) and `semsplit`
+  (`SemSplitMap::Params`), `fused_walker` (default true, `:60`),
+  `tsdf_enabled` (true, `:68`), `far_voxel_fast_paths` (true, `:82`), fine
+  band `fine_ratio_log2` 0 / `fine_sdf_trunc_voxels` 3 /
+  `fine_region_margin` 0.15 / `fine_anchor_enable` true / `AnchorFitParams`.
+- **Ctor** (`:103-136`): copies shared geometry into both sub-maps; aborts if
+  `semantic_band_length > 0 && !fused_walker` (`:129-136`).
+- **`integrateHitFused`** (`:183-565`): the single exact DDA described in
+  §1.3. `band_active` (`:232-234`) requires band > 0, not dynamic, not
+  geometry-off, no BKI kernel, and semantic probabilities present. Far-skip
+  and far-carve (`:273-276`, `:318-322`) are gated on
+  `far_voxel_fast_paths_ && !space_carving && carveFrameOpen()`.
+  `exact_body` is `noinline` (`:369-449`) so the shortcuts can be diffed
+  against it.
+- **`integrateHitSplit`** (`:575-595`): two DDAs; calls `tsdf_.integrateRay`
+  gated only on `!is_dynamic && !geometry_off` — **no `tsdf_enabled_` test**
+  (`:587`, the comment at `:586-587` admits it). Only reached when
+  `fused_walker=false`.
+- **Fine TSDF band** (`fine_ratio_log2 > 0`): a second `TsdfMap` at
+  `resolution / 2^k`, written only inside registered refinement cylinders
+  (`refinement_regions.hpp`; `RefinementRegion.msg`), with optional per-scan
+  2-DoF anchor re-fit. Off in every evaluation path.
+- Accessors used by the node and tests: `farSkippedVoxels()`,
+  `farCarvedVoxels()`, `exactBodyVoxels()`, `farVoxelFastPaths()`,
+  `resetTiming()`, per-walker nanosecond counters.
+
+#### `SemSplitMap` (`sem_split_map.hpp` / `.cpp`) — Beta ∥ Dir substrate
+
+- Owns the persistent Beta and Dir grids, transient Beta/Dir grids (per-frame
+  decay, `decayTransient` `:982-1052`), a `fallback_dir_grid_` for
+  `ray_spread` mode 4, a `CarveStage` (`carve_stage.hpp`: block-keyed,
+  per-voxel max `w_free`) and a `HitStage` + `hit_probs_` pool for
+  `batch_hits`.
+- **Params defaults** (`sem_split_map.hpp`): `w_occ` 1.0, `w_free` 0.5,
+  `kappa0` 1.0, `dirichlet_min_p_occ` 0.5, `hit_flat_share` false,
+  `evidence_saturation` 0, `class_evidence_saturation` −1,
+  `evict_by_confidence` false, `inc_mode` 0, `inc_thresh` 0.10,
+  `semantic_spread_radius` 0, `semantic_band_length` 0,
+  `semantic_band_require_occ` **true**, `ray_spread` 0,
+  `carve_skip_occ_threshold` 0, `batch_free_carve` true, `batch_hits` true,
+  `range_decay_length` 50, `num_classes` 14, `alpha_0` 0.01.
+- **`sanitise(Params&)`** (`.cpp:266-300`): clamps, snaps `w_occ`/`w_free`
+  onto the ⅛ lattice (`:297-298`), clamps `dir_leaf_bits ≤ leaf_bits`,
+  enforces band / BKI ball / ray-spread mutual exclusion. A second
+  `sanitise(HitWeights&)` snaps the fusion profiles the node builds.
+- **Per-ray entry** `integrateHit` (`:362-388`) → `carveRay` (`:399-430`,
+  staged or direct via `applyCarveUpdate` `:435-471`) → hit staged
+  (`batch_hits`) or `applyHitUpdateOn` (`:583-665`) → `commitHit`
+  (`:669-738`). Stageable only when no kernel, no spread, no ray_spread.
+- **Frame protocol**: `beginCarveFrame` / `flushCarveFrame` (`:476-519`)
+  around each scan; `flushStagedHits` (`:521-560`) runs first so occupied
+  wins over carve for the same voxel in the same scan.
+- **Other deposit modes**: BKI kernel `applyHitUpdateKernel` (`:943-977`,
+  `spreadTable` `:918-942`), `raySpreadDeposit` (`:759-829`, modes 1-4),
+  `applyBandSemantic` (`:844-892`).
+- **Queries / drains**: `getBetaVoxel`, `getDirVoxel`, `dominantClassAt`
+  (`:1187-1212`), `drainTouchedBeta` / `drainTouchedDir` (`:1169-1181`,
+  sort-unique, swap-scratch).
+
+#### `TsdfMap` (`tsdf_map.hpp` / `.cpp`)
+
+Curless–Levoy over `TsdfVoxel`; `Params::sdf_trunc` 0.15 clamped positive,
+`space_carving` false; `integrateRay` (band-only DDA), `applyBandUpdate` (the
+per-voxel tail the fused walker calls), weighting factories `constant` /
+`linear` / `exponential` / `rangeDecay`, `drainTouched` / `clearTouched`,
+`forEachVoxel` (centres, not corners). The header still names the
+deleted `SemBetaMap` (`:15-17`, `:49`) and cites a nonexistent
+`feedback_slimvdb_memory_measurement.md` (`:151`).
+
+#### Wire format (`binary_serializer.hpp`, `lz4_codec.hpp`)
+
+- `BinarySerializer::FORMAT_VERSION = 8` (`:168`). Payload: TSDF deltas,
+  Beta deltas, Dir deltas, optional fine-TSDF deltas, block-run coordinate
+  coding assuming 8×8×8 leaf blocks (`:518-519`, i.e. `leaf_bits = 3`).
+- Evidence is u8 sqrt-companded when the sender sets `quant_step =
+  evidence_saturation / 255²` (`scovox_node.cpp:2253-2255`); `quant_step = 0`
+  keeps f32 payloads. Class ids are u8 when `num_classes ≤ 255`.
+  `Frame::quant_step`'s comment (`:182-183`) still describes the older u16
+  scheme.
+- `MAX_NUM_CLASSES` 4096, `MAX_FINE_RATIO_LOG2` 8.
+- `lz4_codec.hpp`: 4-byte big-endian original-size header + LZ4 block,
+  256 MB decode cap.
+- ROS envelope `ScovoxMapBinary`: `version` (the node writes 5,
+  `scovox_node.cpp:2495`), `little_endian`, `map_from_source` transform,
+  `data`.
+
+#### Everything else in `scovox_core`
+
+| file | role |
+|---|---|
+| `consensus_merge.hpp` | `mergeBeta` (floors at the prior), `mergeDir` (insertion-sort fold, not fully order independent) |
+| `uncertainty.hpp/.cpp` | Beta / Dirichlet entropy and variance helpers (21 tests) |
+| `mesh_labelling.hpp`, `marching_cubes.hpp` | mesh extraction + per-vertex labels for `ExtractMesh` |
+| `refinement_regions.hpp`, `dbh_fit.hpp` | fine-band cylinders, 2-DoF anchor fit, DBH fit |
+| `carve_stage.hpp` | block-keyed staged carve |
+| `e0_counters.hpp` | admission / eviction counters behind `SCOVOX_E0_COUNTERS` |
+| `ray_iterator.hpp` | exact DDA iterator (the only traversal since `d5da6a8`) |
+| `map_interface.hpp` | `scovox::Params` (the node's map-parameter struct), `SemanticMode`, `HitWeights` |
+| `version.hpp` | `0.1.0` |
+| `tools/split_memory_demo.cpp` | prints grid memory for the three-grid layout |
+
+### 2.4 `scovox_msgs`
+
+| type | fields |
+|---|---|
+| `ScovoxMapBinary.msg` | `header`, `version` u8, `little_endian`, `map_from_source` (Transform), `data` u8[] |
+| `ScovoxMap.msg` | `header`, `resolution`, `origin`, `occupancy_threshold`, `semantic_threshold`, `max_semantic_classes` u8, `ScovoxVoxel[] voxels` |
+| `ScovoxVoxel.msg` | `position` Point32, `a_occ`, `a_free`, `a_unk`, `ScovoxSemanticEvidence[]` |
+| `ScovoxSemanticEvidence.msg` | `class_id` u16, `evidence_count` f32 |
+| `RefinementRegion.msg` | `id`, `x`, `y`, `base_z`, `radius`, `remove` |
+| `GetRegion.srv` | AABB → `ScovoxMap` |
+| `GetOccupancyGrid.srv` | `z_min`, `z_max`, `resolution_2d` → `nav_msgs/OccupancyGrid` |
+| `ExtractMesh.srv` | `min_weight`, `output_path` → counts + `ply_path` |
+
+### 2.5 `scovox_mapping`
+
+#### `scovox_node.cpp` (`scovox_mapping_node`, class `SCovoxNode`)
+
+**Lifecycle.** Ctor `:65-310` → `declareMapParams` (`:322-422`, fills
+`scovox::Params P`) → `declareNodeParams` (`:423-811`) → build
+`ScovoxMapSplit::Params SP` from `P` and node members (`:91-146`) →
+`buildFusionProfiles` (`:820-863`) → `setupSubscribers` (`:880+`) →
+`setupPublishers` (`:957-996`). `main` (`:3367-3396`) spins a
+`MultiThreadedExecutor` with 2 threads; the viz timer sits in its own
+callback group; the map is guarded by `map_mtx_` (`std::shared_mutex`).
+
+**Map parameters and their `dp()` defaults** (`declareMapParams`):
+
+| parameter | default | line |
+|---|---|---|
+| `resolution` | 0.10 | 325 |
+| `inner_bits` / `leaf_bits` / `dir_leaf_bits` | 2 / 3 / 2 | 326-328 |
+| `w_free` / `w_occ` | 1.0 / 2.0 | 334 |
+| `kappa0` | 2.0 | 335 |
+| `enable_tsdf` / `sdf_trunc_voxels` | true / 3 | 354-357 |
+| `semantic_occ_gate` | 0.5 | ~360 |
+| `batch_hits` | true | 364 |
+| `evidence_saturation` | 1000 | 369 |
+| `dirichlet_min_p_occ` | 0.5 | 378 |
+| `range_decay_length` | −1.0 | 380 |
+| `semantic_mode` | "dirichlet" | 383-386 |
+| `max_semantic_classes` | 10 | 387 |
+| `semantic_evict_by_confidence` | false | 391 |
+| `semantic_spread_radius` | 0 | 392 |
+| `semantic_band_length` | 0.0 | 393 |
+| `semantic_band_require_occ` | true | 394 |
+| `min_range` / `max_range` | 0.3 / 10.0 | ~381-382 |
+
+**Node parameters** (`declareNodeParams`, selected): `base_frame` base_link,
+`integration_frame` odom, `depth_topic`, `stride` 1 (`:444`), `min_depth` /
+`max_depth` 0.1 / 10.0 (`:445`), `trace_no_return_rays` false (`:446`),
+`carve_band` −1, `mode` "rolling" (`:453`), `occupancy_vis_threshold` 0.7,
+`publish_planning_map` true, the `share_*` wire knobs, `fused_walker` true
+(`:676`), `num_classes` 14 (`:682`), `dirichlet_prior` 0.01 (`:684`),
+`tsdf_dump_path` "" (`:693`), `deskew_mode` "auto" + IMU knobs (`:703-715`),
+`tf_lookup_timeout_sec` 0.2 / `tf_require_exact` false / `rgbd_tf_timeout_sec`
+0.2 (`:724-732`), `downsample_voxel_size` **0.5** (`:754`),
+`startup_tf_stable_sec` 2.0 / jump thresholds (`:762-774`), the localizer
+reject gate (`:785-788`), `topk_probs_dir` (`:796`), `eviction_stats_csv`
+(`:800`). `dataset_queue_depth` 1000 (`:938`).
+
+**How `P` reaches the library** (`:91-146`): geometry and TSDF from `P`;
+`SP.tsdf_enabled = (sdf_trunc_launch_ > 0)` (`:108`); `w_free`, `w_occ`,
+`kappa0`, `carve_skip_occ_threshold`, `batch_free_carve`, `batch_hits`,
+`evidence_saturation`, `dirichlet_min_p_occ`, `range_decay_length`,
+`semantic_mode` from `P`; `evict_by_confidence`, `semantic_spread_radius`,
+`semantic_band_length`, `semantic_band_require_occ`, `num_classes`,
+`alpha_0`, `fused_walker` and the fine-band fields from node members.
+**Not set anywhere in the node**: `hit_flat_share`, `inc_mode`, `inc_thresh`,
+`class_evidence_saturation`, `ray_spread`, `far_voxel_fast_paths` — they stay
+at `SemSplitMap::Params` / `ScovoxMapSplit::Params` defaults.
+
+**Input paths.**
+- RGB-D: `onImages` (`:1301-1371`) → `DepthSnapshot` →
+  `integrateDepthSnapshot` (`:1179-1238`, per-pixel `integrateHit`, no-return
+  carve at `:1232` when `trace_no_return_rays`) → `finishScanTail`
+  (`:1257-1293`).
+- LiDAR: `onPointCloud` (`:1791+`) → `LidarSnapshot` →
+  `integrateLidarSnapshot` (`:1503-1788`): gyro deskew (`:1373-1477`
+  helpers), optional translation deskew, medoid voxel downsample
+  (`:1661-1738`), per-point label / top-k path (`:1740-1783`), one carve frame
+  per scan (`:1660`, `:1784`).
+- Fusion (`fuse_lidar_rgbd`): both streams, LiDAR profile = global weights,
+  RGB-D profile `w_occ 0 / w_free 0 / geometry_off / min_p_occ 0.55` (`:820-863`).
+- Gates: `tfGatePass` (`:1070-1112`: startup stability + runtime jump),
+  localizer reject gate, `admitFrame` (`:1147`).
+
+**Outputs.** `publishScovoxMap` (`:2051-2093`), `publishBinaryMap`
+(`:2170-2620`: change gate, heartbeat, state-flip / binarize modes, chunk
+interleave, byte budget), `publishPlanningMap` (`:2629-2755`,
+terrain-relative), `publishPointCloud` (`:2766-2937`, 14/16 fields),
+`publishTSDFPointCloud` (`:2945-2993`), `publishFineTSDFPointCloud`
+(`:3031-3058`), services `GetRegion`, `GetOccupancyGrid`, `ExtractMesh`
+(`onExtractMesh` `:3060-3093`, ASCII PLY), `onRefinementRegion`
+(`:3005-3026`). Memory / perf line via `scheduleMemUsage` (`:1866-1961`),
+optional TSDF dump to `tsdf_dump_path`.
+
+#### `dscovox_node.cpp` (`dscovox_mapping_node`, class `DSCovoxNode`)
+
+One `SourceGrid` per `header.frame_id` (`:84-105`), stored in the map frame
+via the carried `map_from_source` — first pose wins and is never refreshed
+(`:96-101`, "requires c-slam disabled"). `onBinaryMap` (`:314-555`) decodes
+rev-8 frames, checks envelope version 5 and endianness, snapshot-replaces the
+source grid, then reset-and-refolds each touched cell into
+`split_fused_beta_` / `split_fused_dir_` in sorted source-key order
+(`dscovox_consensus.hpp`: `isPriorBeta/Dir`, `refoldBeta/Dir`,
+`projectBetaDirTo*`). The fused grids are built from `scovox::Params`
+defaults, so the Dir grid uses `leaf_bits` 3 rather than `dir_leaf_bits` 2.
+Outputs: `publishPointCloud` (`:623-731`, 11 fields), `publishFusedMap`
+(`:834-852`, latched `ScovoxMap`), `GetRegion` (`fillRegion`),
+`GetOccupancyGrid` (`occupancyGridOnGrid` `:858-920`). Parameters:
+`occupancy_vis_threshold` 0.7, `semantic_occ_gate` 0.5, `publish_rate_hz`
+1.0, `pointcloud_min_interval_s` 0.1, `share_roi_z_*`.
+
+#### `scovoxmap.hpp/.cpp` (`scovoxmap` library)
+
+Legacy `scovox::Map` over unified `Voxel`; the only consumer of
+`range_decay_length` as an exponential weight (`scovoxmap.cpp:67-68`,
+`:365-366`). Not instantiated by either node's mapping path; exercised by
+`test_beta_update` and `test_consensus`.
+
+#### Launch files (`src/scovox_mapping/launch/`)
+
+| file | map defaults it sets |
+|---|---|
+| `scenenn_eval.launch.py` | res 0.05, stride 2, depth 0.4–4.0, NYU 41 classes, `w_occ` 6.0, `w_free` 1.0, `kappa0` 2.0, `enable_tsdf` true, `fused_walker` true, `batch_hits` true; no band, no evict-by-confidence |
+| `scenenet_eval.launch.py` | res 0.05, stride 1, depth 0.1–10, 14 classes, `w_occ` 6.0, `kappa0` 2.0, `semantic_evict_by_confidence` arg default "false", **no `semantic_band_length` arg at all** |
+| `scenenet_eval_fusion.launch.py` | as above with `semantic_occ_gate` 0.6; fusion profiles |
+| `semantickitti_eval.launch.py` | res 0.05, `carve_band` 0.1, `w_occ` 6.0, `kappa0` 2.0, 20 classes, range 5–30, depth 1–80, `evidence_saturation` 1000 |
+| `scovox_single_robot.launch.py` | res 0.10, `w_occ` 2.0, `kappa0` 2.0, `evidence_saturation` 1000, `max_semantic_classes` 10, stride 1 |
+| `scovox_multi_robot.launch.py` | wrapper over the single-robot launch |
+| `lidar_mapping.launch.py` | params file driven (`config/*.yaml`) |
+| `dscovox_single_robot.launch.py`, `dscovox_multi_robot.launch.py` | LiDAR: res 0.10, `w_occ` 8 / `w_free` 4, `enable_tsdf` false, `mode` rolling, `downsample_voxel_size` 0.1 |
+
+#### Config files
+
+`config/` (repo root): `scovox_lidar_raw_deskew.yaml`,
+`scovox_lidar_geometric.yaml`, `scovox_fused_lidar_rgbd.yaml`,
+`scovox_robot_share.yaml`, `scovox_fine_band.yaml`,
+`exploration_fused_bag.yaml` — all LiDAR-centric (`w_occ` 8, `w_free` 4, res
+0.10, `enable_tsdf` false). `src/scovox_mapping/config/`:
+`default_params.yaml` (parameter reference mirroring the node's `dp()`
+defaults), `lidar_mapping.yaml`, `dscovox_params.yaml`, `scovox_bin_min.yaml`.
+
+#### Tests
+
+`scovox_core` (11 binaries): `test_carve_stage`, `test_mesh_labelling`,
+`test_fine_tsdf`, `test_binary_serializer`, `test_consensus_merge`,
+`test_tsdf_map`, `test_voxel_layouts`, `test_scovox_map_split` (incl. the
+far-path bit-identity suite `ScovoxMapSplitFarCarve`), `test_sparse_add`,
+`test_uncertainty`, `test_sem_split_map`. `scovox_mapping` (8):
+`test_beta_update`, `test_consensus`, `test_topk_provider`, `test_tsdf_band`,
+`test_marching_cubes`, `test_semantic_audit`, `test_dirichlet_update`,
+`test_heartbeat`. Last recorded run (archived `storage_defaults_2026_09_04.md`,
+`dir_total_basis_2026_09_04.md`): **180/181**, the one failure being
+`ScovoxMapSplitFarCarve.FarCarveBitIdenticalToFullWalk`
+(`test_scovox_map_split.cpp:886`). Not re-run for this document.
+
+### 2.6 `seg_pipeline`
+
+Python node `seg_node.py`: subscribes colour (compressed) + depth + camera
+info, runs Mask2Former (Mapillary Vistas) and publishes a colour-coded
+segmentation image, a re-stamped depth image and camera info on
+`/scovox/segmentation/colored`, `/scovox/depth/image_raw` (`:67-72`,
+`:112-118`). `outdoor_palette.py` maps Mapillary to the 14 outdoor classes.
+Runs in its own container (`src/seg_pipeline/Dockerfile`, `compose.yaml`).
+
+### 2.7 The three parameter structs (why defaults disagree)
+
+| field | `scovox::Params` (`map_interface.hpp`) | `SemSplitMap::Params` | node `dp()` | replay / best method |
+|---|---|---|---|---|
+| `w_occ` | 2.0 | 1.0 | 2.0 | **1.5** |
+| `w_free` | 1.0 | 0.5 | 1.0 | 1.0 |
+| `kappa0` | 2.0 | 1.0 | 2.0 | **1.0** |
+| `evidence_saturation` | 1000 | 0 | 1000 | **0** |
+| `range_decay_length` | 5.0 | 50 | −1.0 | 50 (inert) |
+| `dirichlet_min_p_occ` | 0.5 | 0.5 | 0.5 | 0.5 |
+| `semantic_band_require_occ` | — | true | true | **false** |
+| `evict_by_confidence` | — | false | false | **true** |
+| `semantic_band_length` | — | 0 | 0 | **0.10** |
+| `resolution` | 0.05 | — | 0.10 | 0.05 |
+
+The node copies from `scovox::Params` into `SemSplitMap::Params`, so the
+node's values win at runtime; `SemSplitMap::Params` defaults are only in
+force for direct library users (tests, the replay's untouched fields).
+
+---
+
+## 3. Where the code has not caught up to the best method
+
+### 3.1 Node defaults (`scovox_node.cpp`, `declareMapParams` / `declareNodeParams`)
+
+| knob | node default | best method | line |
+|---|---|---|---|
+| `resolution` | 0.10 | 0.05 | 325 |
+| `w_occ` | 2.0 | 1.5 | 334 |
+| `kappa0` | 2.0 | 1.0 | 335 |
+| `semantic_band_length` | 0.0 (band off) | 0.10 | 393 |
+| `semantic_band_require_occ` | true | false | 394 |
+| `semantic_evict_by_confidence` | false | true | 391 |
+| `evidence_saturation` | 1000 | 0 | 369 |
+| `max_semantic_classes` | 10 | 14 (`num_classes` is already 14 at `:682`) | 387 |
+| `enable_tsdf` → `tsdf_enabled` | true | 0 (evaluation) | 354-357, 108 |
+| `stride` | 1 | 2 | 444 |
+| `min_depth` / `max_depth` | 0.1 / 10.0 | 0.4 / 4.0 | 445 |
+| `trace_no_return_rays` | false | carve-no-return on | 446 |
+
+Commit `e316f07` ("Put the promoted configuration into the code") changed the
+library and the replay; the node's `dp()` defaults above are unchanged from
+before it. Anyone launching `scovox_mapping_node` without a params file gets a
+band-off, evict-by-evidence, `w_occ` 2.0 mapper that no published number
+describes.
+
+### 3.2 Knobs the node cannot set at all
+
+`hit_flat_share`, `inc_mode`, `inc_thresh`, `class_evidence_saturation`,
+`ray_spread` (`SemSplitMap::Params`) and `far_voxel_fast_paths`
+(`ScovoxMapSplit::Params`) have no `declare_parameter`. Their defaults happen
+to equal the best method, so the node is correct by accident; none of the
+ablation arms behind them can be reproduced through ROS. The node prints
+`far_voxel_fast_paths` (`:288`) as if it were configurable.
+
+### 3.3 No readout policy in the node
+
+`--dump-label-gate 0.5 --dump-below-gate-as-unknown` are replay-side. The node
+has `occupancy_vis_threshold` 0.7 for visualisation and `semantic_occ_gate`
+0.5 for the wire, neither of which is the "score below-gate as unknown" rule.
+If a node-produced map is ever scored, the dump policy must be re-implemented
+in the consumer.
+
+### 3.4 Launch and config files
+
+- `scenenet_eval.launch.py` and `scenenn_eval.launch.py` default `w_occ` 6.0
+  and `kappa0` 2.0, never pass a band, and default evict-by-confidence off;
+  `scenenet_eval.launch.py` has no `semantic_band_length` argument to pass.
+- `scovox_single_robot.launch.py` hard-codes `w_occ` 2.0, `kappa0` 2.0,
+  `evidence_saturation` 1000, `max_semantic_classes` 10.
+- `default_params.yaml` documents the node defaults (so it is internally
+  consistent with §3.1) and describes `range_decay_length` as exponential
+  range weighting, which the split path never applies (the node uses it only
+  as the on/off switch for the range cull, `:1229`, `:1534`;
+  `lidar_mapping.yaml` was already corrected to say so in the uncommitted
+  diff).
+- The LiDAR configs (`w_occ` 8, `w_free` 4, res 0.10) are a different
+  operating point by design, not a gap; they are listed so nobody reads them
+  as the best method.
+
+### 3.5 Code defects that touch the method
+
+- `integrateHitSplit` runs the TSDF DDA regardless of `tsdf_enabled`
+  (`scovox_map_split.hpp:587`). Invisible under the default `fused_walker`,
+  but it invalidates any fused-vs-split timing A/B run at `tsdf_enabled=0`.
+- `range_decay_length` is written into `SemSplitMap::Params` and read by
+  nothing in the split path; the E7 "swept, no effect" result for it is
+  therefore not a measurement.
+- `evidence_saturation` caps Beta and, through `class_evidence_saturation
+  = −1`, Dir as well; the node exposes only the shared value.
+- One known failing test (`FarCarveBitIdenticalToFullWalk`, 180/181 in the
+  last recorded run).
+
+### 3.6 Stale text inside the code
+
+`sem_split_map.hpp:8,10` ("8 B" Beta, "16 B" Dir, and `SemDirMap` at `:5`);
+`sem_split_map.cpp:690` ("16 B DirVoxel"); `dir_voxel.hpp:4,26` ("16-byte",
+"16 B at K_TOP=2" — corrected further down at `:96`); `beta_voxel.hpp:17-20`
+("16 B DirVoxel"); `tsdf_voxel.hpp:11` (`SemBetaVoxel`);
+`binary_serializer.hpp:182-183` (u16 quantisation); `wire_study.py:1-12` (v5
+layout, 28 B Dir records). In-code links to documents that moved to
+`docs/archive/` or never existed are listed in
+`docs/code/code_review_2026_09_04.md` §L2.
+
+### 3.7 What already matches
+
+Compile defaults (`K_TOP` 2, `TRACK_QMAX` 1, `TRACK_NHIT` 0, `BETA_U16` 1,
+`EVICT_INHERIT` pinned to 0), `fused_walker` and `far_voxel_fast_paths`
+defaults, `batch_hits` / `batch_free_carve`, `dir_leaf_bits` 2, `alpha_0`
+0.01, `dirichlet_min_p_occ` 0.5, `num_classes` 14, `semantic_mode`
+Dirichlet, the exact DDA as the only traversal, the `DirVoxel` total basis,
+and every replay `Args` default. The library, built as-is, is the best
+method; only the ROS surface around it is behind.

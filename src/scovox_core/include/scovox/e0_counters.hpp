@@ -1,6 +1,6 @@
 /// @file
 /// @brief E0 instrumentation — the history quantities a finished map cannot
-/// answer.  NEW_EXPERIMENTS_PLAN.md §3.
+/// answer.
 ///
 /// Everything here is compiled out unless `-DSCOVOX_E0_COUNTERS=1`, so the
 /// shipped build's bytes are unchanged and E0's own gate (a) — instrumented
@@ -54,8 +54,8 @@ struct Counters {
   // --- deposits offered to the slot store -------------------------------
   // One per class with p > 0 per ray under `soft`; one per ray under `hard`
   // (sem_split_map.cpp:130-168).  Mass that never reached a slot at all — the
-  // `d->other += class_share` early returns for an absent or all-zero
-  // observation — is NOT counted, because no deposit was offered.
+  // no-signal / all-zero-softmax early returns of `dirichletUpdate` — is NOT
+  // counted, because no deposit was offered.
   uint64_t n_deposits_total = 0;
 
   // --- outcome histogram, dir_voxel.hpp:233-236 -------------------------

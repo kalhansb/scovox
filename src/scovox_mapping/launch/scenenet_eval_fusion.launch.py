@@ -1,5 +1,4 @@
-"""SCovox two-robot fusion eval for SceneNet RGB-D (Step 8 follow-up,
-NEW_EXPERIMENT_PLAN.md Phase 3).
+"""SCovox two-robot fusion eval for SceneNet RGB-D.
 
 Brings up:
   - scovox_node A (namespace=robot_a, rolling mode → publishes scovox_bin)
@@ -10,8 +9,8 @@ Mirrors replica_eval_fusion.launch.py with SceneNet-specific knobs
 (14-class NYUv2 colour map, 5cm voxels, max_range=10m, w_occ=6.0).
 The replay node (scenenet_replay_node.py) is launched separately by
 the orchestrator with distinct robot_name + start_frame for the
-trajectory split (typically A=[0..200), B=[100..300) for the 50%-
-overlap split per NEW_EXPERIMENT_PLAN.md).
+trajectory split (typically A=[0..200), B=[100..300) for a 50%
+overlap).
 """
 
 from launch import LaunchDescription

@@ -2,6 +2,7 @@
 /// Task 1.9 + 2.3: Beta-principled consensus fusion (>=10 tests).
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -205,7 +206,7 @@ constexpr float    kAlpha = scovox::kDefaultDirichletPrior;  // 0.01
 constexpr uint16_t kC     = 14;
 
 scovox::BetaVoxel betaPrior() {
-  // Shipped occupancy prior: symmetric Beta(1,1) → p_occ=0.5 (docs/occupancy_prior.md).
+  // Shipped occupancy prior: symmetric Beta(1,1) → p_occ=0.5.
   return scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
 }
 scovox::DirVoxel dirPrior() { return scovox::defaultDirVoxel(kC, kAlpha); }
@@ -223,15 +224,37 @@ TEST(SplitRefold, BetaFoldIntoPriorReproducesSource) {
   EXPECT_FLOAT_EQ(f.a_free, src.a_free);
 }
 
+// Fixtures below fabricate an observation history by writing `cnt[]` directly.
+// Since 2026-09-04 `DirVoxel::other()` is DERIVED from the stored total
+// (dir_voxel.hpp), so a raw `cnt[]` write moves `other()` down by the same
+// amount instead of leaving it alone. seat() restores what these fixtures mean
+// — "slots exactly as written, OTHER at its class prior" — and must be called
+// after the last `cnt[]` write. A fixture wanting a NON-prior OTHER calls
+// set_other() directly instead.
+inline scovox::DirVoxel& seat(scovox::DirVoxel& v, uint16_t C) {
+  v.set_other(std::max(
+      0.f, static_cast<float>(static_cast<int>(C) - scovox::K_TOP) * kAlpha));
+  return v;
+}
+
+// Deposit-and-attribute: the contract `sparse_add_class` now expects of every
+// caller (dir_voxel.hpp). The total is the caller's to own — the function only
+// decides how much of it a slot may claim — so a test that skipped the first
+// line would drive the derived `other()` negative.
+inline void depositClass(scovox::DirVoxel& d, uint16_t c, float inc) {
+  d.s_total += inc;
+  scovox::sparse_add_class(d.cnt, d.cls, c, inc, kAlpha);
+}
+
 TEST(SplitRefold, DirFoldIntoPriorReproducesSource) {
   auto src = dirPrior();
   src.cls[0] = 7; src.cnt[0] = kAlpha + 1.5f;
   src.cls[1] = 3; src.cnt[1] = kAlpha + 0.8f;
-  src.other  = (kC - scovox::K_TOP) * kAlpha + 0.4f;  // some out-of-K evidence
+  src.set_other((kC - scovox::K_TOP) * kAlpha + 0.4f);  // some out-of-K evidence
   auto f = scovox::refoldDir({&src}, kC, kAlpha);
   EXPECT_EQ(f.cls[0], src.cls[0]); EXPECT_FLOAT_EQ(f.cnt[0], src.cnt[0]);
   EXPECT_EQ(f.cls[1], src.cls[1]); EXPECT_FLOAT_EQ(f.cnt[1], src.cnt[1]);
-  EXPECT_FLOAT_EQ(f.other, src.other);
+  EXPECT_FLOAT_EQ(f.other(), src.other());
 }
 
 // Finding 20 (idempotency, end-to-end): a source re-publishes the SAME snapshot
@@ -244,7 +267,7 @@ TEST(SplitRefold, DuplicateSnapshotIsIdempotent) {
   scovox::BetaVoxel betaA{kC * kAlpha + 4.0f, kAlpha + 1.0f};
   auto dirA = dirPrior();
   dirA.cls[0] = 5; dirA.cnt[0] = kAlpha + 2.0f;
-  dirA.other  = (kC - scovox::K_TOP) * kAlpha + 0.3f;
+  dirA.set_other((kC - scovox::K_TOP) * kAlpha + 0.3f);
 
   auto beta_fused  = scovox::refoldBeta({&betaA}, kC, kAlpha);  // first receipt
   auto dir_fused   = scovox::refoldDir({&dirA},  kC, kAlpha);
@@ -256,7 +279,7 @@ TEST(SplitRefold, DuplicateSnapshotIsIdempotent) {
   EXPECT_FLOAT_EQ(beta_refold.a_free, beta_fused.a_free);
   EXPECT_EQ(dir_refold.cls[0], dir_fused.cls[0]);
   EXPECT_FLOAT_EQ(dir_refold.cnt[0], dir_fused.cnt[0]);
-  EXPECT_FLOAT_EQ(dir_refold.other,  dir_fused.other);
+  EXPECT_FLOAT_EQ(dir_refold.other(),  dir_fused.other());
   // The single-source refold seed-copies A verbatim — the prior was reset, not
   // folded a second time.
   EXPECT_FLOAT_EQ(beta_fused.a_occ, betaA.a_occ);
@@ -286,12 +309,12 @@ scovox::DirVoxel dirSrc(uint16_t c0, float n0, uint16_t c1, float n1) {
   auto v = dirPrior();
   v.cls[0] = c0; v.cnt[0] = kAlpha + n0;
   if (scovox::K_TOP > 1) { v.cls[1] = c1; v.cnt[1] = kAlpha + n1; }
-  return v;
+  return seat(v, kC);
 }
 bool sameDir(const scovox::DirVoxel& x, const scovox::DirVoxel& y) {
   for (int i = 0; i < scovox::K_TOP; ++i)
     if (x.cls[i] != y.cls[i] || x.cnt[i] != y.cnt[i]) return false;
-  return x.other == y.other;
+  return x.other() == y.other();
 }
 }  // namespace
 
@@ -411,7 +434,7 @@ TEST(SplitRefold, RefoldingAtPriorVoxelIsNoOp) {
   auto dir_prior_only = scovox::refoldDir({&dp}, kC, kAlpha);
   EXPECT_EQ(dir_prior_only.cls[0], uint16_t(0xFFFF));
   EXPECT_EQ(dir_prior_only.cls[1], uint16_t(0xFFFF));
-  EXPECT_FLOAT_EQ(dir_prior_only.other, (kC - scovox::K_TOP) * kAlpha);
+  EXPECT_FLOAT_EQ(dir_prior_only.other(), (kC - scovox::K_TOP) * kAlpha);
 
   scovox::BetaVoxel betaA{kC * kAlpha + 4.0f, kAlpha + 1.0f};
   auto only_a      = scovox::refoldBeta({&betaA}, kC, kAlpha);
@@ -420,12 +443,12 @@ TEST(SplitRefold, RefoldingAtPriorVoxelIsNoOp) {
   EXPECT_FLOAT_EQ(a_and_prior.a_free, only_a.a_free);
 
   auto dirA = dirPrior();
-  dirA.cls[0] = 5; dirA.cnt[0] = kAlpha + 2.0f;
+  dirA.cls[0] = 5; dirA.cnt[0] = kAlpha + 2.0f; seat(dirA, kC);
   auto only_da      = scovox::refoldDir({&dirA}, kC, kAlpha);
   auto da_and_prior = scovox::refoldDir({&dirA, &dp}, kC, kAlpha);
   EXPECT_EQ(da_and_prior.cls[0], only_da.cls[0]);
   EXPECT_FLOAT_EQ(da_and_prior.cnt[0], only_da.cnt[0]);
-  EXPECT_FLOAT_EQ(da_and_prior.other, only_da.other);
+  EXPECT_FLOAT_EQ(da_and_prior.other(), only_da.other());
 }
 
 // Finding 18: the split RPC projection must hand the planner the SAME raw
@@ -443,8 +466,8 @@ TEST(SplitProjection, RawEvidenceMatchesFused) {
 
   // --- split Dir substrate (prior-inflated counts) ---
   auto d = dirPrior();
-  scovox::sparse_add_class(d.cnt, d.cls, /*c=*/5, /*inc=*/1.0f, &d.other, kAlpha);
-  scovox::sparse_add_class(d.cnt, d.cls, /*c=*/3, /*inc=*/0.5f, &d.other, kAlpha);
+  depositClass(d, /*c=*/5, /*inc=*/1.0f);
+  depositClass(d, /*c=*/3, /*inc=*/0.5f);
 
   // Occupancy carries the calibrated split prior; semantics are what we compare.
   scovox::BetaVoxel b{kC * kAlpha + 3.0f, kAlpha};
@@ -482,15 +505,15 @@ TEST(SplitProjection, OccupancyOnlyNullDir) {
 }
 
 // Finding 18 (OTHER bucket / eviction): when a third class evicts a slot, its
-// observed evidence lands in DirVoxel::other; the projection must surface that as
+// observed evidence lands in DirVoxel's derived other(); the projection must surface that as
 // a_unk = other − (C−K)·α₀ (the OTHER prior subtracted), matching the raw
 // "dropped/evicted mass" convention the unified voxel's a_unk holds.
 TEST(SplitProjection, OtherBucketProjectsToRawAUnk) {
   auto d = dirPrior();
   // Three classes; K_TOP=2 so the smallest is evicted to OTHER.
-  scovox::sparse_add_class(d.cnt, d.cls, /*c=*/5, /*inc=*/3.0f, &d.other, kAlpha);
-  scovox::sparse_add_class(d.cnt, d.cls, /*c=*/3, /*inc=*/2.0f, &d.other, kAlpha);
-  scovox::sparse_add_class(d.cnt, d.cls, /*c=*/9, /*inc=*/1.0f, &d.other, kAlpha);
+  depositClass(d, /*c=*/5, /*inc=*/3.0f);
+  depositClass(d, /*c=*/3, /*inc=*/2.0f);
+  depositClass(d, /*c=*/9, /*inc=*/1.0f);
 
   scovox::BetaVoxel b{kC * kAlpha + 1.0f, kAlpha};
   scovox::Voxel proj = scovox::projectBetaDirToVoxel(b, &d, kC, kAlpha);
@@ -507,7 +530,7 @@ TEST(SplitProjection, OtherBucketProjectsToRawAUnk) {
 TEST(SplitProjection, NumClassesAtKTopClampsOtherPrior) {
   constexpr uint16_t cAtK = scovox::K_TOP;            // residual_dims == 0
   auto d = scovox::defaultDirVoxel(cAtK, kAlpha);     // other == 0 (clamped)
-  d.other = 0.5f;                                     // pretend some evicted mass
+  d.set_other(0.5f);                                  // pretend some evicted mass
   scovox::BetaVoxel b{2.0f, 1.0f};
   auto proj = scovox::projectBetaDirToVoxel(b, &d, cAtK, kAlpha);
   EXPECT_GE(proj.a_unk, 0.0f);
@@ -519,7 +542,7 @@ TEST(SplitProjection, NumClassesAtKTopClampsOtherPrior) {
 TEST(SplitProjection, NumClassesBelowKTopNoPhantomUnknown) {
   constexpr uint16_t cBelowK = 1;                     // (1 − K_TOP) < 0
   auto d = scovox::defaultDirVoxel(cBelowK, kAlpha);
-  d.other = 0.5f;
+  d.set_other(0.5f);
   scovox::BetaVoxel b{2.0f, 1.0f};
   auto proj = scovox::projectBetaDirToVoxel(b, &d, cBelowK, kAlpha);
   EXPECT_FLOAT_EQ(proj.a_unk, 0.5f);  // unclamped would be 0.5 + α₀
@@ -533,7 +556,7 @@ TEST(SplitPrior, IsPriorDirAtAndBelowKTop) {
     auto prior = scovox::defaultDirVoxel(C, kAlpha);
     EXPECT_TRUE(scovox::isPriorDir(prior, C, kAlpha)) << "C=" << C;
     auto obs = prior;
-    scovox::sparse_add_class(obs.cnt, obs.cls, /*c=*/0, /*inc=*/1.0f, &obs.other, kAlpha);
+    depositClass(obs, /*c=*/0, /*inc=*/1.0f);
     EXPECT_FALSE(scovox::isPriorDir(obs, C, kAlpha)) << "C=" << C;
   }
 }

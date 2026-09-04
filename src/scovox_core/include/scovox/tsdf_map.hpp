@@ -81,9 +81,7 @@ class TsdfMap {
   ///
   /// `origin`, `endpoint` are world-space positions in metres. The voxel-set
   /// touched is identical to SLIM-VDB's openvdb DDA range: both are Amanatides
-  /// & Woo, which closed the traversal parity gap §1.1 of
-  /// `docs/design/slimvdb_like_tsdf_mapping_plan.md` acknowledged while this
-  /// walked an integer Bresenham line.
+  /// & Woo, so there is no traversal parity gap between them.
   ///
   /// Per-voxel update inside the band:
   ///     sdf       = sign((vc - origin) · (endpoint - vc)) · ‖endpoint - vc‖
@@ -115,12 +113,16 @@ class TsdfMap {
   /// O(n) clear of the touched buffer without sort+unique. Use on the
   /// no-publisher path (e.g. dataset-mode runs without ~/scovox_bin
   /// subscribers) where the drained coords would be discarded anyway —
-  /// drainTouched()'s sort+unique cost at Replica res 0.05 / 320×240
-  /// stride 1 is ~1 s/frame; clearTouched() is ~µs.
+  /// drainTouched()'s sort+unique dominates a frame at fine resolution and
+  /// full stride; clearTouched() is O(n) with no allocation.
   void clearTouched() noexcept { touched_.clear(); }
 
   /// Touched-set size without draining. Diagnostics / rate-limiting.
   std::size_t touchedCount() const noexcept { return touched_.size(); }
+
+  /// Voxels visited by the band DDA, cumulative. Paired with the walker timers
+  /// so per-voxel cost is comparable across walker structures.
+  std::uint64_t bandVoxels() const noexcept { return band_voxels_; }
 
   // ----------------------------------------------------------------------
   // Voxel queries
@@ -146,7 +148,7 @@ class TsdfMap {
   }
 
   // ----------------------------------------------------------------------
-  // Memory accounting (Q2 / feedback_slimvdb_memory_measurement.md)
+  // Memory accounting
   // ----------------------------------------------------------------------
 
   std::size_t voxelCount()      const;
@@ -208,6 +210,7 @@ class TsdfMap {
   Grid                grid_;
   Grid::Accessor      acc_;
   std::vector<CoordT> touched_;
+  std::uint64_t       band_voxels_ = 0;
   /// drainTouched() swap target: holds the previous drain's result so its
   /// buffer is recycled instead of freed (see drainTouched()).
   std::vector<CoordT> scratch_;

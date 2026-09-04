@@ -16,18 +16,19 @@
 ///
 /// Update model — the SemBeta two-stream calibration, with SemDir-matched
 /// priors (see `beta_voxel.hpp` / `dir_voxel.hpp`):
-///   carve:  Beta `a_free += w_free·quality`  (full ray, wall-guarded)
-///   hit:    Stream A  Beta `a_occ += w_occ·quality`   (always)
+///   carve:  Beta `a_free += w_free`  (full ray, wall-guarded)
+///   hit:    Stream A  Beta `a_occ += w_occ`   (always)
 ///           read `p_occ_post` from the Beta grid
-///           Stream B  (gated on `p_occ_post`) commit `kappa0·p_occ_post·
-///                     quality` of class mass into the Dir grid via the
+///           Stream B  (gated on `p_occ_post`) commit `kappa0·p_occ_post`
+///                     of class mass into the Dir grid via the
 ///                     mass-conserving `sparse_add_class`.
 ///
 /// Difference vs. unified `SemDirVoxel`: class evidence (Stream B) does **not**
 /// feed back into the occupancy marginal — occupancy is driven solely by
 /// occupancy evidence. This is the intended decoupling of the split; it costs
 /// the unified single-vector formalism but keeps strict *per-grid* mass
-/// conservation (Beta: `a_occ + a_free`; Dir: `other + Σcnt`).
+/// conservation (Beta: `a_occ + a_free`; Dir: `s_total`, of which `other` is
+/// the derived unattributed part — see dir_voxel.hpp).
 
 #include <Eigen/Core>
 #include <bonxai/bonxai.hpp>
@@ -99,23 +100,41 @@ extern DepositTraceFn g_deposit_trace;
 /// source carry its own Stream-B gate height. `evidence_saturation` and
 /// `alpha_0` stay GLOBAL (per-grid caps / priors, not per-source evidence).
 struct HitWeights {
-  float w_occ;
-  float w_free;
-  float kappa0;
-  float dirichlet_min_p_occ;
-  bool  geometry_off;
+  float w_occ = 0.0f;
+  float w_free = 0.0f;
+  float kappa0 = 0.0f;
+  float dirichlet_min_p_occ = 0.0f;
+  bool  geometry_off = false;
   /// BKI kernel radius `l` (metres) for RGB-D→LiDAR semantic spread. When
   /// `> 0`, a semantics-only source (e.g. RGB-D) does NOT commit its class at the
   /// single endpoint voxel; instead it deposits kernel-weighted Dirichlet
   /// evidence onto EVERY persistent-Beta (LiDAR-occupied, `p_occ >=
   /// dirichlet_min_p_occ`) voxel within `l` of the endpoint — the S-BKI update
-  /// `α*ᵏ += k(d)·(κ₀·p_occ·q)` with the Melkumyan–Ramos compact-support kernel
+  /// `α*ᵏ += k(d)·(κ₀·p_occ)` with the Melkumyan–Ramos compact-support kernel
   /// (exactly 0 at `d >= l`). This decouples the label commit from exact
   /// voxel coincidence (which the LiDAR downsample makes rare) while keeping pure
   /// LiDAR authority: only LiDAR-occupied voxels ever receive a label. `0`
   /// (the zero-init / null-prof default) = classic exact-voxel gate, byte-identical.
   float kernel_radius = 0.0f;
 };
+
+/// Snap a fusion profile's Beta weights onto the storage lattice, in place.
+///
+/// `SemSplitMap::sanitise` guards the weights that arrive through `Params`.
+/// A `HitWeights` profile is the OTHER way a weight reaches
+/// `applyBetaUpdate`, and it does not pass through that sanitiser at all --
+/// it is built by the caller and handed straight to the integration call.
+/// Without this the count identity `a_occ = prior + w_occ * n_hit` holds for
+/// the single-source path and quietly fails for the fusion path, which is the
+/// worse of the two failure modes: it is invisible in every unit test that
+/// exercises only `Params`. Call it once at profile construction, never per
+/// ray -- the hot path reads the weight raw and must stay that way.
+inline void sanitise(HitWeights& h) noexcept {
+  if (h.w_occ  < 0.0f) h.w_occ  = 0.0f;
+  if (h.w_free < 0.0f) h.w_free = 0.0f;
+  h.w_occ  = beta_lattice_snap(h.w_occ);
+  h.w_free = beta_lattice_snap(h.w_free);
+}
 
 class SemSplitMap {
  public:
@@ -126,8 +145,7 @@ class SemSplitMap {
   /// Knobs mirror `SemDirMap::Params` 1:1 so a launch file porting between the
   /// two substrates needs no edits. The occupancy prior is the symmetric
   /// Beta(1,1) constant (`kBetaOccPrior`), independent of `num_classes` /
-  /// `alpha_0` (which set only the semantic Dirichlet prior); see
-  /// docs/occupancy_prior.md.
+  /// `alpha_0` (which set only the semantic Dirichlet prior).
   struct Params {
     double  resolution                 = 0.05;
     uint8_t inner_bits                 = 2;
@@ -155,6 +173,25 @@ class SemSplitMap {
     float   w_free                     = 0.5f;   ///< Beta a_free increment per carve
     float   kappa0                     = 1.0f;   ///< class-share multiplier (Stream B)
     float   dirichlet_min_p_occ        = 0.5f;   ///< gate per-class update on Beta p_occ
+
+    /// What ONE endpoint observation deposits into the class channel, once it
+    /// has passed the `dirichlet_min_p_occ` gate. The gate is unaffected
+    /// either way; only the weight changes.
+    ///
+    ///   false — `kappa0 · p_occ_post`, the voxel's own posterior occupancy
+    ///           (shipped). A first look on a fresh surface deposits ~0.71 and
+    ///           a settled one ~0.94, so the endpoint's mass tracks how well
+    ///           the geometry is established.
+    ///   true  — flat `kappa0`, the same unit the semantic band already
+    ///           deposits under `semantic_band_require_occ = false`. This makes
+    ///           every admitted observation worth exactly one unit everywhere,
+    ///           which is what turns `cnt[]` into a count of looks rather than
+    ///           an accumulation of fractional evidence.
+    ///
+    /// Read only on the DIRICHLET endpoint path. `semantic_spread_radius > 0`
+    /// routes to applyHitUpdateKernel instead, which keeps its own p_occ
+    /// weighting; the two are mutually exclusive by sanitise().
+    bool    hit_flat_share             = false;
     float   evidence_saturation        = 0.0f;   ///< 0 disables; per-grid cap (see below)
 
     /// Per-grid cap for the CLASS channel alone.
@@ -165,9 +202,8 @@ class SemSplitMap {
     /// rescale preserves `p_occ` exactly, but it also shrinks the accumulated
     /// total the next observation is weighed against, so a capped occupancy
     /// channel becomes recency-dominated and voxels fall back through the
-    /// `p_occ >= 0.5` readout gate. Measured on SceneNN 016 at cap 50, the
-    /// predicted-occupied set lost 20% of its voxels and occupancy IoU fell
-    /// from 0.6036 to 0.5260, which swamps whatever the semantic cap bought.
+    /// `p_occ >= 0.5` readout gate, so a low cap costs occupancy IoU far more
+    /// than the semantic cap can buy back.
     ///
     /// Negative means "follow `evidence_saturation`", which is the default and
     /// reproduces the previous behaviour exactly. Set it >= 0 to cap the class
@@ -193,8 +229,14 @@ class SemSplitMap {
     ///              whole; the other classes deposit nothing.
     ///   2 THRESH — SOFT, but a class whose own probability falls below
     ///              `inc_thresh` deposits nothing and its mass goes to OTHER.
-    /// All three conserve the strict invariant `Δ(other + Σcnt) == class_share`;
-    /// they differ only in how that mass is split between slots and OTHER.
+    /// All three conserve `Δ s_total == class_share`, and since 2026-09-04
+    /// they do so STRUCTURALLY rather than by discipline: `dirichletUpdate`
+    /// makes that single add before it branches, and OTHER is derived as
+    /// `s_total − Σcnt`, so no mode can leak. (While `other` was the stored
+    /// word the invariant read `Δ(other + Σcnt) == class_share` and each mode
+    /// had to close its own books; THRESH and SOFT each did so with a residual
+    /// line, which is where SOFT's `covered` rounding leaked.) The modes differ
+    /// only in how the mass is split between slots and OTHER.
     int     inc_mode                   = 0;
     float   inc_thresh                 = 0.10f;  ///< only read when inc_mode == 2
 
@@ -258,7 +300,7 @@ class SemSplitMap {
     /// each carrying its `alpha` histogram — it has no occupancy model and
     /// applies no surface filter. Setting this false reproduces that: the Beta
     /// read is skipped entirely and every band voxel takes a FLAT
-    /// `kappa0 · quality` deposit, the analogue of `alpha[label] += 1`.
+    /// `kappa0` deposit, the analogue of `alpha[label] += 1`.
     ///
     /// This is the single knob on which "same rule as SLIM-VDB" turns, so it is
     /// exposed rather than decided here. Note the two settings are not merely
@@ -343,7 +385,7 @@ class SemSplitMap {
 
     /// Dataset class count `C`. Sets the semantic OTHER prior `(C − K_TOP)·α₀`.
     /// (The occupancy prior is the symmetric Beta(1,1) constant `kBetaOccPrior`,
-    /// independent of `C` — see docs/occupancy_prior.md.)
+    /// independent of `C`.)
     uint16_t num_classes               = 14;
     /// Symmetric per-dim Dirichlet prior `α₀`.
     float    alpha_0                   = kDefaultDirichletPrior;
@@ -368,7 +410,6 @@ class SemSplitMap {
   void integrateHit(const Eigen::Vector3f&    origin,
                     const Eigen::Vector3f&    endpoint,
                     const std::vector<float>* sem_probs,
-                    float                     quality,
                     const HitWeights*         prof = nullptr);
 
   /// Dynamic-aware return: free-space carve stays persistent (a moving object
@@ -378,33 +419,31 @@ class SemSplitMap {
   void integrateHit(const Eigen::Vector3f&    origin,
                     const Eigen::Vector3f&    endpoint,
                     const std::vector<float>* sem_probs,
-                    float                     quality,
                     bool                      is_dynamic,
                     const HitWeights*         prof = nullptr);
 
   /// No-return: carve free (Beta) along [origin, endpoint] inclusive. No hit.
   void integrateMiss(const Eigen::Vector3f& origin,
                      const Eigen::Vector3f& endpoint,
-                     float                  quality,
                      const HitWeights*      prof = nullptr);
 
   // ----------------------------------------------------------------------
   // Per-voxel API (used by the ScovoxMapSplit fused walker)
   // ----------------------------------------------------------------------
 
-  /// Per-voxel carve: Beta `a_free += w_free·quality`. Touches the Beta grid
+  /// Per-voxel carve: Beta `a_free += w_free`. Touches the Beta grid
   /// only. Returns `false` only when the (optional, default-off) immediate-path
   /// wall guard blocks the voxel (`carve_skip_occ_threshold > 0` and
   /// `p_occ > threshold`); otherwise `true`.
   ///
   /// Behaviour depends on whether a carve frame is open (beginCarveFrame):
   ///   - frame OPEN  (batched, the live pipeline): the update is STAGED into a
-  ///     per-scan accumulator (max `w_free·quality` per voxel) with NO grid read
+  ///     per-scan accumulator (max `w_free` per voxel) with NO grid read
   ///     and NO guard, then written once at flushCarveFrame. Always returns
   ///     `true` (a scan never blocks itself — see class docs).
   ///   - frame CLOSED (immediate): writes the Beta grid in place, applying the
   ///     wall guard iff `carve_skip_occ_threshold > 0`.
-  bool applyCarveUpdate(const CoordT& c, float quality,
+  bool applyCarveUpdate(const CoordT& c,
                         const HitWeights* prof = nullptr);
 
   // ----------------------------------------------------------------------
@@ -435,13 +474,15 @@ class SemSplitMap {
 
   /// Whether a carve frame is currently open (staging mode).
   bool carveFrameOpen() const noexcept { return carve_frame_open_; }
+  /// Voxels visited by the free-space carve DDA, cumulative. Paired with the
+  /// walker timers so per-voxel cost is comparable across walker structures.
+  std::uint64_t carveVoxels() const noexcept { return carve_voxels_; }
 
   /// Per-voxel hit: Stream A (Beta) always, then gated Stream B (Dir). Touches
   /// the Beta grid always; allocates + touches the Dir grid only when a class
   /// is actually committed (the sparse-semantics memory win).
   void applyHitUpdate(const CoordT&             c,
                       const std::vector<float>* sem_probs,
-                      float                     quality,
                       const HitWeights*         prof = nullptr);
 
   /// Dynamic-aware per-voxel hit. When `is_dynamic` is true the endpoint's
@@ -454,7 +495,6 @@ class SemSplitMap {
   /// fusion wire). `is_dynamic == false` is byte-identical to the 3-arg form.
   void applyHitUpdate(const CoordT&             c,
                       const std::vector<float>* sem_probs,
-                      float                     quality,
                       bool                      is_dynamic,
                       const HitWeights*         prof = nullptr);
 
@@ -477,7 +517,7 @@ class SemSplitMap {
   ///     voxel from a labelled surface. For SCovox the gate is what keeps the
   ///     Dir grid from growing a label shell through the free space in front of
   ///     every surface. THIS IS THE ONE PLACE THE MIRROR IS NOT EXACT.
-  ///  3. FLAT weight — `kappa0 · p_occ · quality`, the same expression the
+  ///  3. FLAT weight — `kappa0 · p_occ`, the same expression the
   ///     endpoint uses, with no distance kernel. That is the point of contrast
   ///     with `applyHitUpdateKernel`, which tapers by `k(d)`. SLIM-VDB's
   ///     `alpha[label] += 1` is flat across its whole band, and at p_occ→1 this
@@ -488,7 +528,6 @@ class SemSplitMap {
   /// across the static surfaces behind it.
   void applyBandSemantic(const CoordT&             c,
                          const std::vector<float>* sem_probs,
-                         float                     quality,
                          const HitWeights*         prof = nullptr);
 
   /// Per-frame multiplicative decay of the transient grids toward their priors
@@ -634,7 +673,6 @@ class SemSplitMap {
                         const Eigen::Vector3f&    endpoint,
                         const CoordT&             k_hit,
                         const std::vector<float>* sem_probs,
-                        float                     quality,
                         const HitWeights*         prof);
 
   BetaVoxel defaultBeta() const noexcept {
@@ -673,7 +711,7 @@ class SemSplitMap {
   // Per-scan carve accumulator (batched path). `carve_stage_` keys each free
   // voxel by its Beta leaf block (`coord >> leaf_bits`) into a reused
   // open-addressed table of dense per-block weight arrays + occupancy bitmask,
-  // keeping the MAX `w_free·quality` seen this scan (strongest free evidence,
+  // keeping the MAX `w_free` seen this scan (strongest free evidence,
   // one write); flush then walks blocks in ascending block-key order — the
   // same block order the retired per-voxel std::sort produced — without ever
   // sorting individual voxels (see carve_stage.hpp for the identity argument).
@@ -684,8 +722,7 @@ class SemSplitMap {
   /// The per-source gains are carried per entry because the winning ray may
   /// come from a different sensor than the previous one.
   struct HitStage {
-    float    w_occ_share = 0.f;  ///< max `w_occ·quality` of the scan's rays here
-    float    quality     = 0.f;  ///< quality of the ray that set `w_occ_share`
+    float    w_occ_share = 0.f;  ///< max `w_occ` of the scan's rays here
     float    kappa0      = 0.f;  ///< that ray's class gain
     float    min_p_occ   = 0.f;  ///< that ray's Stream B admission gate
     uint32_t probs_off   = kNoHitProbs;  ///< start of its softmax in hit_probs_
@@ -704,15 +741,15 @@ class SemSplitMap {
   std::vector<float>                  hit_probs_scratch_;  ///< flush-time view
   std::vector<CoordT>                 hit_order_;          ///< flush-time sort
   bool                       carve_frame_open_ = false;
+  std::uint64_t carve_voxels_ = 0;
 
   /// Symmetric Beta(1,1) occupancy prior (kBetaOccPrior/kBetaFreePrior) →
-  /// p_occ_prior = 0.5. Hot-path constants; see docs/occupancy_prior.md.
+  /// p_occ_prior = 0.5. Hot-path constants.
   float                beta_occ_prior_;   ///< 1.0
   float                beta_free_prior_;  ///< 1.0
 
   void carveRay(const Eigen::Vector3f& origin,
                 const Eigen::Vector3f& endpoint,
-                float                  quality,
                 bool                   inclusive_endpoint,
                 const HitWeights*      prof = nullptr);
 
@@ -730,7 +767,6 @@ class SemSplitMap {
   /// long gone.
   void       commitHit(const CoordT&             c,
                        const std::vector<float>* sem_probs,
-                       float                     quality,
                        float                     w_occ_share,
                        float                     kappa0,
                        float                     min_p_occ,
@@ -747,7 +783,6 @@ class SemSplitMap {
   DirVoxel*  getOrAllocateDirOn(DirGrid::Accessor& acc, const CoordT& c);
   void       applyHitUpdateOn(const CoordT&             c,
                               const std::vector<float>* sem_probs,
-                              float                     quality,
                               BetaGrid::Accessor&       bacc,
                               DirGrid::Accessor&        dacc,
                               std::vector<CoordT>*      touched_beta,
@@ -766,7 +801,6 @@ class SemSplitMap {
   /// identical either way, and in both cases occupancy is read, never written.
   void       applyHitUpdateKernel(const CoordT&             c,
                                   const std::vector<float>* sem_probs,
-                                  float                     quality,
                                   DirGrid::Accessor&        dacc,
                                   std::vector<CoordT>*      touched_dir,
                                   float                     l,

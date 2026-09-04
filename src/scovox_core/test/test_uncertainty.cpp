@@ -99,7 +99,7 @@ TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
   // Near-point-mass occupied voxel (huge a_occ, tiny a_free) — exercises the
   // Beta differential-entropy divergence regardless of the prior. The C*alpha0
   // term is just a convenient large offset, NOT the shipped occupancy prior
-  // (now symmetric Beta(1,1); see docs/occupancy_prior.md).
+  // (now symmetric Beta(1,1)).
   float h = entropy(makeBeta(C * alpha0 + 50.f, alpha0));
   EXPECT_TRUE(std::isfinite(h)) << "differential entropy must stay finite, got " << h;
   EXPECT_LT(h, -10.f) << "Beta differential entropy must diverge negative on a "

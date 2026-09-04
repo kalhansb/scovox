@@ -46,15 +46,15 @@ scovox::BinarySerializer::Frame makeFrame() {
   f.beta_deltas.push_back({Bonxai::CoordT{4, 5, 6}, scovox::BetaVoxel{2.0f, 0.01f}});
 
   scovox::DirVoxel a = scovox::defaultDirVoxel(14, scovox::kDefaultDirichletPrior);
-  a.other  = 0.30f;        // 0.12 prior + 0.18 evidence
   a.cls[0] = 5; a.cnt[0] = 1.20f;
   a.cls[1] = 9; a.cnt[1] = 0.80f;
+  a.set_other(0.30f);      // 0.12 prior + 0.18 evidence; after the slots
   f.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, a});
 
   scovox::DirVoxel b = scovox::defaultDirVoxel(14, scovox::kDefaultDirichletPrior);
-  b.other  = 0.12f;        // prior only
   b.cls[0] = 7; b.cnt[0] = 0.50f;
   // slot 1 left at the empty-sentinel default.
+  b.set_other(0.12f);      // prior only
   f.dir_deltas.push_back({Bonxai::CoordT{4, 5, 6}, b});
 
   return f;
@@ -110,7 +110,7 @@ void expectFrameEq(scovox::BinarySerializer::Frame a,
     EXPECT_EQ(a.dir_deltas[i].coord.x, b.dir_deltas[i].coord.x);
     EXPECT_EQ(a.dir_deltas[i].coord.y, b.dir_deltas[i].coord.y);
     EXPECT_EQ(a.dir_deltas[i].coord.z, b.dir_deltas[i].coord.z);
-    EXPECT_FLOAT_EQ(a.dir_deltas[i].data.other, b.dir_deltas[i].data.other);
+    EXPECT_FLOAT_EQ(a.dir_deltas[i].data.other(), b.dir_deltas[i].data.other());
     for (int j = 0; j < scovox::K_TOP; ++j) {
       EXPECT_FLOAT_EQ(a.dir_deltas[i].data.cnt[j], b.dir_deltas[i].data.cnt[j]);
       EXPECT_EQ(a.dir_deltas[i].data.cls[j],       b.dir_deltas[i].data.cls[j]);
@@ -294,9 +294,9 @@ TEST(BinarySerializer, QuantizedRoundTripOnCompandedGrid) {
       {Bonxai::CoordT{4, 5, 6}, scovox::BetaVoxel{1.f + 500.25f, 1.f + 999.9f}});
 
   scovox::DirVoxel a = scovox::defaultDirVoxel(14, f.alpha_0);
-  a.other  = 0.12f + 0.18f;
   a.cls[0] = 5; a.cnt[0] = f.alpha_0 + 1.19f;
   // slot 1 stays empty: cls=0xFFFF, cnt=α₀ placeholder.
+  a.set_other(0.12f + 0.18f);
   f.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, a});
 
   auto g = scovox::BinarySerializer::deserialize(
@@ -321,7 +321,7 @@ TEST(BinarySerializer, QuantizedRoundTripOnCompandedGrid) {
   }
   ASSERT_EQ(g.dir_deltas.size(), 1u);
   const auto& d = g.dir_deltas[0].data;
-  EXPECT_FLOAT_EQ(d.other,  q8(a.other,  other_prior));
+  EXPECT_FLOAT_EQ(d.other(),  q8(a.other(),  other_prior));
   EXPECT_FLOAT_EQ(d.cnt[0], q8(a.cnt[0], f.alpha_0));
   EXPECT_EQ(d.cls[0], 5);
   // Empty slot: q=0 reconstructs the α₀ placeholder bit-exactly.
@@ -350,7 +350,7 @@ TEST(BinarySerializer, QuantizedAtPriorReconstructsExactly) {
   EXPECT_FLOAT_EQ(g.beta_deltas[0].data.a_free, scovox::kBetaFreePrior);
   ASSERT_EQ(g.dir_deltas.size(), 1u);
   const auto def = scovox::defaultDirVoxel(14, f.alpha_0);
-  EXPECT_FLOAT_EQ(g.dir_deltas[0].data.other, def.other);
+  EXPECT_FLOAT_EQ(g.dir_deltas[0].data.other(), def.other());
   for (int j = 0; j < scovox::K_TOP; ++j) {
     EXPECT_FLOAT_EQ(g.dir_deltas[0].data.cnt[j], def.cnt[j]);
     EXPECT_EQ(g.dir_deltas[0].data.cls[j], def.cls[j]);
@@ -395,6 +395,7 @@ TEST(BinarySerializer, ClassIdWidthFollowsNumClasses) {
 
   scovox::DirVoxel a = scovox::defaultDirVoxel(300, f.alpha_0);
   a.cls[0] = 299; a.cnt[0] = f.alpha_0 + 3.f;
+  a.set_other(298.f * f.alpha_0);   // derived other(): restate it after cnt[]
   f.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, a});
 
   auto g = scovox::BinarySerializer::deserialize(
@@ -411,6 +412,7 @@ TEST(BinarySerializer, ClassIdWidthFollowsNumClasses) {
   bad.alpha_0     = scovox::kDefaultDirichletPrior;
   scovox::DirVoxel v = scovox::defaultDirVoxel(14, bad.alpha_0);
   v.cls[0] = 300; v.cnt[0] = bad.alpha_0 + 1.f;
+  v.set_other(12.f * bad.alpha_0);
   bad.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, v});
   EXPECT_THROW(scovox::BinarySerializer::serialize(bad), std::runtime_error);
 }

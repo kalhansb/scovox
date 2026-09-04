@@ -80,8 +80,6 @@ struct Params {
   // obstacle in its path should clear, not block the carve. The batched carve
   // path (the live pipeline) ignores this guard entirely; a positive value only
   // re-enables it for the immediate (unbatched) path — offline tools/ablations.
-  // (Formerly 0.7; the joint ray-cast reach_prob variant was reverted for a
-  // ~6 mIoU cold-start tax on indoor RGB-D — see docs/exp_ablations.md.)
   float carve_skip_occ_threshold = 0.0f;
 
   // Batched free-space carve toggle. When false, the live batch path still
@@ -93,11 +91,10 @@ struct Params {
   // one per pixel that landed in it. See SemSplitParams::batch_hits.
   bool batch_hits = true;
 
-  // -- Production knobs (load-bearing on Replica m2f mIoU) --
-  // Together these restore OLD-pipeline mIoU within noise (verified by
-  // res_step_bayesian: 0.3488 vs OLD baseline_newgate_05 0.3481). The four
-  // pre-cleanup knobs (smc, smooth-gate sigmoid) were proved redundant —
-  // these two carry all the load. See docs/exp_ablations.md.
+  // -- Production knobs --
+  // These two carry the load between them: the cap bounds how confident a
+  // single voxel's posterior can become, and the p_occ gate keeps class
+  // evidence out of voxels not yet believed occupied.
   uint16_t evidence_saturation = 1000;       ///< Cap on (a_occ, a_free, sem_cnt). 0 = disabled.
   float    dirichlet_min_p_occ = 0.5f;       ///< Skip Dirichlet update when p_occ below this. 0 = disabled.
 

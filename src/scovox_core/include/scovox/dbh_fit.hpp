@@ -2,8 +2,7 @@
 
 /// @file dbh_fit.hpp
 /// @brief POST-PROCESSING utility: robust circle fit for trunk DBH on a
-/// fine TSDF lattice (docs/design/fine_tsdf_band_dbh_2026_07_30.md,
-/// "DBH measurement").
+/// fine TSDF lattice.
 ///
 /// Nothing in the mapping runtime calls this. The mapping node's job ends
 /// at producing the fine lattice (locally, and on the wire via the rev-7

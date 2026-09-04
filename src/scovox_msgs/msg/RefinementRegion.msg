@@ -1,7 +1,7 @@
 # Registers (remove=false) or unregisters (remove=true) a fine-TSDF
 # refinement region on a scovox_node — a vertical cylinder around a trunk
 # inside which ray hits additionally fuse into the fine-resolution TSDF
-# lattice (docs/design/fine_tsdf_band_dbh_2026_07_30.md). Consumed on the
+# lattice. Consumed on the
 # node's `fine_region_topic` subscription; ignored when the node runs with
 # fine_ratio_log2 = 0.
 #

@@ -28,18 +28,37 @@
 /// `Beta(C·α₀, α₀)` prior (`p_occ = C/(C+1) ≈ 0.933`, which matched the unified
 /// `SemDirVoxel` occupancy marginal) and over the Jeffreys prior
 /// `Beta(0.5,0.5)` — for single-ray-noise robustness against the carve
-/// wall-guard; see docs/occupancy_prior.md for the full derivation and the
-/// Jeffreys runner-up. The factory is prior-agnostic, so the calibrated prior
+/// wall-guard. Jeffreys was the runner-up. The factory is prior-agnostic, so
+/// the calibrated prior
 /// `defaultBetaVoxel(C·α₀, α₀)` remains available as an ablation.
 
 #include <cstddef>
+#include <cmath>
+#include <limits>
 #include <cstdint>
 #include <type_traits>
 
-/// Storage width of one Beta parameter. 0 = `float` (8 B voxel, the shipped
-/// default). 1 = fixed-point `uint16` (4 B voxel), which halves the occupancy
-/// grid — 72.6 MB on a 19 M-voxel SceneNN map, where 98.2% of voxels carry a
-/// Beta cell and no Dirichlet cell.
+/// Storage width of one Beta parameter. 0 = `float` (8 B voxel).
+/// 1 = fixed-point `uint16` (4 B voxel), which halves the occupancy grid.
+/// **This is the shipped default as of 2026-09-04.**
+///
+/// WHY IT IS THE DEFAULT RATHER THAN AN OPT-IN. The occupancy grid is where
+/// this map's memory is. A `BetaVoxel` is allocated for every voxel a ray
+/// touches; a `DirVoxel` only for a voxel that took a semantic deposit, which
+/// is a small minority of them. A byte off `BetaVoxel` is therefore worth many
+/// times the same byte off `DirVoxel`, and layout work that starts at the
+/// semantic cell is optimising the smaller grid.
+///
+/// It is a free saving, not a trade. Every weight this repo ships is a whole
+/// eighth, so uint16-of-eighths accumulates the *same* number float does — not
+/// a near number (see `kBetaLatticeStep` below, and `sanitise()`, which snaps
+/// the weights so a future config cannot silently break it). The A/B against
+/// the float build is a byte-compare of the dumps, not a metric comparison:
+/// anything short of byte identity means a weight left the lattice, or
+/// `applyBetaSaturation` fired and halved a voxel under uint16 that float kept.
+///
+/// Independent of the semantic deposit model — occupancy takes no class
+/// evidence — so the result carries to any `hit_share` setting.
 ///
 /// `batch_hits` is a hard prerequisite: un-batched, `a_occ` counts depth
 /// *pixels*, and the largest value measured on this suite is 756,508 — 23x
@@ -47,7 +66,7 @@
 /// takes at most one deposit per scan, so the same map's ceiling is
 /// `prior + w_occ x frames` ~ 1.5 x 1300 ~ 1951.
 #ifndef SCOVOX_BETA_U16
-#define SCOVOX_BETA_U16 0
+#define SCOVOX_BETA_U16 1
 #endif
 
 /// Fixed-point counts per unit of Beta evidence, i.e. the reciprocal of the
@@ -74,8 +93,10 @@ namespace scovox {
 ///
 ///   - **Increments below half a count vanish.** `a_occ += x` with
 ///     `x < 0.5/SCALE` (0.0625 at the default) rounds back to the value it
-///     started from, so a stream of such rays accumulates nothing. Every
-///     shipped weight is >= 1.0, so this needs `quality < 0.0625` to bite.
+///     started from, so a stream of such rays accumulates nothing. Since the
+///     per-observation increment is now exactly `w_occ` / `w_free` with no
+///     confidence factor, and both are >= 1.0 in every shipped config, no
+///     increment can land in that dead band.
 ///   - **Stores clamp instead of wrapping.** `SemSplitMap::applyBetaSaturation`
 ///     rescales both parameters — preserving `p_occ` — before a counter can
 ///     reach the ceiling, so the clamp here is the backstop, not the mechanism.
@@ -141,11 +162,97 @@ using BetaCount = float;
 
 #endif  // SCOVOX_BETA_U16
 
+// ---------------------------------------------------------------------------
+// The count identity, and the lattice it needs
+// ---------------------------------------------------------------------------
+//
+// Every admitted observation contributes a FIXED increment — `a_occ += w_occ`
+// at a hit, `a_free += w_free` along the carve — with no per-observation
+// confidence factor. So the accumulated parameters are determined entirely by
+// two integer counts:
+//
+//     a_occ  = kBetaOccPrior  + w_occ  * n_hit
+//     a_free = kBetaFreePrior + w_free * n_miss
+//
+// That identity is what lets fixed-point storage be EXACT rather than merely
+// close: under `SCOVOX_BETA_U16` a parameter is an integer number of
+// `1/SCOVOX_BETA_U16_SCALE` units, so if the prior and both weights are
+// themselves whole multiples of that unit, every reachable value lands on the
+// lattice and no accumulation rounds. At the shipped scale of 8 the candidate
+// weights are exact — `w_occ = 1.5 = 12/8`, `w_free = 1.0 = 8/8`, prior
+// `1.0 = 8/8` — and the storage is integer counts denominated in eighths.
+//
+// Float storage needs the same discipline for a different reason: 1.3 has no
+// exact binary representation, so `a_occ += 1.3f` drifts off the identity by
+// accumulated rounding. Whole eighths are dyadic and exact in both.
+//
+// The identity breaks if a weight is NOT on the lattice: each increment then
+// rounds, the errors accumulate in one direction, and `n_hit` is no longer
+// recoverable from `a_occ`. `kBetaLatticeStep` and the two helpers below make
+// that condition checkable instead of assumed. Two sanitisers snap the two
+// places a weight can enter: `SemSplitMap::sanitise` for `Params`, and
+// `sanitise(HitWeights&)` for the per-source fusion profiles, which do NOT go
+// through the first. Any third entry point has to snap for itself -- the
+// per-ray read sites take the weight raw, deliberately, so the hot path pays
+// no rounding.
+
+/// Spacing of the weight lattice. This is deliberately the SAME under both
+/// storage modes, and that is the point: if `w_occ` / `w_free` were quantised
+/// only under fixed point, turning `SCOVOX_BETA_U16` on would silently move
+/// the weights and any A/B across the flag would be comparing two models
+/// rather than two storage layouts. Quantising identically in both makes the
+/// flag a pure storage choice.
+///
+/// Float storage is not exempt from needing a lattice, only from needing THIS
+/// one: binary floating point cannot represent 1.3 either, so accumulating it
+/// drifts just as surely as fixed point rounds it. A whole multiple of 1/8 is
+/// a dyadic rational, exact in float and exact on the fixed-point lattice at
+/// the shipped scale, so one rule covers both.
+/// Derived from `SCOVOX_BETA_U16_SCALE` in BOTH storage modes, not just under
+/// fixed point. A float build compiled with a non-default scale must snap to
+/// the same lattice the matching u16 build would use, or the two stop being
+/// storage variants of one model at exactly the moment someone tunes the
+/// scale -- which is the failure this constant exists to prevent.
+constexpr float kBetaLatticeStep = 1.0f / static_cast<float>(SCOVOX_BETA_U16_SCALE);
+#if SCOVOX_BETA_U16
+static_assert(kBetaLatticeStep == BetaCount::kInv,
+              "lattice step must equal the fixed-point storage resolution");
+#endif
+
+/// Nearest exactly-representable weight to `x`.
+inline float beta_lattice_snap(float x) noexcept {
+  return std::nearbyint(x / kBetaLatticeStep) * kBetaLatticeStep;
+}
+
+/// True when `x` is on the lattice, so repeated `+= x` never rounds.
+inline bool beta_lattice_exact(float x) noexcept {
+  return beta_lattice_snap(x) == x;
+}
+
+/// How many increments of `w` a parameter admits before it stops being exact —
+/// the storage ceiling under fixed point, and effectively unbounded under
+/// float. Reported rather than enforced: `applyBetaSaturation` halves both
+/// parameters well short of the ceiling, which preserves `p_occ` but does end
+/// the count identity for that voxel.
+/// Returns `infinity` when the parameter has no accumulation ceiling (float
+/// storage) and `0` when `w <= 0` admits no increments at all -- the two cases
+/// a single `0` sentinel used to conflate.
+inline double beta_max_increments([[maybe_unused]] float w,
+                                  [[maybe_unused]] float prior) noexcept {
+  if (w <= 0.0f) return 0.0;
+#if SCOVOX_BETA_U16
+  return static_cast<double>(BetaCount::kMax - prior) / static_cast<double>(w);
+#else
+  (void)prior;
+  return std::numeric_limits<double>::infinity();  // float has no ceiling
+#endif
+}
+
 /// Beta occupancy voxel. `a_occ + a_free` is the total observation
 /// count after the prior is consumed; `p_occ = a_occ / (a_occ + a_free)`.
 struct BetaVoxel {
-  /// Beta posterior parameters (α). Bumped by `a_occ += w_occ·quality` at a
-  /// hit (Stream A) and `a_free += w_free·quality` along the carve ray.
+  /// Beta posterior parameters (α). Bumped by `a_occ += w_occ` at a
+  /// hit (Stream A) and `a_free += w_free` along the carve ray.
   BetaCount a_occ;
   BetaCount a_free;
 
@@ -182,8 +289,7 @@ static_assert(offsetof(BetaVoxel, a_free) == offsetof(BetaVoxel, a_occ) + sizeof
 /// all reference these constants, so sender and receiver stay consistent — the
 /// prior is a compile-time constant, NOT carried on the wire. Decoupled from
 /// the semantic `(num_classes, α₀)` because occupancy and semantics are
-/// independent priors. See docs/occupancy_prior.md (incl. the Jeffreys
-/// `Beta(0.5,0.5)` runner-up and the conditions to switch).
+/// independent priors. `Beta(0.5,0.5)` (Jeffreys) is the runner-up.
 constexpr float kBetaOccPrior  = 1.0f;
 constexpr float kBetaFreePrior = 1.0f;
 
@@ -198,7 +304,7 @@ constexpr float kBetaFreePrior = 1.0f;
 /// Beta(1,1) occupancy prior (`p_occ = 0.5`), which `SemSplitMap` passes
 /// explicitly via `kBetaOccPrior` / `kBetaFreePrior`. Pass `occ_prior = C·α₀`,
 /// `free_prior = α₀` to reproduce the old calibrated unified-Dirichlet marginal
-/// (`p_occ = C/(C+1)`) as an ablation. See docs/occupancy_prior.md.
+/// (`p_occ = C/(C+1)`) as an ablation.
 inline BetaVoxel defaultBetaVoxel(float occ_prior = 1.0f,
                                   float free_prior = 1.0f) noexcept {
   BetaVoxel v{};            // zero-init

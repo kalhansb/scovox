@@ -15,7 +15,7 @@
 ///
 ///   DirVoxel (semantics): the slot-reconciling Dirichlet rule with no FREE
 ///     dimension:
-///       other ← A.other + B.other − (C − K_TOP)·α₀
+///       other ← A.other + B.other − (C − K_TOP)·α₀   (installed via set_other)
 ///       top-K slots: union, sum coinciding counts (subtract one duplicated α₀
 ///         prior per coincidence), sort by count, re-truncate to K_TOP;
 ///         the remainder's observed evidence flows to OTHER.
@@ -76,7 +76,7 @@ struct CoordEq {
 /// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) occupancy prior.
 /// The `num_classes` / `alpha_0` params are retained for call-site symmetry with
 /// `mergeDir` but are UNUSED for occupancy: the prior is now the decoupled
-/// constant `kBetaOccPrior` = `kBetaFreePrior` = 1.0 (docs/occupancy_prior.md),
+/// constant `kBetaOccPrior` = `kBetaFreePrior` = 1.0,
 /// not the old calibrated `C·α₀`. Sender and receiver share this compile-time
 /// constant, so the prior-subtraction below stays consistent across nodes.
 inline BetaVoxel mergeBeta(const BetaVoxel& a,
@@ -114,7 +114,10 @@ inline DirVoxel mergeDir(const DirVoxel& a,
       0.f, static_cast<float>(static_cast<int>(num_classes) - K_TOP) * alpha_0);
 
   DirVoxel f{};
-  f.other = std::max(other_prior, a.other + b.other - other_prior);
+  // Accumulated locally and installed with set_other() once `cnt[]` is final:
+  // `other` is derived from the slots, so writing it before they are filled
+  // would be undone by every subsequent slot write.
+  float f_other = std::max(other_prior, a.other() + b.other() - other_prior);
 
   // Union dict of (class -> count); at most 2·K_TOP entries. Empty slots
   // (cls == 0xFFFF) carry only the per-slot α₀ prior and are skipped.
@@ -174,8 +177,16 @@ inline DirVoxel mergeDir(const DirVoxel& a,
   // Tail past K_TOP: dump observed-evidence (cnt − α₀) into OTHER; the α₀
   // prior stays in the slot — consistent with sparse_add_class eviction.
   for (int i = K_TOP; i < n; ++i) {
-    f.other += std::max(0.f, merged[i].cnt - alpha_0);
+    f_other += std::max(0.f, merged[i].cnt - alpha_0);
   }
+  // `set_other` stores `f_other + Σ cnt` and `other()` recovers it by
+  // subtracting the same slots back, so the round trip is exact only to
+  // ulp(s_total): a residual clamped exactly onto the `other_prior` floor above
+  // can read back marginally BELOW it. "other ≥ other_prior after a merge" is
+  // therefore no longer a postcondition. Nothing downstream depends on it — `a_unk` in
+  // dscovox_consensus.hpp applies its own std::max(0.f, …) — but do not add an
+  // assert here expecting exactness.
+  f.set_other(f_other);
   return f;
 }
 

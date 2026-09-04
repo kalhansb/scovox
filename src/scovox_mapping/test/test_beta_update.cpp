@@ -423,11 +423,11 @@ TEST(BetaUpdate, FarHitsGetLessEvidence) {
   Eigen::Vector3f near_hit(1, 0, 0);
   Eigen::Vector3f far_hit(8, 0, 0);
 
-  map.integrateRay(origin, near_hit, /*is_dynamic=*/false, nullptr, 1.f,
+  map.integrateRay(origin, near_hit, /*is_dynamic=*/false, nullptr,
                    std::exp(-1.0f / 5.0f), 1.f);  // range_w for 1m
 
   auto map2 = makeMap(0.5);
-  map2.integrateRay(origin, far_hit, /*is_dynamic=*/false, nullptr, 1.f,
+  map2.integrateRay(origin, far_hit, /*is_dynamic=*/false, nullptr,
                     std::exp(-8.0f / 5.0f), 1.f);  // range_w for 8m
 
   Voxel v_near = defaultVoxel(), v_far = defaultVoxel();

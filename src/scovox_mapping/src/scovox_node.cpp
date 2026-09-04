@@ -517,9 +517,8 @@ private:
     //     any semantics it already holds, it just stops receiving updates.
     share_dir_ = dp("share_dir", true);
     // ── Fine TSDF band — localized two-lattice refinement ──────────────────
-    // docs/design/fine_tsdf_band_dbh_2026_07_30.md. fine_ratio_log2 = 0 (the
-    // default) disables everything (no fine grid, no subscription). k = 2 at
-    // resolution 0.10 → 2.5 cm fine voxels. The node's job ends at PRODUCING
+    // fine_ratio_log2 = 0 (the default) disables everything (no fine grid,
+    // no subscription). k = 2 at resolution 0.10 → 2.5 cm fine voxels. The node's job ends at PRODUCING
     // the fine lattice; measurement (e.g. the DBH circle fit, dbh_fit.hpp) is
     // post-processing on the shared/saved map, not a mapping responsibility.
     fine_ratio_log2_      = std::clamp<int>((int)dp("fine_ratio_log2", 0), 0, 8);
@@ -570,7 +569,7 @@ private:
     share_gate_evidence_rel_dir_ = dp("share_gate_evidence_rel_dir", -1.0);
     if (share_gate_evidence_rel_dir_ < 0.0)
       share_gate_evidence_rel_dir_ = share_gate_evidence_rel_;
-    // ── E6.6 gate-policy experiment knobs (experiment_plan.md §E6.6) ──
+    // ── Gate-policy experiment knobs ──
     // share_gate_mode selects the emit TRIGGER when share_change_gate is on:
     //   "significance"      (default) — |Δp_occ| > τ OR relative evidence
     //                       growth > share_gate_evidence_rel (κ = 1 + rel).
@@ -746,10 +745,9 @@ private:
     // centroid per voxel cuts that tail-sampling without throwing away coverage.
     // 0.0 = off (full per-point path, unchanged). Geometric only: when >0 the
     // per-point semantic/top-k labels are dropped (fine for the raw LiDAR path).
-    // Default 0.5 = the swept optimum for coarse-map thinness (see the sweep
-    // table in scovox_lidar_raw_deskew.yaml: 4x thinner shared columns than
-    // 0.1 for only -7% footprint). Configs may override (geometric/fused run
-    // 0.1 = map resolution); refinement regions are unaffected either way —
+    // Default 0.5 = the swept optimum for coarse-map thinness; the sweep table
+    // is in scovox_lidar_raw_deskew.yaml. Configs may override (geometric and
+    // fused run 0.1 = map resolution); refinement regions are unaffected either way —
     // in-region raw returns bypass this via refineHit (fine_raw_returns).
     downsample_voxel_size_ = dp("downsample_voxel_size", 0.5);
     {
@@ -844,6 +842,14 @@ private:
     // Start ~0.4 (LiDAR length-scale from Gan et al.); ~1 voxel at resolution
     // 0.10. Cost scales as (2·l/res+1)³ persistent-Beta lookups per RGB-D point.
     rgbd_prof_.kernel_radius = (float)dp("rgbd_kernel_radius", 0.0);
+    // Snap both profiles onto the Beta storage lattice. These weights reach
+    // applyBetaUpdate WITHOUT passing through SemSplitMap::sanitise -- the
+    // profile is handed straight to the integration call -- so without this the
+    // count identity `a_occ = prior + w_occ * n_hit` would hold on the single-
+    // sensor path and silently fail on the fusion path. Snapping here, once at
+    // construction, keeps the per-ray read raw and free.
+    scovox::sanitise(lidar_prof_);
+    scovox::sanitise(rgbd_prof_);
     if (fuse_lidar_rgbd_) {
       RCLCPP_INFO(get_logger(),
         "FUSION on: LiDAR{w_occ=%.2f w_free=%.2f kappa0=%.2f min_p=%.2f} "
@@ -1185,11 +1191,6 @@ private:
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
     std::vector<Eigen::Vector3f> nr_eps;
-    auto rdZ = [&](int pu, int pv) -> float {
-      if (pu<0||pu>=W||pv<0||pv>=H) return 0.f;
-      if (d16) { float d = float(reinterpret_cast<const uint16_t*>(depth->data.data()+pv*depth->step)[pu])*dsc; return (std::isfinite(d)&&d>0.f)?d:0.f; }
-      else { float d = reinterpret_cast<const float*>(depth->data.data()+pv*depth->step)[pu]; return (std::isfinite(d)&&d>0.f)?d:0.f; }
-    };
     // Soft-prob path: load per-frame top-K image once. We use the
     // depth-image stamp's low 16 bits as the frame index (same convention
     // the replay node sets via _stamp_from_index).
@@ -1222,21 +1223,11 @@ private:
         uint16_t lbl = lookupLabel((uint32_t(r)<<16)|(uint32_t(g)<<8)|uint32_t(b));
         if (lbl > 0 && lbl < max_sem_) { std::fill(cp.begin(), cp.end(), 0.f); cp[lbl] = 1.f; vs = true; }
       }
-      float rng = (Hp-O).norm(), rw = 1.f;
-      if (P.range_decay_length > 0) { if (rng<P.min_range||rng>P.max_range) continue; rw = std::exp(-rng/float(P.range_decay_length)); }
-      float aw = 1.f;
-      if (P.grazing_angle_threshold > 0 && rng > 0.01f) {
-        Eigen::Vector3f rd = (Hp-O).normalized();
-        float zl=rdZ(u-st,v), zr=rdZ(u+st,v), zu=rdZ(u,v-st), zd=rdZ(u,v+st);
-        if (zl>0&&zr>0&&zu>0&&zd>0) {
-          Eigen::Vector3f pl(float((u-st-cx)*zl/fx),float((v-cy)*zl/fy),zl), pr(float((u+st-cx)*zr/fx),float((v-cy)*zr/fy),zr);
-          Eigen::Vector3f pu2(float((u-cx)*zu/fx),float((v-st-cy)*zu/fy),zu), pd(float((u-cx)*zd/fx),float((v+st-cy)*zd/fy),zd);
-          Eigen::Vector3f no = (pr-pl).cross(pd-pu2); float nl = no.norm();
-          if (nl>1e-6f) { float ca = std::abs(rd.dot(T_oo.linear()*(no/nl))); if (ca<P.grazing_angle_threshold) aw = ca/float(P.grazing_angle_threshold); }
-        }
-      }
-      float q = rw*aw;
-      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q, rgbdProf());
+      float rng = (Hp-O).norm();
+      // The range cull has always been gated on range_decay_length > 0; it kept
+      // that shape when the decay weight itself was removed.
+      if (P.range_decay_length > 0 && (rng<P.min_range||rng>P.max_range)) continue;
+      integrateHit(O, Hp, rng, vs ? &cp : nullptr, rgbdProf());
     }
     carveNoReturnRays(O, nr_eps, rgbdProf());
     split_map_->flushCarveFrame();
@@ -1741,8 +1732,7 @@ private:
         Eigen::Vector3f Hp = T_oi * a.best_p;
         if (apply_trans) Hp += v_odom * a.best_off;
         const float rng = need_rng ? (Hp - O).norm() : 0.f;
-        const float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
-        integrateHit(O, Hp, rng, nullptr, rw, lidarProf());
+        integrateHit(O, Hp, rng, nullptr, lidarProf());
       }
     } else {
     std::vector<float> cp(max_sem_, 0.f);
@@ -1768,8 +1758,6 @@ private:
       Eigen::Vector3f Hp = T_oi * praw;
       if (apply_trans) Hp += v_odom * off_i;
       const float rng = need_rng ? (Hp - O).norm() : 0.f;
-      float rw = (P.range_decay_length > 0) ? std::exp(-rng / float(P.range_decay_length)) : 1.f;
-      float q = rw;
 
       bool vs = false;
       if (use_topk) {
@@ -1788,7 +1776,7 @@ private:
         if (lbl > 0 && lbl < max_sem_) { std::fill(cp.begin(), cp.end(), 0.f); cp[lbl] = 1.f; vs = true; }
       }
 
-      integrateHit(O, Hp, rng, vs ? &cp : nullptr, q, lidarProf());
+      integrateHit(O, Hp, rng, vs ? &cp : nullptr, lidarProf());
     }
     }  // end else (per-point path)
     split_map_->flushCarveFrame();  // one Beta write per carved voxel, block-ordered
@@ -1971,11 +1959,11 @@ private:
   }
 
   void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp, float rng,
-                    const std::vector<float>* cp, float q,
+                    const std::vector<float>* cp,
                     const scovox::HitWeights* prof = nullptr) {
     // Split-grid path. TsdfMap walks the SDF band, SemSplitMap walks the carve
-    // band leading up to the hit. `q` already bakes in the range/grazing
-    // weights (rw*aw) at the call site.
+    // band leading up to the hit. Every admitted return contributes the same
+    // count: `a_occ += w_occ`, with no per-ray confidence factor.
     //
     // carve_band: when `carve_band_ > 0` (Replica / KITTI launch default =
     // 0.1), walk the semantic carve along only the last `carve_band` metres
@@ -1997,7 +1985,7 @@ private:
         if ((*cp)[i] > best_p) { best_p = (*cp)[i]; best = (int)i; }
       if (best >= 0 && dyn_cls_.count((uint16_t)best)) is_dynamic = true;
     }
-    split_map_->integrateHit(co, Hp, cp, q, is_dynamic, prof);
+    split_map_->integrateHit(co, Hp, cp, is_dynamic, prof);
     markMapDirty();
   }
   // Decay the transient (dynamic-class) grid one step toward the prior. Called
@@ -2012,11 +2000,10 @@ private:
   void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps,
                          const scovox::HitWeights* prof = nullptr) {
     // Beta-only carve along no-return rays (no TSDF surface to anchor).
-    // q=1.0f matches the legacy carve which doesn't apply rw/aw. `prof` carries
-    // the per-source w_free — a semantics-only source (RGB-D, w_free=0) deposits
-    // NO a_free here, so its many no-return (sky/far) rays can't erode LiDAR
-    // occupancy on the shared Beta grid.
-    for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f, prof);
+    // `prof` carries the per-source w_free — a semantics-only source
+    // (RGB-D, w_free=0) deposits NO a_free here, so its many no-return
+    // (sky/far) rays can't erode LiDAR occupancy on the shared Beta grid.
+    for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, prof);
     markMapDirty();
   }
   void loadSemanticColorMap() {
@@ -2087,7 +2074,7 @@ private:
       vv.a_occ=b.a_occ; vv.a_free=b.a_free;
       const scovox::DirVoxel* dv = dacc.value(c);
       if (dv) {
-        vv.a_unk = dv->other;
+        vv.a_unk = dv->other();
         for (int i = 0; i < scovox::K_TOP; ++i) {
           if (dv->cls[i] == 0xFFFF) continue;
           scovox_msgs::msg::ScovoxSemanticEvidence e;
@@ -2190,7 +2177,8 @@ private:
       share_deferred_bytes_ = 0;
       prev_sub_count_ = cur_sub;
       // Discard path: nothing consumes the coords, so skip drainTouched*'s
-      // sort+unique (~1 s/frame at Replica res 0.05 stride 1) for a ~µs clear.
+      // sort+unique — which dominates a frame at fine resolution — for an
+      // O(n) clear.
       split_map_->clearTouchedTsdf();
       split_map_->clearTouchedSemDir();
       split_map_->clearTouchedFine();
@@ -2266,7 +2254,7 @@ private:
         ? static_cast<float>(map_params_.evidence_saturation) / 65025.f
         : 0.f;
 
-    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
+    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1)
     const float dir_other_prior =
         static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
 
@@ -2303,7 +2291,12 @@ private:
       const uint16_t d =
           scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_);
       w.cls[0] = d;
-      w.cnt[0] = alpha_0_ + (float)share_binarize_evidence_;
+      // Paired writes: attributing evidence to a slot and adding it to the
+      // total are two steps since the 2026-09-04 basis change. `cnt[0]` alone
+      // would drive the derived `other()` negative by exactly this evidence.
+      // See dir_voxel.hpp's "writing cnt[] directly" hazard.
+      w.cnt[0] += (float)share_binarize_evidence_;
+      w.s_total += (float)share_binarize_evidence_;
       return w;
     };
 
@@ -2402,7 +2395,7 @@ private:
         bool any_sem = false;
         for (int i = 0; i < scovox::K_TOP; ++i)
           if (v.cls[i] != 0xFFFF) { any_sem = true; break; }
-        const bool at_prior = !any_sem && (v.other <= dir_other_prior + 1e-4f);
+        const bool at_prior = !any_sem && (v.other() <= dir_other_prior + 1e-4f);
         if (at_prior) return;
         if (zband) {
           const double zc = dgrid.coordToPos(c).z + zhalf;
@@ -2827,7 +2820,7 @@ private:
         "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
     }
 
-    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1) — see docs/occupancy_prior.md
+    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1)
     auto has_beta_evidence = [&](const scovox::BetaVoxel& b) {
       return b.a_occ > beta_occ_prior + 1e-3f || b.a_free > scovox::kBetaFreePrior + 1e-3f;
     };
@@ -2854,7 +2847,7 @@ private:
       v.a_occ = b.a_occ; v.a_free = b.a_free;
       const scovox::DirVoxel* dv = diracc.value(co);
       if (dv) {
-        v.a_unk = dv->other;
+        v.a_unk = dv->other();
         for (int i = 0; i < scovox::K_TOP; ++i) {
           v.sem_cnt[i] = std::max(0.f, dv->cnt[i] - alpha_0_);
           v.sem_cls[i] = dv->cls[i];
@@ -2999,8 +2992,8 @@ private:
   }
 
   // ── Fine TSDF band: region registration / viz ──────────────────────────
-  // (docs/design/fine_tsdf_band_dbh_2026_07_30.md; all no-ops when
-  // fine_ratio_log2 = 0 — none of these callbacks are created then.)
+  // (All no-ops when fine_ratio_log2 = 0 — none of these callbacks are
+  // created then.)
   // Measurement on the fine lattice (e.g. the DBH circle fit) is deliberately
   // NOT here: the node's responsibility ends at generating the map. Consumers
   // post-process the shared rev-7 fine stream or the saved map.
@@ -3152,7 +3145,7 @@ private:
   std::unordered_map<uint16_t, sensor_msgs::msg::Image::ConstSharedPtr> ds_depth_cache_, ds_seg_cache_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr ds_depth_sub_, ds_seg_sub_;
   int max_sem_, stride_{1}; double min_d_{0.1}, max_d_{10.0}, min_occ_, transient_decay_rate_{0.8}, sem_vis_thresh_{-1.0};
-  // Mechanism knobs measured offline on SceneNN; all default to shipped behaviour.
+  // Semantic mechanism knobs; all default to shipped behaviour.
   int    semantic_topk_trunc_{0};
   bool   evict_by_confidence_{false};
   double semantic_spread_radius_{0.0};

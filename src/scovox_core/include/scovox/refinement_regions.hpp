@@ -2,8 +2,7 @@
 
 /// @file refinement_regions.hpp
 /// @brief Refinement-region registry + per-scan anchor re-registration for
-/// the fine-resolution TSDF band
-/// (docs/design/fine_tsdf_band_dbh_2026_07_30.md).
+/// the fine-resolution TSDF band.
 ///
 /// A refinement region is a vertical cylinder `(cx, cy, r, z_lo, z_hi)`
 /// around a registered trunk. Hits inside `r + margin` route to the fine

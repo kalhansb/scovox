@@ -18,28 +18,71 @@
 /// model), which is the intended meaning of "split Beta and Dirichlet".
 ///
 /// Layout (K_TOP = 2):
-///   offset 0:   other  (float, 4 B)  — lumped OTHER / evicted mass
+///   offset 0:   s_total (float, 4 B) — TOTAL class evidence, `C·α₀ + Σ deposits`
 ///   offset 4:   cnt[0] (float, 4 B)  — α for top-K slot 0
 ///   offset 8:   cnt[1] (float, 4 B)  — α for top-K slot 1
 ///   offset 12:  cls[0] (uint16, 2 B) — class id at slot 0 (0xFFFF = empty)
 ///   offset 14:  cls[1] (uint16, 2 B) — class id at slot 1
 ///   total: 16 B at K_TOP=2.
 ///
-/// Mass conservation: `sparse_add_class` preserves the strict invariant
-///   Δ(other + Σ cnt) == Σ Δ inputs
-/// — every increment lands somewhere (matched slot / empty slot / evicted-to-
-/// OTHER / dropped-to-OTHER), never lost. This is the same eviction-to-OTHER
-/// discipline as `sparse_add_unified` in semdir_map.cpp, ported to the
-/// occupancy-free Dirichlet; it is *not* the legacy `voxel.hpp::sparse_add`
-/// with its `≥ 0` slack.
+/// WHY THE TOTAL IS STORED AND `other` IS DERIVED (design choice, 2026-09-04).
+/// The offset-0 word used to hold `other`, the unattributed remainder, and
+/// `s_class()` summed `other + Σ cnt` on every read. Storing the *total* and
+/// deriving `other = s_total − Σ cnt` is the same 4 bytes and the same
+/// information — it is a change of basis, not a saving — chosen for three
+/// reasons, in order of weight:
 ///
-/// One bounded exception, from evidence saturation
-/// (`SemSplitMap::applyDirSaturation`): the rescale multiplies an EMPTY slot's
-/// α₀ placeholder down to k·α₀ (only FILLED slots are floored back to α₀ —
-/// flooring empty ones would re-inflate `s_class` past the cap). The next
-/// empty-slot fill overwrites that placeholder with `α₀ + inc`, so the fill's
-/// Δ exceeds `inc` by α₀·(1−k) ≤ α₀. This merely restores the eroded prior,
-/// is bounded by α₀ per fill, and needs no downstream guard.
+///  1. `S` IS EXACT, AND THE OLD BASIS WAS NOT. Under the shipped
+///     `--hit-share flat` every look deposits exactly `kappa0`, so
+///     `S − C·α₀` is the number of looks the voxel has absorbed, an integer.
+///     Summing three separately-accumulated floats does not recover it. `other`
+///     carries ~88% of the mass and takes the most adds, so it absorbs small
+///     residuals into a large running value and loses them. The drift grows
+///     with the look count, is unbounded, and is NOT one-signed — its sign
+///     depends on where the mantissa happens to land. One accumulator adding
+///     `class_share` once per look stays orders of magnitude closer to the
+///     integer across the whole range a busy voxel reaches.
+///
+///  2. THE MASS INVARIANT BECOMES STRUCTURAL. It used to be a property four
+///     coordinated `*other +=` writes had to maintain, and every branch of
+///     `sparse_add_class` carried a comment arguing that it did. There is now
+///     one write, `*s_total += inc`, made by the caller once per look; a branch
+///     *cannot* leak mass, because no branch touches the total. What the
+///     branches do is decide how much of it is attributed to a slot.
+///
+///  3. `s_class()` IS O(1) rather than a K_TOP-length sum, and it is read on
+///     every classification (`p_c = cnt[c] / S`) and every share gate.
+///
+/// The cost is that `other()` is now the derived quantity and inherits the
+/// (much smaller) accumulated error of `Σ cnt`. That is the right place for it:
+/// `other` is by definition the bucket of mass that cannot be attributed, it is
+/// read only as `a_unk` and by the prior gate, and it is never a denominator.
+///
+/// Mass conservation: the strict invariant
+///   Δ(s_total) == Σ Δ inputs,   and   other ≡ s_total − Σ cnt
+/// — every increment lands somewhere (matched slot / empty slot / evicted-to-
+/// OTHER / dropped-to-OTHER), never lost. `other ≥ 0` holds in exact
+/// arithmetic but is NOT a float postcondition; see `other()` below. This is
+/// the same eviction-to-OTHER discipline as `sparse_add_unified` in
+/// semdir_map.cpp, ported to the occupancy-free Dirichlet; it is *not* the
+/// legacy `voxel.hpp::sparse_add` with its `≥ 0` slack.
+///
+/// Two bounded exceptions, both from evidence saturation
+/// (`SemSplitMap::applyDirSaturation`), which rescales by k = cap/s and floors
+/// FILLED slots back to α₀ but not empty ones (flooring empty ones would
+/// re-inflate `s_class` past the cap). Both re-attribute α₀·(1−k) ≤ α₀ that
+/// the rescale had eroded:
+///   • empty-slot fill — the placeholder sits at k·α₀ and is overwritten with
+///     `α₀ + inc`, so `Σ cnt` grows by more than `inc`;
+///   • eviction of a slot eroded below α₀ — `raw = cnt − α₀ < 0`, and the
+///     newcomer's fresh `α₀ + inc` likewise overgrows `Σ cnt`.
+/// Under the OLD basis this excess was created out of nothing: `other` was
+/// untouched, so the voxel's total silently grew by more than was deposited.
+/// It now comes out of the derived `other()` instead, which is the correct
+/// accounting — the mass is restored to the slot from the unattributed bucket,
+/// not conjured. The visible consequence is that `other()` can dip by up to α₀
+/// per fill or eroded eviction. Reachable only when the saturation cap is
+/// enabled: the offline replay pins it to 0, the ROS node defaults it to 1000.
 
 #include <cstddef>
 #include <cstdint>
@@ -76,17 +119,16 @@
 #define SCOVOX_TRACK_NHIT 0
 #endif
 
-// The slot-rule matrix axes -- VICTIM_MEAN, VICTIM_QMAX, ADMIT_NORM and the
-// nonzero EVICT_INHERIT arms -- were build-time alternatives swept against each
-// other; the sweep is closed and only the selected rules remain below. The
-// last source that implements them is tagged `pre-flag-removal-2026-09-02` in
-// this repo, which is where any cell citing them must be rebuilt from.
+// VICTIM_MEAN, VICTIM_QMAX, ADMIT_NORM and the nonzero EVICT_INHERIT arms were
+// build-time alternatives to the rules below; the source that implements them
+// is tagged `pre-flag-removal-2026-09-02` in this repo, which is where a build
+// needing one must come from.
 //
 // Trap rather than ignore: an undefined macro is 0 to the preprocessor, so a
 // driver still passing one of these would compile cleanly and emit a binary
-// LABELLED as a variant but byte-identical to the shipped build. That is the
-// one failure mode that leaves a working binary and a wrong label, and it is
-// the failure the sweep's own build driver was written to catch.
+// LABELLED as a variant but byte-identical to the shipped build -- a working
+// binary with a wrong label, which is the one failure mode a build manifest
+// of md5s cannot catch.
 #if defined(SCOVOX_VICTIM_MEAN) && (SCOVOX_VICTIM_MEAN)
 #error "SCOVOX_VICTIM_MEAN was removed; rebuild from tag pre-flag-removal-2026-09-02."
 #endif
@@ -106,9 +148,11 @@ namespace scovox {
 /// slot; `cnt[i]` then holds the per-slot prior `α₀` (set by
 /// `defaultDirVoxel()` — never zero, to keep closed-form variance valid).
 struct DirVoxel {
-  /// Lumped pseudo-counts for the `C − K_TOP` classes outside the top-K slots
-  /// plus any evicted slot evidence. Conserved by `sparse_add_class`.
-  float    other;
+  /// TOTAL occupied-class evidence: `C·α₀` at the prior, plus every deposit
+  /// this voxel has absorbed. The single accumulator — written once per look by
+  /// the caller of `sparse_add_class`, never by `sparse_add_class` itself. See
+  /// the file header for why this, and not `other`, is the stored word.
+  float    s_total;
 
   /// Top-K class slots, by accumulated `cnt[i]`. `cls[i] == 0xFFFF` is the
   /// empty-slot sentinel; an empty slot's `cnt[i]` holds the prior `α₀`.
@@ -131,18 +175,58 @@ struct DirVoxel {
   uint16_t nhit[K_TOP];
 #endif
 
-  /// Total class (occupied-semantic) evidence: `other + Σ cnt`. The analogue
-  /// of `SemDirVoxel::s_occ()` (which additionally folds in occupancy mass);
-  /// here it is purely semantic.
-  inline float s_class() const noexcept {
-    float s = other;
-    for (int i = 0; i < K_TOP; ++i) s += cnt[i];
-    return s;
+  /// Total class (occupied-semantic) evidence. The analogue of
+  /// `SemDirVoxel::s_occ()` (which additionally folds in occupancy mass); here
+  /// it is purely semantic. O(1): this is the stored word.
+  inline float s_class() const noexcept { return s_total; }
+
+  /// Lumped pseudo-counts for the `C − K_TOP` classes outside the top-K slots,
+  /// plus any evicted slot evidence — i.e. the mass this voxel has absorbed but
+  /// cannot attribute to a tracked class. DERIVED, not stored.
+  ///
+  /// `≥ 0` in exact arithmetic — `sparse_add_class` never attributes more than
+  /// was deposited — but NOT in float32, and a small negative is not by itself
+  /// evidence of a bug. `s_total` and `cnt[]` accumulate the same increments
+  /// from different starting offsets (C·α₀ vs α₀), so they round apart, and a
+  /// residual that is a true positive smaller than `ulp(s_total)` can read back
+  /// as a small negative. Do NOT assert on the sign.
+  /// A negative far exceeding the ulp of `s_total` is still the signature
+  /// of an unpaired `cnt[]` write (see the hazard note below), which is why
+  /// this is left unclamped. The consumers that must not see a negative
+  /// (`a_unk` in dscovox_consensus.hpp) apply their own `std::max(0.f, …)`.
+  inline float other() const noexcept {
+    float o = s_total;
+    for (int i = 0; i < K_TOP; ++i) o -= cnt[i];
+    return o;
+  }
+
+  /// HAZARD, worth knowing before you touch `cnt[]` anywhere. Writing a slot
+  /// directly no longer leaves `other()` alone — it moves it by exactly the
+  /// negative of what you wrote, because the total did not change. Live code
+  /// only ever reaches `cnt[]` through `sparse_add_class`, which is paired with
+  /// the caller's `s_total` add, so this bites test fixtures and tools that
+  /// fabricate an observation history. Finish such a fixture with `set_other()`.
+  /// (Three merge tests failed exactly this way when the basis changed, and one
+  /// of them was the mass-conservation test itself.)
+  ///
+  /// Set the derived `other()` to `o`, holding `cnt[]` fixed. For the handful
+  /// of callers that genuinely compute a residual and need to install it —
+  /// deserialisation, `mergeDir`, test fixtures — rather than depositing
+  /// through `dirichletUpdate`. **Call it after `cnt[]` is final**: it reads
+  /// the slots to work out the total, so a later write to `cnt[]` silently
+  /// moves `other()` by the same amount.
+  ///
+  /// The live deposit path does NOT use this, and must not: rebuilding the
+  /// total from the residual on every look is exactly the accumulation this
+  /// basis exists to avoid.
+  inline void set_other(float o) noexcept {
+    s_total = o;
+    for (int i = 0; i < K_TOP; ++i) s_total += cnt[i];
   }
 };
 
 // Layout invariants. K_TOP=2 (production / paper default):
-//   sizeof == 4 (other) + 4·K_TOP (cnt) + 2·K_TOP (cls) = 4 + 12 = 16.
+//   sizeof == 4 (s_total) + 4·K_TOP (cnt) + 2·K_TOP (cls) = 4 + 12 = 16.
 // General K_TOP: 4 + 6·K_TOP, rounded up to 4-byte alignment for the trailing
 // uint16_t pair.
 /// 6 B per slot (4 cnt + 2 cls), or 8 B when the qmax confidence track is
@@ -163,15 +247,16 @@ static_assert(std::is_trivial_v<DirVoxel>,
     "DirVoxel must be trivial for Bonxai's pool allocator (zero-init).");
 static_assert(std::is_standard_layout_v<DirVoxel>,
     "DirVoxel must have standard layout for byte-for-byte wire emit.");
-static_assert(offsetof(DirVoxel, cnt) == offsetof(DirVoxel, other) + sizeof(float),
-    "DirVoxel layout: cnt[] must immediately follow other.");
+static_assert(offsetof(DirVoxel, cnt) == offsetof(DirVoxel, s_total) + sizeof(float),
+    "DirVoxel layout: cnt[] must immediately follow s_total.");
 static_assert(offsetof(DirVoxel, cls) == offsetof(DirVoxel, cnt) + K_TOP * sizeof(float),
     "DirVoxel layout: cls[] must immediately follow cnt[K_TOP] with no padding.");
 
 /// Default symmetric prior. The top-K slots and OTHER carry the same per-dim
 /// prior `α₀` that the unified `SemDirVoxel` uses, minus the FREE dimension:
 ///   - each `cnt[i] = α₀`  (K_TOP slot placeholders)
-///   - `other = (C − K_TOP) · α₀`  (the collapsed out-of-K dimensions)
+///   - `s_total = C · α₀`, so the derived `other` is `(C − K_TOP) · α₀`
+///     (the collapsed out-of-K dimensions)
 /// Total class prior `= C · α₀`, equal to `SemDirVoxel::s_occ()` at prior and
 /// to `BetaVoxel`'s `a_occ` prior (`C·α₀`) — keeping the split consistent with
 /// the live path at the prior.
@@ -179,7 +264,11 @@ inline DirVoxel defaultDirVoxel(uint16_t num_classes = 14,
                                 float    alpha_0     = kDefaultDirichletPrior) noexcept {
   DirVoxel v{};                     // zero-init
   const int residual_dims = static_cast<int>(num_classes) - K_TOP;
-  v.other = (residual_dims > 0) ? (residual_dims * alpha_0) : 0.f;
+  // s_total = other_prior + K_TOP·α₀ = C·α₀ whenever C ≥ K_TOP. Written in the
+  // residual form so a C < K_TOP taxonomy keeps the old behaviour (other = 0)
+  // rather than silently giving the voxel a negative unattributed bucket.
+  v.s_total = ((residual_dims > 0) ? (residual_dims * alpha_0) : 0.f)
+            + static_cast<float>(K_TOP) * alpha_0;
   for (int i = 0; i < K_TOP; ++i) {
     v.cnt[i] = alpha_0;             // per-dim prior on each top-K slot
     v.cls[i] = 0xFFFF;             // empty-slot sentinels
@@ -189,11 +278,26 @@ inline DirVoxel defaultDirVoxel(uint16_t num_classes = 14,
 
 /// Heavy-hitter sparse-add into the occupied-class Dirichlet, parametrised by
 /// the per-dim prior `α₀`. Routes `inc` into one of the top-K_TOP class slots
-/// (Space-Saving / Metwally 2005) or the OTHER bucket — never lost. Preserves
-/// the strict mass invariant `Δ(other + Σcnt) == inc`.
+/// (Space-Saving / Metwally 2005), or leaves it unattributed — never lost.
 ///
-/// Direct port of `sparse_add_unified` (semdir_map.cpp), with `alpha_other`
-/// renamed `other` and no FREE interaction (FREE is in the Beta grid).
+/// THIS FUNCTION DOES NOT ADD MASS (design choice, 2026-09-04). It only decides
+/// how much of a deposit the caller has ALREADY added to `s_total` is
+/// attributable to a tracked class; whatever it does not put in `cnt[]` stays
+/// in the derived `other()` by arithmetic. It used to take a `float* other` and
+/// write to it on three of its four branches, so the invariant
+/// `Δ(other + Σcnt) == inc` was a discipline every branch had to observe and
+/// every branch carried a comment defending. Dropping the parameter makes the
+/// invariant unbreakable — there is no branch that CAN leak mass — and, because
+/// the caller now adds `class_share` exactly once per look, the running total
+/// is exact rather than the sum of four separately-drifting accumulators. See
+/// the file header.
+///
+/// The contract for callers is one line: add the deposit to `s_total` (or to
+/// your own total) BEFORE or after calling this, exactly once, whatever branch
+/// is taken.
+///
+/// Direct port of `sparse_add_unified` (semdir_map.cpp), without its
+/// `alpha_other` output and with no FREE interaction (FREE is in the Beta grid).
 /// `q` is the deposit's own class probability in [0,1] (for a Dirichlet update
 /// that is `inc / class_share`). It is *not* evidence and never changes what is
 /// deposited — it only feeds the optional confidence eviction comparator, and
@@ -202,7 +306,6 @@ inline void sparse_add_class(float*    cnt,
                              uint16_t* cls,
                              uint16_t  c,
                              float     inc,
-                             float*    other,
                              float     alpha_0,
                              float     q    = -1.0f,
                              uint16_t* qmax = nullptr,
@@ -238,11 +341,10 @@ inline void sparse_add_class(float*    cnt,
   // whose argmax index hits 0xFFFF) must NOT be written into a slot: it would
   // fill `cls[i] = 0xFFFF` with real mass yet still read as EMPTY, so the next
   // add re-fills the slot from scratch (losing the prior inc) and isPriorDir /
-  // dominantClass mis-treat it as unfilled — breaking the strict invariant
-  // Δ(other + Σcnt) == inc. Route the (untrackable) sentinel class straight to
-  // OTHER, which both conserves mass and keeps every slot's sentinel meaning intact.
+  // dominantClass mis-treat it as unfilled. Leave the (untrackable) sentinel
+  // class unattributed — it stays in `other()` because no `cnt[]` claims it,
+  // which keeps every slot's sentinel meaning intact.
   if (c == 0xFFFF) {
-    *other += inc;
     g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
     say(0);
     return;
@@ -275,15 +377,14 @@ inline void sparse_add_class(float*    cnt,
   int min_i = 0;
   for (int i = 1; i < K_TOP; ++i) if (cnt[i] < cnt[min_i]) min_i = i;
   // Clamp at 0. A filled slot should always hold >= α₀ (prior + observed
-  // evidence), but an evidence-saturation rescale can erode it below α₀; an
-  // unclamped `cnt[min_i] − α₀` would then be NEGATIVE and turn the
-  // `*other += evicted_evidence` below into a mass SUBTRACTION (driving OTHER
-  // negative, breaking the Δ(other + Σcnt) == inc invariant). The saturation
-  // path also floors filled slots at α₀, so this is normally a no-op safety net.
+  // evidence), but an evidence-saturation rescale can erode it below α₀. The
+  // clamp no longer guards a mass write — it guards the eviction TEST below,
+  // which compares `inc` against this value: a negative key would make every
+  // arrival win the contest for an eroded slot.
   const float raw_evicted = cnt[min_i] - alpha_0;
   const float evicted_evidence = raw_evicted > 0.f ? raw_evicted : 0.f;
   // Comparator choice changes only WHICH deposits win a contested slot, never
-  // how much mass moves: both branches below conserve Δ(other + Σcnt) == inc.
+  // how much mass moves: neither branch below can move any, only re-attribute.
   // Shipped rule weighs accumulated evidence, so a class that arrives often
   // beats one that arrives certain; the confidence rule inverts that, letting a
   // single high-probability observation displace a pile of low-probability
@@ -299,8 +400,10 @@ inline void sparse_add_class(float*    cnt,
                                : (inc > evicted_evidence);
   if (evict_now) {
     // Evict: incoming class displaces slot min_i. The newcomer gets a FRESH
-    // counter and the victim's accumulated evidence goes to OTHER, so mass is
-    // conserved here as on the admit and drop paths: Δ(other + Σcnt) == inc.
+    // counter, so `Σcnt` moves by `inc − evicted_evidence` and the victim's
+    // accumulated evidence falls back into the derived `other()` — the same
+    // outcome the explicit `*other += evicted_evidence` used to produce, now by
+    // arithmetic rather than by a second write that had to be kept in step.
     //
     // This is not canonical Space-Saving (Metwally, Agrawal & El Abbadi, ICDT
     // 2005), which hands the newcomer the VICTIM's counter plus its own
@@ -312,7 +415,6 @@ inline void sparse_add_class(float*    cnt,
     //
     // `qmax` is never inherited: it is a peak CONFIDENCE, and one class's
     // confidence is not evidence about another's.
-    *other += evicted_evidence;
     cls[min_i] = c;
     cnt[min_i] = alpha_0 + inc;
     if (track) qmax[min_i] = q_fx;
@@ -320,8 +422,8 @@ inline void sparse_add_class(float*    cnt,
     g_sparse_evict_count.fetch_add(1, std::memory_order_relaxed);
     say(3);
   } else {
-    // Drop: incoming evidence smaller than every tracked class. Mass to OTHER.
-    *other += inc;
+    // Drop: incoming evidence smaller than every tracked class. Nothing is
+    // attributed, so the deposit stays in `other()`.
     g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
     say(4);
   }
@@ -359,7 +461,7 @@ inline uint16_t dominantClass(const DirVoxel& v,
   // genuine out-of-K evidence — not the prior — may veto the tracked argmax.
   const int   residual_dims = static_cast<int>(num_classes) - K_TOP;
   const float other_prior   = (residual_dims > 0) ? (residual_dims * alpha_0) : 0.f;
-  const float other_evidence = v.other - other_prior;
+  const float other_evidence = v.other() - other_prior;
   if (other_evidence > best_evidence) return 0xFFFF;
   return cls;
 }

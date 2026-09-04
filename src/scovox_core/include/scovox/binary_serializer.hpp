@@ -13,7 +13,7 @@
 /// so the receiver reconstructs two independent grids and merges each with its
 /// own conjugate rule (see consensus_merge.hpp).
 ///
-/// Revision 6 (docs/design/comms_design_2026_07_30.md, Part 1) reworks the
+/// Revision 6 reworks the
 /// Beta/Dir record layout only — the merge rules, the priors, and the shaper
 /// are untouched:
 ///
@@ -69,7 +69,7 @@
 /// drill as the 4→5 occupancy-prior bump. The ROS envelope `version` (=5)
 /// routes to this codec and is unchanged.
 ///
-/// Revision 7 (docs/design/fine_tsdf_band_dbh_2026_07_30.md) adds the fine
+/// Revision 7 adds the fine
 /// TSDF band: a `fine_ratio_log2` header byte (0 = sender has no fine grid)
 /// and one fine-TSDF stream after the Dir stream. Fine coords are indices on
 /// the FINE lattice (`resolution / 2^fine_ratio_log2`); payload layout is
@@ -158,9 +158,8 @@ class BinarySerializer {
   static constexpr uint16_t MAX_NUM_CLASSES = 4096;
   // Blob codec revision (distinct from the ROS envelope `version`=5 that routes
   // to this codec). Bumped 5→6 for the block-run coordinate coding + u16
-  // payload quantization (comms_design_2026_07_30.md Part 1); 6→7 for the
-  // fine-TSDF band (fine_ratio_log2 header byte + trailing fine stream,
-  // fine_tsdf_band_dbh_2026_07_30.md); 7→8 for u8 sqrt-companded evidence
+  // payload quantization; 6→7 for the fine-TSDF band (fine_ratio_log2 header
+  // byte + trailing fine stream); 7→8 for u8 sqrt-companded evidence
   // payloads + u8 class ids (see the revision-8 block in the file header).
   // Any layout change means a mixed-revision fleet fails loud (deserialize
   // rejects the VERSION byte and the frame is dropped with a warning) instead
@@ -302,14 +301,15 @@ class BinarySerializer {
     // exactly.
     writeBlockStream(out, frame.dir_deltas, [&](const DirDelta& d) {
       if (quant) {
-        const uint8_t q_other = quantize8(d.data.other, other_prior, step);
+        const uint8_t q_other = quantize8(d.data.other(), other_prior, step);
         appendBytes(out, &q_other, sizeof(q_other));
         for (int i = 0; i < K_TOP; ++i) {
           const uint8_t q_cnt = quantize8(d.data.cnt[i], frame.alpha_0, step);
           appendBytes(out, &q_cnt, sizeof(q_cnt));
         }
       } else {
-        appendBytes(out, &d.data.other, sizeof(float));
+        const float other_f = d.data.other();   // derived; needs an lvalue
+        appendBytes(out, &other_f, sizeof(float));
         for (int i = 0; i < K_TOP; ++i)
           appendBytes(out, &d.data.cnt[i], sizeof(float));
       }
@@ -473,15 +473,20 @@ class BinarySerializer {
     readBlockStream(r, dir_count, [&](const Bonxai::CoordT& c) {
       DirDelta d{};
       d.coord = c;
+      // The wire format is unchanged: `other` then `cnt[]`, exactly as before.
+      // Only the in-memory basis moved, so `other` is buffered until the slots
+      // are read and then installed with set_other().
+      float other_in = 0.f;
       if (quant) {
-        d.data.other = dequantize8(r.get<uint8_t>(), other_prior, step);
+        other_in = dequantize8(r.get<uint8_t>(), other_prior, step);
         for (int j = 0; j < K_TOP; ++j)
           d.data.cnt[j] = dequantize8(r.get<uint8_t>(), f.alpha_0, step);
       } else {
-        d.data.other = r.get<float>();
+        other_in = r.get<float>();
         for (int j = 0; j < K_TOP; ++j)
           d.data.cnt[j] = r.get<float>();
       }
+      d.data.set_other(other_in);
       for (int j = 0; j < K_TOP; ++j)
         d.data.cls[j] = readCls();
       f.dir_deltas.push_back(d);

@@ -44,18 +44,19 @@ inline void sparse_add_class_traced(DirVoxel* d, uint16_t c, float inc,
   uint16_t* nhit = nullptr;
 #endif
 #if SCOVOX_TRACK_QMAX
-  sparse_add_class(d->cnt, d->cls, c, inc, &d->other, alpha_0, p, qmax,
+  sparse_add_class(d->cnt, d->cls, c, inc, alpha_0, p, qmax,
                    evict_by_confidence, nhit, outcome);
 #else
-  sparse_add_class(d->cnt, d->cls, c, inc, &d->other, alpha_0, -1.0f, nullptr,
+  sparse_add_class(d->cnt, d->cls, c, inc, alpha_0, -1.0f, nullptr,
                    true, nhit, outcome);
 #endif
 }
 
 /// Sparse-Dirichlet hit update on a `DirVoxel` (DIRICHLET mode). Mirrors
 /// `dirichletUpdate` in semdir_map.cpp / sembeta_map.cpp: distribute
-/// `class_share` over the observed softmax, routing uncovered + evicted mass
-/// to OTHER. Total mass added to the voxel is exactly `class_share`.
+/// `class_share` over the observed softmax, leaving uncovered + evicted mass
+/// unattributed. Total mass added to the voxel is exactly `class_share`, and
+/// it is added HERE, on the first line, by the one statement below.
 void dirichletUpdate(DirVoxel*                 d,
                      const std::vector<float>* class_probs,
                      float                     class_share,
@@ -66,6 +67,15 @@ void dirichletUpdate(DirVoxel*                 d,
                      int32_t                   tx = 0,
                      int32_t                   ty = 0,
                      int32_t                   tz = 0) {
+  // THE deposit. Every branch of this function — no signal, zero softmax, HARD,
+  // SOFT, THRESH — adds exactly `class_share` and no more, so the add belongs
+  // here, once, rather than being re-derived on each exit path. Under the
+  // shipped `--hit-share flat` this makes `s_total − C·α₀` the voxel's exact
+  // look count: one float add per look, rather than a dozen small ones spread
+  // over four accumulators that round apart as the voxel's total grows.
+  // What follows only ATTRIBUTES this mass to slots; `d->other()` is whatever
+  // is left over.
+  d->s_total += class_share;
 #if SCOVOX_DEPOSIT_TRACE
   // Snapshot before each deposit so the record can report the slot state the
   // comparator actually saw. Which slot a deposit touched is recoverable from
@@ -141,16 +151,14 @@ void dirichletUpdate(DirVoxel*                 d,
   };
 #endif
   if (!class_probs || class_probs->empty()) {
-    d->other += class_share;  // mass landed but no class signal to distribute
-    return;
+    return;  // mass landed but no class signal to distribute: stays in other()
   }
   const auto& obs = *class_probs;
 
   float sum_p = 0.f;
   for (size_t i = 0; i < obs.size(); ++i) if (obs[i] > 0.f) sum_p += obs[i];
   if (sum_p <= 0.f) {
-    d->other += class_share;
-    return;
+    return;  // no class has positive probability: the whole share stays in other()
   }
   const float norm = (sum_p > 1.0f) ? (1.0f / sum_p) : 1.0f;
 
@@ -185,7 +193,7 @@ void dirichletUpdate(DirVoxel*                 d,
     size_t bi = 0;
     float  bp = -1.f;
     for (size_t i = 0; i < obs.size(); ++i) if (obs[i] > bp) { bp = obs[i]; bi = i; }
-    if (bp <= 0.f) { d->other += class_share; return; }
+    if (bp <= 0.f) return;  // stays in other()
     const float p_i = bp * norm;
     trace_one(static_cast<uint16_t>(bi), p_i, class_share);
     return;
@@ -200,8 +208,7 @@ void dirichletUpdate(DirVoxel*                 d,
     // `inc` mixes it with class_share and so tracks the geometry, not the label.
     const float p_i = obs[i] * norm;
     // THRESH: a class this unsure contributes no evidence at all. Its mass is
-    // not deleted — the residual line below routes it to OTHER, so the strict
-    // invariant still holds.
+    // not deleted — nothing claims it, so it remains in `other()`.
     if (inc_mode == 2 && p_i < inc_thresh) continue;
     const float inc = class_share * p_i;
     if (inc <= 0.f) continue;
@@ -212,14 +219,14 @@ void dirichletUpdate(DirVoxel*                 d,
     // dump carries no confidence trail for an offline readout rule to read.
     trace_one(static_cast<uint16_t>(i), p_i, inc);
   }
-  if (inc_mode == 2) {
-    d->other += class_share - deposited;
-  } else {
-    // Kept in its original form so the SOFT path stays bit-identical to the
-    // pre-patch build rather than merely algebraically equal.
-    const float covered = sum_p * norm;
-    d->other += class_share * (1.0f - covered);
-  }
+  // No residual line. Both modes used to close the books by adding the
+  // unattributed remainder to OTHER — `class_share − deposited` under THRESH,
+  // `class_share · (1 − covered)` under SOFT. Both are now identities of the
+  // stored total: `other() == s_total − Σcnt`, and `Σcnt` grew by exactly
+  // `deposited`. Removing them removes the only two places where the residual
+  // was computed one way and the deposits another, which is where the SOFT
+  // path's `covered` rounding used to leak.
+  (void)deposited;
 }
 
 /// NAIVE mode: overwrite slot 0 with the argmax label at `α₀ + 1`, dumping
@@ -231,15 +238,18 @@ void naiveUpdate(DirVoxel* d, const std::vector<float>* class_probs, float alpha
   if (*it <= 0.f) return;
   const uint16_t label = static_cast<uint16_t>(std::distance(obs.begin(), it));
 
+  // Releasing a slot moves its observed evidence out of `cnt[]` and therefore
+  // into `other()` automatically — the total does not change, so unlike the old
+  // form there is no second write to keep in step with the reset.
   for (int i = 0; i < K_TOP; ++i) {
     if (d->cls[i] != 0xFFFF) {
-      d->other += d->cnt[i] - alpha_0;  // conserve evidence, keep prior
       d->cls[i] = 0xFFFF;
       d->cnt[i] = alpha_0;
     }
   }
   d->cls[0] = label;
   d->cnt[0] = alpha_0 + 1.0f;
+  d->s_total += 1.0f;   // the deposit itself: one unit of evidence
 }
 
 /// MAJORITY_VOTE mode: single +1 sparse-add to the argmax class.
@@ -249,7 +259,8 @@ void majorityVoteUpdate(DirVoxel* d, const std::vector<float>* class_probs, floa
   auto it = std::max_element(obs.begin(), obs.end());
   if (*it <= 0.f) return;
   const uint16_t label = static_cast<uint16_t>(std::distance(obs.begin(), it));
-  sparse_add_class(d->cnt, d->cls, label, 1.0f, &d->other, alpha_0);
+  d->s_total += 1.0f;   // caller-owned deposit; sparse_add_class only attributes
+  sparse_add_class(d->cnt, d->cls, label, 1.0f, alpha_0);
 }
 
 SemSplitMap::Params sanitise(SemSplitMap::Params p) {
@@ -275,6 +286,15 @@ SemSplitMap::Params sanitise(SemSplitMap::Params p) {
   if (p.ray_spread < 0 || p.ray_spread > 4) p.ray_spread = 0;
   if (p.semantic_spread_radius > 0.f || p.semantic_band_length > 0.f)
     p.ray_spread = 0;
+  // Keep the count identity exact. With no per-observation confidence factor,
+  // `a_occ = prior + w_occ * n_hit` holds only while every increment lands on
+  // the storage lattice; a weight off the lattice rounds on every hit and the
+  // error accumulates one-directionally. Snapping to the nearest representable
+  // value is a no-op under float storage and under every shipped weight (1.5
+  // and 1.0 are whole eighths), so this changes nothing that is configured
+  // today -- it bounds what a future config can silently do.
+  p.w_occ  = beta_lattice_snap(p.w_occ);
+  p.w_free = beta_lattice_snap(p.w_free);
   return p;
 }
 
@@ -305,7 +325,7 @@ SemSplitMap::SemSplitMap(const Params& p)
     // own leaf order, so the stage is keyed by the SAME (sanitised) leaf_bits.
     , carve_stage_(params_.leaf_bits)
     // Shipped occupancy prior is symmetric Beta(1,1) → p_occ=0.5, decoupled from
-    // the semantic (num_classes, α₀). See docs/occupancy_prior.md.
+    // the semantic (num_classes, α₀).
     , beta_occ_prior_(kBetaOccPrior)
     , beta_free_prior_(kBetaFreePrior) {}
 
@@ -342,37 +362,34 @@ DirVoxel* SemSplitMap::getOrAllocateDir(const CoordT& c) {
 void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
                                const Eigen::Vector3f&    endpoint,
                                const std::vector<float>* sem_probs,
-                               float                     quality,
                                const HitWeights*         prof) {
-  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false, prof);
+  carveRay(origin, endpoint, /*inclusive_endpoint=*/false, prof);
   const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
-  applyHitUpdate(k_hit, sem_probs, quality, prof);
+  applyHitUpdate(k_hit, sem_probs, prof);
   if (params_.ray_spread != 0)
-    raySpreadDeposit(origin, endpoint, k_hit, sem_probs, quality, prof);
+    raySpreadDeposit(origin, endpoint, k_hit, sem_probs, prof);
 }
 
 void SemSplitMap::integrateHit(const Eigen::Vector3f&    origin,
                                const Eigen::Vector3f&    endpoint,
                                const std::vector<float>* sem_probs,
-                               float                     quality,
                                bool                      is_dynamic,
                                const HitWeights*         prof) {
   // Free-space carve is always persistent; only the endpoint hit is routed.
-  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/false, prof);
+  carveRay(origin, endpoint, /*inclusive_endpoint=*/false, prof);
   const CoordT k_hit = beta_grid_.posToCoord(endpoint.x(), endpoint.y(), endpoint.z());
-  applyHitUpdate(k_hit, sem_probs, quality, is_dynamic, prof);
+  applyHitUpdate(k_hit, sem_probs, is_dynamic, prof);
   // A dynamic endpoint routes to the transient substrate; smearing a moving
   // object's class into persistent neighbours would defeat that routing, so
   // the spread applies to persistent hits only.
   if (params_.ray_spread != 0 && !is_dynamic)
-    raySpreadDeposit(origin, endpoint, k_hit, sem_probs, quality, prof);
+    raySpreadDeposit(origin, endpoint, k_hit, sem_probs, prof);
 }
 
 void SemSplitMap::integrateMiss(const Eigen::Vector3f& origin,
                                 const Eigen::Vector3f& endpoint,
-                                float                  quality,
                                 const HitWeights*      prof) {
-  carveRay(origin, endpoint, quality, /*inclusive_endpoint=*/true, prof);
+  carveRay(origin, endpoint, /*inclusive_endpoint=*/true, prof);
 }
 
 // ===========================================================================
@@ -381,7 +398,6 @@ void SemSplitMap::integrateMiss(const Eigen::Vector3f& origin,
 
 void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
                            const Eigen::Vector3f& endpoint,
-                           float                  quality,
                            bool                   inclusive_endpoint,
                            const HitWeights*      prof) {
   const CoordT k0    = beta_grid_.posToCoord(origin.x(),   origin.y(),   origin.z());
@@ -393,12 +409,13 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
   // circuits the whole carve here, so it never deposits a_free onto the shared
   // Beta grid — matching applyCarveUpdate's own w_inc<=0 no-op per voxel.
   const float w_free = prof ? prof->w_free : params_.w_free;
-  const float w_inc  = w_free * quality;
+  const float w_inc  = w_free;
   if (w_inc <= 0.f && !inclusive_endpoint) return;
 
   const auto walk_body = [&](const CoordT& c) -> bool {
+    ++carve_voxels_;
     if (c == k_end) return false;  // hit voxel handled separately for hits
-    return applyCarveUpdate(c, quality, prof);
+    return applyCarveUpdate(c, prof);
   };
   // The walk already excludes k_end, so the c==k_end early-out above is
   // belt-and-braces; it is kept because `inclusive_endpoint` below is the one
@@ -407,7 +424,7 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
                    params_.resolution, walk_body);
 
   if (inclusive_endpoint) {
-    (void)applyCarveUpdate(k_end, quality, prof);
+    (void)applyCarveUpdate(k_end, prof);
   }
 }
 
@@ -415,10 +432,10 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
 // Per-voxel API (for the ScovoxMapSplit fused walker)
 // ===========================================================================
 
-bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
+bool SemSplitMap::applyCarveUpdate(const CoordT& c,
                                    const HitWeights* prof) {
   const float w_free = prof ? prof->w_free : params_.w_free;
-  const float w_inc  = w_free * quality;
+  const float w_inc  = w_free;
   if (w_inc <= 0.f) return true;  // no-op; not a wall
 
   // Batched path (a carve frame is open — the live pipeline): stage the
@@ -535,7 +552,7 @@ std::size_t SemSplitMap::flushStagedHits() {
           hit_probs_.begin() + st.probs_off + st.probs_len);
       probs = &hit_probs_scratch_;
     }
-    commitHit(c, probs, st.quality, st.w_occ_share, st.kappa0, st.min_p_occ,
+    commitHit(c, probs, st.w_occ_share, st.kappa0, st.min_p_occ,
               beta_acc_, dir_acc_, &touched_beta_, &touched_dir_);
   }
   return hit_order_.size();
@@ -543,31 +560,28 @@ std::size_t SemSplitMap::flushStagedHits() {
 
 void SemSplitMap::applyHitUpdate(const CoordT&             c,
                                  const std::vector<float>* sem_probs,
-                                 float                     quality,
                                  const HitWeights*         prof) {
-  applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
+  applyHitUpdateOn(c, sem_probs, beta_acc_, dir_acc_,
                    &touched_beta_, &touched_dir_, prof);
 }
 
 void SemSplitMap::applyHitUpdate(const CoordT&             c,
                                  const std::vector<float>* sem_probs,
-                                 float                     quality,
                                  bool                      is_dynamic,
                                  const HitWeights*         prof) {
   if (is_dynamic) {
     // Route to the transient substrate. No touched-set: transient voxels are
     // local-only and never drained to the fusion wire.
-    applyHitUpdateOn(c, sem_probs, quality, transient_beta_acc_,
+    applyHitUpdateOn(c, sem_probs, transient_beta_acc_,
                      transient_dir_acc_, nullptr, nullptr, prof);
   } else {
-    applyHitUpdateOn(c, sem_probs, quality, beta_acc_, dir_acc_,
+    applyHitUpdateOn(c, sem_probs, beta_acc_, dir_acc_,
                      &touched_beta_, &touched_dir_, prof);
   }
 }
 
 void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
                                    const std::vector<float>* sem_probs,
-                                   float                     quality,
                                    BetaGrid::Accessor&       bacc,
                                    DirGrid::Accessor&        dacc,
                                    std::vector<CoordT>*      touched_beta,
@@ -593,13 +607,12 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
                         && params_.semantic_spread_radius <= 0.f
                         && params_.ray_spread == 0;
     if (stageable) {
-      const float w = (prof ? prof->w_occ : params_.w_occ) * quality;
+      const float w = (prof ? prof->w_occ : params_.w_occ);
       // `!st.staged` admits the first ray even at w == 0 (a semantics-only
       // source carries w_occ = 0 and still owns the class deposit).
       if (!st.staged || w > st.w_occ_share) {
         st.staged      = true;
         st.w_occ_share = w;
-        st.quality     = quality;
         st.kappa0      = prof ? prof->kappa0              : params_.kappa0;
         st.min_p_occ   = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
         if (sem_probs && !sem_probs->empty()) {
@@ -630,7 +643,7 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   // contributes nothing — a semantics-only source must not touch geometry.
   if (kernel_ray) {
     if (sem_probs && !sem_probs->empty())
-      applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir,
+      applyHitUpdateKernel(c, sem_probs, dacc, touched_dir,
                            prof->kernel_radius, prof->kappa0,
                            prof->dirichlet_min_p_occ);
     return;
@@ -646,7 +659,7 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   const float kappa0    = prof ? prof->kappa0             : params_.kappa0;
   const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
 
-  commitHit(c, sem_probs, quality, w_occ * quality, kappa0, min_p_occ,
+  commitHit(c, sem_probs, w_occ, kappa0, min_p_occ,
             bacc, dacc, touched_beta, touched_dir);
 }
 
@@ -655,7 +668,6 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
 // ---------------------------------------------------------------------------
 void SemSplitMap::commitHit(const CoordT&             c,
                             const std::vector<float>* sem_probs,
-                            float                     quality,
                             float                     w_occ_share,
                             float                     kappa0,
                             float                     min_p_occ,
@@ -701,12 +713,16 @@ void SemSplitMap::commitHit(const CoordT&             c,
       // the kernel sees and carries its freshly-updated p_occ — the spread adds
       // neighbours, it does not redirect the deposit away from the hit.
       if (params_.semantic_spread_radius > 0.f && sem_probs && !sem_probs->empty()) {
-        applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir,
+        applyHitUpdateKernel(c, sem_probs, dacc, touched_dir,
                              params_.semantic_spread_radius, kappa0, min_p_occ);
         break;
       }
       if (p_occ_post >= min_p_occ) {
-        const float class_share = kappa0 * p_occ_post * quality;
+        // Flat share makes the endpoint deposit the same unit the band does,
+        // so one look is worth one unit wherever it lands (SemSplitParams::
+        // hit_flat_share). The gate above is untouched.
+        const float class_share =
+            params_.hit_flat_share ? kappa0 : kappa0 * p_occ_post;
         if (class_share > 0.f) {
           DirVoxel* d = getOrAllocateDirOn(dacc, c);
           dirichletUpdate(d, sem_probs, class_share, params_.alpha_0,
@@ -744,7 +760,6 @@ void SemSplitMap::raySpreadDeposit(const Eigen::Vector3f&    origin,
                                    const Eigen::Vector3f&    endpoint,
                                    const CoordT&             k_hit,
                                    const std::vector<float>* sem_probs,
-                                   float                     quality,
                                    const HitWeights*         prof) {
   if (params_.semantic_mode != SemanticMode::DIRICHLET) return;
   if (!sem_probs || sem_probs->empty()) return;
@@ -759,7 +774,7 @@ void SemSplitMap::raySpreadDeposit(const Eigen::Vector3f&    origin,
   if (!b) return;
   const float p_occ_post = b->p_occ();
   if (p_occ_post < min_p_occ) return;
-  const float class_share = kappa0 * p_occ_post * quality;
+  const float class_share = kappa0 * p_occ_post;
   if (class_share <= 0.f) return;
 
   const Eigen::Vector3d w = endpoint.cast<double>();
@@ -828,7 +843,6 @@ void SemSplitMap::raySpreadDeposit(const Eigen::Vector3f&    origin,
 // per band voxel per point, which on KITTI is ~5 extra calls per return.
 void SemSplitMap::applyBandSemantic(const CoordT&             c,
                                     const std::vector<float>* sem_probs,
-                                    float                     quality,
                                     const HitWeights*         prof) {
   // No class signal ⇒ nothing to pool. Unlike the endpoint path we must NOT
   // fall through to `other += class_share` here: a bare geometric return
@@ -857,14 +871,14 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
     if (!b) return;
     const float p_occ = b->p_occ();
     if (p_occ < min_p_occ) return;
-    class_share = kappa0 * p_occ * quality;
+    class_share = kappa0 * p_occ;
   } else {
     // Faithful SLIM-VDB mirror: no occupancy model, no gate, flat weight. This
     // is `alpha[label] += 1` with kappa0 as the unit. Skipping the Beta read is
     // not just a shortcut — an ungated band voxel may have no Beta entry at all,
     // so there is no p_occ to weight by, and inventing one (say 1.0) would
     // quietly re-introduce a different rule again.
-    class_share = kappa0 * quality;
+    class_share = kappa0;
   }
   if (class_share <= 0.f) return;
 
@@ -928,7 +942,6 @@ const std::vector<SemSplitMap::SpreadOffset>& SemSplitMap::spreadTable(float l) 
 
 void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
                                        const std::vector<float>* sem_probs,
-                                       float                     quality,
                                        DirGrid::Accessor&        dacc,
                                        std::vector<CoordT>*      touched_dir,
                                        float                     l,
@@ -950,7 +963,7 @@ void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
     const float p_occ = b->p_occ();
     if (p_occ < min_p_occ) continue;
 
-    const float class_share = kappa0 * p_occ * quality * o.wk;
+    const float class_share = kappa0 * p_occ * o.wk;
     if (class_share <= 0.f) continue;
 
     DirVoxel* dv = getOrAllocateDirOn(dacc, n);
@@ -1009,8 +1022,14 @@ void SemSplitMap::decayTransient(float rate) {
     const float other_prior = (residual > 0) ? (residual * a0) : 0.f;
     std::vector<CoordT> prune;
     transient_dir_grid_.forEachCell([&](DirVoxel& v, const CoordT& c) {
-      v.other = other_prior + (v.other - other_prior) * rate;
-      bool any = std::fabs(v.other - other_prior) >= kPruneEps;
+      // `other` is derived, so decaying it means rebuilding the total: read the
+      // residual, shrink it, then re-add whatever `cnt[]` holds once the slot
+      // loop below has decayed and possibly released each slot. The sum runs
+      // over ALL slots, not just filled ones — a released slot still carries an
+      // α₀ placeholder, and a saturation rescale can leave an empty slot
+      // holding something other than exactly α₀.
+      const float other_decayed = other_prior + (v.other() - other_prior) * rate;
+      bool any = std::fabs(other_decayed - other_prior) >= kPruneEps;
       for (int i = 0; i < K_TOP; ++i) {
         if (v.cls[i] == 0xFFFF) continue;
         v.cnt[i] = a0 + (v.cnt[i] - a0) * rate;
@@ -1021,6 +1040,9 @@ void SemSplitMap::decayTransient(float rate) {
           any = true;
         }
       }
+      float sum_cnt = 0.f;
+      for (int i = 0; i < K_TOP; ++i) sum_cnt += v.cnt[i];
+      v.s_total = other_decayed + sum_cnt;
       if (!any) prune.push_back(c);
     });
     auto acc = transient_dir_grid_.createAccessor();
@@ -1097,16 +1119,26 @@ void SemSplitMap::applyDirSaturation(DirVoxel* d) const {
   if (s <= cap) return;
   const float k       = cap / s;      // preserves per-class probabilities
   const float alpha_0 = params_.alpha_0;
-  d->other *= k;
+  // Scale both parts, then rebuild the total from them. `s_total *= k` alone
+  // would be wrong: the α₀ floor below puts mass back into `cnt[]` without any
+  // matching change to the residual, so a floored slot would eat into the
+  // derived `other()` and could drive it negative. Rebuilding keeps this
+  // function's pre-existing behaviour exactly — including that a fired floor
+  // leaves the voxel marginally above `cap`.
+  const float other_scaled = d->other() * k;
   for (int i = 0; i < K_TOP; ++i) {
     d->cnt[i] *= k;
     // A FILLED slot must never scale below its α₀ prior: a slot conceptually
     // holds α₀ + observed evidence, and eroding α₀ makes sparse_add_class read a
-    // negative evicted_evidence (cnt − α₀ < 0) and subtract mass from OTHER. Floor
+    // negative evicted_evidence (cnt − α₀ < 0), which would hand every arrival
+    // the contest for that slot regardless of its evidence. Floor
     // FILLED slots only — flooring empty slots (cnt ≈ k·α₀) would re-inflate
     // s_class back above the saturation cap.
     if (d->cls[i] != 0xFFFF && d->cnt[i] < alpha_0) d->cnt[i] = alpha_0;
   }
+  float sum_cnt = 0.f;
+  for (int i = 0; i < K_TOP; ++i) sum_cnt += d->cnt[i];
+  d->s_total = other_scaled + sum_cnt;
 }
 
 // ===========================================================================

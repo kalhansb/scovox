@@ -16,7 +16,7 @@
 # Then open the subscriber gate (gate 2 below) with the merger, OR just:
 #   ros2 topic echo /robot1/scovox_node/scovox_bin --field header
 #
-# The three gates on ~/scovox_bin (see docs/scovox_bin_manual_bringup.md):
+# The three gates on ~/scovox_bin:
 #   GATE 1  publisher exists ONLY in mode:=rolling      → `mode` below
 #   GATE 2  publish is subscriber-gated (0 subs = drop) → run a merger / echo
 #   GATE 3  no TF at scan stamp ⇒ scan dropped ⇒ empty map ⇒ nothing to emit

@@ -103,7 +103,7 @@ void Map::carve_free(const Eigen::Vector3f& origin, const Eigen::Vector3f& hit,
 
 void Map::update_endpoint(const CoordT& c,
                           const std::vector<float>* class_probs,
-                          float quality, float range_w, float angle_w)
+                          float range_w, float angle_w)
 {
   Voxel* v = acc_.value(c);
   if (!v) {
@@ -119,12 +119,12 @@ void Map::update_endpoint(const CoordT& c,
     return;
   }
 
-  apply_semantics(v, class_probs, quality);
+  apply_semantics(v, class_probs);
 }
 
 void Map::update_endpoint_on(Grid::Accessor& target_acc, const CoordT& c,
                               const std::vector<float>* class_probs,
-                              float quality, float range_w, float angle_w)
+                              float range_w, float angle_w)
 {
   Voxel* v = target_acc.value(c);
   if (!v) {
@@ -140,11 +140,10 @@ void Map::update_endpoint_on(Grid::Accessor& target_acc, const CoordT& c,
     return;
   }
 
-  apply_semantics(v, class_probs, quality);
+  apply_semantics(v, class_probs);
 }
 
-void Map::apply_semantics(Voxel* v, const std::vector<float>* class_probs,
-                          float quality) const {
+void Map::apply_semantics(Voxel* v, const std::vector<float>* class_probs) const {
   // Bayesian-soft for DIRICHLET: weight by p_occ directly (no hard gate).
   // NAIVE and MAJORITY_VOTE are ablation baselines and use a hard `p_occ > 0.5`
   // cutoff (their accumulators don't take a continuous weight) so that the
@@ -162,8 +161,7 @@ void Map::apply_semantics(Voxel* v, const std::vector<float>* class_probs,
     case SemanticMode::DIRICHLET:
     default:
       if (p_occ >= params_.dirichlet_min_p_occ) {
-        dirichlet_update_semantics(v, class_probs, quality, p_occ,
-                                   params_.kappa0);
+        dirichlet_update_semantics(v, class_probs, p_occ, params_.kappa0);
       }
       break;
   }
@@ -174,7 +172,7 @@ void Map::integrateRay(const Eigen::Vector3f& origin,
                        const Eigen::Vector3f& hit,
                        bool is_dynamic,
                        const std::vector<float>* class_probs,
-                       float quality, float range_w, float angle_w)
+                       float range_w, float angle_w)
 {
   if (is_dynamic) {
     // Transient layer: legacy two-pass path. TSDF is intentionally not
@@ -182,11 +180,11 @@ void Map::integrateRay(const Eigen::Vector3f& origin,
     // frame so a running average would smear the SDF estimate.
     carve_free(origin, hit);
     auto c = posToCoord(hit);
-    update_endpoint_on(transient_acc_, c, class_probs, quality, range_w, angle_w);
+    update_endpoint_on(transient_acc_, c, class_probs, range_w, angle_w);
     return;
   }
   fused_integrate_ray_static(origin, hit, /*updated_coords=*/nullptr,
-                             class_probs, quality, range_w, angle_w);
+                             class_probs, range_w, angle_w);
 }
 
 void Map::integrateRay(const Eigen::Vector3f& origin,
@@ -194,30 +192,30 @@ void Map::integrateRay(const Eigen::Vector3f& origin,
                        std::vector<CoordT>& updated_coords,
                        bool is_dynamic,
                        const std::vector<float>* class_probs,
-                       float quality, float range_w, float angle_w)
+                       float range_w, float angle_w)
 {
   if (is_dynamic) {
     carve_free(origin, hit, updated_coords);
     auto c = posToCoord(hit);
-    update_endpoint_on(transient_acc_, c, class_probs, quality, range_w, angle_w);
+    update_endpoint_on(transient_acc_, c, class_probs, range_w, angle_w);
     updated_coords.push_back(c);
     return;
   }
   fused_integrate_ray_static(origin, hit, &updated_coords,
-                             class_probs, quality, range_w, angle_w);
+                             class_probs, range_w, angle_w);
 }
 
 void Map::integrateEndpointOnly(const Eigen::Vector3f& hit,
                                 bool is_dynamic,
                                 const std::vector<float>* class_probs,
-                                float quality, float range_w, float angle_w)
+                                float range_w, float angle_w)
 {
   auto c = posToCoord(hit);
   if (is_dynamic) {
-    update_endpoint_on(transient_acc_, c, class_probs, quality, range_w, angle_w);
+    update_endpoint_on(transient_acc_, c, class_probs, range_w, angle_w);
     return;
   }
-  update_endpoint(c, class_probs, quality, range_w, angle_w);
+  update_endpoint(c, class_probs, range_w, angle_w);
 
   // Endpoint-only mode (carve_band == 0) skips the DDA on purpose. We still
   // record a TSDF surface mass on the hit voxel — `sdf == 0` for the hit
@@ -239,7 +237,7 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
                                      const Eigen::Vector3f& hit,
                                      std::vector<CoordT>* updated_coords,
                                      const std::vector<float>* class_probs,
-                                     float quality, float range_w, float angle_w)
+                                     float range_w, float angle_w)
 {
   const Eigen::Vector3f d = hit - origin;
   const float depth = d.norm();
@@ -272,12 +270,11 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
 
   if (k0 == k_far) return;  // degenerate ray inside one voxel
 
-  // Per-voxel independence assumption (OctoMap / log_odds-node style). Joint
-  // ray-cast `reach_prob` was tried (commit 513c969) and reverted: cost
-  // ~6 mIoU points on Replica m2f from cold-start damping (every voxel
-  // starts at p_occ=0.5, so reach_prob ≈ 0.5^N along uninitialised rays).
-  // KITTI was bit-flat either way. Through-wall carving is gated by
-  // `carve_skip_occ_threshold` instead — cheap, well-tested, sufficient.
+  // Per-voxel independence assumption (OctoMap / log_odds-node style). A joint
+  // ray-cast `reach_prob` damps every voxel along a ray that starts at the
+  // p_occ=0.5 prior, because reach_prob ~ 0.5^N until the ray is observed.
+  // Through-wall carving is gated by `carve_skip_occ_threshold` instead —
+  // cheap, well-tested, sufficient.
   bool past_wall = false;
   const float skip = params_.carve_skip_occ_threshold;
 
@@ -327,7 +324,7 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
     if (at_hit) {
       v->a_occ += params_.w_occ * range_w * angle_w;
       apply_evidence_saturation(v);
-      if (class_probs) apply_semantics(v, class_probs, quality);
+      if (class_probs) apply_semantics(v, class_probs);
       modified = true;
     }
 

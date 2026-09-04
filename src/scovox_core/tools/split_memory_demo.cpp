@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
       const float u = du(rng);
       if (u < 0.05f) {
         Eigen::Vector3f endpoint = origin + d * args.max_range;
-        map.integrateMiss(origin, endpoint, /*quality=*/0.5f);
+        map.integrateMiss(origin, endpoint);
       } else {
         const float depth = 1.0f + (args.max_range - 1.0f) * u;
         Eigen::Vector3f endpoint = origin + d * depth;
@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
                                  int(endpoint.y() * 11) +
                                  int(endpoint.z() * 13)) % 4;
         sem_probs[cls] = 1.0f;
-        map.integrateHit(origin, endpoint, &sem_probs, /*quality=*/0.9f);
+        map.integrateHit(origin, endpoint, &sem_probs);
       }
     }
     map.flushCarveFrame();

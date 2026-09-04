@@ -1,6 +1,5 @@
 /// @file
-/// @brief Fine-resolution TSDF band gate
-/// (docs/design/fine_tsdf_band_dbh_2026_07_30.md): refinement-region
+/// @brief Fine-resolution TSDF band gate: refinement-region
 /// registry, gated two-lattice integration, per-scan anchor
 /// re-registration (drift absorption), the raw-return fine-only path
 /// (refineHit), and the rev-7 wire fine stream + merge. The DBH circle
@@ -72,7 +71,7 @@ void orbitTrunk(scovox::ScovoxMapSplit& m, float drift_end_x, float drift_end_y,
         const Eigen::Vector3f hit =
             Eigen::Vector3f(cyl.cx + r_meas * std::cos(phi),
                             cyl.cy + r_meas * std::sin(phi), z) + drift;
-        m.integrateHit(origin, hit, nullptr, 1.0f);
+        m.integrateHit(origin, hit, nullptr);
       }
     }
     m.flushCarveFrame();
@@ -160,7 +159,7 @@ TEST(FineTsdf, FineVoxelsOnlyInsideRegisteredRegions) {
 
   // A hit far from any region: coarse grids fill, fine stays empty.
   m.beginCarveFrame();
-  m.integrateHit(Eigen::Vector3f(0, 5, 1), Eigen::Vector3f(3, 5, 1), nullptr, 1.f);
+  m.integrateHit(Eigen::Vector3f(0, 5, 1), Eigen::Vector3f(3, 5, 1), nullptr);
   m.flushCarveFrame();
   EXPECT_GT(m.tsdfVoxelCount(), 0u);
   EXPECT_EQ(m.fineVoxelCount(), 0u);
@@ -186,7 +185,7 @@ TEST(FineTsdf, ImmediateModeWithoutCarveFrame) {
   scovox::ScovoxMapSplit m(fineParams());
   m.addRefinementRegion(trunkRegion());
   m.integrateHit(Eigen::Vector3f(0, 0, 1.3f),
-                 Eigen::Vector3f(2.0f - 0.15f, 0, 1.3f), nullptr, 1.f);
+                 Eigen::Vector3f(2.0f - 0.15f, 0, 1.3f), nullptr);
   EXPECT_GT(m.fineVoxelCount(), 0u);
 }
 
@@ -196,10 +195,10 @@ TEST(FineTsdf, DynamicAndGeometryOffRaysNeverRefine) {
   const Eigen::Vector3f o(0, 0, 1.3f), h(2.0f - 0.15f, 0, 1.3f);
 
   m.beginCarveFrame();
-  m.integrateHit(o, h, nullptr, 1.f, /*is_dynamic=*/true);
+  m.integrateHit(o, h, nullptr, /*is_dynamic=*/true);
   scovox::HitWeights prof{};
   prof.geometry_off = true;
-  m.integrateHit(o, h, nullptr, 1.f, /*is_dynamic=*/false, &prof);
+  m.integrateHit(o, h, nullptr, /*is_dynamic=*/false, &prof);
   m.flushCarveFrame();
   EXPECT_EQ(m.fineVoxelCount(), 0u);
 }

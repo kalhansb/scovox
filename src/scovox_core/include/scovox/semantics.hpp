@@ -3,7 +3,7 @@
 /// @brief Semantic update modes — zero ROS dependencies.
 ///
 /// The Dirichlet update is Bayesian-soft: the per-observation weight is
-/// `kappa0 * p_occ * quality`, which marginalises the class observation
+/// `kappa0 * p_occ`, which marginalises the class observation
 /// over the current Beta posterior on occupancy. Free voxels (low p_occ)
 /// contribute small mass; confidently-occupied voxels contribute fully.
 /// No hard threshold gate.
@@ -23,7 +23,6 @@ enum class SemanticMode : uint8_t {
 
 inline void dirichlet_update_semantics(Voxel* v,
                                        const std::vector<float>* class_probs,
-                                       float quality,
                                        float p_occ,
                                        float kappa0) {
   if (!class_probs) return;
@@ -33,7 +32,7 @@ inline void dirichlet_update_semantics(Voxel* v,
   // Bayesian-soft attribution: weight by current posterior p_occ.
   // Caller is expected to gate the "skip uncertain voxels" behaviour via
   // `dirichlet_min_p_occ` BEFORE calling this function.
-  const float w = kappa0 * p_occ * std::clamp(quality, 0.0f, 1.0f);
+  const float w = kappa0 * p_occ;
   if (w <= 0.0f) return;
 
   // First pass: sum the input probabilities. Used to normalise un-normalised
@@ -67,7 +66,7 @@ inline void dirichlet_update_semantics(Voxel* v,
 ///
 /// "Last observation wins": every update wipes prior semantic state and
 /// stores the argmax class with a fixed count of 1.0. By design this:
-///   - ignores `quality`, `kappa0`, and `p_occ` (no weighting),
+///   - ignores `kappa0` and `p_occ` (no weighting),
 ///   - cannot accumulate confidence over repeated observations,
 ///   - returns the same `semanticEntropy` regardless of how many times the
 ///     cell was observed.
@@ -94,7 +93,7 @@ inline void naive_update_semantics(Voxel* v,
 /// MAJORITY_VOTE mode — intentional ablation baseline.
 ///
 /// Each admitted observation contributes a single +1 vote to the argmax
-/// class. Like NAIVE, this ignores `quality`, `kappa0`, and `p_occ`;
+/// class. Like NAIVE, this ignores `kappa0` and `p_occ`;
 /// unlike NAIVE it accumulates votes across observations. A hard
 /// `p_occ > 0.5` cutoff is applied at `apply_semantics`,
 /// so MAJORITY_VOTE only fires on occupied voxels — the only ablation
