@@ -2377,8 +2377,8 @@ private:
       auto& bgrid = ss.betaGrid();
       std::optional<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor> gacc;
       if (gate_beta_) gacc.emplace(gate_beta_->createAccessor());
-      std::optional<Bonxai::VoxelGrid<double>::Accessor> tacc;
-      if (gate_beta_t_) tacc.emplace(gate_beta_t_->createAccessor());
+      std::optional<Bonxai::VoxelGrid<double>::Accessor> stamp_acc;
+      if (gate_beta_t_) stamp_acc.emplace(gate_beta_t_->createAccessor());
       auto emit_beta = [&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
         // At prior → no posterior information; keep off the wire.
         const bool at_prior = (v.a_occ  <= beta_occ_prior        + 1e-4f) &&
@@ -2389,7 +2389,7 @@ private:
           if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
         }
         if (!scovox::gateAndRefresh(
-                gacc, tacc, c, v, snapshot, t_now,
+                gacc, stamp_acc, c, v, snapshot, t_now,
                 [&](const auto& g, const auto& n) { return betaChangedSinceEmit(g, n); }))
           return;
         frame.beta_deltas.push_back({c, wireBeta(v)});
@@ -2405,8 +2405,8 @@ private:
       auto& dgrid = ss.dirGrid();
       std::optional<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> gacc;
       if (gate_dir_) gacc.emplace(gate_dir_->createAccessor());
-      std::optional<Bonxai::VoxelGrid<double>::Accessor> tacc;
-      if (gate_dir_t_) tacc.emplace(gate_dir_t_->createAccessor());
+      std::optional<Bonxai::VoxelGrid<double>::Accessor> stamp_acc;
+      if (gate_dir_t_) stamp_acc.emplace(gate_dir_t_->createAccessor());
       auto emit_dir = [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
         bool any_sem = false;
         for (int i = 0; i < scovox::K_TOP; ++i)
@@ -2426,7 +2426,7 @@ private:
             scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) == scovox::kEmptySlot)
           return;
         if (!scovox::gateAndRefresh(
-                gacc, tacc, c, v, snapshot, t_now,
+                gacc, stamp_acc, c, v, snapshot, t_now,
                 [&](const auto& g, const auto& n) { return dirChangedSinceEmit(g, n); }))
           return;
         frame.dir_deltas.push_back({c, wireDir(v)});

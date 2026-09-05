@@ -15,6 +15,7 @@
 // publisher, and it does so only once a real subscriber is attached.
 
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -44,17 +45,22 @@ bool sameCoord(const CoordT& a, const CoordT& b) {
   return a.x == b.x && a.y == b.y && a.z == b.z;
 }
 
-// Stand-in for the map's touched-coord bookkeeping. drain() returns by
-// reference and empties the set, exactly as SemSplitMap::drainTouchedBeta does;
-// the counters let a test assert WHICH arm ran, not just what it emitted.
+// Stand-in for the map's touched-coord bookkeeping. drain() SWAPS the set into
+// a member scratch and returns that by reference — the same shape as
+// SemSplitMap::drainTouchedBeta and TsdfMap::drainTouched, and the reason the
+// helper may hold the returned reference across its whole loop. Assigning
+// instead of swapping would also satisfy the helper's static_assert while
+// copying a frame of coords per tick, which is the cost that assert exists to
+// prevent, so the stand-in must not model it that way.
+// The counters let a test assert WHICH arm ran, not just what it emitted.
 struct TouchedSet {
   std::vector<CoordT> coords;
   int drains = 0;
   int clears = 0;
   const std::vector<CoordT>& drain() {
     ++drains;
-    scratch_ = coords;
-    coords.clear();
+    scratch_.clear();
+    std::swap(coords, scratch_);
     return scratch_;
   }
   void clear() {
@@ -86,6 +92,14 @@ struct Fixture {
   }
 };
 
+// Snapshot traversal yields no defined order, so a test that cares WHICH voxel
+// carried WHICH value looks the coord up rather than indexing.
+const BetaVoxel* emittedAt(const Fixture& f, const CoordT& c) {
+  for (const auto& [coord, v] : f.emitted)
+    if (sameCoord(coord, c)) return &v;
+  return nullptr;
+}
+
 // ---------------------------------------------------------------- traversal
 
 TEST(EmitSnapshotOrTouched, SnapshotEmitsEveryCellAndClearsTouched) {
@@ -98,11 +112,51 @@ TEST(EmitSnapshotOrTouched, SnapshotEmitsEveryCellAndClearsTouched) {
 
   f.run(true);
 
-  EXPECT_EQ(f.emitted.size(), 3u);
+  ASSERT_EQ(f.emitted.size(), 3u);
+  // Cardinality alone would also pass an arm that emitted one cell's value
+  // three times, or paired every value with the wrong coord — so pin the
+  // pairing. a_occ is unique per coord above precisely so this can.
+  const BetaVoxel* a = emittedAt(f, {0, 0, 0});
+  const BetaVoxel* b = emittedAt(f, {1, 0, 0});
+  const BetaVoxel* c = emittedAt(f, {40, 7, 3});
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  ASSERT_NE(c, nullptr);
+  EXPECT_FLOAT_EQ(a->a_occ, 3.f);
+  EXPECT_FLOAT_EQ(b->a_occ, 4.f);
+  EXPECT_FLOAT_EQ(c->a_occ, 5.f);
   EXPECT_EQ(f.touched.clears, 1);
   EXPECT_EQ(f.touched.drains, 0);
   // Leaving the touched set populated would re-emit these on the next delta.
   EXPECT_TRUE(f.touched.coords.empty());
+}
+
+// Bonxai's forEachCell takes its visitor BY VALUE (twice — the outer overload
+// forwards a copy into the const one), which is why the snapshot arm passes the
+// emit callable through std::ref. Every emit callable in the node captures by
+// reference and so cannot notice, which is exactly why the guard needs a
+// functor that does: without std::ref this functor's count stays 0 on the
+// snapshot arm while the delta arm reports 2, and the two arms silently
+// disagree about which object they called.
+struct CountingEmit {
+  int seen = 0;  // by value inside the functor, on purpose
+  void operator()(const BetaVoxel&, const CoordT&) { ++seen; }
+};
+
+TEST(EmitSnapshotOrTouched, BothArmsCallTheCallerSFunctorNotACopy) {
+  Fixture f;
+  f.put({0, 0, 0}, beta(3.f, 1.f));
+  f.put({1, 0, 0}, beta(4.f, 1.f));
+  auto drain = [&]() -> const std::vector<CoordT>& { return f.touched.drain(); };
+  auto clear = [&] { f.touched.clear(); };
+
+  CountingEmit delta_emit;
+  scovox::emitSnapshotOrTouched(false, f.live, drain, clear, delta_emit);
+  EXPECT_EQ(delta_emit.seen, 2);
+
+  CountingEmit snapshot_emit;
+  scovox::emitSnapshotOrTouched(true, f.live, drain, clear, snapshot_emit);
+  EXPECT_EQ(snapshot_emit.seen, 2);
 }
 
 TEST(EmitSnapshotOrTouched, DeltaEmitsOnlyTouchedCoords) {
@@ -151,9 +205,11 @@ using StampGrid = Bonxai::VoxelGrid<double>;
 // betaChangedSinceEmit and dirChangedSinceEmit read the LAST-EMITTED voxel as
 // the baseline and ask whether the live one has grown past a threshold above
 // it. A symmetric stand-in ("did it move at all") would pass just as happily
-// with the two arguments swapped — and since both call sites now forward
-// through a generic `const auto&` wrapper, a swap would compile silently and
-// invert the gate. GateDropsWhenEvidenceFalls is what makes the order a test.
+// with the two arguments swapped. GateDropsWhenEvidenceFalls is what makes the
+// order a test — inside gateAndRefresh. It does not reach the node's two
+// call-site wrappers, which forward through a generic `const auto&` pair and so
+// would also swap silently; those live in a translation unit no test target
+// links, and are covered by review only.
 auto grewByOne = [](const BetaVoxel& last, const BetaVoxel& now) {
   return now.a_occ > last.a_occ + 1.f;
 };
@@ -162,14 +218,15 @@ struct GateFixture {
   GateGrid gate{kRes, kInnerBits, kLeafBits};
   StampGrid stamps{kRes, kInnerBits, kLeafBits};
   std::optional<GateGrid::Accessor> gacc;
-  std::optional<StampGrid::Accessor> tacc;
+  std::optional<StampGrid::Accessor> stamp_acc;
 
   void arm(bool with_stamps) {
     gacc.emplace(gate.createAccessor());
-    if (with_stamps) tacc.emplace(stamps.createAccessor());
+    if (with_stamps) stamp_acc.emplace(stamps.createAccessor());
   }
   bool call(const CoordT& c, const BetaVoxel& v, bool snapshot, double t_now) {
-    return scovox::gateAndRefresh(gacc, tacc, c, v, snapshot, t_now, grewByOne);
+    return scovox::gateAndRefresh(gacc, stamp_acc, c, v, snapshot, t_now,
+                                  grewByOne);
   }
 };
 
@@ -196,6 +253,22 @@ TEST(GateAndRefresh, FirstEmitCreatesTheGateEntry) {
   const auto* t = sacc.value({5, 6, 7}, false);
   ASSERT_NE(t, nullptr);
   EXPECT_DOUBLE_EQ(*t, 10.0);
+}
+
+// The miss lookup must NOT create. With create_if_missing the first sight of a
+// voxel returns a value-initialised BetaVoxel instead of nullptr, and the
+// predicate then runs against a_occ = 0 rather than being skipped. Chosen so
+// the two answers differ: 0.5 is not "grown by one" over that phantom
+// baseline, so a creating lookup would DROP a voxel's first ever emit.
+TEST(GateAndRefresh, MissLookupDoesNotCreateAPhantomBaseline) {
+  GateFixture f;
+  f.arm(true);
+  EXPECT_TRUE(f.call({7, 7, 7}, beta(0.5f, 1.f), /*snapshot=*/false, 10.0));
+
+  auto acc = f.gate.createAccessor();
+  const auto* g = acc.value({7, 7, 7}, false);
+  ASSERT_NE(g, nullptr);
+  EXPECT_FLOAT_EQ(g->a_occ, 0.5f);
 }
 
 TEST(GateAndRefresh, DeltaDropsUnchangedVoxelAndLeavesStampAlone) {
@@ -314,6 +387,31 @@ TEST(PublishPath, GatedEmitDropsUnchangedVoxelsButStillDrainsTheTouchedSet) {
   // The drop happens INSIDE emit, so the traversal must still have consumed the
   // touched set. Leaving it populated would re-offer these coords forever.
   EXPECT_TRUE(f.touched.coords.empty());
+
+  // The arm a fresh subscriber actually takes: every voxel walked by
+  // forEachCell, every gate entry refreshed through the snapshot bypass, and
+  // clear() rather than drain() consuming the touched set. It combines the two
+  // corners the delta arm never reaches, so it gets its own assertions on the
+  // coord/value pairing rather than a count.
+  f.emitted.clear();
+  f.touched.coords.push_back({0, 0, 0});
+  gated_run(true, 30.0);
+
+  ASSERT_EQ(f.emitted.size(), 2u);
+  const BetaVoxel* a = emittedAt(f, {0, 0, 0});
+  const BetaVoxel* b = emittedAt(f, {1, 0, 0});
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  EXPECT_FLOAT_EQ(a->a_occ, 3.f);
+  EXPECT_FLOAT_EQ(b->a_occ, 3.f);
+  EXPECT_EQ(f.touched.drains, 2);  // the snapshot arm does not drain
+  EXPECT_EQ(f.touched.clears, 1);
+  EXPECT_TRUE(f.touched.coords.empty());
+  // Bypassed the comparison, but still refreshed: the stamps must have moved.
+  auto sacc = g.stamps.createAccessor();
+  ASSERT_NE(sacc.value({0, 0, 0}, false), nullptr);
+  EXPECT_DOUBLE_EQ(*sacc.value({0, 0, 0}, false), 30.0);
+  EXPECT_DOUBLE_EQ(*sacc.value({1, 0, 0}, false), 30.0);
 }
 
 }  // namespace
