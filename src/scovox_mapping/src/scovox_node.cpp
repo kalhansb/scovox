@@ -2805,7 +2805,20 @@ private:
     cl.header.stamp = (last_input_stamp_.nanoseconds() > 0) ? last_input_stamp_ : get_clock()->now();
     cl.height = 1; cl.is_dense = true; cl.is_bigendian = false;
     sensor_msgs::PointCloud2Modifier mod(cl);
+    // This is the ONE place in the tree that is not generic over K_TOP: the
+    // schema below names sem_cnt0/sem_cls0/sem_cnt1/sem_cls1 by hand, so it can
+    // carry at most two sparse slots. K_TOP=1 is handled (the second pair is
+    // written as empty); K_TOP>=2 fills both. K_TOP>=3 would fit slots 2..K-1
+    // nowhere and drop them SILENTLY, so it is refused here rather than shipped
+    // as a quietly truncated cloud. To raise K_TOP past 2, extend three things
+    // together: the two setPointCloud2Fields lists, the sem_cnt*/sem_cls*
+    // iterator declarations, and the per-point slot writes. (The wire path has
+    // no such limit — binary_serializer is K-generic and carries a K_TOP_wire
+    // byte, so a K sweep that only replays through scovox_core is unaffected.)
     static_assert(scovox::K_TOP >= 1, "publishPointCloud requires at least 1 sparse slot");
+    static_assert(scovox::K_TOP <= 2,
+                  "publishPointCloud's PointCloud2 schema exposes exactly 2 sparse slots "
+                  "(sem_cnt0/1, sem_cls0/1); K_TOP > 2 would silently drop slots 2..K_TOP-1");
     // posterior_variance/eig are schema-present only when
     // publish_uncertainty_fields is set — see the param comment.
     if (pub_unc_fields_) {
