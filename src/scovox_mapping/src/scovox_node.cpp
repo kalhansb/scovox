@@ -2101,7 +2101,7 @@ private:
       if (dv) {
         vv.a_unk = dv->other();
         for (int i = 0; i < scovox::K_TOP; ++i) {
-          if (dv->cls[i] == 0xFFFF) continue;
+          if (dv->cls[i] == scovox::kEmptySlot) continue;
           scovox_msgs::msg::ScovoxSemanticEvidence e;
           e.class_id = dv->cls[i];
           e.evidence_count = std::max(0.f, dv->cnt[i] - alpha_0_);
@@ -2419,7 +2419,7 @@ private:
       auto emit_dir = [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
         bool any_sem = false;
         for (int i = 0; i < scovox::K_TOP; ++i)
-          if (v.cls[i] != 0xFFFF) { any_sem = true; break; }
+          if (v.cls[i] != scovox::kEmptySlot) { any_sem = true; break; }
         const bool at_prior = !any_sem && (v.other() <= dir_other_prior + 1e-4f);
         if (at_prior) return;
         if (zband) {
@@ -2432,26 +2432,18 @@ private:
         // receiver that heard class k earlier keeps class k; the baseline has
         // no retraction, faithfully. (E6.6 measures exactly this blindness.)
         if (gate_binarize_ &&
-            scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) == 0xFFFF)
+            scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) == scovox::kEmptySlot)
           return;
-        if (gacc) {
-          if (!snapshot) {
-            if (auto* g = gacc->value(c, false); g && !dirChangedSinceEmit(*g, v))
-              return;
-          }
-          // setValue, not `*value(c, true)` — see the Beta gate note above.
-          gacc->setValue(c, v);
-          if (tacc) tacc->setValue(c, t_now);
-        }
+        if (!scovox::gateAndRefresh(
+                gacc, tacc, c, v, snapshot, t_now,
+                [&](const auto& g, const auto& n) { return dirChangedSinceEmit(g, n); }))
+          return;
         frame.dir_deltas.push_back({c, wireDir(v)});
       };
-      if (snapshot) {
-        dgrid.forEachCell(emit_dir);
-        split_map_->clearTouchedDir();  // snapshot emitted everything
-      } else {
-        for (const auto& c : split_map_->drainTouchedDir())
-          if (auto* v = dacc.value(c, false)) emit_dir(*v, c);
-      }
+      scovox::emitSnapshotOrTouched(
+          snapshot, dgrid,
+          [&]() -> const std::vector<Bonxai::CoordT>& { return split_map_->drainTouchedDir(); },
+          [&] { split_map_->clearTouchedDir(); }, emit_dir);
     } else {
       // Geometry-only sharing: drop the touched set on the floor each tick.
       // gate_dir_ never gains entries (emit_dir above is its only writer), so
@@ -2485,7 +2477,7 @@ private:
           [&](const scovox::DirVoxel& v) {
             return !(gate_binarize_ &&
                      scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) ==
-                         0xFFFF);
+                         scovox::kEmptySlot);
           },
           [&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
             frame.dir_deltas.push_back({c, wireDir(v)});
@@ -2879,7 +2871,9 @@ private:
         }
       } else {
         v.a_unk = 0.f;
-        for (int i = 0; i < scovox::K_TOP; ++i) { v.sem_cnt[i] = 0.f; v.sem_cls[i] = 0xFFFF; }
+        for (int i = 0; i < scovox::K_TOP; ++i) {
+          v.sem_cnt[i] = 0.f; v.sem_cls[i] = scovox::kEmptySlot;
+        }
       }
       return v;
     };
@@ -2952,7 +2946,7 @@ private:
       if constexpr (scovox::K_TOP >= 2) {
         *isn1 = v.sem_cnt[1]; *isc1 = v.sem_cls[1];
       } else {
-        *isn1 = 0.0f; *isc1 = static_cast<uint16_t>(0xFFFF);
+        *isn1 = 0.0f; *isc1 = scovox::kEmptySlot;
       }
       ++ix; ++iy; ++iz; ++ir; ++ip; ++icl; ++ic2; ++iao; ++iaf;
       ++iau; ++isn0; ++isc0; ++isn1; ++isc1;
@@ -2963,8 +2957,8 @@ private:
   // Publish a thin shell at the TSDF zero-crossing. Caller must hold
   // map_mtx_ (shared). Walks TsdfMap for the surface geometry then runs
   // labelPointCloud against the Dir (semantics) grid to attach the per-point
-  // semantic class. The cross-grid join uses the 0xFFFF sentinel where the Dir
-  // grid has no voxel at the surface coord (same convention labelMesh /
+  // semantic class. The cross-grid join uses the kEmptySlot sentinel where
+  // the Dir grid has no voxel at the surface coord (same convention labelMesh /
   // extractZeroCrossing already produce). 5-field schema.
   void publishTSDFPointCloud() {
     if (!tsdf_pub_ || !split_map_) return;
@@ -2984,7 +2978,7 @@ private:
 
     // Cross-grid label join — labelPointCloud queries the Dir grid at each
     // surface vertex's anchor voxel and writes the argmax class (sentinel
-    // 0xFFFF if absent). Mirrors mesh_labelling.hpp::labelMesh for
+    // kEmptySlot if absent). Mirrors mesh_labelling.hpp::labelMesh for
     // triangle-mesh consumers.
     std::vector<Eigen::Vector3f> positions;
     positions.reserve(points.size());

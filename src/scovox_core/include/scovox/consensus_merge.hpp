@@ -120,7 +120,7 @@ inline DirVoxel mergeDir(const DirVoxel& a,
   float f_other = std::max(other_prior, a.other() + b.other() - other_prior);
 
   // Union dict of (class -> count); at most 2·K_TOP entries. Empty slots
-  // (cls == 0xFFFF) carry only the per-slot α₀ prior and are skipped.
+  // (cls == kEmptySlot) carry only the per-slot α₀ prior and are skipped.
   struct Entry { uint16_t cls; float cnt; };
   Entry merged[2 * K_TOP];
   int n = 0;
@@ -135,8 +135,8 @@ inline DirVoxel mergeDir(const DirVoxel& a,
     merged[n].cnt = cnt;
     ++n;
   };
-  for (int i = 0; i < K_TOP; ++i) if (a.cls[i] != 0xFFFF) upsert(a.cls[i], a.cnt[i]);
-  for (int i = 0; i < K_TOP; ++i) if (b.cls[i] != 0xFFFF) upsert(b.cls[i], b.cnt[i]);
+  for (int i = 0; i < K_TOP; ++i) if (a.cls[i] != kEmptySlot) upsert(a.cls[i], a.cnt[i]);
+  for (int i = 0; i < K_TOP; ++i) if (b.cls[i] != kEmptySlot) upsert(b.cls[i], b.cnt[i]);
 
   // Deterministic, fold-order-invariant ordering: count desc, then class id
   // asc as a tie-break. The secondary key is what makes the order independent of
@@ -167,7 +167,7 @@ inline DirVoxel mergeDir(const DirVoxel& a,
   // Initialise fused slots to prior (matches defaultDirVoxel).
   for (int i = 0; i < K_TOP; ++i) {
     f.cnt[i] = alpha_0;
-    f.cls[i] = 0xFFFF;
+    f.cls[i] = kEmptySlot;
   }
   const int keep = std::min(n, K_TOP);
   for (int i = 0; i < keep; ++i) {

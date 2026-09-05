@@ -18,7 +18,7 @@
 /// SemBeta is the **primary** grid for non-mesh queries. Consumers walking
 /// SemBeta and querying TSDF must handle TSDF-absence with sentinels
 /// (NaN distance, zero weight). Only `labelMesh` walks TSDF and queries
-/// SemBeta; absence in that direction returns class id `0xFFFF`.
+/// SemBeta; absence in that direction returns class id `kEmptySlot`.
 
 #include <cstdint>
 #include <type_traits>
@@ -54,7 +54,7 @@ struct SemBetaVoxel {
   /// by `sparse_add` for mass-conservation tests (E5.1).
   float    a_unk;
 
-  /// Top-K sparse Dirichlet slots, by evidence weight. `sem_cls[i] = 0xFFFF`
+  /// Top-K sparse Dirichlet slots, by evidence weight. `sem_cls[i] = kEmptySlot`
   /// is the "empty slot" sentinel (no class tracked at slot i yet).
   /// `sem_cnt[i]` accumulates Dirichlet pseudo-counts for class `sem_cls[i]`.
   /// Maintained by `sparse_add()` (defined in voxel.hpp during the transition).
@@ -136,7 +136,7 @@ inline SemBetaVoxel defaultSemBetaVoxel() noexcept {
   // packs voxels contiguously) — symptom was a_occ=NaN everywhere in
   // the K=1 cells. Loop emits to all K slots regardless.
   for (int i = 0; i < K_TOP; ++i) {
-    v.sem_cls[i] = 0xFFFF;             // empty-slot sentinels
+    v.sem_cls[i] = kEmptySlot;
   }
   return v;
 }

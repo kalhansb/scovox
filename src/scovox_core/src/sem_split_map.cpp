@@ -112,13 +112,13 @@ void dirichletUpdate(DirVoxel*                 d,
     }
     const float    cb = (slot == 0xFF) ? 0.f : pre_cnt[slot];
     const uint16_t nb = (slot == 0xFF) ? uint16_t{0}
-                      : (pre_cls[slot] == 0xFFFF ? uint16_t{0} : pre_nhit[slot]);
+                      : (pre_cls[slot] == kEmptySlot ? uint16_t{0} : pre_nhit[slot]);
     g_deposit_trace(tx, ty, tz, c, p, inc, outcome, slot, cb, nb);
     // E0 rides the trace's own outcome rather than recomputing it, so the two
     // instruments can never disagree about which branch a deposit took.
     SCOVOX_E0_ON_DEPOSIT(outcome, c,
                          (outcome == 3 && slot != 0xFF) ? pre_cls[slot]
-                                                        : uint16_t{0xFFFF});
+                                                        : kEmptySlot);
   };
 #elif SCOVOX_E0_COUNTERS
   // E0 instrumentation without the full deposit trace: the same branch code,
@@ -138,7 +138,7 @@ void dirichletUpdate(DirVoxel*                 d,
     // On outcome 3 the arriving class now occupies exactly one slot — it
     // matched none on entry (branch 1 runs first) and none was empty (branch
     // 2), so the class that slot held before is the victim, unambiguously.
-    uint16_t victim = 0xFFFF;
+    uint16_t victim = kEmptySlot;
     if (outcome == 3) {
       for (int i = 0; i < K_TOP; ++i)
         if (d->cls[i] == c) { victim = pre_cls[i]; break; }
@@ -180,7 +180,7 @@ void dirichletUpdate(DirVoxel*                 d,
       bool covered = false;
       const uint16_t amc = static_cast<uint16_t>(am);
       for (int i = 0; i < K_TOP; ++i)
-        if (d->cls[i] != 0xFFFF && d->cls[i] == amc) { covered = true; break; }
+        if (d->cls[i] != kEmptySlot && d->cls[i] == amc) { covered = true; break; }
       SCOVOX_E0_ON_ARGMAX(tx, ty, tz, covered);
     }
   }
@@ -243,8 +243,8 @@ void naiveUpdate(DirVoxel* d, const std::vector<float>* class_probs, float alpha
   // into `other()` automatically — the total does not change, so unlike the old
   // form there is no second write to keep in step with the reset.
   for (int i = 0; i < K_TOP; ++i) {
-    if (d->cls[i] != 0xFFFF) {
-      d->cls[i] = 0xFFFF;
+    if (d->cls[i] != kEmptySlot) {
+      d->cls[i] = kEmptySlot;
       d->cnt[i] = alpha_0;
     }
   }
@@ -1041,10 +1041,10 @@ void SemSplitMap::decayTransient(float rate) {
       const float other_decayed = other_prior + (v.other() - other_prior) * rate;
       bool any = std::fabs(other_decayed - other_prior) >= kPruneEps;
       for (int i = 0; i < K_TOP; ++i) {
-        if (v.cls[i] == 0xFFFF) continue;
+        if (v.cls[i] == kEmptySlot) continue;
         v.cnt[i] = a0 + (v.cnt[i] - a0) * rate;
         if (std::fabs(v.cnt[i] - a0) < kPruneEps) {
-          v.cls[i] = 0xFFFF;   // slot faded to prior → release it
+          v.cls[i] = kEmptySlot;   // slot faded to prior → release it
           v.cnt[i] = a0;
         } else {
           any = true;
@@ -1080,7 +1080,7 @@ uint16_t SemSplitMap::transientDominantClassAt(const Eigen::Vector3f& pos) const
   auto acc = transient_dir_grid_.createConstAccessor();
   const CoordT c = transient_dir_grid_.posToCoord(pos.x(), pos.y(), pos.z());
   const DirVoxel* v = acc.value(c);
-  if (!v) return 0xFFFF;
+  if (!v) return kEmptySlot;
   return dominantClass(*v, params_.alpha_0, params_.num_classes);
 }
 
@@ -1144,7 +1144,7 @@ void SemSplitMap::applyDirSaturation(DirVoxel* d) const {
     // the contest for that slot regardless of its evidence. Floor
     // FILLED slots only — flooring empty slots (cnt ≈ k·α₀) would re-inflate
     // s_class back above the saturation cap.
-    if (d->cls[i] != 0xFFFF && d->cnt[i] < alpha_0) d->cnt[i] = alpha_0;
+    if (d->cls[i] != kEmptySlot && d->cnt[i] < alpha_0) d->cnt[i] = alpha_0;
   }
   float sum_cnt = 0.f;
   for (int i = 0; i < K_TOP; ++i) sum_cnt += d->cnt[i];
@@ -1213,7 +1213,7 @@ uint16_t SemSplitMap::dominantClassAt(const Eigen::Vector3f& pos) const {
   auto acc = dir_grid_.createConstAccessor();
   const CoordT c = dir_grid_.posToCoord(pos.x(), pos.y(), pos.z());
   const DirVoxel* v = acc.value(c);
-  if (!v) return 0xFFFF;
+  if (!v) return kEmptySlot;
   return dominantClass(*v, params_.alpha_0, params_.num_classes);
 }
 

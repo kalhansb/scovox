@@ -584,7 +584,7 @@ class SemSplitMap {
   std::optional<BetaVoxel> getBetaVoxel(const Eigen::Vector3f& pos) const;
   std::optional<DirVoxel>  getDirVoxel(const Eigen::Vector3f& pos) const;
 
-  /// Argmax class at `pos`, or 0xFFFF if no Dir voxel / no dominant class.
+  /// Argmax class at `pos`, or kEmptySlot if no Dir voxel / no dominant class.
   uint16_t dominantClassAt(const Eigen::Vector3f& pos) const;
 
   template <typename Fn>
@@ -619,7 +619,7 @@ class SemSplitMap {
   std::optional<BetaVoxel> getTransientBetaVoxel(const Eigen::Vector3f& pos) const;
   std::optional<DirVoxel>  getTransientDirVoxel(const Eigen::Vector3f& pos) const;
 
-  /// Argmax class in the transient Dir grid at `pos`, or 0xFFFF if none.
+  /// Argmax class in the transient Dir grid at `pos`, or kEmptySlot if none.
   uint16_t transientDominantClassAt(const Eigen::Vector3f& pos) const;
 
   template <typename Fn>
