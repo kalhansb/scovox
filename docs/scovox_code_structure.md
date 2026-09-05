@@ -55,6 +55,8 @@ in:
 | `--alpha0` | 0.01 | `semsplit.alpha_0` | Dirichlet prior per class |
 | `--w-occ` | **1.5** | `semsplit.w_occ` | Stream A hit weight; on the ⅛ lattice |
 | `--w-free` | 1.0 | `semsplit.w_free` | full-ray carve weight |
+| `--beta-occ-prior` | **0.5** | `semsplit.beta_occ_prior` | Beta prior `a_occ` at first touch; `0.5 = 4/8`, on the ⅛ lattice |
+| `--beta-free-prior` | **0.5** | `semsplit.beta_free_prior` | Beta prior `a_free`; the pair defaults to the shipped Jeffreys `Beta(0.5,0.5)`. `<= 0` means "unset" to `sanitise()`, so Haldane `Beta(0,0)` is **not** reachable through these flags |
 | `--kappa0` | 1.0 | `semsplit.kappa0` | Stream B deposit scale |
 | `--min-p-occ` | 0.5 | `semsplit.dirichlet_min_p_occ` | Stream B gate on posterior occupancy |
 | `--evict-by-confidence` | **on** | `semsplit.evict_by_confidence` | needs `SCOVOX_TRACK_QMAX=1`; replay refuses otherwise |
@@ -78,8 +80,36 @@ in:
 
 Library-side constants that are part of the method but not flags: `leaf_bits`
 3, `inner_bits` 2, `dir_leaf_bits` 2, `batch_free_carve` true, `carve_skip`
-0, Beta prior `Beta(1,1)`, Beta lattice step ⅛ (`SCOVOX_BETA_U16_SCALE` 8),
-TSDF truncation 3 fine voxels when the fine band is on (it is off here).
+0, Beta lattice step ⅛ (`SCOVOX_BETA_U16_SCALE` 8), TSDF truncation 3 fine
+voxels when the fine band is on (it is off here).
+
+The Beta prior is a flag as of the E11 sweep, but its default is still
+`kBetaOccPrior` / `kBetaFreePrior`, so the promoted configuration passes neither
+flag. **Those constants are Jeffreys `Beta(0.5,0.5)` as of 2026-09-05**,
+promoted from Bayes–Laplace `Beta(1,1)`; E11 measured the switch as +0.0000 on
+all six metrics, 0/8, with `n_occupied` and `n_intersect` identical to the
+voxel. What a *symmetric* prior `Beta(c,c)` can reach is bounded before
+any run: `p_occ >= 0.5` iff `a_occ >= a_free` iff `c + w_occ·n_hit >=
+c + w_free·n_miss`, and `c` cancels. Both gates in the pipeline — the deposit
+gate `dirichlet_min_p_occ` and the scorer's occupied set — sit at exactly 0.5,
+so the occupied voxel set, `n_pred_occupied` and occupancy IoU are invariant
+under any symmetric prior. Exactly one channel is left live, and it is narrower
+than it looks: the **endpoint** class deposit weight `kappa0 · p_occ_post`
+(`sem_split_map.cpp:733-734`, `hit_flat_share` false). The band path does *not*
+share it — with `semantic_band_require_occ` false the band takes the flat
+SLIM-VDB weight `class_share = kappa0` and never reads a Beta voxel
+(`:884-891`) — and the BKI kernel is off (`semantic_spread_radius` 0). That one
+channel is a transient: a smaller prior lets one look reach a higher `p_occ`
+(at `w_occ` 1.5 a first look is `2.5/3.5 = 0.714` under `Beta(1,1)` and
+`2.0/2.5 = 0.800` under the shipped Jeffreys) and both tend to the same limit,
+so the prior re-weights early observations against settled ones and nothing
+else.
+
+The cancellation argument above is confined to the **0.5** gate. Where a
+threshold is not 0.5 the prior is load-bearing: `dscovox_node.cpp:661`
+publishes at `p_occ() >= 0.7`, where Jeffreys admits a voxel after 2 hits
+against one miss and `Beta(1,1)` needed 3. The carve wall guard
+`carve_skip_occ_threshold` is the other such site, and is off by default.
 
 ### 1.3 Per-ray algorithm (what one depth pixel does)
 
@@ -345,7 +375,7 @@ Size invariants are `static_assert`ed: `DirVoxel` 20 B at K=2 with QMAX
 | header | type | status |
 |---|---|---|
 | `tsdf_voxel.hpp` | `TsdfVoxel` 8 B | live (TSDF grid) |
-| `beta_voxel.hpp` | `BetaVoxel`, `BetaCountU16`, lattice helpers `beta_lattice_snap` / `beta_max_increments`, priors `kBetaOccPrior = kBetaFreePrior = 1` | live (occupancy grid) |
+| `beta_voxel.hpp` | `BetaVoxel`, `BetaCountU16`, lattice helpers `beta_lattice_snap` / `beta_max_increments`, priors `kBetaOccPrior = kBetaFreePrior = 0.5` (Jeffreys) | live (occupancy grid) |
 | `dir_voxel.hpp` | `DirVoxel` (total basis: `s_total`, derived `other()`, `set_other()`), `sparse_add_class`, `dominantClass` | live (semantic grid) |
 | `voxel.hpp` | legacy unified `Voxel` (`a_occ,a_free,a_unk,sem_cnt[K],sem_cls[K]`), `sparse_add`, the four `g_sparse_*_count` atomics | legacy: still the projection type for `ScovoxMap` messages and the substrate of `scovox::Map` |
 | `sembeta_voxel.hpp` | `SemBetaVoxel` 24 B | legacy: viz/projection only |
@@ -388,15 +418,20 @@ Size invariants are `static_assert`ed: `DirVoxel` 20 B at K=2 with QMAX
   per-voxel max `w_free`) and a `HitStage` + `hit_probs_` pool for
   `batch_hits`.
 - **Params defaults** (`sem_split_map.hpp`): `w_occ` 1.0, `w_free` 0.5,
-  `kappa0` 1.0, `dirichlet_min_p_occ` 0.5, `hit_flat_share` false,
+  `beta_occ_prior` / `beta_free_prior` = `kBetaOccPrior` / `kBetaFreePrior`
+  (both **0.5**, Jeffreys, since 2026-09-05), `kappa0` 1.0, `dirichlet_min_p_occ` 0.5, `hit_flat_share` false,
   `evidence_saturation` 0, `class_evidence_saturation` −1,
   `evict_by_confidence` false, `inc_mode` 0, `inc_thresh` 0.10,
   `semantic_spread_radius` 0, `semantic_band_length` 0,
   `semantic_band_require_occ` **true**, `ray_spread` 0,
   `carve_skip_occ_threshold` 0, `batch_free_carve` true, `batch_hits` true,
   `range_decay_length` 50, `num_classes` 14, `alpha_0` 0.01.
-- **`sanitise(Params&)`** (`.cpp:266-300`): clamps, snaps `w_occ`/`w_free`
-  onto the ⅛ lattice (`:297-298`), clamps `dir_leaf_bits ≤ leaf_bits`,
+- **`sanitise(Params&)`** (`.cpp:266-308`): clamps, snaps `w_occ`/`w_free`
+  and `beta_occ_prior`/`beta_free_prior` onto the ⅛ lattice — the prior
+  accumulates into the same counters the weights do, so off-lattice it breaks
+  the count identity `a_occ = prior + w_occ·n_hit` under `SCOVOX_BETA_U16`; a
+  non-positive prior is not a valid Beta and falls back to the shipped
+  constant rather than being clamped to an epsilon — clamps `dir_leaf_bits ≤ leaf_bits`,
   enforces band / BKI ball / ray-spread mutual exclusion. A second
   `sanitise(HitWeights&)` snaps the fusion profiles the node builds.
 - **Per-ray entry** `integrateHit` (`:362-388`) → `carveRay` (`:399-430`,
@@ -447,7 +482,7 @@ source files, not documents.
 | file | role |
 |---|---|
 | `consensus_merge.hpp` | `mergeBeta` (floors at the prior), `mergeDir` (insertion-sort fold, not fully order independent) |
-| `uncertainty.hpp/.cpp` | Beta / Dirichlet entropy and variance helpers (21 tests) |
+| `uncertainty.hpp/.cpp` | Beta / Dirichlet entropy and variance helpers (21 tests). **Never names `DirVoxel`** — `estimateDistinctClasses` / `effectiveResidual` are templated on `sem_cnt[K_TOP]` + `a_unk`, fields only `Voxel` and `SemBetaVoxel` carry. It reaches the promoted map anyway: `dscovox_consensus.hpp:78` projects `DirVoxel` → `SemBetaVoxel` (stripping `α₀` and `(C−K)·α₀`), and `dscovox_node.cpp:705` / `scovox_node.cpp:2928` call `argmaxClassConfidence` on the result, so the published `semantic_confidence` **is** a Laplace + Hutter readout of the promoted state — on the basis E12 rejects. See M11 in `docs/code/code_review_2026_09_04.md`. |
 | `mesh_labelling.hpp`, `marching_cubes.hpp` | mesh extraction + per-vertex labels for `ExtractMesh` |
 | `refinement_regions.hpp`, `dbh_fit.hpp` | fine-band cylinders, 2-DoF anchor fit, DBH fit |
 | `carve_stage.hpp` | block-keyed staged carve |

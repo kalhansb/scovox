@@ -181,11 +181,16 @@ TEST(SplitVoxelLayout, Sizes) {
 }
 
 TEST(SplitVoxelLayout, ShippedBetaPriorIsSymmetricHalf) {
-  // Shipped split-path occupancy prior is symmetric Beta(1,1) → p_occ = 0.5
-  // decoupled from the semantic (C, α₀).
+  // Shipped split-path occupancy prior is the symmetric Jeffreys Beta(0.5,0.5)
+  // → p_occ = 0.5 decoupled from the semantic (C, α₀). What this test pins is
+  // the SYMMETRY, not the magnitude: p_occ = 0.5 is the invariant every
+  // occupancy gate is calibrated against, and it holds for any Beta(a,a). The
+  // magnitude is read from the constants so a deliberate prior change moves
+  // this test with it instead of breaking it.
   auto b = scovox::defaultBetaVoxel(scovox::kBetaOccPrior, scovox::kBetaFreePrior);
-  EXPECT_NEAR(b.a_occ,  1.0f, 1e-7f);
-  EXPECT_NEAR(b.a_free, 1.0f, 1e-7f);
+  EXPECT_NEAR(b.a_occ,  scovox::kBetaOccPrior,  1e-7f);
+  EXPECT_NEAR(b.a_free, scovox::kBetaFreePrior, 1e-7f);
+  EXPECT_NEAR(scovox::kBetaOccPrior, scovox::kBetaFreePrior, 1e-7f) << "prior must stay symmetric";
   EXPECT_NEAR(b.p_occ(), 0.5f, 1e-6f);
   // Ablation: the prior-agnostic factory still reproduces the calibrated
   // Beta(C·α₀, α₀) → C/(C+1) marginal on explicit request. Its parameters are
@@ -237,23 +242,26 @@ TEST(BetaCountStorage, ShippedWeightsAccumulateExactly) {
   for (const float w : {1.0f, 1.5f, 6.0f, 0.5f, 0.125f}) {
     scovox::BetaVoxel b = scovox::defaultBetaVoxel();
     for (int i = 0; i < 200; ++i) b.a_occ += w;
-    EXPECT_FLOAT_EQ(b.a_occ, 1.0f + 200.0f * w) << "w = " << w;
+    EXPECT_FLOAT_EQ(b.a_occ, scovox::kBetaOccPrior + 200.0f * w) << "w = " << w;
   }
 }
 
 TEST(BetaCountStorage, PriorAndPOccRoundTrip) {
   scovox::BetaVoxel b = scovox::defaultBetaVoxel(scovox::kBetaOccPrior,
                                                  scovox::kBetaFreePrior);
-  EXPECT_FLOAT_EQ(b.a_occ, 1.0f);
-  EXPECT_FLOAT_EQ(b.a_free, 1.0f);
+  const float a0 = scovox::kBetaOccPrior;
+  const float b0 = scovox::kBetaFreePrior;
+  EXPECT_FLOAT_EQ(b.a_occ, a0);
+  EXPECT_FLOAT_EQ(b.a_free, b0);
   EXPECT_FLOAT_EQ(b.p_occ(), 0.5f);
-  b.a_occ += 3.0f;                       // Beta(4, 1)
-  EXPECT_FLOAT_EQ(b.s_total(), 5.0f);
-  EXPECT_FLOAT_EQ(b.p_occ(), 0.8f);
+  b.a_occ += 3.0f;                       // Beta(a0 + 3, b0)
+  EXPECT_FLOAT_EQ(b.s_total(), a0 + b0 + 3.0f);
+  const float p = (a0 + 3.0f) / (a0 + b0 + 3.0f);
+  EXPECT_FLOAT_EQ(b.p_occ(), p);
   b.a_occ  *= 0.5f;                      // the saturation rescale's operation
   b.a_free *= 0.5f;
-  EXPECT_FLOAT_EQ(b.p_occ(), 0.8f);      // p_occ is preserved
-  EXPECT_FLOAT_EQ(b.s_total(), 2.5f);
+  EXPECT_FLOAT_EQ(b.p_occ(), p);         // p_occ is preserved
+  EXPECT_FLOAT_EQ(b.s_total(), 0.5f * (a0 + b0 + 3.0f));
 }
 
 #if SCOVOX_BETA_U16
@@ -273,9 +281,9 @@ TEST(BetaCountStorage, IncrementsBelowHalfACountVanish) {
   const float res = scovox::BetaCount::kInv;
   scovox::BetaVoxel b = scovox::defaultBetaVoxel();
   for (int i = 0; i < 50; ++i) b.a_occ += 0.4f * res;
-  EXPECT_FLOAT_EQ(b.a_occ, 1.0f);
+  EXPECT_FLOAT_EQ(b.a_occ, scovox::kBetaOccPrior);
   for (int i = 0; i < 4; ++i) b.a_occ += 0.6f * res;   // rounds up each time
-  EXPECT_FLOAT_EQ(b.a_occ, 1.0f + 4.0f * res);
+  EXPECT_FLOAT_EQ(b.a_occ, scovox::kBetaOccPrior + 4.0f * res);
 }
 
 TEST(BetaCountStorage, SaturationGuardKeepsCountersOffTheCeiling) {
@@ -326,7 +334,7 @@ TEST(SemSplitMap, FirstHitTwoStreamMatchesAnalytic) {
   ASSERT_TRUE(b.has_value());
   ASSERT_TRUE(d.has_value());
 
-  // Stream A: a_occ = occ_prior + w_occ·q ; a_free untouched at the Beta(1,1)
+  // Stream A: a_occ = occ_prior + w_occ·q ; a_free untouched at the Beta(0.5,0.5)
   // prior. Occupancy prior is symmetric Beta(1,1) → p_occ_prior=0.5.
   const float w_occ_share = 1.0f;
   EXPECT_NEAR(b->a_occ,  scovox::kBetaOccPrior + w_occ_share, 1e-5f);
@@ -852,9 +860,10 @@ TEST(SemSplitTransient, TransientHitUsesSameTwoStreamMath) {
   auto td = md.getTransientBetaVoxel(pos);
   auto tp = mp.getBetaVoxel(pos);
   ASSERT_TRUE(td.has_value()); ASSERT_TRUE(tp.has_value());
-  EXPECT_FLOAT_EQ(td->a_occ, tp->a_occ);    // prior 1.0 + w_occ·q = 2.0
-  EXPECT_FLOAT_EQ(td->a_free, tp->a_free);  // prior 1.0 (no carve in applyHitUpdate)
-  EXPECT_NEAR(td->a_occ, 2.0f, 1e-6f);
+  EXPECT_FLOAT_EQ(td->a_occ, tp->a_occ);    // prior + w_occ·q
+  EXPECT_FLOAT_EQ(td->a_free, tp->a_free);  // prior (no carve in applyHitUpdate)
+  const float w_occ_share = 1.0f;           // makeMap's w_occ, at q = 1
+  EXPECT_NEAR(td->a_occ, scovox::kBetaOccPrior + w_occ_share, 1e-6f);
   EXPECT_EQ(md.transientDominantClassAt(pos), mp.dominantClassAt(pos));
 }
 
@@ -868,9 +877,11 @@ TEST(SemSplitTransient, DecayMovesEvidenceTowardPrior) {
   m.decayTransient(0.5f);
   auto b = m.getTransientBetaVoxel(pos);
   ASSERT_TRUE(b.has_value());
-  // a_occ: 1 + (2 - 1)·0.5 = 1.5 ; a_free stays at prior 1.0.
-  EXPECT_NEAR(b->a_occ, 1.5f, 1e-6f);
-  EXPECT_NEAR(b->a_free, 1.0f, 1e-6f);
+  // a_occ: prior + w_occ·0.5 ; a_free stays at prior (decay is toward the
+  // prior, so a bucket already sitting on it does not move).
+  const float w_occ_share = 1.0f;           // makeMap's w_occ, at q = 1
+  EXPECT_NEAR(b->a_occ, scovox::kBetaOccPrior + 0.5f * w_occ_share, 1e-6f);
+  EXPECT_NEAR(b->a_free, scovox::kBetaFreePrior, 1e-6f);
   // Persistent untouched by decay.
   EXPECT_EQ(m.betaVoxelCount(), 0u);
 }

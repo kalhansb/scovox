@@ -9,9 +9,9 @@
 ///
 ///   BetaVoxel (occupancy): generalises the Beta-consensus rule
 ///       a_fused = a_A + a_B − prior
-///     to both dimensions, with the SYMMETRIC Beta(1,1) prior (p_occ=0.5):
-///       a_occ  ← A.a_occ  + B.a_occ  − occ_prior   (occ_prior  = kBetaOccPrior  = 1)
-///       a_free ← A.a_free + B.a_free − free_prior  (free_prior = kBetaFreePrior = 1)
+///     to both dimensions, with the SYMMETRIC Beta(0.5,0.5) prior (p_occ=0.5):
+///       a_occ  ← A.a_occ  + B.a_occ  − occ_prior   (occ_prior  = kBetaOccPrior  = 0.5)
+///       a_free ← A.a_free + B.a_free − free_prior  (free_prior = kBetaFreePrior = 0.5)
 ///
 ///   DirVoxel (semantics): the slot-reconciling Dirichlet rule with no FREE
 ///     dimension:
@@ -73,10 +73,10 @@ struct CoordEq {
 
 }  // namespace detail
 
-/// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) occupancy prior.
+/// Per-voxel BetaVoxel merge under the symmetric Beta(0.5,0.5) occupancy prior.
 /// The `num_classes` / `alpha_0` params are retained for call-site symmetry with
 /// `mergeDir` but are UNUSED for occupancy: the prior is now the decoupled
-/// constant `kBetaOccPrior` = `kBetaFreePrior` = 1.0,
+/// constant `kBetaOccPrior` = `kBetaFreePrior` = 0.5,
 /// not the old calibrated `C·α₀`. Sender and receiver share this compile-time
 /// constant, so the prior-subtraction below stays consistent across nodes.
 inline BetaVoxel mergeBeta(const BetaVoxel& a,

@@ -32,16 +32,19 @@
 /// information — it is a change of basis, not a saving — chosen for three
 /// reasons, in order of weight:
 ///
-///  1. `S` IS EXACT, AND THE OLD BASIS WAS NOT. Under the shipped
-///     `--hit-share flat` every look deposits exactly `kappa0`, so
-///     `S − C·α₀` is the number of looks the voxel has absorbed, an integer.
-///     Summing three separately-accumulated floats does not recover it. `other`
-///     carries ~88% of the mass and takes the most adds, so it absorbs small
-///     residuals into a large running value and loses them. The drift grows
-///     with the look count, is unbounded, and is NOT one-signed — its sign
-///     depends on where the mantissa happens to land. One accumulator adding
-///     `class_share` once per look stays orders of magnitude closer to the
-///     integer across the whole range a busy voxel reaches.
+///  1. `S` IS EXACT, AND THE OLD BASIS WAS NOT. `S − C·α₀` is the total
+///     deposited mass: the sum of one `class_share` per look. Under
+///     `--hit-share flat` that share is exactly `kappa0` and the sum is an
+///     integer look count; under the promoted share mode it is
+///     `kappa0 · p_occ_post`, so the sum is a weighted look count and not an
+///     integer — either way it is ONE running total, and summing three
+///     separately-accumulated floats does not recover it. `other` carries most
+///     of the mass and takes the most adds, so it absorbs small residuals into
+///     a large running value and loses them. The drift grows with the look
+///     count, is unbounded, and is NOT one-signed — its sign depends on where
+///     the mantissa happens to land. One accumulator adding `class_share` once
+///     per look stays orders of magnitude closer to the true total across the
+///     whole range a busy voxel reaches.
 ///
 ///  2. THE MASS INVARIANT BECOMES STRUCTURAL. It used to be a property four
 ///     coordinated `*other +=` writes had to maintain, and every branch of

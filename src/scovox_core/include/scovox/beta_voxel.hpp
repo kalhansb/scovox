@@ -22,14 +22,15 @@
 ///     (where the Dirichlet update is gated on this grid's `p_occ`), so the
 ///     extra accessor lookup is paid once per ray, not per carved voxel.
 ///
-/// Prior choice: the **shipped** split-path occupancy prior is symmetric
-/// **Beta(1,1)** (`kBetaOccPrior`/`kBetaFreePrior` below), so an unobserved
-/// voxel has `p_occ = 0.5`. This was chosen over the calibrated
-/// `Beta(C·α₀, α₀)` prior (`p_occ = C/(C+1) ≈ 0.933`, which matched the unified
-/// `SemDirVoxel` occupancy marginal) and over the Jeffreys prior
-/// `Beta(0.5,0.5)` — for single-ray-noise robustness against the carve
-/// wall-guard. Jeffreys was the runner-up. The factory is prior-agnostic, so
-/// the calibrated prior
+/// Prior choice: the **shipped** split-path occupancy prior is the symmetric
+/// Jeffreys prior **Beta(0.5,0.5)** (`kBetaOccPrior`/`kBetaFreePrior` below),
+/// so an unobserved voxel has `p_occ = 0.5`. It is preferred over the
+/// calibrated `Beta(C·α₀, α₀)` prior (`p_occ = C/(C+1) ≈ 0.933`, which matched
+/// the unified `SemDirVoxel` occupancy marginal) because that one is asymmetric
+/// and biases an unobserved voxel toward occupied, and over `Beta(1,1)` because
+/// Jeffreys is reparameterisation-invariant while the `p_occ > 0.5` admission
+/// gate is identical under both (see the cancellation argument at the constants
+/// below). The factory is prior-agnostic, so the calibrated prior
 /// `defaultBetaVoxel(C·α₀, α₀)` remains available as an ablation.
 
 #include <cstddef>
@@ -104,7 +105,7 @@ namespace scovox {
 /// One prior is out of reach: the calibrated `Beta(C·α₀, α₀)` ablation is
 /// α₀-scale (0.14 / 0.01), and holding those alongside the thousands of units
 /// a full run accumulates needs a dynamic range near 2e5 — past `uint16`'s
-/// 65,535 at any scale. The shipped symmetric `Beta(1,1)` prior sits exactly on
+/// 65,535 at any scale. The shipped symmetric `Beta(0.5,0.5)` prior sits exactly on
 /// the lattice; run the calibrated ablation under float storage.
 ///
 /// Contractions toward a target also stop moving once the residual falls under
@@ -281,17 +282,34 @@ static_assert(std::is_standard_layout_v<BetaVoxel>,
 static_assert(offsetof(BetaVoxel, a_free) == offsetof(BetaVoxel, a_occ) + sizeof(BetaCount),
     "BetaVoxel layout: a_free must immediately follow a_occ.");
 
-/// Shipped split-substrate occupancy prior: symmetric **Beta(1,1)** (uniform /
-/// Bayes–Laplace) → prior `p_occ = 0.5`. SINGLE SOURCE OF TRUTH for the split
+/// Shipped split-substrate occupancy prior: symmetric **Beta(0.5,0.5)**
+/// (Jeffreys) → prior `p_occ = 0.5`. SINGLE SOURCE OF TRUTH for the split
 /// occupancy prior: allocation (`SemSplitMap`), the consensus merge's
 /// prior-subtraction (`mergeBeta`), the receiver's at-prior detection
 /// (`isPriorBeta`), the sender's emit gate, and the SSMI unobserved baseline
 /// all reference these constants, so sender and receiver stay consistent — the
 /// prior is a compile-time constant, NOT carried on the wire. Decoupled from
 /// the semantic `(num_classes, α₀)` because occupancy and semantics are
-/// independent priors. `Beta(0.5,0.5)` (Jeffreys) is the runner-up.
-constexpr float kBetaOccPrior  = 1.0f;
-constexpr float kBetaFreePrior = 1.0f;
+/// independent priors.
+///
+/// Jeffreys is the reference prior for a Bernoulli rate: it is the unique
+/// symmetric Beta invariant under reparameterisation of that rate, so it does
+/// not privilege any occupancy scale. Both eighths-exact (`0.5 = 4/8`), so the
+/// integer-lattice storage identity below is unchanged.
+///
+/// WHY THE SWITCH IS SAFE AT THE ADMISSION GATE, AND WHERE IT IS NOT.
+/// Occupancy admission tests `p_occ > 0.5`, and for ANY symmetric `Beta(a,a)`
+///     `p_occ > 0.5  ⇺  a + W_occ > a + W_free  ⇺  W_occ > W_free`,
+/// so `a` cancels exactly and the admitted set is prior-invariant. That is
+/// algebra, not a tolerance. It does NOT extend to a threshold other than 0.5:
+/// `carve_skip_occ_threshold` (the wall guard, off by default and absent from
+/// the batched live path) compares `p_occ` against an arbitrary value, and a
+/// smaller prior reaches an extreme `p_occ` after fewer looks — one hit gives
+/// `0.80` here against `0.71` under `Beta(1,1)` at `w_occ = 1.5`. A caller that
+/// turns the wall guard on is choosing a regime where the prior is load-bearing
+/// and should re-check its threshold.
+constexpr float kBetaOccPrior  = 0.5f;
+constexpr float kBetaFreePrior = 0.5f;
 
 /// Beta prior factory. **Required at every allocation**: Bonxai's pool
 /// allocator zero-initialises new leaf blocks, leaving `a_occ = a_free = 0`.
@@ -300,13 +318,13 @@ constexpr float kBetaFreePrior = 1.0f;
 /// (the same first-touch invariant as `defaultSemBetaVoxel` /
 /// `defaultSemDirVoxel`).
 ///
-/// The factory is prior-agnostic. The 1.0/1.0 default IS the shipped symmetric
-/// Beta(1,1) occupancy prior (`p_occ = 0.5`), which `SemSplitMap` passes
+/// The factory is prior-agnostic. The 0.5/0.5 default IS the shipped symmetric
+/// Jeffreys occupancy prior (`p_occ = 0.5`), which `SemSplitMap` passes
 /// explicitly via `kBetaOccPrior` / `kBetaFreePrior`. Pass `occ_prior = C·α₀`,
 /// `free_prior = α₀` to reproduce the old calibrated unified-Dirichlet marginal
-/// (`p_occ = C/(C+1)`) as an ablation.
-inline BetaVoxel defaultBetaVoxel(float occ_prior = 1.0f,
-                                  float free_prior = 1.0f) noexcept {
+/// (`p_occ = C/(C+1)`) as an ablation, or `1.0/1.0` for Bayes–Laplace.
+inline BetaVoxel defaultBetaVoxel(float occ_prior = 0.5f,
+                                  float free_prior = 0.5f) noexcept {
   BetaVoxel v{};            // zero-init
   v.a_occ  = occ_prior;
   v.a_free = free_prior;

@@ -39,13 +39,13 @@ static constexpr float kPriorSlop = 1e-4f;
 
 /// BetaVoxel "is at prior" check for the split consensus refold. A voxel
 /// is at prior iff a_occ ≈ kBetaOccPrior and a_free ≈ kBetaFreePrior (the
-/// symmetric Beta(1,1) occupancy prior). `slop`
+/// symmetric Beta(0.5,0.5) occupancy prior). `slop`
 /// matches isPriorDir's one-quantum tolerance.
 inline bool isPriorBeta(const scovox::BetaVoxel& v,
                         uint16_t num_classes, float alpha_0) {
   (void)num_classes; (void)alpha_0;  // occupancy prior is the symmetric constant
-  // Shipped occupancy prior is symmetric Beta(1,1) (kBetaOccPrior=kBetaFreePrior
-  // =1, p_occ=0.5) — decoupled from (num_classes, α₀).
+  // Shipped occupancy prior is symmetric Jeffreys Beta(0.5,0.5)
+  // (kBetaOccPrior=kBetaFreePrior=0.5, p_occ=0.5) — decoupled from (num_classes, α₀).
   // slop = kPriorSlop (1e-4) matches the sender's at-prior emit gate so a
   // barely-observed Beta voxel the sender put on the wire is not dropped on refold.
   const float slop = kPriorSlop;
@@ -119,12 +119,12 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
 /// `sem_cnt > 0` test.
 ///
 /// OCCUPANCY now uses the SAME prior as the fused Voxel: a_occ / a_free are copied
-/// verbatim from the BetaVoxel, which ships the symmetric Beta(1,1) prior
+/// verbatim from the BetaVoxel, which ships the symmetric Beta(0.5,0.5) prior
 /// (a_occ = a_free = 1.0 → prior p_occ = 0.5) — identical to the unified/fused Voxel
 /// (defaultVoxel). So there is no longer a prior-induced p_occ / variance / EIG /
 /// SSMI gap vs the fused Voxel at the prior. (Historically the split path used a calibrated
 /// Beta(C·α_0, α_0) prior, p_occ = C/(C+1) ≈ 0.933; that was switched to
-/// Beta(1,1).)
+/// Beta(0.5,0.5).)
 inline scovox::Voxel projectBetaDirToVoxel(
     const scovox::BetaVoxel& b, const scovox::DirVoxel* d,
     uint16_t num_classes, float alpha_0) {
@@ -150,7 +150,7 @@ inline scovox::Voxel projectBetaDirToVoxel(
 }
 
 /// Pure core of the per-cell occupancy refold (BetaVoxel stream). Reset the
-/// fused cell to the symmetric Beta(1,1) prior, then fold every NON-prior source
+/// fused cell to the symmetric Beta(0.5,0.5) prior, then fold every NON-prior source
 /// via mergeBeta (seed-copying the first non-prior source). `sources[i] ==
 /// nullptr` means that source has no voxel at this cell; sources at prior are
 /// skipped via isPriorBeta (a pure optimisation — folding the prior is a no-op).

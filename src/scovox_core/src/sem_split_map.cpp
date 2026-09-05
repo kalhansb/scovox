@@ -69,9 +69,10 @@ void dirichletUpdate(DirVoxel*                 d,
                      int32_t                   tz = 0) {
   // THE deposit. Every branch of this function — no signal, zero softmax, HARD,
   // SOFT, THRESH — adds exactly `class_share` and no more, so the add belongs
-  // here, once, rather than being re-derived on each exit path. Under the
-  // shipped `--hit-share flat` this makes `s_total − C·α₀` the voxel's exact
-  // look count: one float add per look, rather than a dozen small ones spread
+  // here, once, rather than being re-derived on each exit path. That makes
+  // `s_total − C·α₀` one running sum of one `class_share` per look — under
+  // `--hit-share flat` an exact integer look count, and under the promoted
+  // share mode an exact weighted one — rather than a dozen small adds spread
   // over four accumulators that round apart as the voxel's total grows.
   // What follows only ATTRIBUTES this mass to slots; `d->other()` is whatever
   // is left over.
@@ -295,6 +296,14 @@ SemSplitMap::Params sanitise(SemSplitMap::Params p) {
   // today -- it bounds what a future config can silently do.
   p.w_occ  = beta_lattice_snap(p.w_occ);
   p.w_free = beta_lattice_snap(p.w_free);
+  // The prior is accumulated into the same counters the weights are, so it
+  // needs the same lattice. A non-positive prior is not a valid Beta and would
+  // make `p_occ` of a freshly allocated voxel 0, 1 or NaN, so it falls back to
+  // the shipped constant rather than being clamped to an arbitrary epsilon.
+  if (p.beta_occ_prior  <= 0.f) p.beta_occ_prior  = kBetaOccPrior;
+  if (p.beta_free_prior <= 0.f) p.beta_free_prior = kBetaFreePrior;
+  p.beta_occ_prior  = beta_lattice_snap(p.beta_occ_prior);
+  p.beta_free_prior = beta_lattice_snap(p.beta_free_prior);
   return p;
 }
 
@@ -324,10 +333,11 @@ SemSplitMap::SemSplitMap(const Params& p)
     // Beta-grid block geometry: the flush walk must reproduce the accessor's
     // own leaf order, so the stage is keyed by the SAME (sanitised) leaf_bits.
     , carve_stage_(params_.leaf_bits)
-    // Shipped occupancy prior is symmetric Beta(1,1) → p_occ=0.5, decoupled from
-    // the semantic (num_classes, α₀).
-    , beta_occ_prior_(kBetaOccPrior)
-    , beta_free_prior_(kBetaFreePrior) {}
+    // Occupancy prior, cached out of the sanitised Params. Its default is the
+    // shipped symmetric Beta(0.5,0.5) → p_occ=0.5, decoupled from the semantic
+    // (num_classes, α₀).
+    , beta_occ_prior_(params_.beta_occ_prior)
+    , beta_free_prior_(params_.beta_free_prior) {}
 
 // ===========================================================================
 // Allocation (enforce prior at first touch — Bonxai zero-inits leaf blocks)

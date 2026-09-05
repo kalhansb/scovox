@@ -305,7 +305,7 @@ private:
   // NOTE: the RPC query services (GetRegion / GetOccupancyGrid) project the
   // split Beta(+Dir) grids into a transient scovox::Voxel via a
   // substrate-agnostic templated core. The SEMANTIC query math uses the
-  // raw-evidence convention; the OCCUPANCY math uses the symmetric Beta(1,1)
+  // raw-evidence convention; the OCCUPANCY math uses the symmetric Beta(0.5,0.5)
   // prior (p_occ=0.5) — see projectBetaDirToVoxel.
   // Occupancy-only services (GetOccupancyGrid) read just the Beta grid;
   // GetRegion joins the Dir grid for per-class evidence.
@@ -558,7 +558,7 @@ private:
   std::vector<const scovox::BetaVoxel*> refold_beta_src_;
   std::vector<const scovox::DirVoxel*>  refold_dir_src_;
 
-  // BetaVoxel-typed refold. Reset fused[mc] to the symmetric Beta(1,1) occupancy
+  // BetaVoxel-typed refold. Reset fused[mc] to the symmetric Beta(0.5,0.5) occupancy
   // prior, then fold every source's value via mergeBeta (conjugate Beta consensus).
   // The reset-then-refold core lives in scovox::refoldBeta (shared with tests).
   void refoldCellBeta(
@@ -658,7 +658,7 @@ private:
       // (Gating on isPriorBeta rather than a p_occ threshold keeps this correct
       // for any prior: the old calibrated prior p_occ ≈ 0.933 exceeded the 0.7
       // threshold and would publish as phantom occupied; the prior is now
-      // Beta(1,1)/0.5.) Mirror the RPC walkers' gate.
+      // Beta(0.5,0.5)/0.5.) Mirror the RPC walkers' gate.
       if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
       if (v.p_occ() >= ot) pc_scratch.emplace_back(co, v);
     });
