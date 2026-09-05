@@ -156,15 +156,24 @@ class BinarySerializer {
   // re-sent snapshots from the same bad sender agree, so the per-frame equality
   // check can't catch it). No real taxonomy approaches this ceiling.
   static constexpr uint16_t MAX_NUM_CLASSES = 4096;
-  // Blob codec revision (distinct from the ROS envelope `version`=5 that routes
-  // to this codec). Bumped 5→6 for the block-run coordinate coding + u16
-  // payload quantization; 6→7 for the fine-TSDF band (fine_ratio_log2 header
+  // Blob codec revision (distinct from the ROS envelope version,
+  // ENVELOPE_VERSION below, which routes a message to this codec). Bumped
+  // 5→6 for the block-run coordinate coding + u16 payload
+  // quantization; 6→7 for the fine-TSDF band (fine_ratio_log2 header
   // byte + trailing fine stream); 7→8 for u8 sqrt-companded evidence
   // payloads + u8 class ids (see the revision-8 block in the file header).
   // Any layout change means a mixed-revision fleet fails loud (deserialize
   // rejects the VERSION byte and the frame is dropped with a warning) instead
   // of silently misparsing.
   static constexpr uint8_t  FORMAT_VERSION = 8;
+  // ROS envelope version, carried in ScovoxMapBinary::version. It answers a
+  // different question from FORMAT_VERSION: the envelope says which codec the
+  // message body belongs to, the codec revision says which layout that codec
+  // is on. They move independently — every bump above left this at 5. Lives
+  // here, next to its sibling, so the sender (scovox_node) and the receiver
+  // (dscovox_node) — which are in the same package but were agreeing on a bare
+  // literal — cannot drift.
+  static constexpr uint8_t  ENVELOPE_VERSION = 5;
   // Sanity ceiling on the fine-lattice ratio: k=8 is res/256 — far beyond any
   // deployable fine resolution. A forged large k would reconstruct absurd
   // fine lattices downstream (res_fine underflow in consumers).

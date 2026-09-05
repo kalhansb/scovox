@@ -311,10 +311,11 @@ private:
   // GetRegion joins the Dir grid for per-class evidence.
   // ==================================================================
   void onBinaryMap(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
-    if (msg->version != 5) {
+    if (msg->version != scovox::BinarySerializer::ENVELOPE_VERSION) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "wire receiver expects envelope version 5, got %d (dropping)",
-        msg->version);
+        "wire receiver expects envelope version %d, got %d (dropping)",
+        static_cast<int>(scovox::BinarySerializer::ENVELOPE_VERSION),
+        static_cast<int>(msg->version));
       return;
     }
     // The frame body is serialized in host byte order (BinarySerializer uses raw

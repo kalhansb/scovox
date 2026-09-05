@@ -2127,9 +2127,9 @@ private:
   // coords from the SemSplitMap substrate, reads each voxel's current state,
   // builds a BinarySerializer::Frame (three streams), optionally elides the
   // TSDF section per share_tsdf_, LZ4-compresses, and publishes with
-  // msg->version=5. Beta (occupancy) and Dir (semantics) cross the wire as
-  // SEPARATE streams — the receiver merges each with its own conjugate rule
-  // (consensus_merge.hpp), losslessly.
+  // msg->version = BinarySerializer::ENVELOPE_VERSION. Beta (occupancy) and
+  // Dir (semantics) cross the wire as SEPARATE streams — the receiver merges
+  // each with its own conjugate rule (consensus_merge.hpp), losslessly.
   //
   // Snapshot-on-resub + at-prior elision are applied per grid. This is the
   // node's only wire path; the SPLIT substrate (semsplit()) is always valid.
@@ -2508,7 +2508,8 @@ private:
       bin.header.stamp    = get_clock()->now();
       bin.header.frame_id  = int_frame_;
       bin.map_from_source  = map_from_source;
-      bin.version          = 5;   // envelope version — dscovox onBinaryMap routes on it
+      // dscovox onBinaryMap routes on this.
+      bin.version          = scovox::BinarySerializer::ENVELOPE_VERSION;
 #if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
       bin.little_endian = true;
 #else
