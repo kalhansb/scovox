@@ -34,7 +34,8 @@ function names will not. The previous version of this document is at
 `SCOVOX_TRACK_NHIT` is no longer set (the counter was write-only; the dump is
 byte-identical with or without it). `SCOVOX_BETA_U16` is on by default in the
 headers and needs no flag. All four values are already the header defaults
-except `E0_COUNTERS`, which is a diagnostics-only counter set. Any build that
+except `E0_COUNTERS`, whose default is `0` — it is a diagnostics-only counter
+set, and the flag turns it on. Any build that
 sets `SCOVOX_EVICT_INHERIT` to a non-zero value, or any of the removed
 `SCOVOX_VICTIM_MEAN` / `SCOVOX_VICTIM_QMAX` / `SCOVOX_ADMIT_NORM` flags, is
 refused at compile time by `#error` traps in
@@ -262,7 +263,7 @@ baseline loses it 8/8).
 > `.build/e5/k2_i0_evid/replay_scenenn`, md5 `60e17da907d0`, built
 > **2026-08-30**. Three commits since then change what the deposit path does:
 > `e316f07` (hit batching default-on, `uint16` Beta), `d5da6a8` (the exact walk
-> replaces Bresenham) and `1101e53` (count storage). Re-running the promoted arm
+> replaces the earlier approximate traversal) and `1101e53` (count storage). Re-running the promoted arm
 > on the current binary, same CLI and same frames, moves occupancy IoU by −0.029
 > on scene 016 and −0.062 on 015: `n_pred_occupied` falls ~26 %, precision
 > rises, recall falls, intersection mIoU rises, union mIoU falls. Ray counts are
@@ -357,18 +358,64 @@ Line counts (working tree): `scovox_node.cpp` 3396, `sem_split_map.cpp`
 
 | macro | default | effect |
 |---|---|---|
-| `SCOVOX_K_TOP` | 2 | slots per `DirVoxel` (`voxel.hpp:21-24`) |
-| `SCOVOX_TRACK_QMAX` | 1 | per-slot confidence `qmax[]`; +4 B; required by evict-by-confidence (`dir_voxel.hpp:108-109`) |
-| `SCOVOX_TRACK_NHIT` | 0 | per-slot deposit counter; write-only; +4 B (`dir_voxel.hpp:118-119`) |
-| `SCOVOX_BETA_U16` | 1 | 2×u16 fixed-point Beta counters (`beta_voxel.hpp:68-69`) — **uncommitted default flip** |
-| `SCOVOX_BETA_U16_SCALE` | 8 | lattice step ⅛ (`beta_voxel.hpp:78-79`) |
-| `SCOVOX_E0_COUNTERS` | unset | admission/eviction counters (`e0_counters.hpp`) |
-| `SCOVOX_EVICT_INHERIT` | must be 0 | any other value → `#error` (`dir_voxel.hpp:142-144`) |
-| `SCOVOX_VICTIM_MEAN`, `SCOVOX_VICTIM_QMAX`, `SCOVOX_ADMIT_NORM` | removed | `#error` (`dir_voxel.hpp:133-141`) |
+| `SCOVOX_K_TOP` | 2 | slots per `DirVoxel` (`voxel.hpp:20-21`) |
+| `SCOVOX_TRACK_QMAX` | 1 | per-slot confidence `qmax[]`; +4 B; required by evict-by-confidence (`dir_voxel.hpp:111-112`) |
+| `SCOVOX_TRACK_NHIT` | 0 | per-slot deposit counter; write-only; +4 B (`dir_voxel.hpp:121-122`) |
+| `SCOVOX_BETA_U16` | 1 | 2×u16 fixed-point Beta counters (`beta_voxel.hpp:69-70`) |
+| `SCOVOX_BETA_U16_SCALE` | 8 | lattice step ⅛ (`beta_voxel.hpp:79-80`) |
+| `SCOVOX_DEPOSIT_TRACE` | 0 | per-deposit trace sink; null unless one is installed (`sem_split_map.hpp:63-64`) |
+| `SCOVOX_E0_COUNTERS` | 0 | admission/eviction counters (`e0_counters.hpp:42-44`) |
+| `SCOVOX_EVICT_INHERIT` | must be 0 | any other value → `#error` (`dir_voxel.hpp:145-147`) |
+| `SCOVOX_VICTIM_MEAN`, `SCOVOX_VICTIM_QMAX`, `SCOVOX_ADMIT_NORM` | removed | `#error` (`dir_voxel.hpp:135-143`) |
 
 Size invariants are `static_assert`ed: `DirVoxel` 20 B at K=2 with QMAX
-(`dir_voxel.hpp:245-246`), 16 B without; `BetaVoxel` 4 B under u16, 8 B float
-(`beta_voxel.hpp:273-276`); `TsdfVoxel` 8 B (`tsdf_voxel.hpp:31`).
+(`dir_voxel.hpp:251-253`), 16 B without; `BetaVoxel` 4 B under u16, 8 B float
+(`beta_voxel.hpp:274-277`); `TsdfVoxel` 8 B (`tsdf_voxel.hpp:31`).
+
+#### What the build system itself sets (nothing)
+
+The table above is the whole switch story, because **no `CMakeLists.txt` in the
+tree defines a single compile macro**. Every switch above takes its value from an
+`#ifndef` default in a header unless a `-D` overrides it on the command line, so
+"the default build" and "the header defaults" are the same object. Read back
+from the generated `build.ninja`, the compile line for every core and mapping TU
+is exactly:
+
+```
+-O3 -DNDEBUG -std=gnu++17 -Wall -Wextra
+```
+
+`CMAKE_CXX_FLAGS` is empty; both C++ package `CMakeLists.txt` files
+(`scovox_core` and `scovox_mapping` — `scovox_msgs` is message generation only
+and sets neither) default `CMAKE_BUILD_TYPE` to `Release` (with the reason
+written down) and add `-Wall -Wextra`. There is no `-march`, no `-ffast-math`, and no LTO. Three
+consequences worth knowing:
+
+* **`-DNDEBUG` costs almost no checking.** Exactly one `assert()` exists outside
+  the tests (`carve_stage.hpp:78`); every other invariant is a `static_assert`,
+  which `NDEBUG` does not touch.
+* **`-march` is left off deliberately, not by omission.** The x86-64 baseline has
+  no FMA, so although `-std=gnu++17` leaves `-ffp-contract=fast` enabled, no
+  contraction actually happens. Turning on `-march=native` emits 76 `vfmadd` /
+  `vfmsub` instructions, which can change float results — and byte-identity of
+  the output map across builds is a contract this project leans on.
+* **Every switch declares its own `#ifndef` default**, so `-Wundef` can be
+  carried permanently at zero noise and an undeclared `#if` switch is impossible
+  in source. `SCOVOX_E0_COUNTERS` was the last exception and now declares `0` at
+  `e0_counters.hpp:42-44`.
+* **A misspelled `-D` on a build command line is a different hazard**, which no
+  warning flag catches and no md5 distinguishes from an intended change. The
+  binary reports its own compiled-in switch values instead:
+  `scovox::buildSwitches()` (`version.hpp` / `src/version.cpp`) returns one
+  `NAME=value` line, and `replay_scenenn` prints it to stderr at startup, so a
+  run log records what the binary *is* rather than only that two builds differ.
+
+Note that `-O2` cannot be selected by passing it in `CMAKE_CXX_FLAGS`: cmake
+emits `CMAKE_CXX_FLAGS_RELEASE` (`-O3 -DNDEBUG`) after it and the last `-O` on
+the line wins. Override `CMAKE_CXX_FLAGS_RELEASE` instead —
+`../scovox_slot_rules/scripts/build_flags.sh` (the harness repo, a sibling of
+this one) does this and prints each arm's
+actual compile line, read back from `build.ninja` rather than the one intended.
 
 #### Voxel types
 

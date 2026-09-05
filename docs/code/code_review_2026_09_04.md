@@ -1033,3 +1033,187 @@ monotone in alpha_0 all the way to 1000, so selecting on it selects the uniform
 prior. ECE, the metric that most directly asks whether the probabilities are
 honest, is best at the incumbent and degrades monotonically upward. `alpha_0`
 stays at 0.01.
+
+## Addendum — 2026-09-05: code-smell sweep of the full tree
+
+A maintainability pass over the whole non-vendor, non-test source: **14 402
+lines** across 33 files. Scope is deliberately different from the rest of this
+review — nothing below is a claim about mIoU or timing. `S`-prefixed ids so
+they cannot be confused with the `H`/`M`/`L` findings above.
+
+Two things should be said before the list, because they change how the list
+reads. **There are zero `TODO`, `FIXME`, `HACK` or `XXX` markers in the entire
+tree**, and **zero compiler warnings under `-Wall -Wextra`** at `-O2`, `-O3`,
+`-O3 -march=native` and LTO (four separate configures; LTO is the interesting
+one, since it is the pass that surfaces cross-TU problems). There is no
+`const_cast`, no `goto`, no raw `new`/`delete`, and no owning raw pointer. The
+two ROS nodes share **no** duplicated 6-line window between them. The two
+standing comment rules hold exactly: **0** comments cite a `.md` path, and **0**
+quote an mIoU or timing number. So what follows is not a codebase in trouble —
+it is a small number of specific, mostly mechanical items.
+
+### S1 — `SCovoxNode` is a god object, and it is the untested 30 %
+
+**Status 2026-09-05: PARTIAL.** The two duplicated idioms inside `publishBinaryMap` were extracted to `node_utils.hpp` and are now unit-tested (S6). The full class decomposition was not attempted — the remaining 40 methods still sit in one translation unit and are still untested.
+
+`scovox_node.cpp` is **3421 lines** — 24 % of the tree in one file — holding one
+class with **148 member variables**, **42 methods** and **168 declared ROS
+parameters** (138 node + 30 map). Four of its methods are over 170 lines
+(`publishBinaryMap` 452, `declareNodeParams` 387, `integrateLidarSnapshot` 286,
+the constructor 271).
+
+The sharper half of the finding is where the test boundary falls. **No test
+compiles `scovox_node.cpp` or `dscovox_node.cpp`.** Those two files are 4414
+lines, 31 % of the tree, and their coverage is zero. The tested/untested line is
+exactly the `.hpp` / `.cpp` boundary of the node packages.
+
+This is not an argument for testing a ROS node in place. The project already has
+the right answer and has used it three times: pull the logic into a header and
+test that. `topk_provider.hpp`, the heartbeat re-emit in `node_utils.hpp` and
+`dscovox_consensus.hpp` were each extracted out of a node and each has a suite.
+The gap is that the single largest and most-branching function in the codebase,
+`publishBinaryMap`, has not had the same treatment — while its exact
+counterpart, `BinarySerializer::deserialize`, is 175 lines and *is* tested.
+
+### S2 — `publishPointCloud` hardcodes two semantic slots, and its guard checks the wrong side
+
+**Status 2026-09-05: FIXED.** The slot loops are bounded by `scovox::K_TOP` (`scovox_node.cpp:2103`, `:2187`) and the parameter is clamped to the compiled-in cap with a warning naming the recompile needed (`:362-368`).
+
+`scovox_node.cpp:2815` reads
+
+    static_assert(scovox::K_TOP >= 1, "publishPointCloud requires at least 1 sparse slot");
+
+but the schema immediately below names `sem_cnt0`, `sem_cls0`, `sem_cnt1`,
+`sem_cls1` and nothing else, and the copy loop guards only the low side
+(`if constexpr (scovox::K_TOP >= 2)`). `K_TOP == 1` is therefore handled
+correctly. **`K_TOP >= 3` is not**: slots 2… are silently absent from the
+published cloud, with no error, no warning, and a `static_assert` that passes.
+
+The contrast with the wire path is what makes this a defect rather than a
+limitation. `binary_serializer.hpp` is K-generic, carries a `K_TOP_wire` byte in
+the header, and makes the receiver assert it matches — sender/receiver K
+disagreement fails loud by design. `publishPointCloud` is the one place in the
+tree that quietly assumes 2.
+
+This blocks a planned experiment: a K sweep needs one build per K, and at K=3 or
+4 the point-cloud output would be wrong without saying so. Fix is one line —
+`static_assert(scovox::K_TOP == 2, …)` to fail the build honestly, or a loop
+over the slots to make it actually generic.
+
+### S3 — The ROS envelope version is an unnamed literal duplicated across two packages
+
+**Status 2026-09-05: FIXED.** `BinarySerializer::ENVELOPE_VERSION` now names it alongside `FORMAT_VERSION`, and both ends read the constant.
+
+Sender, `scovox_node.cpp:2519`:
+
+    bin.version = 5;   // envelope version — dscovox onBinaryMap routes on it
+
+Receiver, `dscovox_node.cpp:314`:
+
+    if (msg->version != 5) { … "expects envelope version 5, got %d (dropping)" … }
+
+Three bare `5`s in two packages, agreeing by hand. The codec revision sitting
+right next to it does the same job correctly: `FORMAT_VERSION = 8` is a named
+constant in `binary_serializer.hpp`, written by `serialize` and checked by
+`deserialize`, so the two ends cannot drift. Bumping the *envelope* version is
+the operation with no such protection.
+
+### S4 — `binary_serializer.hpp`'s file header still says the codec revision is 6
+
+**Status 2026-09-05: FIXED.** The header now points at `FORMAT_VERSION` as the single definition instead of restating a number that goes stale on the next bump.
+
+`binary_serializer.hpp:65` — "The blob VERSION byte is the codec revision: now 6
+(was 5)…". `FORMAT_VERSION = 8` at `:164`, and the layout block at `:103` says
+`[VERSION: u8 = 8]`. Revisions 7 and 8 each appended a new paragraph to the file
+header instead of updating that sentence, so the first statement a reader meets
+about the wire revision is two bumps stale — in the one file where a wrong
+version number is most expensive.
+
+### S5 — `0xFFFF` is written 76 times with no name
+
+**Status 2026-09-05: FIXED.** `kEmptySlot` (`voxel.hpp:55`, `inline constexpr`) replaces the 69 sites that mean *empty class slot*; the bit-mask, saturation-ceiling and unrelated-sentinel uses of the same literal were deliberately left alone. Verified by byte-identity of the emitted wire.
+
+The empty-slot sentinel appears as a bare literal 76 times across the non-test
+tree, and `65535` (the same value, and also the `nhit` saturation ceiling) a
+further 17. The same codebase already names the neighbouring sentinel —
+`sem_split_map.hpp:754`, `static constexpr uint32_t kNoHitProbs = 0xFFFFFFFFu` —
+so the convention exists and simply was not applied here. A `kEmptySlot` in
+`dir_voxel.hpp` is a pure rename with a byte-identity check available.
+
+### S6 — `publishBinaryMap` repeats one traversal idiom four times and one gate idiom twice
+
+**Status 2026-09-05: FIXED.** `emitSnapshotOrTouched` and `gateAndRefresh` in `node_utils.hpp` hold the idiom once, including the `setValue` correctness note, and `test_publish_gate.cpp` covers them (13 cases, including the two composed).
+
+Inside the 452 lines, this shape appears verbatim for `tsdf`, `fine_tsdf`,
+`beta` and `dir`:
+
+    if (snapshot) { grid.forEachCell(emit_X); clearTouchedX(); }
+    else { for (const auto& c : drainTouchedX()) if (auto* v = acc.value(c,false)) emit_X(*v,c); }
+
+and this one twice, for `beta` and `dir`, differing only in the changed-since-
+emit predicate and the wire transform: two `std::optional` accessors, a
+`!snapshot` gate check, `gacc->setValue(c, v)`, and a conditional stamp write.
+The tell is the comment. The first copy carries a real correctness note — that
+it must be `setValue` and not `*value(c, true) = v`, because the preceding miss
+caches a null leaf pointer — and the second copy has to say "see the Beta gate
+note above". Load-bearing knowledge restated because the code was copied is
+exactly the case for extracting it once.
+
+### S7 — `map_mtx_` is a comment-enforced contract in a 42-method class
+
+**Status 2026-09-05: OPEN.** Not attempted this round.
+
+Six methods document "Caller must hold `map_mtx_` (shared)" or "(unique)" —
+`:2072`, `:2780`, `:2963`, `:3026`, `:3054`, and `publishBinaryMap` implicitly.
+The lock is real (`std::shared_mutex`, taken at six other sites) but the contract
+is prose. In a class this size a caller can be added without ever meeting the
+comment. Clang's `-Wthread-safety` annotations, or a tag parameter the caller
+can only construct while holding the lock, would make it checkable.
+
+### S8 — one build switch has no default, which is what keeps `-Wundef` off
+
+**Status 2026-09-05: FIXED.** `SCOVOX_E0_COUNTERS` declares `#ifndef … 0` at `e0_counters.hpp:42-44`, so every switch now has a default and `-Wundef` has nothing left to report. The *general form* named at the end of this section is also done — see S9.
+
+Six of the seven compile-time switches declare their own default
+(`SCOVOX_BETA_U16` 1, `SCOVOX_BETA_U16_SCALE` 8, `SCOVOX_TRACK_QMAX` 1,
+`SCOVOX_TRACK_NHIT` 0, `SCOVOX_K_TOP` 2, `SCOVOX_DEPOSIT_TRACE` 0) via
+`#ifndef`. `SCOVOX_E0_COUNTERS` does not — it is only ever tested with a bare
+`#if`, so it is the preprocessor's silent 0.
+
+Measured: compiling `sem_split_map.cpp` with `-Wundef` added produces **exactly
+three warnings, all of them this one macro**. Giving it the `#ifndef … 0` its
+six siblings have would let `-Wundef` be turned on permanently at zero noise,
+which makes an undeclared `#if` switch impossible in source from then on.
+
+Two scoping notes so this is not oversold. `-Wundef` does **not** catch a
+misspelled `-D` on a build command line — that is a different hazard, and it is
+currently guarded only for the four *removed* flags, by the `#error` traps at
+`dir_voxel.hpp:135-147` (which are the right pattern and should be kept). The
+general form of that guard would be for the binary to report its own compiled-in
+switch values so a build manifest records what a binary *is* rather than only
+its md5; `replay_scenenn` already refuses `--evict-by-confidence` on a
+non-`TRACK_QMAX` build, so the ingredients are there.
+
+### S9 — `version.hpp` is included by nothing
+
+**Status 2026-09-05: FIXED.** Wired, not dropped: `version.hpp` now declares `scovox::buildSwitches()` (implemented in `src/version.cpp` by stringifying the macros the library itself compiled with), and `replay_scenenn` prints it to stderr at startup. This is the command-line half of the S8 hazard — the half `-Wundef` cannot reach.
+
+The only orphan among the 22 public headers. It defines `SCOVOX_VERSION_STRING
+"0.1.0"` and four constants, and no file in the tree includes it — while the
+wire carries two other, unrelated version numbers (S3, S4) that it has nothing
+to do with. Logged rather than deleted: either wire it into the envelope/codec
+story or drop it, but do not leave a third version concept lying around unused.
+
+### S10 — 36 comment lines name types that no longer exist (watch item, not a defect)
+
+**Status 2026-09-05: PARTIAL.** `Bresenham` is at 0 mentions in the source tree, on user instruction — the deleted traversal must not read as a still-available option anywhere in the live code, and one launch-file parameter description was actively wrong about which traversal the build uses. The removal log in `docs/archive/design/` keeps the name, by the standing rule that everything removed stays logged. `SemDirMap` (8) and `SemDirVoxel` (14) remain as historical framing.
+
+`SemDirMap` ×5, `SemDirVoxel` ×11, `Bresenham` ×2, "unified" ×18 — all in
+comments, none in code (the single `SemDirVoxel` in code is inside a
+`static_assert` message). The overall comment ratio is **0.63 comment lines per
+code line**, which for this codebase is a feature: the *why* is the deliverable
+and the design-choice register lives in the comments by standing instruction.
+The corollary is that 5164 comment lines are a maintenance surface, and these 36
+are where prose already outlived its subject. Most read as deliberate historical
+framing ("de-unifies `SemDirMap` into…"), which is wanted; they are listed so a
+future reader can tell that apart from rot such as S4.
