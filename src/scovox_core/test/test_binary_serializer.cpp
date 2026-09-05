@@ -368,19 +368,25 @@ TEST(BinarySerializer, QuantizedClampsBelowPriorAndAboveCap) {
   f.alpha_0     = scovox::kDefaultDirichletPrior;
   f.quant_step  = kStep;
 
+  // The below-prior input is written as a FRACTION of the prior, not as a
+  // literal: a literal chosen under one prior silently stops being below the
+  // next one, and the clamp then goes untested while the test still passes.
+  const float below_prior = 0.62f * scovox::kBetaFreePrior;
   f.beta_deltas.push_back(
-      {Bonxai::CoordT{0, 0, 0}, scovox::BetaVoxel{999.5f, 0.62f}});   // a_free < prior
+      {Bonxai::CoordT{0, 0, 0}, scovox::BetaVoxel{999.5f, below_prior}});
   f.beta_deltas.push_back(
-      {Bonxai::CoordT{0, 0, 1}, scovox::BetaVoxel{1.f + 2000.f, 1.f}});  // above cap
+      {Bonxai::CoordT{0, 0, 1},
+       scovox::BetaVoxel{scovox::kBetaOccPrior + 2000.f, scovox::kBetaFreePrior}});
 
   auto g = scovox::BinarySerializer::deserialize(
       scovox::BinarySerializer::serialize(f));
   ASSERT_EQ(g.beta_deltas.size(), 2u);
   EXPECT_FLOAT_EQ(g.beta_deltas[0].data.a_free, scovox::kBetaFreePrior);
-  // 999.5 sits in the top companding cell (q=255) → the cap, 1.5 above the
-  // input but within the ~7.9 local step there.
-  EXPECT_FLOAT_EQ(g.beta_deltas[0].data.a_occ, 1.f + 1000.f);
-  EXPECT_FLOAT_EQ(g.beta_deltas[1].data.a_occ, 1.f + 1000.f);
+  // 999.5 sits in the top companding cell (q=255) → the cap, which is
+  // `prior + 255²·step`; the input lands within the ~7.9 local step there.
+  const float cap = scovox::kBetaOccPrior + 1000.f;
+  EXPECT_FLOAT_EQ(g.beta_deltas[0].data.a_occ, cap);
+  EXPECT_FLOAT_EQ(g.beta_deltas[1].data.a_occ, cap);
 }
 
 // Rev 8 class-id packing: num_classes > 255 keeps u16 ids on the wire (the

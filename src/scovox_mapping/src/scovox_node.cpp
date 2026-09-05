@@ -851,7 +851,7 @@ private:
     rgbd_prof_.w_occ  = (float)dp("rgbd_w_occ",  0.0);
     rgbd_prof_.w_free = (float)dp("rgbd_w_free", 0.0);
     rgbd_prof_.kappa0 = (float)dp("rgbd_kappa0", (double)P.kappa0);
-    // Gate MUST be strictly above the Beta(1,1) prior (p_occ=0.5): with
+    // Gate MUST be strictly above the Beta(0.5,0.5) prior (p_occ=0.5): with
     // rgbd_w_occ=0 an RGB-D hit on a voxel LiDAR never touched allocates a Beta
     // voxel at prior, and the DIRICHLET gate is `p_occ_post >= min_p_occ`, so a
     // 0.5 default would commit semantics on prior-only geometry — defeating pure
@@ -2279,7 +2279,7 @@ private:
         ? static_cast<float>(map_params_.evidence_saturation) / 65025.f
         : 0.f;
 
-    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1)
+    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(0.5,0.5)
     const float dir_other_prior =
         static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
 
@@ -2845,7 +2845,7 @@ private:
         "sem_cls1",1,sensor_msgs::msg::PointField::UINT16);
     }
 
-    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(1,1)
+    const float beta_occ_prior = scovox::kBetaOccPrior;  // symmetric Beta(0.5,0.5)
     auto has_beta_evidence = [&](const scovox::BetaVoxel& b) {
       return b.a_occ > beta_occ_prior + 1e-3f || b.a_free > scovox::kBetaFreePrior + 1e-3f;
     };

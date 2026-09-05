@@ -36,6 +36,8 @@ static read could not have produced: an 8-scene re-score on the current binary.
 | M7 | Medium | `evidence_saturation` is one knob for two caps | **partly resolved** — trap documented at the point of use |
 | M8 | Medium | Experiment write-ups still print the demoted build flag | **resolved** — plus a second error found in the same block |
 | M9 | Medium | `batch_hits` stages the endpoint only; the semantic band is un-batched | open — mIoU unaffected, but it inverts any confidence read; **deferred action plan recorded, run on request** |
+| M10 | Medium | The semantic-uncertainty basis was undefined, and the ROS wire ships the wrong one | **basis resolved** (E12 — Dirichlet aggregation; `calib_alpha0.py:106`) — **but a live defect is now split out as M11**; vacuity is retracted as a functional (it is `-S` exactly) |
+| M11 | Medium | The published `semantic_confidence` is a Laplace+Hutter readout, not the posterior marginal | open — live on RViz, the npz exporter and both RPCs; `p_OTHER` inflated 6.6x at delta=20 |
 | L1 | Low | Stale byte-size and type-name comments | open |
 | L2 | Low | In-code references to moved or nonexistent documents | **partly resolved** — code swept; `scovox_slot_rules/scripts/` not |
 | L3 | Low | README document index broken by the archive move | **resolved** |
@@ -599,6 +601,129 @@ that first or the ranking has no dependent variable.
 
 ---
 
+### M10 — The semantic-uncertainty basis (RESOLVED by E12)
+
+**Status.** The basis question is settled. The measurement that settled it also
+retracts this section's own recommendation and exposes a live defect, split out
+below as **M11**.
+
+**Where.** `scovox_slot_rules/scripts/calib_alpha0.py:106-180` (the answer);
+`src/scovox_core/include/scovox/uncertainty.hpp:41-96` and
+`experiments/uncertainty/functionals.py` (deleted by `821374e`, recover with
+`git show fcf7c86:experiments/uncertainty/functionals.py`) — the rejected basis.
+
+**The resolution.** By **Dirichlet aggregation**, merging categories of a
+Dirichlet gives a Dirichlet whose alphas are the sums, so the
+`{slot_0, slot_1, OTHER}` marginal of the symmetric `C`-class posterior is
+*unique* — not a modelling choice. `reparam()` already computes it:
+
+```
+alpha_i = cnt[i]                        filled slot i   (already alpha0 + e_i)
+alpha_O = s_total - sum_filled cnt[i]   = (C - n_f)*alpha0 + e_pool
+A       = C*alpha0 + S
+H       = -sum p_j ln p_j                       total
+E[H]    = psi(A+1) - sum p_j psi(alpha_j+1)     aleatoric
+MI      = max(0, H - E[H])                      epistemic
+```
+
+The `n_pool = C - n_f` unresident classes are exchangeable under the symmetric
+prior, so their identical terms collapse and the cost is `O(K+1)` digammas per
+voxel. Mass conserves exactly; no Laplace `+1`, no Hutter floor.
+
+Laplace `+1` on the three cells is not a prior: it implies per-class prior 1 on
+residents and `1/(C-K)` on non-residents, the assignment is made *after* seeing
+which classes are resident, and it changes on every eviction. The OTHER `+1`
+never decays — that is the mechanism behind the 6.6x `p_OTHER` gap below.
+
+**What the two bases do to the numbers** (one class at delta = 20 deposits):
+
+| | `functionals.py` (Laplace + Hutter) | `reparam()` posterior marginal |
+|---|---|---|
+| resident slot alpha | `cnt + 1` | `alpha0 + evidence` |
+| OTHER alpha | `effectiveResidual + 1` | `(C-n_f)*alpha0 + escaped evidence` |
+| `H_y` | 0.206 | 0.047 |
+| `p_OTHER` | 0.053 | 0.008 |
+
+**Three retractions this section must carry.**
+
+1. *"the floor ships and never runs on the promoted map"* — **false**. See M11.
+2. *"vacuity is the only quotable functional"* — **retracted**. Vacuity is
+   `C*alpha0/A`, monotone in `S`, so as a ranking it is `-S` exactly: measured
+   `AUROC(vacuity) == AUROC(-S)` to **0.00e+00 on all 8 scenes**, mean 0.4752,
+   worse than chance. It is invariant to the basis because it is not an
+   uncertainty — it is a visit counter.
+3. *"E3.2 must fix one alpha basis before any number is quoted"* — done, and
+   the numbers are now quoted in `scovox_slot_rules/REVIEW_LOG.md` (E12).
+
+**What the basis bought, measured.** Aleatoric equals total
+(`max |AUROC(H) - AUROC(E[H])| = 1.24e-03`, 8 scenes); epistemic MI is dead
+(mean AUROC 0.5102, above chance 4/8, `spearman(miss_rate, AUROC_MI) = +0.071,
+p = 0.88`) because MI's large-`A` asymptote `(C-1)/(2A)` pins it at `A ~ 1e4`;
+`p_OTHER` is the miss detector (mean 0.7781, beating MI by +0.2679 and vacuity
+by +0.3029, both 7/8, `p = 0.0234`, material). And the whole family
+anti-correlates with scene difficulty:
+`spearman(miss_rate, AUROC_H) = -0.9286, exact p = 0.00223`. Full tables, the
+tempering sweep that disqualifies `class_evidence_saturation`, and the graded
+pre-registered predictions are in `scovox_slot_rules/REVIEW_LOG.md` under E12.
+
+**One trap survives for anyone reviving the deleted file.** It tests residency
+with `cnt > 0` and no `cls != EMPTY` guard, but a `DirVoxel` empty slot holds
+`cnt = alpha0 = 0.01 > 0` and would read as an observed class
+(`calib_alpha0.py:118` guards this). And `hutterEscapeMass` is **clamped** —
+`min(., N)` plus `ratio <= 1 -> N` (`uncertainty.hpp:75-79`) — which quotations
+of the bare formula routinely drop; at `m=1, N=0.14` the raw term is 3.816
+against a shipped 0.140.
+
+---
+
+### M11 — The published `semantic_confidence` uses the rejected basis
+
+**Where.** `src/scovox_mapping/include/scovox/dscovox_consensus.hpp:78`
+(`projectBetaDirToSemBetaForViz`) and `:128` (`projectBetaDirToVoxel`);
+`src/scovox_mapping/src/dscovox_node.cpp:702, 705, 813`;
+`src/scovox_mapping/src/scovox_node.cpp:2928`;
+`src/scovox_mapping/include/scovox/node_utils.hpp:246-247`.
+
+**What.** M10 previously recorded that `uncertainty.hpp` "never names
+`DirVoxel`" and therefore never runs on the promoted map. The first half is
+true and the conclusion does not follow: a projection exists whose entire
+purpose is to bridge the two. `projectBetaDirToSemBetaForViz` strips `alpha0`
+from every slot and `(C-K)*alpha0` from OTHER, yielding the raw-evidence
+convention the legacy helpers expect:
+
+```cpp
+out.a_unk    = std::max(0.f, d->other() - other_prior);   // other_prior = (C-K)*alpha_0
+out.sem_cnt[i] = std::max(0.f, d->cnt[i] - alpha_0);
+```
+
+`dscovox_node.cpp:705` then calls `argmaxClassConfidence`, whose denominator is
+`sum_cnt + n_active + effectiveResidual(v) + 1` (`node_utils.hpp:246-247`) —
+Laplace on the residents, Hutter-floored `+1` on OTHER. So the published
+`semantic_confidence` PointField, the `pointcloud_to_npz.py` export, the RViz
+colouring and both the GetRegion and GetOccupancyGrid RPCs all read the
+promoted state through the basis M10/E12 rejects.
+
+**Why it matters.** The `+1` on OTHER never decays, so a well-observed voxel's
+residual mass is over-stated without bound in the look count: at delta = 20 the
+readout gives `p_OTHER` 0.053 against the posterior marginal's 0.008, and `H_y`
+0.206 against 0.047. Confidence is correspondingly depressed, which interacts
+with the labelling threshold. Note the projection's own comment records that
+leaving the prior in `a_unk` had already made the published confidence disagree
+with the RPC for the identical voxel — the same class of bug, fixed once at the
+prior and still open at the `+1`.
+
+**Why it was not caught.** Nothing *evaluated* reads it. The mIoU scorer works
+off the `.slots` dump and the calibration study off `reparam()`; the confidence
+field is wire-only. That is also why the fix is low-risk for the published
+numbers and high-value for anything downstream that consumes the field.
+
+**Action.** Replace the `argmaxClassConfidence` denominator with the posterior
+marginal (`alpha_best / A`, `A = C*alpha0 + S`) computed directly from
+`DirVoxel`, and keep `semanticEntropy` / `semanticVariance` consistent with it
+— `node_utils.hpp:242-245` explicitly requires all three to share one
+categorical. Not done: it changes a wire value and needs its own before/after
+on the labelling threshold. Untested, not removed.
+
 ## Low
 
 ### L1 — Stale byte-size and type-name comments
@@ -759,8 +884,10 @@ after: both `a76dd502bb5b`.
   (`dir_voxel.hpp:133-144`); size `static_assert`s on all three voxel types.
 - `sanitise()` snaps `w_occ` / `w_free` onto the ⅛ lattice
   (`sem_split_map.cpp:297-298`) and the node snaps both fusion profiles
-  (`scovox_node.cpp:851-852`), so the count identity `a_occ = 1 + w_occ·n`
-  holds on both paths.
+  (`scovox_node.cpp:851-852`), so the count identity
+  `a_occ = kBetaOccPrior + w_occ·n` holds on both paths. Since 2026-09-05 the
+  prior in that identity is **0.5**, not 1.0 (see the new item below); `0.5 = 4/8`
+  is itself on the lattice, and `sanitise()` now snaps the two prior fields too.
 - The u16 Beta halving at 90 % of `kMax` runs unconditionally before the
   opt-in cap (`sem_split_map.cpp:1097-1102`) and cannot loop.
 - `applyDirSaturation` rebuilds `s_total` from the scaled parts and floors
@@ -777,3 +904,61 @@ after: both `a76dd502bb5b`.
 - `MultiThreadedExecutor(…, 2)` with the viz timer in its own callback group
   and `map_mtx_` as a `shared_mutex`; the `last_pc_pub_ns_` atomic in
   `dscovox` makes the rate limiter race-free under shared locks.
+
+
+## Addendum — 2026-09-05: the occupancy prior moved to Jeffreys `Beta(0.5,0.5)`
+
+`kBetaOccPrior` / `kBetaFreePrior` (`beta_voxel.hpp`) and `defaultBetaVoxel`'s
+default arguments are now `0.5f`, promoted from Bayes–Laplace `Beta(1,1)`. E11
+measured the switch across the eight SceneNN scenes at the shipped flags:
++0.0000 on union mIoU, intersection mIoU, occupancy IoU, both accuracies and
+band mIoU, 0/8 wins, with `n_occupied` (21164.2) and `n_intersect` (12519.1)
+identical to the voxel. The reason is algebraic — occupancy admission tests
+`p_occ > 0.5`, and for any symmetric `Beta(a,a)` that reduces to
+`W_occ > W_free` with `a` cancelling — so no tolerance is being leaned on.
+
+**Three sites this review should now treat as prior-sensitive.**
+
+1. `dscovox_node.cpp:661` publishes on `v.p_occ() >= ot` with `ot = 0.7`. The
+   cancellation above does not extend to a non-0.5 threshold: at
+   `w_occ=1.5, w_free=1.0` Jeffreys publishes after 2 hits against one miss
+   where `Beta(1,1)` needed 3. This is a real change on the ROS wire and is not
+   covered by the offline-dump measurement.
+2. `carve_skip_occ_threshold` (`sem_split_map.hpp:378`) compares `p_occ`
+   against an arbitrary value. It defaults to `0.0f` = off and the batched live
+   path has no wall guard at all (`sem_split_map.cpp:452,462-467`), which is
+   why the prior change is safe today — but a caller that enables it is
+   choosing a regime where the prior is load-bearing.
+3. `binary_serializer.hpp:284-285,454-455` quantize and dequantize `a_occ`
+   against `kBetaOccPrior`. Self-consistent for new data; a `.scovox_bin`
+   archived under `Beta(1,1)` now decodes 0.5 low.
+
+**Known divergence, deliberate.** The legacy `SemBetaVoxel` / `Voxel` substrate
+(`sembeta_voxel.hpp:129`, `voxel.hpp:89`, `map_interface.hpp:48`,
+`scovoxmap.cpp:45`) hardcodes `1.0f` and never reads the constants. It was left
+alone: it is a different substrate, and unifying it is a change no measurement
+here covers.
+
+**Sentinel worth noting.** `sanitise()` treats `beta_occ_prior <= 0.f` as
+"unset" and substitutes the constant, so Haldane `Beta(0,0)` cannot be reached
+through `--beta-occ-prior` / `--beta-free-prior`. That arm is untested, not
+rejected.
+
+**Test-suite note.** Seven tests hardcoded a prior of 1.0 and were rewritten in
+terms of the constants. One of them,
+`BinarySerializer.QuantizedClampsBelowPriorAndAboveCap`, had a latent hazard
+worth generalising from: its "below prior" input was the literal `0.62f`, which
+is below 1.0 but above 0.5, so under the new prior it would have stopped
+exercising the clamp *while still passing*. Prior-relative inputs, not
+literals, wherever a test's premise is "below the prior".
+
+**Pre-existing failure, unrelated.**
+`ScovoxMapSplitFarCarve.FarCarveBitIdenticalToFullWalk` fails at pristine HEAD
+on its `band = 0.30f` arm (verified by stashing the whole working tree: 183/184,
+that test the only failure; it fails identically with the constants reverted).
+The fast path stages more carve writes than the exact walk — 2887 vs 2886 on
+scan 0, 3043 vs 3040 on scan 3 — so the far-voxel reduction is not exact when
+`sem_band > sdf_trunc`: at band 0.30 / trunc 0.15 / res 0.05 `far_thr` is 7
+voxels while the walk already reaches 6 behind the hit. The shipped
+configuration runs `--sem-band 0.10 < sdf_trunc 0.15`, which is why it went
+unnoticed. **The suite baseline is 183/184, not 184/184.**

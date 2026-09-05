@@ -144,7 +144,7 @@ class SemSplitMap {
 
   /// Knobs mirror `SemDirMap::Params` 1:1 so a launch file porting between the
   /// two substrates needs no edits. The occupancy prior is the symmetric
-  /// Beta(1,1) constant (`kBetaOccPrior`), independent of `num_classes` /
+  /// Beta(0.5,0.5) constant (`kBetaOccPrior`), independent of `num_classes` /
   /// `alpha_0` (which set only the semantic Dirichlet prior).
   struct Params {
     double  resolution                 = 0.05;
@@ -171,6 +171,28 @@ class SemSplitMap {
 
     float   w_occ                      = 1.0f;   ///< Beta a_occ increment per hit (Stream A)
     float   w_free                     = 0.5f;   ///< Beta a_free increment per carve
+
+    /// Occupancy prior, `Beta(beta_occ_prior, beta_free_prior)`, stamped into
+    /// every voxel at first touch. Defaults to the shipped symmetric Beta(0.5,0.5)
+    /// (`kBetaOccPrior` / `kBetaFreePrior`); `beta_voxel.hpp` owns the choice
+    /// and the reasoning.
+    ///
+    /// These are fields rather than the bare constants so a prior can be swept
+    /// without a rebuild. Two properties bound what a sweep can reach:
+    ///
+    ///   - Any SYMMETRIC prior leaves every `p_occ >= 0.5` decision exactly
+    ///     where it was. `p_occ >= 0.5` iff `a_occ >= a_free` iff
+    ///     `c + w_occ·n_hit >= c + w_free·n_miss`, and `c` cancels. The
+    ///     deposit gate (`dirichlet_min_p_occ`) and the scorer's occupied set
+    ///     are both at exactly 0.5, so the occupied voxel set is invariant and
+    ///     only the `kappa0 · p_occ` deposit WEIGHT moves.
+    ///   - Both are snapped to the storage lattice by `sanitise()` for the
+    ///     same reason `w_occ` is: off-lattice, the count identity
+    ///     `a_occ = prior + w_occ·n_hit` stops holding under `SCOVOX_BETA_U16`.
+    ///     Beta(1,1) and Beta(0.5,0.5) are both whole eighths; the calibrated
+    ///     `Beta(C·α₀, α₀)` ablation is not, and needs a float build.
+    float   beta_occ_prior             = kBetaOccPrior;
+    float   beta_free_prior            = kBetaFreePrior;
     float   kappa0                     = 1.0f;   ///< class-share multiplier (Stream B)
     float   dirichlet_min_p_occ        = 0.5f;   ///< gate per-class update on Beta p_occ
 
@@ -384,7 +406,7 @@ class SemSplitMap {
     float   range_decay_length         = 50.0f;  ///< exp(-r/L); 0 disables (caller-applied)
 
     /// Dataset class count `C`. Sets the semantic OTHER prior `(C − K_TOP)·α₀`.
-    /// (The occupancy prior is the symmetric Beta(1,1) constant `kBetaOccPrior`,
+    /// (The occupancy prior is the symmetric Beta(0.5,0.5) constant `kBetaOccPrior`,
     /// independent of `C`.)
     uint16_t num_classes               = 14;
     /// Symmetric per-dim Dirichlet prior `α₀`.
@@ -743,10 +765,12 @@ class SemSplitMap {
   bool                       carve_frame_open_ = false;
   std::uint64_t carve_voxels_ = 0;
 
-  /// Symmetric Beta(1,1) occupancy prior (kBetaOccPrior/kBetaFreePrior) →
-  /// p_occ_prior = 0.5. Hot-path constants.
-  float                beta_occ_prior_;   ///< 1.0
-  float                beta_free_prior_;  ///< 1.0
+  /// The occupancy prior, cached out of the sanitised `Params` at construction
+  /// so the allocation path reads a member rather than chasing `params_`. The
+  /// default is the shipped symmetric Beta(0.5,0.5) (kBetaOccPrior/kBetaFreePrior)
+  /// → p_occ_prior = 0.5.
+  float                beta_occ_prior_;
+  float                beta_free_prior_;
 
   void carveRay(const Eigen::Vector3f& origin,
                 const Eigen::Vector3f& endpoint,
