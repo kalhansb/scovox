@@ -1464,3 +1464,35 @@ band voxel takes one deposit per depth pixel while the hit voxel takes one per
 frame), there are now two independent reasons a raw `s_total` overstates the
 semantic evidence behind a voxel. Neither affects mIoU — the scorer excludes
 Dir-only voxels by `state` — and both matter to any confidence readout.
+
+---
+
+## Addendum — 2026-09-05: the batch is verified byte-identical on all 8 scenes
+
+Every fix in this review series was claimed to be behaviour-preserving. That
+claim is now measured rather than asserted, three independent ways, and the
+detail lives in `scovox_slot_rules/REVIEW_LOG.md` under *"Verifying the
+code-review batch"*.
+
+- **The gate.** `scripts/verify_fixes.sh` PASSes: clean build at the shipped
+  `-O3` flag set with **0 warnings in our tree**, **0** under `-Wundef`,
+  `scovox_core` 184 / 1 and `scovox_mapping` 143 / 0. The one red is M4's
+  `FarCarveBitIdenticalToFullWalk` at `band = 0.30`, red at HEAD before this
+  batch.
+- **Byte identity against HEAD itself.** `scripts/pristine_head_replay.sh`
+  compiles a `git archive HEAD` snapshot of both trees — submodule `32121f2`,
+  toplevel `e04b76d` — at a flag line character-identical to the reviewed
+  build, and replays all eight scenes. **8/8 identical**, 458.8 MB of map
+  matching byte for byte from two different binaries.
+- **The metrics.** `cells/goal8.tsv` regrades the shipped candidate on all
+  eight scenes; see H4 above, whose `total` column reproduces unchanged.
+
+The scope this rests on: outside tests, the entire compiled delta of the batch
+is one function extraction (`bernoulliEntropy` out of the two
+`expectedInformationGain` overloads). `map_interface.hpp`, `version.hpp`,
+`scovoxmap.cpp`, `split_memory_demo.cpp` and all three touched YAMLs differ in
+**comments only**. Byte identity therefore confirms the scope claim; it does
+not validate the extraction, since no offline path calls it — the only callers
+are `scovox_node.cpp:2944` and `dscovox_node.cpp:725`. What covers the
+extraction is 18 assertions in `test_uncertainty.cpp`, three of them added for
+the guard's out-of-range and NaN behaviour, plus three in `test_beta_update.cpp`.
