@@ -78,6 +78,7 @@ set(SCOVOX_TEST_SOURCES
   test/test_tsdf_band.cpp
   test/test_marching_cubes.cpp
   test/test_heartbeat.cpp
+  test/test_publish_gate.cpp
 )
 
 foreach(TEST_SRC ${SCOVOX_TEST_SOURCES})
