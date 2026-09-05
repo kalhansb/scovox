@@ -564,6 +564,17 @@ source files, not documents.
 `MultiThreadedExecutor` with 2 threads; the viz timer sits in its own
 callback group; the map is guarded by `map_mtx_` (`std::shared_mutex`).
 
+**The `map_mtx_` contract is a parameter, not a comment.** Six helpers —
+`publishScovoxMap`, `publishPointCloud`, `publishTSDFPointCloud`,
+`publishFineTSDFPointCloud`, `onRefinementRegion`, `publishBinaryMap` —
+deliberately do not take the lock, because the viz timer holds one lock across
+four of them and `std::shared_mutex` is non-recursive. Each takes a
+`scovox::MapLockHeld&` (or `MapWriteHeld&` where it mutates): a witness with no
+public constructor, produced only by `scovox::MapReadLock` / `MapWriteLock`
+(`scovox_mapping/include/scovox/map_lock.hpp`), which are the only two ways the
+node takes `map_mtx_`. A caller that has not locked cannot name the argument,
+so the contract is checked by the shipped gcc build rather than by a reader.
+
 **Map parameters and their `dp()` defaults** (`declareMapParams`):
 
 | parameter | default | line |

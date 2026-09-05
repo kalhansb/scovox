@@ -37,6 +37,7 @@
 #include "scovox/node_utils.hpp"
 #include "scovox/topk_provider.hpp"
 #include "scovox/version.hpp"     // buildSwitches() — logged once at startup
+#include "scovox/map_lock.hpp"    // the map_mtx_ witness, see the header
 #include "scovox_msgs/msg/scovox_map.hpp"
 #include "scovox_msgs/msg/scovox_voxel.hpp"
 #include "scovox_msgs/msg/scovox_semantic_evidence.hpp"
@@ -200,18 +201,19 @@ public:
     viz_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     sm_timer_ = rclcpp::create_timer(this, get_clock(), std::chrono::duration<double>(1.0/sm_rate),
       [this]{
-        // Hold one shared_lock for the whole timer tick so the ScovoxMap and
+        // Hold one lock for the whole timer tick so the ScovoxMap and
         // PointCloud always represent the same map state, and so neither
         // helper races against scheduleMemUsage's detached reader thread or,
         // now that this timer lives in its own callback group under the
-        // MultiThreadedExecutor, against integration itself. publishScovoxMap
-        // and publishPointCloud must NOT take map_mtx_ themselves —
-        // std::shared_mutex is non-recursive, so re-locking here would be UB.
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        publishScovoxMap();
-        if (pub_pc_) publishPointCloud();
-        if (tsdf_pub_) publishTSDFPointCloud();
-        if (fine_tsdf_pub_) publishFineTSDFPointCloud();
+        // MultiThreadedExecutor, against integration itself. The four helpers
+        // must NOT take map_mtx_ themselves — std::shared_mutex is
+        // non-recursive, so re-locking here would be UB. `lock.held()` is what
+        // lets them require that without being able to acquire it.
+        scovox::MapReadLock lock(map_mtx_);
+        publishScovoxMap(lock.held());
+        if (pub_pc_) publishPointCloud(lock.held());
+        if (tsdf_pub_) publishTSDFPointCloud(lock.held());
+        if (fine_tsdf_pub_) publishFineTSDFPointCloud(lock.held());
       }, viz_cb_group_);
     if (bin_pub_ && share_rate_hz_ > 0.0) {
       // Timer-owned binary publish (share_rate_hz > 0): the sensor callbacks
@@ -223,8 +225,8 @@ public:
       bin_timer_ = rclcpp::create_timer(this, get_clock(),
         std::chrono::duration<double>(1.0 / share_rate_hz_),
         [this]{
-          std::unique_lock<std::shared_mutex> lock(map_mtx_);
-          publishBinaryMap();
+          scovox::MapWriteLock lock(map_mtx_);
+          publishBinaryMap(lock.held());
         });
       RCLCPP_INFO(get_logger(),
         "share timer: ScovoxMapBinary coalesced at %.2f Hz (change_gate=%d "
@@ -249,8 +251,8 @@ public:
           fine_region_topic_,
           rclcpp::QoS(rclcpp::KeepLast(100)).reliable().transient_local(),
           [this](const scovox_msgs::msg::RefinementRegion::SharedPtr m) {
-            std::unique_lock<std::shared_mutex> lock(map_mtx_);
-            onRefinementRegion(*m);
+            scovox::MapWriteLock lock(map_mtx_);
+            onRefinementRegion(*m, lock.held());
           });
       if (pub_fine_tsdf_) {
         fine_tsdf_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -1288,14 +1290,15 @@ private:
   ScanTailStats finishScanTail(
       const std::chrono::high_resolution_clock::time_point& t_start,
       const std::chrono::high_resolution_clock::time_point& t_tf,
-      const std::chrono::high_resolution_clock::time_point& t_integrate) {
+      const std::chrono::high_resolution_clock::time_point& t_integrate,
+      const scovox::MapWriteHeld& held) {
     ScanTailStats st;
     if (bin_pub_) {
       // share_rate_hz > 0: the share timer owns the publish. Touched coords
       // just accumulate here and coalesce at the next tick (drainTouched*
       // sort+uniques, so N same-voxel writes become one wire record).
       if (share_rate_hz_ <= 0.0) {
-        auto [bv,bm] = publishBinaryMap(); st.bin_bytes = bv; (void)bm;
+        auto [bv,bm] = publishBinaryMap(held); st.bin_bytes = bv; (void)bm;
       }
     }
     else {
@@ -1335,7 +1338,7 @@ private:
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(depth->header.stamp.nanosec & 0xFFFF);
     if (!have_di_.load(std::memory_order_acquire)) { RCLCPP_WARN(get_logger(), "recv=%zu replay=%u: waiting for CameraInfo", frame_recv_, replay_idx); return; }
-    std::unique_lock<std::shared_mutex> lock(map_mtx_);
+    scovox::MapWriteLock lock(map_mtx_);
     // TF-safe map republish stamp. Written under the unique_lock: the viz timer
     // (own callback group, second executor thread) reads it under a shared_lock,
     // and rclcpp::Time is not atomic — a pre-lock write would race it.
@@ -1392,7 +1395,8 @@ private:
     const DepthIntegrateResult res = integrateDepthSnapshot(snap);
     if (!res.admitted) return;   // frame-admission gate rejected the pose
     // `tail`, not `st`: this scope already has `const int st = stride_` above.
-    const ScanTailStats tail = finishScanTail(t_start, res.t_tf, res.t_integrate);
+    const ScanTailStats tail =
+        finishScanTail(t_start, res.t_tf, res.t_integrate, lock.held());
     RCLCPP_INFO(get_logger(),
                 "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
                 "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu",
@@ -1824,7 +1828,7 @@ private:
     split_map_->resetTiming();
     ++frame_recv_;
     uint16_t replay_idx = (uint16_t)(cloud->header.stamp.nanosec & 0xFFFF);
-    std::unique_lock<std::shared_mutex> lock(map_mtx_);
+    scovox::MapWriteLock lock(map_mtx_);
     // TF-safe map republish stamp — under the unique_lock; see onImages note.
     last_input_stamp_ = rclcpp::Time(cloud->header.stamp, RCL_ROS_TIME);
 
@@ -1881,7 +1885,8 @@ private:
     if (!res.admitted) return;   // gate reject or malformed cloud
     const bool do_deskew = res.do_deskew;
     const size_t ds_in = res.ds_in, ds_out = res.ds_out;
-    const ScanTailStats tail = finishScanTail(t_start, res.t_tf, res.t_integrate);
+    const ScanTailStats tail =
+        finishScanTail(t_start, res.t_tf, res.t_integrate, lock.held());
     RCLCPP_INFO(get_logger(),
                 "recv=%zu replay=%u frame_ms=%.1f tf_ms=%.1f integrate_ms=%.1f "
                 "publish_ms=%.1f rss_mb=%.1f tsdf_ms=%.1f sembeta_ms=%.1f bin_bytes=%zu "
@@ -1911,7 +1916,7 @@ private:
     // walk and avoid a use-after-free of `this`/map_mtx_/split_map_ at shutdown.
     if (mem_log_thread_.joinable()) mem_log_thread_.join();
     mem_log_thread_ = std::thread([this]() {
-      std::shared_lock<std::shared_mutex> lock(map_mtx_);
+      scovox::MapReadLock lock(map_mtx_);
       // Split-grid per-substrate memory log. Consumed by
       // eval_e13_byte_parity.py to compare TsdfMap bytes against
       // SLIM-VDB's vdb_tsdf_mb_final (acceptance gate 15%, paper headline
@@ -2077,9 +2082,10 @@ private:
     tsdf_pc_dirty_.store(true, std::memory_order_relaxed);
   }
 
-  // Caller must hold map_mtx_ (shared). Lock removed from this function so
-  // the timer body can hold one outer shared_lock spanning both publishers.
-  std::pair<size_t,double> publishScovoxMap() {
+  // The MapLockHeld parameter is the lock contract: this function does not
+  // acquire map_mtx_ so that the timer body can hold one outer lock spanning
+  // all four publishers.
+  std::pair<size_t,double> publishScovoxMap(const scovox::MapLockHeld&) {
     if (sm_pub_->get_subscription_count() == 0) return {0, 0.0};
     if (!sm_dirty_.exchange(false)) return {0, 0.0};
     auto& ss = split_map_->semsplit();
@@ -2198,7 +2204,9 @@ private:
     return (now.s_class() - s0) > (float)share_gate_evidence_rel_dir_ * s0;
   }
 
-  std::pair<size_t,double> publishBinaryMap() {
+  // MapWriteHeld, not MapLockHeld: this drains the touched-sets and writes
+  // the change-gate shadow grids, so a shared lock would not be enough.
+  std::pair<size_t,double> publishBinaryMap(const scovox::MapWriteHeld&) {
     if (!bin_pub_) return {0, 0};
     auto& ss = split_map_->semsplit();
 
@@ -2753,8 +2761,6 @@ private:
         if (nx>=0&&nx<w&&ny>=0&&ny<h) inf[ny*w+nx]=100; } } g.data=std::move(inf); }
     pl_pub_->publish(g);
   }
-  // Caller must hold map_mtx_ (shared). The timer body locks once for both
-  // publishScovoxMap and publishPointCloud so they see the same map state.
   // Split-substrate pointcloud publisher. Occupancy comes from the Beta
   // grid; semantics from the Dir grid at the same coord. The two are projected
   // into a SemBetaVoxel so the shared viz helpers (argmaxClassConfidence /
@@ -2763,7 +2769,7 @@ private:
   // publish_uncertainty_fields is set (audit item 3) — pointcloud_to_npz.py
   // copies fields by name and tolerates their absence, and the uncertainty
   // campaign scores offline ScovoxMapBinary snapshots, not this cloud.
-  void publishPointCloud() {
+  void publishPointCloud(const scovox::MapLockHeld&) {
     if (!pc_pub_ || !split_map_) return;
     // Subscriber-rise re-arm (Run 4 review): this topic is KeepLast(1)
     // reliable, NOT transient_local, so with only the dirty gate a subscriber
@@ -2951,13 +2957,13 @@ private:
     pc_pub_->publish(cl);
   }
 
-  // Publish a thin shell at the TSDF zero-crossing. Caller must hold
-  // map_mtx_ (shared). Walks TsdfMap for the surface geometry then runs
+  // Publish a thin shell at the TSDF zero-crossing.
+  // Walks TsdfMap for the surface geometry then runs
   // labelPointCloud against the Dir (semantics) grid to attach the per-point
   // semantic class. The cross-grid join uses the kEmptySlot sentinel where
   // the Dir grid has no voxel at the surface coord (same convention labelMesh /
   // extractZeroCrossing already produce). 5-field schema.
-  void publishTSDFPointCloud() {
+  void publishTSDFPointCloud(const scovox::MapLockHeld&) {
     if (!tsdf_pub_ || !split_map_) return;
     // Subscriber-rise re-arm + dirty gate — see publishPointCloud.
     const size_t cur_sub = tsdf_pub_->get_subscription_count();
@@ -3014,10 +3020,11 @@ private:
   // NOT here: the node's responsibility ends at generating the map. Consumers
   // post-process the shared rev-7 fine stream or the saved map.
 
-  /// Caller must hold map_mtx_ (unique). Re-publishing an id updates its
-  /// canonical cylinder in place (slot-stable) — this is how a downstream
-  /// estimator refines a region's model (e.g. a fitted radius) at runtime.
-  void onRefinementRegion(const scovox_msgs::msg::RefinementRegion& m) {
+  /// Re-publishing an id updates its canonical cylinder in place
+  /// (slot-stable) — this is how a downstream estimator refines a region's
+  /// model (e.g. a fitted radius) at runtime. Mutates, hence MapWriteHeld.
+  void onRefinementRegion(const scovox_msgs::msg::RefinementRegion& m,
+                          const scovox::MapWriteHeld&) {
     if (!split_map_ || !split_map_->fineEnabled()) return;
     if (m.remove) {
       const bool ok = split_map_->removeRefinementRegion(m.id);
@@ -3042,8 +3049,7 @@ private:
 
   /// Fine-lattice zero-crossing shell for RViz QA. Geometry-only 4-field
   /// cloud (labels live on the coarse lattice; join there if ever needed).
-  /// Caller must hold map_mtx_ (shared).
-  void publishFineTSDFPointCloud() {
+  void publishFineTSDFPointCloud(const scovox::MapLockHeld&) {
     if (!fine_tsdf_pub_ || !split_map_ || !split_map_->fineEnabled()) return;
     if (fine_tsdf_pub_->get_subscription_count() == 0) return;
     const double res = split_map_->fineResolution();
@@ -3076,7 +3082,7 @@ private:
       const scovox_msgs::srv::ExtractMesh::Request::SharedPtr rq,
       scovox_msgs::srv::ExtractMesh::Response::SharedPtr rs)
   {
-    std::shared_lock<std::shared_mutex> lk(map_mtx_);
+    scovox::MapReadLock lk(map_mtx_);
     if (!split_map_ || sdf_trunc_launch_ <= 0.f) {
       rs->vertex_count = 0;
       rs->triangle_count = 0;
@@ -3307,7 +3313,10 @@ private:
   // transformable into map/any frame at any playback rate.
   rclcpp::Time last_input_stamp_{0, 0, RCL_ROS_TIME};
   sensor_msgs::msg::CameraInfo di_; std::atomic<bool> have_di_{false};
-  mutable std::shared_mutex map_mtx_;  // protects split_map_
+  // Protects split_map_. Take it through scovox::MapReadLock /
+  // MapWriteLock rather than a bare std::shared_lock: the guards hand out
+  // the witness that the helpers below require, and a bare lock cannot.
+  mutable std::shared_mutex map_mtx_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr di_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr input_pc_sub_;
   // ── Intra-scan deskew (gyro-based rotation correction) ──────────────────

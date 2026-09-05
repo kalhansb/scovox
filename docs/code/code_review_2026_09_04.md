@@ -1161,7 +1161,18 @@ exactly the case for extracting it once.
 
 ### S7 — `map_mtx_` is a comment-enforced contract in a 42-method class
 
-**Status 2026-09-05: OPEN.** Not attempted this round.
+**Status 2026-09-05: FIXED, by the tag parameter rather than the annotations.**
+All six methods now take a `scovox::MapLockHeld&` (or `MapWriteHeld&` where
+the body mutates), a witness with no public constructor that only
+`scovox::MapReadLock` / `MapWriteLock` can produce — see
+`scovox_mapping/include/scovox/map_lock.hpp`. All seven lock sites now go
+through those guards, and `finishScanTail` carries the witness through to
+`publishBinaryMap`. The clang route was measured and rejected: neither the
+host nor the container image has clang, and `apt-cache policy clang` offers
+no candidate, so `-Wthread-safety` attributes would have been carried by gcc
+as decoration and checked by nothing. `test/test_map_lock.cpp` asserts the
+properties the contract leans on (witness not constructible, not copyable,
+exclusive converts to shared and not the reverse).
 
 Six methods document "Caller must hold `map_mtx_` (shared)" or "(unique)" —
 `:2072`, `:2780`, `:2963`, `:3026`, `:3054`, and `publishBinaryMap` implicitly.
