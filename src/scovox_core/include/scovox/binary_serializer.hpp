@@ -5,17 +5,16 @@
 ///
 /// Triple-stream codec carrying:
 ///   - TSDF deltas      (20 B/voxel on wire, optional, flat records)
-///   - BetaVoxel deltas (block-run coords + u16-quantized evidence)
-///   - DirVoxel deltas  (block-run coords + u16-quantized evidence)
+///   - BetaVoxel deltas (block-run coords + companded evidence)
+///   - DirVoxel deltas  (block-run coords + companded evidence, packed ids)
 ///
 /// This is the faithful wire counterpart of `SemSplitMap`: occupancy
 /// (`BetaVoxel`) and semantics (`DirVoxel`) cross the wire as SEPARATE streams,
 /// so the receiver reconstructs two independent grids and merges each with its
 /// own conjugate rule (see consensus_merge.hpp).
 ///
-/// Revision 6 reworks the
-/// Beta/Dir record layout only — the merge rules, the priors, and the shaper
-/// are untouched:
+/// Revision 6 reworks the Beta/Dir record layout only — the merge rules, the
+/// priors, and the shaper are untouched:
 ///
 ///  1. **Block-run coordinate coding** (lossless). Records are grouped by
 ///     their 8×8×8 Bonxai leaf block (`leaf_bits=3`); one block coord
@@ -62,15 +61,19 @@
 ///     value is meaningful; the emit path never produces duplicates anyway.
 ///
 /// The header carries the priors so the receiver reconstructs them without
-/// sharing launch params. The blob VERSION byte is the codec revision: now 6
-/// (was 5) for the block-run/quantized record layout. deserialize rejects a
-/// mismatched revision, so a mixed-revision fleet fails loud (the frame is
-/// dropped with a warning) instead of silently corrupting fused mass — same
-/// drill as the 4→5 occupancy-prior bump. The ROS envelope `version` (=5)
-/// routes to this codec and is unchanged.
+/// sharing launch params. The blob VERSION byte is the codec revision, and it
+/// is currently 8 — see `FORMAT_VERSION`, which is the single definition; the
+/// per-revision notes below are history, so read the constant, not the prose.
+/// deserialize rejects a mismatched revision, so a mixed-revision fleet fails
+/// loud (the frame is dropped with a warning) instead of silently corrupting
+/// fused mass — same drill as the 4→5 occupancy-prior bump.
 ///
-/// Revision 7 adds the fine
-/// TSDF band: a `fine_ratio_log2` header byte (0 = sender has no fine grid)
+/// The ROS envelope `version` is a SEPARATE number (`ENVELOPE_VERSION`, = 5):
+/// it selects which codec a `ScovoxMapBinary` message routes to, and does not
+/// move when the codec revision does.
+///
+/// Revision 7 adds the fine TSDF band on top of revision 6's layout above: a
+/// `fine_ratio_log2` header byte (0 = sender has no fine grid)
 /// and one fine-TSDF stream after the Dir stream. Fine coords are indices on
 /// the FINE lattice (`resolution / 2^fine_ratio_log2`); payload layout is
 /// identical to the coarse TSDF stream. Everything else is unchanged from 6.
