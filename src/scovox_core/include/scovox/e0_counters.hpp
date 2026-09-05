@@ -8,16 +8,17 @@
 /// about added *observation*, never about added behaviour.  Nothing in this
 /// header is read by the mapper: every function is a sink.
 ///
-/// WHY THIS EXISTS WHEN voxel.hpp ALREADY HAS COUNTERS.  `g_sparse_*_count`
-/// (voxel.hpp:39-42) already counts four of the five branches, and the ROS
-/// node already reads them (scovox_node.cpp:860-863).  Two gaps make them
+/// WHY THIS EXISTS WHEN voxel.hpp ALREADY HAS COUNTERS.  The `g_sparse_*_count`
+/// atomics in `voxel.hpp` already count four of the five branches, and
+/// `SCovoxNode` already reads them in its stats log.  Two gaps make them
 /// insufficient for E0, and both are traps rather than omissions:
 ///
-///   1. `g_sparse_drop_count` is incremented from TWO branches — the sentinel
-///      guard at dir_voxel.hpp:250 (outcome 0, class id 0xFFFF, which never
-///      reached the comparator) and the real drop-to-OTHER at :459 (outcome 4,
-///      which did).  E0's `n_admit_tests` is outcome 3 + outcome 4.  Reading
-///      it off `g_sparse_drop_count` would silently fold in arrivals that were
+///   1. `g_sparse_drop_count` is incremented from TWO branches of
+///      `sparse_add_class` — the sentinel guard (outcome 0, class id
+///      kEmptySlot, which never reached the comparator) and the real
+///      drop-to-OTHER (outcome 4, which did).  E0's `n_admit_tests` is
+///      outcome 3 + outcome 4, so reading it off `g_sparse_drop_count`
+///      would silently fold in arrivals that were
 ///      never tested, in an unknown proportion.  The counters below keep the
 ///      five outcomes apart and report the sentinel count so the conflation is
 ///      measurable rather than assumed to be zero.
@@ -29,6 +30,21 @@
 /// both sets, and their disagreement is itself a finding.
 #ifndef SCOVOX_E0_COUNTERS_HPP
 #define SCOVOX_E0_COUNTERS_HPP
+
+// Declare the switch's own default, the way every other SCOVOX_* switch does
+// (dir_voxel.hpp, beta_voxel.hpp). Without it this is the one build switch that
+// is only ever read through a bare `#if`, so a misspelling in source
+// preprocesses to 0 and compiles the instrumentation out in silence, with no
+// diagnostic and no md5 change to catch it. With the default declared,
+// `-Wundef` has nothing left to complain about in scovox's own headers, which
+// is what makes the next undeclared switch in THIS tree impossible rather than
+// merely unlikely. (Whether it can be carried on the full compile line also
+// depends on Eigen and the rclcpp headers, which this repo does not control.)
+// (This guards the SOURCE. A misspelled -D on a build command line is a
+// different hazard and needs the binary to report its own compiled-in switches.)
+#ifndef SCOVOX_E0_COUNTERS
+#define SCOVOX_E0_COUNTERS 0
+#endif
 
 #if SCOVOX_E0_COUNTERS
 
@@ -53,13 +69,14 @@ namespace e0 {
 struct Counters {
   // --- deposits offered to the slot store -------------------------------
   // One per class with p > 0 per ray under `soft`; one per ray under `hard`
-  // (sem_split_map.cpp:130-168).  Mass that never reached a slot at all — the
+  // (the two deposit branches of `dirichletUpdate`).  Mass that never reached
+  // a slot at all — the
   // no-signal / all-zero-softmax early returns of `dirichletUpdate` — is NOT
   // counted, because no deposit was offered.
   uint64_t n_deposits_total = 0;
 
-  // --- outcome histogram, dir_voxel.hpp:233-236 -------------------------
-  //   0 = sentinel routed to OTHER (class id 0xFFFF; never tested)
+  // --- outcome histogram; codes are assigned by sparse_add_class --------
+  //   0 = sentinel routed to OTHER (class id kEmptySlot; never tested)
   //   1 = matched a tracked slot
   //   2 = filled an empty slot
   //   3 = evicted the weakest slot
