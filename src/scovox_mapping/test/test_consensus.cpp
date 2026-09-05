@@ -58,10 +58,21 @@ TEST(Consensus, BetaCombinationFormula) {
 TEST(Consensus, IdenticalVoxelsPreserveProbability) {
   Map map(makeParams());
   Voxel dst = makeOcc(20, 5);
-  float p_before = dst.p_occ();
+  const float p_before = dst.p_occ();          // 20/25 = 0.8
   Voxel src = makeOcc(20, 5);
   map.consensusMerge(dst, src);
-  // Same ratio -> same probability
+
+  // Beta(a1+a2-1, b1+b2-1): the shared prior is subtracted once so two views of
+  // one surface do not count it twice.  That subtraction is exactly why the
+  // probability does NOT come back unchanged -- 39/48 = 0.8125 against 0.8 --
+  // and the old bare +-0.02 band was wider than the whole 0.0125 effect, so
+  // dropping the "-1" (39/48 -> 40/50 = 0.8) would also have passed.  Pin the
+  // merged pair, then keep the loose bound as the "approximately preserved"
+  // claim the name makes.
+  EXPECT_FLOAT_EQ(dst.a_occ, 39.f);
+  EXPECT_FLOAT_EQ(dst.a_free, 9.f);
+  EXPECT_FLOAT_EQ(dst.p_occ(), 39.f / 48.f);
+  EXPECT_GT(dst.p_occ(), p_before);
   EXPECT_NEAR(dst.p_occ(), p_before, 0.02f);
 }
 

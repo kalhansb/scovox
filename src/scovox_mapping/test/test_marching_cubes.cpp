@@ -208,9 +208,15 @@ TEST(ZeroCrossing, EmptyGridReturnsEmpty) {
 
 TEST(ZeroCrossing, WeightFilteringWorks) {
   auto grid = makePlanarGrid(0.10, 3, 3.0f, 5.0f);
-  // With min_weight > 5 → nothing
-  auto points = extractZeroCrossing(grid, 100.0f, 0.10);
-  EXPECT_EQ(points.size(), 0u);
+  // Only the negative half was asserted, so a filter that rejected everything
+  // -- the obvious way to break weight filtering -- passed this test.  Both
+  // sides of the threshold are needed for it to mean anything.
+  EXPECT_EQ(extractZeroCrossing(grid, 100.0f, 0.10).size(), 0u)
+      << "min_weight above every voxel weight must reject the whole grid";
+  EXPECT_GT(extractZeroCrossing(grid, 5.0f, 0.10).size(), 0u)
+      << "min_weight at the voxel weight must still admit the surface";
+  EXPECT_GT(extractZeroCrossing(grid, 1.0f, 0.10).size(), 0u)
+      << "min_weight below the voxel weight must admit the surface";
 }
 
 TEST(ZeroCrossing, SemanticFromPositiveSide) {
