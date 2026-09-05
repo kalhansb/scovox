@@ -1142,7 +1142,21 @@ so the convention exists and simply was not applied here. A `kEmptySlot` in
 
 ### S6 — `publishBinaryMap` repeats one traversal idiom four times and one gate idiom twice
 
-**Status 2026-09-05: FIXED.** `emitSnapshotOrTouched` and `gateAndRefresh` in `node_utils.hpp` hold the idiom once, including the `setValue` correctness note, and `test_publish_gate.cpp` covers them (13 cases, including the two composed).
+**Status 2026-09-05: FIXED.** `emitSnapshotOrTouched` and `gateAndRefresh` in `node_utils.hpp` hold the idiom once, including the `setValue` correctness note, and `test_publish_gate.cpp` covers them (15 cases).
+
+An adversarial review of the extraction confirmed the six call sites are
+behaviourally exact and found no lifetime hazard in the drained touched
+vector, but landed six coverage and accuracy defects, all since fixed: the
+test stand-in for `drainTouched*` copied where the real one swaps (and its
+comment claimed otherwise); the `std::ref` guard, the gate's
+`create_if_missing == false`, and the composed snapshot tick were each
+documented as load-bearing yet passed with the property removed; the snapshot
+traversal asserted cardinality but not coord/value pairing; and the asymmetric
+predicate's comment claimed to pin an argument order at the node's two
+call-site wrappers, which no test target compiles. The one finding not fixed
+in code is a history defect: four commits in this series use the helpers
+before the commit that defines them, so `git bisect` cannot build across
+`f202860..bd45049`.
 
 Inside the 452 lines, this shape appears verbatim for `tsdf`, `fine_tsdf`,
 `beta` and `dir`:
