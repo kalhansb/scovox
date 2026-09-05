@@ -60,6 +60,16 @@ float entropy(const Voxel& v) {
        + (s - 2.f) * digamma(s);
 }
 
+float bernoulliEntropy(float p) {
+  // Written as the negation of the in-range test, NOT as `p <= lo || p >= hi`.
+  // The two differ on NaN: the De Morgan form falls through and returns NaN,
+  // this one returns 0, and 0 is what the three call sites this was extracted
+  // from have always produced.  A refactor that is byte-identical on every
+  // reachable input but not on the unreachable one is still a behaviour change.
+  if (!(p > 1e-7f && p < 1.f - 1e-7f)) return 0.f;
+  return -p * std::log(p) - (1.f - p) * std::log(1.f - p);
+}
+
 float expectedInformationGain(const Voxel& v) {
   const float a = v.a_occ;
   const float b = v.a_free;
@@ -67,9 +77,7 @@ float expectedInformationGain(const Voxel& v) {
   if (s <= 0.f) return 0.f;
   const float p = a / s;
 
-  float H_y = 0.f;
-  if (p > 1e-7f && p < 1.f - 1e-7f)
-    H_y = -p * std::log(p) - (1.f - p) * std::log(1.f - p);
+  const float H_y = bernoulliEntropy(p);
 
   const float E_H = digamma(s + 1.f)
                    - p        * digamma(a + 1.f)
@@ -205,9 +213,7 @@ float expectedInformationGain(const SemBetaVoxel& v) {
   if (s <= 0.f) return 0.f;
   const float p = a / s;
 
-  float H_y = 0.f;
-  if (p > 1e-7f && p < 1.f - 1e-7f)
-    H_y = -p * std::log(p) - (1.f - p) * std::log(1.f - p);
+  const float H_y = bernoulliEntropy(p);
 
   const float E_H = digamma(s + 1.f)
                    - p        * digamma(a + 1.f)

@@ -32,10 +32,12 @@ struct Params {
   uint8_t inner_bits = 2;  ///< Inner grid dimension bits (2 → 4×4×4 inner cells)
   uint8_t leaf_bits  = 3;  ///< Leaf block dimension bits (3 → 8×8×8 = 512 voxels/block)
                            ///< The old advice "use leaf_bits=1 for sparse outdoor LiDAR
-                           ///< to reduce waste" is RETIRED: E8.2 measured 1 as the WORST
-                           ///< rung on SemanticKITTI (3 vs 1: −31.81 ms/frame t=−11.02,
-                           ///< −69.38 MB RSS t=−5.68, map bit-identical), so the LiDAR
-                           ///< configs now carry this default rather than overriding it.
+                           ///< to reduce waste" is RETIRED: 1 measured as the worst rung
+                           ///< on sparse LiDAR -- slower AND larger, map bit-identical --
+                           ///< so the LiDAR configs now carry this default rather than
+                           ///< overriding it.  A block that is too small pays more
+                           ///< allocations and more pointer chasing than the empty
+                           ///< voxels of a bigger one cost.
   /// Leaf block bits for the SEMANTIC (Dirichlet) grid only — see
   /// SemSplitMap::Params::dir_leaf_bits. The Dir grid is ~18× sparser than the
   /// Beta grid (hit-only + gated) so it wastes far more of an 8³ block; 2 →

@@ -25,8 +25,13 @@ void Map::beta_update_free(Voxel* v, float range_w) const {
 }
 
 // Optional pre-cleanup behaviour: cap (a_occ, a_free, sem_cnt) at
-// `evidence_saturation`. Disabled when the param is 0 (default). Applied
-// after each Beta/Dirichlet update so accumulated mass never runs away.
+// `evidence_saturation`. Disabled when the param is 0, but 0 is NOT the
+// default: `map_interface.hpp` declares 1000, both launch files pass 1000, and
+// no shipped YAML overrides it -- so on the ROS path capping is always ON. The
+// offline replay harness is the one caller that defaults it to 0
+// (`replay_scenenn.cpp`), which is why the published numbers were produced with
+// this rescale off. Applied after each Beta/Dirichlet update so accumulated
+// mass never runs away.
 void Map::apply_evidence_saturation(Voxel* v) const {
   const float cap = static_cast<float>(params_.evidence_saturation);
   if (cap <= 0.f) return;

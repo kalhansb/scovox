@@ -6,7 +6,7 @@
 #   ros2 run scovox_mapping scovox_mapping_node --ros-args \
 #     --params-file /scovox/config/scovox_lidar_geometric.yaml \
 #     --params-file /scovox/config/scovox_fine_band.yaml
-# Design: docs/design/fine_tsdf_band_dbh_2026_07_30.md.
+# Design: docs/archive/design/fine_tsdf_band_dbh_2026_07_30.md.
 #
 # Regions arrive on <node>/refinement_region (scovox_msgs/RefinementRegion,
 # field-compatible with explo_planner TreeTarget). The node only GENERATES

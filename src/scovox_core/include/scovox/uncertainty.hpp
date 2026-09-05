@@ -19,6 +19,22 @@ float digamma(float x);
 float variance(const Voxel& v);
 float entropy(const Voxel& v);
 float expectedInformationGain(const Voxel& v);
+
+/// Bernoulli Shannon entropy of an occupancy probability, in nats.
+///
+/// The BOUNDED occupancy-uncertainty stat, in [0, ln2] for every p -- unlike
+/// entropy(), which is a Beta DIFFERENTIAL entropy and diverges to -inf as the
+/// voxel saturates.  Use this wherever a comparable, aggregatable number is
+/// wanted; entropy() only where the differential quantity is meant.
+///
+/// Exported because the same eight-token expression was written out three
+/// times (both expectedInformationGain overloads and a test that mirrored
+/// them), so the test could only ever agree with its own copy.  The 1e-7
+/// guard is part of the contract, not an implementation detail: it is what
+/// makes p == 0 and p == 1 return 0 instead of NaN, and the EIG clamp at
+/// max(0, H_y - E_H) exists to absorb the small negative residual it leaves.
+/// A NaN p returns 0 as well, for the same reason the endpoints do.
+float bernoulliEntropy(float p);
 float semanticEntropy(const Voxel& v);
 float semanticVariance(const Voxel& v, uint16_t class_id);
 float betaKL(const Voxel& a, const Voxel& b);

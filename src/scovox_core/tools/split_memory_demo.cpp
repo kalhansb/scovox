@@ -13,9 +13,10 @@
 /// (Replica-shaped) but the absolute numbers will scale with
 /// `--frames` / `--rays-per-frame` / `--max-range` knobs.
 ///
-/// Usage:
-///   ./split_memory_demo --frames 100 --rays-per-frame 4096 \
-///       --max-range 5.0 --resolution 0.05 --sdf-trunc 0.15
+/// Usage (aligned, not `\`-continued: a trailing backslash on a //-comment line
+/// splices the next line into it and hides half the invocation):
+///   ./split_memory_demo --frames 100 --rays-per-frame 4096
+///                       --max-range 5.0 --resolution 0.05 --sdf-trunc 0.15
 ///
 /// Default config matches Replica room0 broad shape:
 ///   resolution = 0.05 m  (Replica eval default)
