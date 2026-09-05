@@ -6,16 +6,15 @@
 /// Tracing" (1987). 6-connected, steps one axis at a time, and visits every
 /// voxel the continuous segment crosses.
 ///
-/// This replaced an integer-Bresenham sibling that stepped up to three axes at
-/// once and therefore SKIPPED voxels the segment genuinely crosses — 1.84x
-/// fewer voxels per ray, and on 82% of random oblique rays it visited a voxel
-/// the true segment never enters, so the two sets were not nested either way.
-/// Upstream states the consequence for that traversal: "carving is weaker and
-/// depends on the direction of the ray relative to the grid axes." Free-space
-/// carving is the measurement most exposed to it — the skipped voxels are
-/// exactly the free-space evidence that never gets deposited — so the
-/// approximate walk is gone rather than selectable. It costs ~46% more walk
-/// time, well under the 1.84x voxel ratio.
+/// Visiting EVERY crossed voxel is the requirement, not an optimisation, and it
+/// is why there is only one traversal here rather than a fast/exact choice.
+/// Free-space carving deposits its evidence per visited voxel, so any walk that
+/// advances more than one axis in a step skips voxels the segment really
+/// crosses, and the evidence for exactly those voxels is never deposited. The
+/// damage is not uniform either: which voxels get skipped depends on the ray's
+/// direction relative to the grid axes, so carving strength becomes a function
+/// of viewing angle. An approximate walk is therefore not offered as an option.
+/// The exactness is paid for in walk time.
 
 #include <cmath>
 #include <limits>

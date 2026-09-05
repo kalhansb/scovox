@@ -2,9 +2,9 @@
 /// @brief SLIM-VDB-equivalent TSDF integration. Verbatim port of
 /// `slimvdb::VDBVolume::Integrate` (CLOSED variant), using Bonxai's
 /// `VoxelGrid<TsdfVoxel>` and `scovox::ExactRayIterator` instead of OpenVDB's
-/// `FloatGrid` and `openvdb::math::DDA`. Both are Amanatides & Woo, so the
-/// traversal parity gap §1.1 of the design plan acknowledged is CLOSED as of
-/// 2026-09-02 (it existed while this file walked an integer Bresenham line).
+/// `FloatGrid` and `openvdb::math::DDA`. Both are Amanatides & Woo, so the two
+/// implementations visit the same voxel set and there is no traversal parity
+/// gap against upstream to account for when comparing results.
 /// The `k_hit` revisit guard remains, for the reason given at its use below:
 /// the walk aims at the CENTRE of the end voxel, not at `endpoint`.
 
