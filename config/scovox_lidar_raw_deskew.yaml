@@ -9,7 +9,7 @@
 # WHY: feeding /glim_ros/points fixes the 7.2 m vertical smear (-> 0.40 m) but
 # costs recall because GLIM downsamples to ~10k pts/scan. Native deskew keeps the
 # full-res cloud -> thin surfaces AND full coverage. The smear is intra-scan SKEW
-# (per the feed-cmp in scovox-vertical-overfill.md); rotation dominates it, and
+# (measured by feeding the same log through both paths); rotation dominates it, and
 # gyro integration reproduces GLIM's rotational deskew without GLIM's downsampling.
 #
 # GLIM still runs as the LOCALIZER and owns the TF tree

@@ -14,7 +14,7 @@
 #     --params-file /scovox/config/scovox_lidar_geometric.yaml \
 #     --params-file /scovox/config/scovox_robot_share.yaml \
 #     -p integration_frame:=r1_map
-# See docs/distributed_mapping_lidar.md for the full runbook.
+# See docs/archive/distributed_mapping_lidar.md for the full runbook.
 #
 # Frames: map --NDT--> odom --EKF--> base_link --STATIC--> os_lidar. The
 # localizer (hmr_localisation NDT vs the shared gt_map) owns map->odom, so every
