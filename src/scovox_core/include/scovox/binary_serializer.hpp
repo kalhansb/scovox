@@ -94,7 +94,7 @@
 ///     At-prior q=0 still reconstructs the prior bit-exactly.
 ///  2. **u8 class ids** when the header's num_classes ≤ 255 (every real
 ///     taxonomy here: SceneNet 14, NYU40, KITTI): the empty-slot sentinel
-///     0xFFFF maps to 0xFF on the wire and back. num_classes > 255 keeps u16
+///     kEmptySlot maps to 0xFF on the wire and back. num_classes > 255 keeps u16
 ///     ids — the width is implied by the header, so the frame stays
 ///     self-describing. Serialize throws on a real id ≥ 0xFF when packing
 ///     (sender invariant violation: ids are < num_classes ≤ 255).
@@ -262,16 +262,16 @@ class BinarySerializer {
       }
     }
 
-    // Rev 8 class-id emit: u8 when num_classes ≤ 255 (sentinel 0xFFFF ↔ 0xFF),
+    // Rev 8 class-id emit: u8 when num_classes ≤ 255 (sentinel kEmptySlot ↔ 0xFF),
     // u16 otherwise. A real id that doesn't fit the packed width is a sender
     // invariant violation (ids are < num_classes) — fail loud.
     auto writeCls = [&](uint16_t cls) {
       if (cls8) {
-        if (cls != 0xFFFF && cls >= 0xFF)
+        if (cls != kEmptySlot && cls >= 0xFF)
           throw std::runtime_error(
               "BinarySerializer: class id " + std::to_string(cls) +
               " does not fit u8 packing (num_classes ≤ 255)");
-        const uint8_t c = (cls == 0xFFFF) ? 0xFF : static_cast<uint8_t>(cls);
+        const uint8_t c = (cls == kEmptySlot) ? 0xFF : static_cast<uint8_t>(cls);
         appendBytes(out, &c, sizeof(c));
       } else {
         appendBytes(out, &cls, sizeof(cls));
@@ -297,7 +297,7 @@ class BinarySerializer {
     });
 
     // Dir stream (occupied-class semantics), block-run coded. Empty slots
-    // (cls=0xFFFF, cnt=α₀) quantize to q=0 and reconstruct their placeholder
+    // (cls=kEmptySlot, cnt=α₀) quantize to q=0 and reconstruct their placeholder
     // exactly.
     writeBlockStream(out, frame.dir_deltas, [&](const DirDelta& d) {
       if (quant) {
@@ -429,12 +429,12 @@ class BinarySerializer {
     }
 
     // Rev 8: class-id width is implied by the header's num_classes; the u8
-    // sentinel 0xFF widens back to the in-memory 0xFFFF empty-slot marker.
+    // sentinel 0xFF widens back to the in-memory kEmptySlot marker.
     const bool cls8 = f.num_classes <= 255;
     auto readCls = [&]() -> uint16_t {
       if (cls8) {
         const uint8_t c = r.get<uint8_t>();
-        return (c == 0xFF) ? uint16_t{0xFFFF} : static_cast<uint16_t>(c);
+        return (c == 0xFF) ? kEmptySlot : static_cast<uint16_t>(c);
       }
       return r.get<uint16_t>();
     };

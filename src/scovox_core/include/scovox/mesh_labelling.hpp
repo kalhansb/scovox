@@ -11,7 +11,7 @@
 ///   labelPointCloud(positions, sembeta_grid)         → per-point labels
 ///
 /// Cross-grid absence policy (Q5 of the design plan): a missing SemBeta
-/// voxel returns the sentinel class id `0xFFFF` ("unknown"). This can
+/// voxel returns the sentinel class id `kEmptySlot` ("unknown"). This can
 /// happen legitimately (Dirichlet gated by `dirichlet_min_p_occ`, or
 /// SLIM-VDB-only mode with no SemBeta grid) and consumers must filter
 /// for it.
@@ -31,10 +31,10 @@ namespace scovox {
 
 namespace detail {
 
-/// Argmax of SemBeta sparse-Dirichlet slots. Returns 0xFFFF if no slot
+/// Argmax of SemBeta sparse-Dirichlet slots. Returns kEmptySlot if no slot
 /// has positive count (= voxel allocated but Dirichlet never updated).
 inline uint16_t dominantClass(const SemBetaVoxel& v) {
-  uint16_t cls = 0xFFFF;
+  uint16_t cls = kEmptySlot;
   float best = 0.f;
   for (int i = 0; i < K_TOP; ++i) {
     if (v.sem_cnt[i] > best) {
@@ -72,7 +72,7 @@ inline std::vector<uint16_t> labelMesh(
     if (tri[0] >= (int)geom.vertices.size() ||
         tri[1] >= (int)geom.vertices.size() ||
         tri[2] >= (int)geom.vertices.size()) {
-      labels.push_back(0xFFFF);
+      labels.push_back(kEmptySlot);
       continue;
     }
     const Eigen::Vector3f centroid =
@@ -80,13 +80,13 @@ inline std::vector<uint16_t> labelMesh(
     const auto coord = sembeta_grid.posToCoord(
         centroid.x(), centroid.y(), centroid.z());
     const SemBetaVoxel* v = sembeta_acc.value(coord);
-    labels.push_back(v ? detail::dominantClass(*v) : uint16_t(0xFFFF));
+    labels.push_back(v ? detail::dominantClass(*v) : kEmptySlot);
   }
   return labels;
 }
 
 /// Per-point labels. For each world-space position, query the SemBeta
-/// grid and emit the argmax class. Sentinel `0xFFFF` on miss.
+/// grid and emit the argmax class. Sentinel `kEmptySlot` on miss.
 inline std::vector<uint16_t> labelPointCloud(
     const std::vector<Eigen::Vector3f>&     positions,
     const Bonxai::VoxelGrid<SemBetaVoxel>&  sembeta_grid)
@@ -97,7 +97,7 @@ inline std::vector<uint16_t> labelPointCloud(
   for (const auto& p : positions) {
     const auto coord = sembeta_grid.posToCoord(p.x(), p.y(), p.z());
     const SemBetaVoxel* v = acc.value(coord);
-    labels.push_back(v ? detail::dominantClass(*v) : uint16_t(0xFFFF));
+    labels.push_back(v ? detail::dominantClass(*v) : kEmptySlot);
   }
   return labels;
 }
@@ -131,14 +131,14 @@ inline std::vector<uint16_t> labelMesh(
     if (tri[0] >= (int)geom.vertices.size() ||
         tri[1] >= (int)geom.vertices.size() ||
         tri[2] >= (int)geom.vertices.size()) {
-      labels.push_back(0xFFFF);
+      labels.push_back(kEmptySlot);
       continue;
     }
     const Eigen::Vector3f centroid =
         (geom.vertices[tri[0]] + geom.vertices[tri[1]] + geom.vertices[tri[2]]) / 3.0f;
     const auto coord = dir_grid.posToCoord(centroid.x(), centroid.y(), centroid.z());
     const DirVoxel* v = dir_acc.value(coord);
-    labels.push_back(v ? dominantClass(*v, alpha_0) : uint16_t(0xFFFF));
+    labels.push_back(v ? dominantClass(*v, alpha_0) : kEmptySlot);
   }
   return labels;
 }
@@ -155,7 +155,7 @@ inline std::vector<uint16_t> labelPointCloud(
   for (const auto& p : positions) {
     const auto coord = dir_grid.posToCoord(p.x(), p.y(), p.z());
     const DirVoxel* v = acc.value(coord);
-    labels.push_back(v ? dominantClass(*v, alpha_0) : uint16_t(0xFFFF));
+    labels.push_back(v ? dominantClass(*v, alpha_0) : kEmptySlot);
   }
   return labels;
 }

@@ -711,7 +711,7 @@ inline TriangleMesh extractMesh(
         edge_local[tri_table[cube_index][i]],
         edge_local[tri_table[cube_index][i + 2]],
         edge_local[tri_table[cube_index][i + 1]]);
-      mesh.tri_labels.push_back(0xFFFF);  // sentinel — labelled separately
+      mesh.tri_labels.push_back(kEmptySlot);  // sentinel — labelled separately
     }
   });
 
@@ -755,7 +755,7 @@ inline std::vector<SurfacePoint> extractZeroCrossing(
           (float)p0.y + h + t * (float)(p1.y - p0.y),
           (float)p0.z + h + t * (float)(p1.z - p0.z));
 
-        points.push_back({pos, 0.f, 0xFFFF});
+        points.push_back({pos, 0.f, kEmptySlot});
       }
     }
   });

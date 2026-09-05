@@ -23,6 +23,37 @@ namespace scovox {
 constexpr int K_TOP = SCOVOX_K_TOP;
 static_assert(K_TOP >= 1, "K_TOP must be >= 1");
 
+/// The "no class here" class id. It is a value no real taxonomy uses; the
+/// neighbouring sentinel in the same family is `SemSplitMap::kNoHitProbs`.
+///
+/// WHICH ARRAYS ACTUALLY USE IT — the three substrates do not agree, and
+/// assuming they do is the way to misread an empty slot as class 0:
+///
+///   `DirVoxel::cls[]`        LIVE marker. Written on eviction, tested to find
+///                            a free slot, and carried across the wire.
+///   `SemBetaVoxel::sem_cls[]` INITIAL value only, set by
+///                            `defaultSemBetaVoxel`. Nothing restores or tests
+///                            it afterwards.
+///   `Voxel::sem_cls[]`       DOES NOT USE IT. The legacy fused substrate
+///                            zero-initialises the class ids and marks a slot
+///                            empty with `sem_cnt[i] <= 0`, so its idle slots
+///                            read as class 0, not as this sentinel.
+///
+/// It is also the "no class" return of `dominantClass` and of the mesh /
+/// marching-cubes label joins.
+///
+/// Not a policy knob and not overridable: it is baked into the wire (the codec
+/// maps it to 0xFF when the taxonomy fits in u8) and `sparse_add_class`
+/// refuses to admit an observation whose class id equals it, precisely so a
+/// real id can never be mistaken for "empty".
+///
+/// `inline` is load-bearing, not decoration: a namespace-scope `constexpr` is
+/// implicitly `const` and therefore internal-linkage, so header-inline
+/// functions that odr-use it (`labelMesh` and `extractMesh` bind it to the
+/// `const uint16_t&` of a `push_back`) would each refer to a different entity
+/// per translation unit — an ODR violation no compiler is required to report.
+inline constexpr uint16_t kEmptySlot = 0xFFFF;
+
 /// Default symmetric Dirichlet prior `α₀` applied per underlying class
 /// dimension. **Recommended ship value `0.01`** — matches the "Beta starts
 /// near zero" behaviour of the legacy code and minimises behavioural drift

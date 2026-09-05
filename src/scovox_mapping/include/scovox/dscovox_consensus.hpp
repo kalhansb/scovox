@@ -67,7 +67,7 @@ inline bool isPriorDir(const scovox::DirVoxel& v,
   const float slop = kPriorSlop;
   if (v.other() > other_prior + slop) return false;
   for (int i = 0; i < scovox::K_TOP; ++i)
-    if (v.cls[i] != 0xFFFF) return false;
+    if (v.cls[i] != kEmptySlot) return false;
   return true;
 }
 
@@ -99,7 +99,7 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
     }
   } else {
     out.a_unk = 0.f;
-    for (int i = 0; i < scovox::K_TOP; ++i) { out.sem_cnt[i] = 0.f; out.sem_cls[i] = 0xFFFF; }
+    for (int i = 0; i < scovox::K_TOP; ++i) { out.sem_cnt[i] = 0.f; out.sem_cls[i] = kEmptySlot; }
   }
   return out;
 }

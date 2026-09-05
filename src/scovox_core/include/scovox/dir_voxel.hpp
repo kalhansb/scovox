@@ -21,7 +21,7 @@
 ///   offset 0:   s_total (float, 4 B) — TOTAL class evidence, `C·α₀ + Σ deposits`
 ///   offset 4:   cnt[0] (float, 4 B)  — α for top-K slot 0
 ///   offset 8:   cnt[1] (float, 4 B)  — α for top-K slot 1
-///   offset 12:  cls[0] (uint16, 2 B) — class id at slot 0 (0xFFFF = empty)
+///   offset 12:  cls[0] (uint16, 2 B) — class id at slot 0 (kEmptySlot = empty)
 ///   offset 14:  cls[1] (uint16, 2 B) — class id at slot 1
 ///   total: 16 B at K_TOP=2.
 ///
@@ -147,8 +147,8 @@
 
 namespace scovox {
 
-/// Per-voxel occupied-class Dirichlet state. `cls[i] == 0xFFFF` marks an empty
-/// slot; `cnt[i]` then holds the per-slot prior `α₀` (set by
+/// Per-voxel occupied-class Dirichlet state. `cls[i] == kEmptySlot` marks an
+/// empty slot; `cnt[i]` then holds the per-slot prior `α₀` (set by
 /// `defaultDirVoxel()` — never zero, to keep closed-form variance valid).
 struct DirVoxel {
   /// TOTAL occupied-class evidence: `C·α₀` at the prior, plus every deposit
@@ -157,7 +157,7 @@ struct DirVoxel {
   /// the file header for why this, and not `other`, is the stored word.
   float    s_total;
 
-  /// Top-K class slots, by accumulated `cnt[i]`. `cls[i] == 0xFFFF` is the
+  /// Top-K class slots, by accumulated `cnt[i]`. `cls[i] == kEmptySlot` is the
   /// empty-slot sentinel; an empty slot's `cnt[i]` holds the prior `α₀`.
   float    cnt[K_TOP];
   uint16_t cls[K_TOP];
@@ -279,7 +279,7 @@ inline DirVoxel defaultDirVoxel(uint16_t num_classes = 14,
             + static_cast<float>(K_TOP) * alpha_0;
   for (int i = 0; i < K_TOP; ++i) {
     v.cnt[i] = alpha_0;             // per-dim prior on each top-K slot
-    v.cls[i] = 0xFFFF;             // empty-slot sentinels
+    v.cls[i] = kEmptySlot;
   }
   return v;
 }
@@ -344,22 +344,22 @@ inline void sparse_add_class(float*    cnt,
   const auto bump = [nhit](int i) {
     if (nhit && nhit[i] != 65535) ++nhit[i];
   };
-  // (0) Sentinel guard. `0xFFFF` is the empty-slot marker in `cls[]`, so a real
-  // observation of class id 0xFFFF (e.g. a 65535-class taxonomy, or a classifier
-  // whose argmax index hits 0xFFFF) must NOT be written into a slot: it would
-  // fill `cls[i] = 0xFFFF` with real mass yet still read as EMPTY, so the next
+  // (0) Sentinel guard. `kEmptySlot` is the empty-slot marker in `cls[]`, so a real
+  // observation of class id kEmptySlot (e.g. a 65535-class taxonomy, or a classifier
+  // whose argmax index hits kEmptySlot) must NOT be written into a slot: it would
+  // fill `cls[i] = kEmptySlot` with real mass yet still read as EMPTY, so the next
   // add re-fills the slot from scratch (losing the prior inc) and isPriorDir /
   // dominantClass mis-treat it as unfilled. Leave the (untrackable) sentinel
   // class unattributed — it stays in `other()` because no `cnt[]` claims it,
   // which keeps every slot's sentinel meaning intact.
-  if (c == 0xFFFF) {
+  if (c == kEmptySlot) {
     g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
     say(0);
     return;
   }
   // (1) Match — incoming class already tracked in a slot.
   for (int i = 0; i < K_TOP; ++i) {
-    if (cls[i] != 0xFFFF && cls[i] == c) {
+    if (cls[i] != kEmptySlot && cls[i] == c) {
       cnt[i] += inc;
       if (track && q_fx > qmax[i]) qmax[i] = q_fx;
       bump(i);
@@ -370,7 +370,7 @@ inline void sparse_add_class(float*    cnt,
   }
   // (2) Empty slot available — fill it. The slot's α₀ prior stays; add on top.
   for (int i = 0; i < K_TOP; ++i) {
-    if (cls[i] == 0xFFFF) {
+    if (cls[i] == kEmptySlot) {
       cls[i] = c;
       cnt[i] = alpha_0 + inc;
       if (track) qmax[i] = q_fx;
@@ -438,7 +438,7 @@ inline void sparse_add_class(float*    cnt,
 }
 
 /// Argmax of the top-K class slots by observed evidence (`cnt − α₀`). Returns
-/// 0xFFFF if no slot is filled, or if `OTHER`'s *observed* evidence exceeds
+/// kEmptySlot if no slot is filled, or if `OTHER`'s *observed* evidence exceeds
 /// every slot's evidence (the bulk of the class mass is on out-of-K classes,
 /// so committing to a tracked class would be misleading). Mirrors the
 /// `SemDirVoxel` overload in mesh_labelling.hpp, restricted to the
@@ -454,10 +454,10 @@ inline void sparse_add_class(float*    cnt,
 inline uint16_t dominantClass(const DirVoxel& v,
                               float    alpha_0     = kDefaultDirichletPrior,
                               uint16_t num_classes = 14) noexcept {
-  uint16_t cls = 0xFFFF;
+  uint16_t cls = kEmptySlot;
   float best_evidence = 0.f;
   for (int i = 0; i < K_TOP; ++i) {
-    if (v.cls[i] == 0xFFFF) continue;
+    if (v.cls[i] == kEmptySlot) continue;
     const float evidence = v.cnt[i] - alpha_0;
     if (evidence > best_evidence) {
       best_evidence = evidence;
@@ -470,7 +470,7 @@ inline uint16_t dominantClass(const DirVoxel& v,
   const int   residual_dims = static_cast<int>(num_classes) - K_TOP;
   const float other_prior   = (residual_dims > 0) ? (residual_dims * alpha_0) : 0.f;
   const float other_evidence = v.other() - other_prior;
-  if (other_evidence > best_evidence) return 0xFFFF;
+  if (other_evidence > best_evidence) return kEmptySlot;
   return cls;
 }
 
