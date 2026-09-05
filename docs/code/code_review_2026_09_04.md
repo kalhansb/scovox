@@ -118,6 +118,17 @@ It costs ~663 voxels and 0.011 recall per scene — consistent 8/8 in sign, but 
 order of magnitude under batching. The correctness fix did not buy a numbers
 problem; batching did.
 
+**Confirmed after the code-review batch, 2026-09-05.** The whole `total` column
+above was re-measured from the post-review tree — `cells/goal8.tsv`, the
+promoted `abl_inherit` argv and the `e5/k2_i0_evid` flags, all eight scenes —
+and it comes back unchanged: `n_pred_occupied` −11 566, recall −0.1850,
+precision +0.0690, intersection mIoU +0.0318, occupancy IoU −0.0399, union mIoU
+−0.0191, phantom voxels 16 005 → 8 645. The scene-016 column above reproduces
+to four decimals as well. That matters twice over: it fixes the size of the H4
+gap on the full dataset rather than on two scenes, and it says the review batch
+contributed exactly nothing to it — the drift is the three deposit-path commits
+and nothing else.
+
 **What batching itself does** (one binary, no confound, `paired_stats` at
 MATERIAL 0.001): intersection mIoU **+0.0290** (material, 8/8), precision
 **+0.0663** (material, 8/8), recall **−0.1744** (material, 8/8), union mIoU
@@ -623,7 +634,7 @@ retracts this section's own recommendation and exposes a live defect, split out
 below as **M11**.
 
 **Where.** `scovox_slot_rules/scripts/calib_alpha0.py:106-180` (the answer);
-`src/scovox_core/include/scovox/uncertainty.hpp:56-111` and
+`src/scovox_core/include/scovox/uncertainty.hpp:55-112` and
 `experiments/uncertainty/functionals.py` (deleted by `821374e`, recover with
 `git show fcf7c86:experiments/uncertainty/functionals.py`) — the rejected basis.
 
@@ -685,7 +696,7 @@ pre-registered predictions are in `scovox_slot_rules/REVIEW_LOG.md` under E12.
 with `cnt > 0` and no `cls != EMPTY` guard, but a `DirVoxel` empty slot holds
 `cnt = alpha0 = 0.01 > 0` and would read as an observed class
 (`calib_alpha0.py:118` guards this). And `hutterEscapeMass` is **clamped** —
-`min(., N)` plus `ratio <= 1 -> N` (`uncertainty.hpp:92-93`) — which quotations
+`min(., N)` plus `ratio <= 1 -> N` (`uncertainty.hpp:93-94`) — which quotations
 of the bare formula routinely drop; at `m=1, N=0.14` the raw term is 3.816
 against a shipped 0.140.
 

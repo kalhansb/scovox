@@ -299,6 +299,28 @@ baseline loses it 8/8).
 > magnitude; occupancy IoU −0.0018; recall −0.011. The traversal correctness fix
 > did not cost the numbers; batching moved them.
 >
+> **Re-measured on all eight scenes, 2026-09-05** (`cells/goal8.tsv`: the
+> promoted `abl_inherit` argv and the `e5/k2_i0_evid` flags, replayed from the
+> post-code-review tree). This is what the table above becomes on the current
+> binary:
+>
+> | metric | published (E9) | current tree | Δ | scenes |
+> |---|---|---|---|---|
+> | intersection mIoU | 0.5853 | 0.6172 | **+0.0318** | 8/8 up |
+> | union mIoU | 0.2981 | 0.2790 | **−0.0191** | 5/8 down |
+> | occupancy IoU | 0.4393 | 0.3993 | **−0.0399** | 6/8 down |
+> | precision | 0.5236 | 0.5926 | +0.0690 | 8/8 up |
+> | recall | 0.7272 | 0.5422 | −0.1850 | 8/8 down |
+> | phantom voxels | 16 005 | 8 645 | −7 360 | — |
+> | `n_pred_occupied` | 32 730 | 21 164 | −11 566 | — |
+>
+> Every one of those deltas is the *total* column of the `--batch-hits` A/B
+> above, to the digit — −0.1850 recall, +0.0690 precision, +0.0318 intersection,
+> −0.0191 union, −11 566 predicted-occupied — and the two per-scene occupancy
+> figures quoted earlier land at −0.0291 (016) and −0.0618 (015). The shift is
+> the one already attributed, reproduced end to end; the code review added
+> nothing to it, which is the point of running it.
+>
 > Batching is a **reparameterization**, not a separate optimization: sweeping
 > `w_occ` batched recovers the un-batched result. Batched `w_occ` 6.0 against
 > un-batched `w_occ` 1.5 grades **ambiguous on all six metrics at n = 8**, union
@@ -949,8 +971,12 @@ in the consumer.
   package's CTest aggregate, and the total was a colcon-console reading rather
   than an XML count. It is still the only failure.
 - The numbers in §1.5 predate three commits to the deposit path and no longer
-  describe this code. See the box in §1.5 and `code_review_2026_09_04.md` §H4;
-  re-basing them is a re-run of the ablation ring, not a doc edit.
+  describe this code. See the box in §1.5 and `code_review_2026_09_04.md` §H4.
+  The box now carries what the promoted arm *does* score on the current binary,
+  measured on all eight scenes (`cells/goal8.tsv`, 2026-09-05), so the size of
+  the gap is no longer an open question. Promoting those figures to the headline
+  table is still not a doc edit: the campaign selected the arm on the old deposit
+  rule, and a re-base means re-running the ablation ring against the new one.
 
 ### 3.6 Stale text inside the code
 
