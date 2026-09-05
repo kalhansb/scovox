@@ -46,7 +46,8 @@ endif()
 add_library(scovox_core
     src/uncertainty.cpp
     src/tsdf_map.cpp
-    src/sem_split_map.cpp)
+    src/sem_split_map.cpp
+    src/version.cpp)
 
 target_link_libraries(scovox_core
   PUBLIC Eigen3::Eigen
