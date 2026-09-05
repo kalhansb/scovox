@@ -2328,18 +2328,14 @@ private:
     // ----- TSDF section (elided when share_tsdf_=false) -----
     if (share_tsdf_) {
       auto& tsdf_grid = split_map_->tsdf().grid();
-      auto tacc = tsdf_grid.createAccessor();
       auto emit_tsdf = [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
         if (v.weight <= 0.f) return;
         frame.tsdf_deltas.push_back({c, v});
       };
-      if (snapshot) {
-        tsdf_grid.forEachCell(emit_tsdf);
-        split_map_->clearTouchedTsdf();  // snapshot emitted everything
-      } else {
-        for (const auto& c : split_map_->drainTouchedTsdf())
-          if (auto* v = tacc.value(c, false)) emit_tsdf(*v, c);
-      }
+      scovox::emitSnapshotOrTouched(
+          snapshot, tsdf_grid,
+          [&]() -> const std::vector<Bonxai::CoordT>& { return split_map_->drainTouchedTsdf(); },
+          [&] { split_map_->clearTouchedTsdf(); }, emit_tsdf);
     } else {
       split_map_->clearTouchedTsdf();
     }
@@ -2348,18 +2344,14 @@ private:
     if (split_map_->fineEnabled() && share_tsdf_) {
       frame.fine_ratio_log2 = split_map_->fineRatioLog2();
       auto& fgrid = split_map_->fineTsdf().grid();
-      auto facc = fgrid.createAccessor();
       auto emit_fine = [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
         if (v.weight <= 0.f) return;
         frame.fine_tsdf_deltas.push_back({c, v});
       };
-      if (snapshot) {
-        fgrid.forEachCell(emit_fine);
-        split_map_->clearTouchedFine();  // snapshot emitted everything
-      } else {
-        for (const auto& c : split_map_->drainTouchedFine())
-          if (auto* v = facc.value(c, false)) emit_fine(*v, c);
-      }
+      scovox::emitSnapshotOrTouched(
+          snapshot, fgrid,
+          [&]() -> const std::vector<Bonxai::CoordT>& { return split_map_->drainTouchedFine(); },
+          [&] { split_map_->clearTouchedFine(); }, emit_fine);
     } else {
       split_map_->clearTouchedFine();
     }
@@ -2367,7 +2359,6 @@ private:
     // ----- Beta section (occupancy; full-ray, always emitted) -----
     {
       auto& bgrid = ss.betaGrid();
-      auto bacc = bgrid.createAccessor();
       std::optional<Bonxai::VoxelGrid<scovox::BetaVoxel>::Accessor> gacc;
       if (gate_beta_) gacc.emplace(gate_beta_->createAccessor());
       std::optional<Bonxai::VoxelGrid<double>::Accessor> tacc;
@@ -2381,37 +2372,21 @@ private:
           const double zc = bgrid.coordToPos(c).z + zhalf;
           if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
         }
-        if (gacc) {
-          // Change gate vs the last-EMITTED state. Snapshots bypass the check
-          // (a fresh subscriber needs full state) but still refresh the gate.
-          if (!snapshot) {
-            if (auto* g = gacc->value(c, false); g && !betaChangedSinceEmit(*g, v))
-              return;
-          }
-          // MUST be setValue, not `*value(c, true) = v`: the miss above caches
-          // prev_leaf_ptr_ = nullptr for this inner key, and value(c, true)
-          // skips the refresh on a same-key hit → returns nullptr even with
-          // create_if_missing. setValue re-fetches on a null cached leaf.
-          gacc->setValue(c, v);
-          // Stamp twin stays in lockstep with the gate (heartbeat armed only);
-          // same setValue rationale.
-          if (tacc) tacc->setValue(c, t_now);
-        }
+        if (!scovox::gateAndRefresh(
+                gacc, tacc, c, v, snapshot, t_now,
+                [&](const auto& g, const auto& n) { return betaChangedSinceEmit(g, n); }))
+          return;
         frame.beta_deltas.push_back({c, wireBeta(v)});
       };
-      if (snapshot) {
-        bgrid.forEachCell(emit_beta);
-        split_map_->clearTouchedBeta();  // snapshot emitted everything
-      } else {
-        for (const auto& c : split_map_->drainTouchedBeta())
-          if (auto* v = bacc.value(c, false)) emit_beta(*v, c);
-      }
+      scovox::emitSnapshotOrTouched(
+          snapshot, bgrid,
+          [&]() -> const std::vector<Bonxai::CoordT>& { return split_map_->drainTouchedBeta(); },
+          [&] { split_map_->clearTouchedBeta(); }, emit_beta);
     }
 
     // ----- Dir section (semantics; hit-sparse; elided when share_dir_=false) -----
     if (share_dir_) {
       auto& dgrid = ss.dirGrid();
-      auto dacc = dgrid.createAccessor();
       std::optional<Bonxai::VoxelGrid<scovox::DirVoxel>::Accessor> gacc;
       if (gate_dir_) gacc.emplace(gate_dir_->createAccessor());
       std::optional<Bonxai::VoxelGrid<double>::Accessor> tacc;

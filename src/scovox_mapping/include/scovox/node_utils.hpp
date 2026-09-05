@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <cmath>
@@ -73,6 +76,82 @@ void forEachCellInBox(
       }
     }
   }
+}
+
+// The wire publish's per-grid traversal. A publish tick is either a SNAPSHOT
+// (a subscriber just arrived and needs the whole map) or a DELTA (emit only
+// what the integrator touched since the last tick), and every grid the frame
+// carries — TSDF, fine TSDF, Beta, Dir — makes that choice the same way. Both
+// arms leave the touched set empty, which is what lets the caller treat the
+// two tick kinds as interchangeable; forgetting the `clear()` on the snapshot
+// arm would re-emit the touched coords on the very next delta tick.
+//
+// `drain` must return the touched container BY REFERENCE: this is a hot path
+// and the touched set is a whole frame's worth of coords, so a lambda written
+// without an explicit `-> const std::vector<CoordT>&` would let `auto` strip
+// the reference and deep-copy the lot every tick — correct, silent, and slow.
+// The static_assert below makes that a build error instead of a comment.
+//
+// A voxel that was touched and has since been erased yields no accessor hit
+// and is skipped, exactly as a per-grid inline loop did.
+//
+// The accessor is created here rather than passed in. It is used on one arm
+// only, it has no state worth sharing across calls, and taking it as a
+// parameter meant handing the helper a grid and an accessor as two unrelated
+// positional arguments — the live grid and its change-gate grid have the same
+// type, so passing the gate's accessor by mistake would compile and quietly
+// emit last-emitted state in place of live state.
+template <typename Grid, typename DrainFn, typename ClearFn, typename EmitFn>
+void emitSnapshotOrTouched(bool snapshot, Grid& grid, DrainFn&& drain,
+                           ClearFn&& clear, EmitFn&& emit) {
+  static_assert(std::is_reference_v<std::invoke_result_t<DrainFn&>>,
+                "drain must return the touched container by reference; returning "
+                "by value copies a frame's worth of coords on every publish tick");
+  if (snapshot) {
+    // std::ref: Bonxai's forEachCell takes its visitor BY VALUE, so an emit
+    // functor carrying by-value state would have its mutations dropped on
+    // snapshot ticks and kept on delta ticks. Passing a reference wrapper makes
+    // the two arms agree on which object they are calling.
+    grid.forEachCell(std::ref(emit));
+    clear();  // the snapshot emitted everything, so nothing is still pending
+  } else {
+    auto acc = grid.createAccessor();
+    for (const auto& c : drain())
+      if (auto* v = acc.value(c, false)) emit(*v, c);
+  }
+}
+
+// The wire publish's change gate, shared by the Beta and Dir sections. The gate
+// grid holds each voxel's last EMITTED state; a delta tick drops a voxel whose
+// live state has not moved since. Returns true when the caller should emit.
+//
+// Three properties this centralises, each of which was a separate hazard while
+// the Beta and Dir copies were maintained side by side:
+//
+//   1. Snapshot ticks bypass the comparison but still refresh the gate — a
+//      fresh subscriber needs full state, and the gate must not go stale.
+//   2. The refresh MUST be `setValue`, not `*value(c, true) = v`. The miss
+//      lookup just above caches prev_leaf_ptr_ = nullptr for this inner key,
+//      and `value(c, true)` skips the leaf refresh on a same-key hit, so it
+//      returns nullptr even with create_if_missing. setValue re-fetches on a
+//      null cached leaf.
+//   3. The stamp twin moves in lockstep with the gate (allocated only when the
+//      heartbeat is armed), for the same setValue reason.
+//
+// No gate grid configured means gating is off: emit unconditionally.
+template <typename GateAcc, typename StampAcc, typename VoxelT,
+          typename ChangedFn>
+bool gateAndRefresh(std::optional<GateAcc>& gate, std::optional<StampAcc>& stamps,
+                    const Bonxai::CoordT& c, const VoxelT& v, bool snapshot,
+                    double t_now, ChangedFn&& changed_since_emit) {
+  if (!gate) return true;
+  if (!snapshot) {
+    if (auto* g = gate->value(c, false); g && !changed_since_emit(*g, v))
+      return false;
+  }
+  gate->setValue(c, v);
+  if (stamps) stamps->setValue(c, t_now);
+  return true;
 }
 
 // Heartbeat re-emit sweep for the change-gate wire path (audit item 7 split
