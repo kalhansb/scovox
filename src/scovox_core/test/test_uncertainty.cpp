@@ -118,16 +118,29 @@ TEST(Uncertainty, BernoulliShannonEntropyBoundedOnNearPointMass) {
   auto v = makeBeta(C * alpha0 + 50.f, alpha0);
   const float s = v.a_occ + v.a_free;
   const float p = v.a_occ / s;
-  // Mirror the production H_y guard in uncertainty.cpp.
-  float h_bern = 0.f;
-  if (p > 1e-7f && p < 1.f - 1e-7f)
-    h_bern = -p * std::log(p) - (1.f - p) * std::log(1.f - p);
+  // Call the production function.  This used to re-implement the H_y guard
+  // inline, so it tested the test's own copy of the formula: any change to
+  // uncertainty.cpp -- including deleting the guard -- left it green.
+  const float h_bern = bernoulliEntropy(p);
   EXPECT_GE(h_bern, 0.f);
   EXPECT_LE(h_bern, static_cast<float>(M_LN2) + 1e-6f)
       << "Bernoulli Shannon entropy must be bounded by ln2, got " << h_bern;
   // And it is a small positive number here (near-certain occupancy), NOT the
   // ~-99 the differential entropy reports for the identical voxel.
   EXPECT_LT(h_bern, 0.1f);
+
+  // The guard itself, which is the part the inline mirror could silently lose:
+  // a saturated voxel must return exactly 0, not NaN from log(0).
+  EXPECT_FLOAT_EQ(bernoulliEntropy(0.f), 0.f);
+  EXPECT_FLOAT_EQ(bernoulliEntropy(1.f), 0.f);
+  // And the maximum is ln2 at p = 1/2.
+  EXPECT_NEAR(bernoulliEntropy(0.5f), static_cast<float>(M_LN2), 1e-6f);
+  // Out of range and NaN also return 0, which is what the three inline copies
+  // this was extracted from produced: the guard is `!(lo < p && p < hi)`, and
+  // the De Morgan rewrite `p <= lo || p >= hi` would return NaN here instead.
+  EXPECT_FLOAT_EQ(bernoulliEntropy(-0.25f), 0.f);
+  EXPECT_FLOAT_EQ(bernoulliEntropy(1.25f), 0.f);
+  EXPECT_FLOAT_EQ(bernoulliEntropy(std::numeric_limits<float>::quiet_NaN()), 0.f);
 }
 
 // =====================================================================

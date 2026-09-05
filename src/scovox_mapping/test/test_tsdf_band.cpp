@@ -214,13 +214,18 @@ TEST(TSDFBand, BandOnlyIntegrationSkipsFarFreeSpace) {
 
   // Far-from-hit voxel (x=0.55, coord 5) — would be carved Beta-free under
   // the full-ray path; must be untouched in band-only mode.
-  Voxel far;
-  if (getVoxelAtCoord(m, Eigen::Vector3f(0.55f, 0, 0), far)) {
-    EXPECT_FLOAT_EQ(far.a_free, 1.0f)
-        << "band-only mode carved a voxel outside the band";
-    EXPECT_FLOAT_EQ(far.a_occ, 1.0f);
-    EXPECT_FLOAT_EQ(far.tsdf_weight, 0.f);
-  }
+  // Seeded with the prior and NOT guarded on the lookup: band-only mode is
+  // free either to skip the cell or to visit it and deposit nothing, and both
+  // leave `far` at the prior, so one unconditional set of assertions covers
+  // them.  Under the old `if` an unallocated cell asserted nothing -- which
+  // read as a pass for the wrong reason -- while a regression that starts
+  // carving here fails on the value, exactly as it should.
+  Voxel far = defaultVoxel();
+  getVoxelAtCoord(m, Eigen::Vector3f(0.55f, 0, 0), far);
+  EXPECT_FLOAT_EQ(far.a_free, 1.0f)
+      << "band-only mode carved a voxel outside the band";
+  EXPECT_FLOAT_EQ(far.a_occ, 1.0f);
+  EXPECT_FLOAT_EQ(far.tsdf_weight, 0.f);
 
   // Hit voxel still gets Beta-occupied + TSDF-zero.
   Voxel at_hit;

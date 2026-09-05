@@ -90,7 +90,7 @@ TEST(BetaUpdate, SingleHitIncreasesOccupancy) {
 }
 
 TEST(BetaUpdate, NHitsConvergesToExpected) {
-  // After N hits with w_occ=2, a_occ = 1 + 2*N, a_free = 1
+  // After N hits with w_occ=2, a_occ = prior + 2*N, a_free = prior
   // p_occ = (1 + 2N) / (2 + 2N) -> 1 as N -> inf
   auto map = makeMap(0.5);  // coarse grid so origin != hit cell
   Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
@@ -101,10 +101,19 @@ TEST(BetaUpdate, NHitsConvergesToExpected) {
 
   Voxel v = defaultVoxel();
   ASSERT_TRUE(map.getVoxel(hit, v));
-  float expected_a_occ = 1.0f + 2.0f * N;  // w_occ=2 default
-  // Range weighting reduces this, but p_occ should still be high
-  EXPECT_GT(v.p_occ(), 0.9f);
-  EXPECT_GT(v.a_occ, 10.0f);
+  // Exact, not a bound: the deposit is w_occ * range_w * angle_w, this overload
+  // defaults both weights to 1, and nothing on the static path recomputes a
+  // range decay (range_decay_length is consulted only in carve_free).
+  // evidence_saturation (1000) is far above the 41 reached here.
+  const float expected_a_occ = 1.0f + 2.0f * N;  // prior 1 + w_occ=2 per hit
+  EXPECT_FLOAT_EQ(v.a_occ, expected_a_occ);
+  // The free deposit is guarded by `!at_hit`, so the endpoint keeps the
+  // untouched prior however the walk reaches it; that is what makes p_occ
+  // predictable rather than merely large.  (The DDA also stops short of the
+  // endpoint here, but only because sdf_trunc is 0 and the band is empty --
+  // the guard is the load-bearing half.)
+  EXPECT_FLOAT_EQ(v.a_free, 1.0f);
+  EXPECT_FLOAT_EQ(v.p_occ(), expected_a_occ / (expected_a_occ + 1.0f));
 }
 
 TEST(BetaUpdate, FreeSpaceUpdateIncreasesAFree) {
@@ -112,13 +121,16 @@ TEST(BetaUpdate, FreeSpaceUpdateIncreasesAFree) {
   Eigen::Vector3f origin(0, 0, 0), hit(3, 0, 0);
   map.integrateRay(origin, hit);
 
-  // Voxel at midpoint should have free evidence
+  // ASSERT, not `if`: a total failure of free carving allocates nothing along
+  // the ray, and under a conditional body that is a silent pass -- the one
+  // regression this test exists to catch.
   Eigen::Vector3f mid(1, 0, 0);
   Voxel v = defaultVoxel();
-  if (map.getVoxel(mid, v)) {
-    EXPECT_GT(v.a_free, 1.0f);
-    EXPECT_LT(v.p_occ(), 0.5f);
-  }
+  ASSERT_TRUE(map.getVoxel(mid, v)) << "free carving allocated no voxel at the midpoint";
+  // Exact: one traversal deposits w_free * range_w = 1.0 on the 1.0 prior.
+  EXPECT_FLOAT_EQ(v.a_free, 2.0f);
+  EXPECT_FLOAT_EQ(v.a_occ, 1.0f);
+  EXPECT_LT(v.p_occ(), 0.5f);
 }
 
 // --- 3. Temporal decay ---
@@ -148,35 +160,97 @@ TEST(BetaUpdate, DecayMovesTowardPrior) {
   EXPECT_LT(after.a_occ - 1.0f, before.a_occ - 1.0f);
 }
 
+// Reads the one transient voxel a single dynamic ray leaves behind.  Both
+// decay tests need it, and going through the grid is the point: the earlier
+// versions re-implemented `1 + (x-1)*rate` in the test body and then asserted
+// properties of the arithmetic they had just written, so a change to the
+// production rule could not break them.
+static Voxel soleTransientVoxel(Map& map) {
+  Voxel found = defaultVoxel();
+  size_t n = 0;
+  map.transientGrid().forEachCell([&](const Voxel& v, const Bonxai::CoordT&) {
+    if (v.a_occ > 1.0f) { found = v; ++n; }
+  });
+  EXPECT_EQ(n, 1u) << "expected exactly one occupied transient voxel, got " << n;
+  return found;
+}
+
 TEST(BetaUpdate, DecayPreservesRatio) {
-  Voxel v = defaultVoxel();
-  v.a_occ = 10.0f;
-  v.a_free = 5.0f;
-  float ratio_before = v.a_occ / v.a_free;
+  auto map = makeMap(0.5);
+  Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
+  map.integrateRay(origin, hit, /*is_dynamic=*/true);
 
-  // Manual decay like Map::decayTransientGrid
-  float rate = 0.8f;
-  v.a_occ = 1.0f + (v.a_occ - 1.0f) * rate;
-  v.a_free = 1.0f + (v.a_free - 1.0f) * rate;
+  const Voxel before = soleTransientVoxel(map);
+  ASSERT_FLOAT_EQ(before.a_occ, 3.0f);   // prior 1 + w_occ 2
+  ASSERT_FLOAT_EQ(before.a_free, 1.0f);  // free carving goes to the persistent grid
+  const float ratio_before = before.a_occ / before.a_free;
 
-  // Ratio should be approximately preserved (not exactly, due to prior shift)
-  float ratio_after = v.a_occ / v.a_free;
-  // Both move toward 1, so ratio should move toward 1 as well
-  EXPECT_GT(ratio_after, 1.0f);  // still favors occupied
+  map.decayTransientGrid(0.8f);
+  const Voxel after = soleTransientVoxel(map);
+  const float ratio_after = after.a_occ / after.a_free;
+
+  // Both buckets move toward the prior, so the ratio moves toward 1: above 1
+  // still, but strictly below where it started.  The upper bound is the half
+  // that distinguishes a decay from a rescale, so both are asserted.  With
+  // b at the prior the algebra is 1 + (a-1)r over 1, exact in binary32 here.
+  EXPECT_FLOAT_EQ(after.a_occ, 1.0f + 2.0f * 0.8f);
+  EXPECT_FLOAT_EQ(after.a_free, 1.0f);
+  EXPECT_GT(ratio_after, 1.0f);           // still favors occupied
+  EXPECT_LT(ratio_after, ratio_before);   // but moved toward the prior
 }
 
 TEST(BetaUpdate, FullDecayResetsToPrior) {
+  auto map = makeMap(0.5);
+  Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
+  map.integrateRay(origin, hit, /*is_dynamic=*/true);
+  ASSERT_FLOAT_EQ(soleTransientVoxel(map).a_occ, 3.0f);
+
+  map.decayTransientGrid(0.0f);  // rate 0 means immediate reset
+
+  // soleTransientVoxel's `a_occ > 1.0f` filter finds nothing now, which is the
+  // assertion: read the cell back directly instead.
+  size_t n = 0;
   Voxel v = defaultVoxel();
-  v.a_occ = 10.0f;
-  v.a_free = 5.0f;
-
-  // Decay with rate 0 means immediate reset
-  v.a_occ = 1.0f + (v.a_occ - 1.0f) * 0.0f;
-  v.a_free = 1.0f + (v.a_free - 1.0f) * 0.0f;
-
+  map.transientGrid().forEachCell([&](const Voxel& tv, const Bonxai::CoordT&) {
+    v = tv; ++n;
+  });
+  ASSERT_EQ(n, 1u);
   EXPECT_FLOAT_EQ(v.a_occ, 1.0f);
   EXPECT_FLOAT_EQ(v.a_free, 1.0f);
   EXPECT_FLOAT_EQ(v.p_occ(), 0.5f);
+}
+
+// The semantic half of decayTransientGrid -- `sem_cnt[i] *= rate` and
+// `a_unk *= rate` -- had no test at all: it is multiplicative where the Beta
+// half is affine, so the two cannot cover each other.
+TEST(BetaUpdate, DecayScalesSemanticCountsMultiplicatively) {
+  auto map = makeMap(0.5);
+  Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
+  // Three classes against K_TOP slots: with K_TOP == 2 the smallest is routed
+  // into a_unk by sparse_add, so a_unk carries real mass and its assertion
+  // below is not 0 == 0 * rate.
+  std::vector<float> probs(10, 0.0f);
+  probs[3] = 0.5f;
+  probs[5] = 0.3f;
+  probs[7] = 0.2f;
+  map.integrateRay(origin, hit, /*is_dynamic=*/true, &probs);
+
+  const Voxel before = soleTransientVoxel(map);
+  float cnt_before = 0.f;
+  for (int i = 0; i < K_TOP; ++i) cnt_before += before.sem_cnt[i];
+  ASSERT_GT(cnt_before, 0.f) << "no semantic mass deposited; the rest is vacuous";
+  ASSERT_GT(before.a_unk, 0.f) << "no residual mass; the a_unk assertion would be vacuous";
+
+  const float rate = 0.8f;
+  map.decayTransientGrid(rate);
+  const Voxel after = soleTransientVoxel(map);
+  float cnt_after = 0.f;
+  for (int i = 0; i < K_TOP; ++i) cnt_after += after.sem_cnt[i];
+
+  // Multiplicative, so unlike the Beta buckets there is no prior floor: the
+  // counts scale straight through zero.
+  EXPECT_FLOAT_EQ(cnt_after, cnt_before * rate);
+  EXPECT_FLOAT_EQ(after.a_unk, before.a_unk * rate);
 }
 
 // --- 4. Update properties ---
@@ -187,23 +261,30 @@ TEST(BetaUpdate, FullDecayResetsToPrior) {
 // removed when reach_prob was introduced.
 
 TEST(BetaUpdate, MultipleHitsAreAdditive) {
-  // Beta update is conjugate: 2 hits should give same result as 1+1
+  // Beta update is conjugate: N hits add N*w_occ of above-prior mass.  Both
+  // maps used to get two rays each, so the only thing asserted was that
+  // integrateRay is deterministic -- true of any update rule, additive or not.
+  // The one-hit arm is what makes the comparison about additivity.
   auto map1 = makeMap(0.5);
   auto map2 = makeMap(0.5);
 
   Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
 
-  map1.integrateRay(origin, hit);
-  map1.integrateRay(origin, hit);
+  map1.integrateRay(origin, hit);          // one hit
 
-  map2.integrateRay(origin, hit);
+  map2.integrateRay(origin, hit);          // two hits
   map2.integrateRay(origin, hit);
 
   Voxel v1 = defaultVoxel(), v2 = defaultVoxel();
   ASSERT_TRUE(map1.getVoxel(hit, v1));
   ASSERT_TRUE(map2.getVoxel(hit, v2));
-  EXPECT_FLOAT_EQ(v1.a_occ, v2.a_occ);
-  EXPECT_FLOAT_EQ(v1.a_free, v2.a_free);
+  // Exact: w_occ = 2 on the 1.0 prior, deposited once and twice.
+  EXPECT_FLOAT_EQ(v1.a_occ, 3.0f);
+  EXPECT_FLOAT_EQ(v2.a_occ, 5.0f);
+  EXPECT_FLOAT_EQ(v2.a_occ - 1.0f, 2.0f * (v1.a_occ - 1.0f));
+  // The endpoint takes no free mass on either arm, so the prior is untouched.
+  EXPECT_FLOAT_EQ(v1.a_free, 1.0f);
+  EXPECT_FLOAT_EQ(v2.a_free, 1.0f);
 }
 
 // --- 5. Carving a beam through an occupied voxel leaves it solid ---
@@ -252,12 +333,11 @@ TEST(BetaUpdate, CarvingAddsFreeToClearVoxels) {
   Eigen::Vector3f origin(0, 0, 0), hit(3, 0, 0);
   map.integrateRay(origin, hit);
 
-  // Intermediate voxel should have free evidence
+  // ASSERT, not `if`: see FreeSpaceUpdateIncreasesAFree.
   Eigen::Vector3f mid(1.0f, 0, 0);
   Voxel v = defaultVoxel();
-  if (map.getVoxel(mid, v)) {
-    EXPECT_GT(v.a_free, 1.0f);
-  }
+  ASSERT_TRUE(map.getVoxel(mid, v)) << "carving allocated no intermediate voxel";
+  EXPECT_FLOAT_EQ(v.a_free, 2.0f);
 }
 
 // --- 6. Transient layer isolation ---
@@ -267,20 +347,27 @@ TEST(BetaUpdate, DynamicEndpointGoesToTransient) {
   Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
   map.integrateRay(origin, hit, /*is_dynamic=*/true);
 
-  // Persistent grid should NOT have the endpoint (beyond free carving evidence)
+  // Persistent grid should NOT have the endpoint occupied.  The lookup may or
+  // may not find a cell there (free carving skips the endpoint, so nothing
+  // allocates it on this path), and either answer is consistent with the
+  // contract -- what is not is an occupied one.
   Voxel pv = defaultVoxel();
-  bool in_persistent = map.getVoxel(hit, pv);
-  if (in_persistent) {
-    // If persistent has it, it's only from free carving — should not be occupied
+  if (map.getVoxel(hit, pv)) {
     EXPECT_LT(pv.p_occ(), 0.5f) << "Dynamic endpoint should not be in persistent grid";
   }
 
-  // Transient grid should have the endpoint
-  bool found_in_transient = false;
-  map.transientGrid().forEachCell([&](const Voxel& v, const Bonxai::CoordT&) {
-    if (v.a_occ > 1.01f) found_in_transient = true;
+  // Transient grid should have the endpoint -- AT THE ENDPOINT.  The coord was
+  // discarded before, so an occupied transient voxel anywhere satisfied a test
+  // whose name asserts a location.
+  const auto k_hit = map.transientGrid().posToCoord(hit.x(), hit.y(), hit.z());
+  bool found_at_endpoint = false;
+  map.transientGrid().forEachCell([&](const Voxel& v, const Bonxai::CoordT& c) {
+    if (c == k_hit) {
+      found_at_endpoint = true;
+      EXPECT_FLOAT_EQ(v.a_occ, 3.0f);   // prior 1 + w_occ 2, one dynamic hit
+    }
   });
-  EXPECT_TRUE(found_in_transient);
+  EXPECT_TRUE(found_at_endpoint);
 }
 
 TEST(BetaUpdate, StaticEndpointGoesToPersistent) {
@@ -306,12 +393,21 @@ TEST(BetaUpdate, FreeCarveAlwaysGoesToPersistent) {
   Eigen::Vector3f origin(0, 0, 0), hit(3, 0, 0);
   map.integrateRay(origin, hit, /*is_dynamic=*/true);
 
-  // Check persistent grid has free evidence along the ray
+  // ASSERT, not `if`.  The regression this test names -- free carving routed
+  // to the transient grid -- makes the persistent lookup fail, which under a
+  // conditional body skipped the only assertion and passed.
   Eigen::Vector3f mid(1.0f, 0, 0);
   Voxel v = defaultVoxel();
-  if (map.getVoxel(mid, v)) {
-    EXPECT_GT(v.a_free, 1.0f) << "Free carving should go to persistent even for dynamic rays";
-  }
+  ASSERT_TRUE(map.getVoxel(mid, v))
+      << "Free carving should go to persistent even for dynamic rays";
+  // Exact, and NOT the 2.0 the two static-ray carve tests above see.  The
+  // dynamic branch of integrateRay calls the two-argument `carve_free`, which
+  // derives its own range weight exp(-|hit - origin| / range_decay_length)
+  // (scovoxmap.cpp:69-74); the static branch instead carves with the range_w
+  // its caller supplies, which defaults to 1.  Same geometry, different free
+  // mass -- assert the value the dynamic path actually owes.
+  const float range_w = std::exp(-(hit - origin).norm() / map.params().range_decay_length);
+  EXPECT_FLOAT_EQ(v.a_free, 1.0f + map.params().w_free * range_w);
 }
 
 TEST(BetaUpdate, ClearTransientGridRemovesAll) {
@@ -452,5 +548,9 @@ TEST(BetaUpdate, ForEachVoxelVisitsAllObserved) {
     ++count;
   });
 
-  EXPECT_GE(count, 2u);  // at least the 2 hit points + free space
+  // The name says ALL, so count them: at resolution 0.5 each ray allocates the
+  // five coords 0..4 along its axis (the walk stops short of k_far, and the
+  // explicit follow-up visit covers it), and the two rays share the origin
+  // cell.  5 + 5 - 1 = 9.  `>= 2` tolerated forEachVoxel skipping seven.
+  EXPECT_EQ(count, 9u);
 }

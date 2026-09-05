@@ -103,13 +103,16 @@ TEST(DirichletUpdate, MixedObsProportionalCounts) {
     if (v.sem_cls[si] == 2) cnt2 = v.sem_cnt[si];
   }
 
-  EXPECT_GT(cnt1, 0.f);
-  EXPECT_GT(cnt2, 0.f);
-  // Ratio should approximate 0.7/0.3 ~ 2.33
-  if (cnt2 > 0.f) {
-    float ratio = cnt1 / cnt2;
-    EXPECT_NEAR(ratio, 0.7f / 0.3f, 0.5f);
-  }
+  ASSERT_GT(cnt1, 0.f);
+  ASSERT_GT(cnt2, 0.f);   // ASSERT: the ratio below is meaningless without it,
+                          // and the old `if (cnt2 > 0.f)` made a zero count a
+                          // silent pass on the very assertion that matters.
+  // The two increments are w * 0.7 and w * 0.3 with the SAME w on every ray,
+  // so the ratio is 0.7/0.3 exactly in real arithmetic and off only by float
+  // accumulation.  The old +-0.5 band spanned 1.83..2.83, wide enough to admit
+  // a 2:1 or 3:1 rule -- i.e. it did not test proportionality at all.
+  const float ratio = cnt1 / cnt2;
+  EXPECT_NEAR(ratio, 0.7f / 0.3f, 1e-3f);
 }
 
 TEST(DirichletUpdate, TwoClassesBothStored) {
@@ -250,23 +253,40 @@ TEST(DirichletUpdate, NullProbsSkipsSemUpdate) {
 
 TEST(DirichletUpdate, A0DeltaTracksTotal) {
   auto map = makeSemanticMap();
-  Eigen::Vector3f hit = prepareOccupied(map);
-  Eigen::Vector3f origin(0, 0, 0);
+  Eigen::Vector3f origin(0, 0, 0), hit(2, 0, 0);
 
+  // Probabilities summing to 0.9, so the 0.1 residual lands in a_unk and the
+  // conservation law below covers both halves of the split.  Two classes for
+  // K_TOP == 2: no eviction, so this measures the deposit, not the evictor.
   std::vector<float> probs(10, 0.0f);
   probs[1] = 0.6f;
   probs[2] = 0.3f;
 
-  for (int i = 0; i < 10; ++i)
-    map.integrateRay(origin, hit, false, &probs);
+  map.integrateRay(origin, hit, false, &probs);   // exactly one observation
 
   Voxel v = defaultVoxel();
   ASSERT_TRUE(map.getVoxel(hit, v));
 
-  // a0() should equal sum of all named class counts + a_unk
+  // The law is MASS CONSERVATION: one observation contributes exactly
+  // kappa0 * p_occ pseudocounts, split between the named slots and a_unk
+  // (semantics.hpp: "each observation contributes exactly w pseudocounts").
+  // Occupancy is deposited before semantics, so the p_occ the deposit saw is
+  // the one readable now.
+  //
+  // The old form summed sem_cnt + a_unk and compared it to a0() -- which is
+  // DEFINED as sem_cnt + a_unk (voxel.hpp:93-96).  It expanded a definition
+  // and checked the expansion against itself, so it held for any deposit rule,
+  // including one that dropped the residual on the floor.  Tying a0() to
+  // kappa0 and to the occupancy state makes it a real constraint.
+  const float w = map.params().kappa0 * v.p_occ();
+  EXPECT_NEAR(v.a0(), w, 1e-4f * w);
+
+  // And the split itself, so a regression cannot pass by moving mass between
+  // the two halves while keeping the total.
   float sum_named = 0.f;
   for (int si = 0; si < K_TOP; ++si) sum_named += v.sem_cnt[si];
-  EXPECT_NEAR(v.a0(), sum_named + v.a_unk, 0.01f);
+  EXPECT_NEAR(sum_named, 0.9f * w, 1e-4f * w);
+  EXPECT_NEAR(v.a_unk,   0.1f * w, 1e-4f * w);
 }
 
 // =====================================================================

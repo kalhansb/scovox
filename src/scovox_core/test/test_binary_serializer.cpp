@@ -257,7 +257,16 @@ TEST(BinarySerializer, EmitSizeMatchesSpec) {
   // Dir:    4 (count) + 19 + 2 × 14 = 51 B                   (f32: other +
   //                              cnt 4·K + cls 1·K, K=2; rev 8 u8 class ids)
   // Fine:   4 (count, empty here) = 4 B                      (rev 7 tail)
-  if (scovox::K_TOP == 2) {
+  //
+  // Every byte count above is derived for K_TOP == 2.  Wrapping the body in
+  // `if (K_TOP == 2)` meant a K-sweep build reported this test GREEN having
+  // asserted nothing at all -- the failure mode a size-contract test exists to
+  // prevent.  GTEST_SKIP says "not run" where the reader can see it.
+  if (scovox::K_TOP != 2) {
+    GTEST_SKIP() << "emit sizes are derived for K_TOP == 2; built with K_TOP = "
+                 << scovox::K_TOP;
+  }
+  {
     auto full = scovox::BinarySerializer::serialize(
         f, scovox::BinarySerializer::Options{/*share_tsdf=*/true});
     EXPECT_EQ(full.size(), 21u + 44u + 39u + 51u + 4u) << "share_tsdf=true emit size";  // 159

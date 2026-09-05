@@ -410,10 +410,48 @@ TEST(SemSplitMap, EvictionConservesMassToOther) {
   EXPECT_TRUE(has1);
   EXPECT_TRUE(has2);
   EXPECT_FALSE(has7) << "weakest class must not occupy a slot";
-  // Mass is conserved regardless of eviction routing (no negative, no loss).
-  EXPECT_GT(d->other(), (kC - scovox::K_TOP) * kAlpha)
-      << "evicted/dropped evidence must accumulate in OTHER";
-  EXPECT_GT(d->s_class(), kC * kAlpha);
+
+  // MASS CONSERVATION, stated exactly.  `other()` is DERIVED as
+  // `s_total - sum(cnt)` (dir_voxel.hpp:200-204), so "other + sum(cnt) equals
+  // s_class" -- what the header comment claims -- is an identity that holds
+  // however much mass the evictor loses.  The two EXPECT_GTs that stood here
+  // said only "more than the prior", which a rule that dropped eight of the
+  // nine injected shares would also satisfy.
+  //
+  // The independent total: every applyHitUpdate adds w_occ = 1 to a_occ on the
+  // Beta(0.5, 0.5) prior, so after n hits p_occ = (0.5 + n) / (1 + n); the
+  // semantic deposit is kappa0 * p_occ, with the same post-update p_occ the
+  // sibling MassConservation test above pins.
+  //
+  // ALL TEN hits deposit, the nullptr one included.  `commitHit` gates on
+  // p_occ_post alone and `dirichletUpdate` opens with an unconditional
+  // `d->s_total += class_share` before it ever looks at the probability vector
+  // (sem_split_map.cpp:79), so a hit that names no class still books its whole
+  // share -- as uncovered mass, i.e. into OTHER.  Starting the sum at n = 2
+  // undercounts by exactly that first share (0.75).
+  const int n_hits = 1 + 5 + 3 + 1;
+  float injected = 0.f, share_first_cls = 0.f, share_last_cls = 0.f, share_null = 0.f;
+  for (int n = 1; n <= n_hits; ++n) {
+    const float p_occ_post = (scovox::kBetaOccPrior + (float)n)
+                           / (scovox::kBetaOccPrior + scovox::kBetaFreePrior + (float)n);
+    injected += p_occ_post;
+    if (n == 1) share_null = p_occ_post;          // the nullptr-probs hit
+    if (n >= 2 && n <= 6) share_first_cls += p_occ_post;  // class 1, hits 2..6
+    if (n == n_hits) share_last_cls = p_occ_post; // class 7, the dropped one
+  }
+  EXPECT_NEAR(d->s_class(), kC * kAlpha + injected, 1e-3f)
+      << "injected semantic mass was lost or double-counted";
+
+  // And the routing, so conservation cannot be met by parking everything in
+  // one bucket: the tracked slots keep their own shares (within one alpha_0,
+  // whichever bucket the per-class prior sits in) and the dropped class 7
+  // share is in OTHER.
+  float cnt1 = 0.f;
+  for (int i = 0; i < scovox::K_TOP; ++i) if (d->cls[i] == 1) cnt1 = d->cnt[i];
+  EXPECT_NEAR(cnt1, share_first_cls, kAlpha + 1e-3f);
+  EXPECT_GE(d->other(), share_null + share_last_cls)
+      << "the dropped class's evidence and the no-class share must both land "
+         "in OTHER, not on the floor";
 }
 
 // ===========================================================================
