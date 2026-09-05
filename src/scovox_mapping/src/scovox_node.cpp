@@ -36,6 +36,7 @@
 #include "scovox/scovox_map_split.hpp"
 #include "scovox/node_utils.hpp"
 #include "scovox/topk_provider.hpp"
+#include "scovox/version.hpp"     // buildSwitches() — logged once at startup
 #include "scovox_msgs/msg/scovox_map.hpp"
 #include "scovox_msgs/msg/scovox_voxel.hpp"
 #include "scovox_msgs/msg/scovox_semantic_evidence.hpp"
@@ -265,6 +266,13 @@ public:
         fine_region_z_lo_, fine_region_z_hi_, (int)fine_raw_returns_,
         fine_region_topic_.c_str());
     }
+    // The compiled-in switch values, logged once at startup. A runtime
+    // parameter dump says what the node was ASKED for; this says what the
+    // binary IS. The two hazards it closes are invisible to every other check:
+    // a `-D` misspelled on the build line preprocesses to nothing and leaves no
+    // warning, and a build that silently differs shows up in an md5 as a
+    // difference without saying which switch moved.
+    RCLCPP_INFO(get_logger(), "%s", scovox::buildSwitches());
     RCLCPP_INFO(get_logger(), "SCovox ready res=%.3f mode=%s frame=%s share_tsdf=%d share_dir=%d fused_walker=%d",
       P.resolution, mode_.c_str(), int_frame_.c_str(), (int)share_tsdf_, (int)share_dir_, (int)fused_walker_);
     if (!share_dir_) {
