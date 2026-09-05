@@ -1008,3 +1008,28 @@ slots filled and MI is uninformative there too.
 Jeffreys promotion in the addendum above. Both arms share that binary so the
 comparison is internally valid, but its absolute numbers are not comparable to a
 post-promotion run.
+
+**E13b — calibration, and the one place the prior is not inert.** The pass above
+graded uncertainty with AUROC, a *ranking* measure that no monotone rescaling
+can move, so it could not speak to calibration. Scoring Brier / ECE / NLL on the
+same dumps splits the effect three ways: cell A (built 0.01, read 0.01), cell C
+(built 0.01, read 1/14 — E10's readout counterfactual) and cell B (built 1/14,
+read 1/14).
+
+The **build** contribution `B − C` is at most `4.7e-6` absolute on `nll_miss`
+and `5.1e-9` on `nll_hit`, Brier and ECE — float noise, sign-split 4/8. So
+`B − A` equals `C − A` to five decimals. **Consequence for anyone reading this
+review: a post-hoc reparameterisation of a 0.01 dump answers any α₀ question
+exactly, and no replay is needed.** That retroactively validates E10's method,
+which was the one open methodological doubt about it.
+
+The prior is **not** inert on `nll_miss` — the surprise on voxels whose truth
+was in neither slot improves 8/8, 4.8423 → 4.8171, because a miss is scored out
+of the pool at `(alpha_0 + o_e/n_pool)/D` and a bigger prior raises that floor.
+Three qualifications keep it from being a reason to move: one scene (015, miss
+rate 27.9 %) is 93 % of the mean and 100 % of the total-NLL effect; `nll_hit` is
+*worse* on 7/8 and rises monotonically in alpha_0 there; and `nll_miss` itself is
+monotone in alpha_0 all the way to 1000, so selecting on it selects the uniform
+prior. ECE, the metric that most directly asks whether the probabilities are
+honest, is best at the incumbent and degrades monotonically upward. `alpha_0`
+stays at 0.01.

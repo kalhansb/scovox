@@ -52,7 +52,7 @@ in:
 | `--stride` | 2 | replay only | depth subsample; must match the stored top-k payload |
 | `--min-depth` / `--max-depth` | 0.4 / 4.0 | replay only | Asus Xtion usable band |
 | `--num-classes` | 14 | `semsplit.num_classes` | sets the OTHER bucket as `C − K_TOP` |
-| `--alpha0` | 0.01 | `semsplit.alpha_0` | Dirichlet prior per class. Settled: E10 swept it at readout, E13 (2026-09-05) re-ran the mapper so the `evict_by_confidence` path was live, and 1/14 (Perks) is exactly inert — union/inter mIoU and occupancy IoU delta `+0.000e+00` on 8/8, slot class residency differing on 6 voxels in 19.1 M and none of them past the `p_occ > 0.5` gate |
+| `--alpha0` | 0.01 | `semsplit.alpha_0` | Dirichlet prior per class. Settled: E10 swept it at readout, E13 (2026-09-05) re-ran the mapper so the `evict_by_confidence` path was live, and 1/14 (Perks) is exactly inert — union/inter mIoU and occupancy IoU delta `+0.000e+00` on 8/8, slot class residency differing on 6 voxels in 19.1 M and none of them past the `p_occ > 0.5` gate. E13b adds the calibration half: the BUILD contribution is float noise (≤ 4.7e-6), so a post-hoc reparameterisation of a 0.01 dump answers any α₀ question exactly and **no replay is needed**. The one non-inert metric is `nll_miss` (8/8 better at 1/14), but it is monotone in α₀ to 1000, concentrated on one scene, and paid for on `nll_hit` (worse 7/8); ECE is best at the incumbent |
 | `--w-occ` | **1.5** | `semsplit.w_occ` | Stream A hit weight; on the ⅛ lattice |
 | `--w-free` | 1.0 | `semsplit.w_free` | full-ray carve weight |
 | `--beta-occ-prior` | **0.5** | `semsplit.beta_occ_prior` | Beta prior `a_occ` at first touch; `0.5 = 4/8`, on the ⅛ lattice |
