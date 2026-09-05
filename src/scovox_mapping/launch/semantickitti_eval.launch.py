@@ -266,7 +266,7 @@ def generate_launch_description():
                                           "gap-mechanism finding)."),
         DeclareLaunchArgument("fused_walker", default_value="true",
                               description="Step 12.10 (2026-05-09): hit rays "
-                                          "go through a single Bresenham DDA over the union of the "
+                                          "go through a single exact DDA over the union of the "
                                           "TSDF band and SemBeta carve range with per-voxel dispatch "
                                           "into both grids. Default true (production); set false to "
                                           "fall back to the legacy two-DDA split path for A/B parity."),
