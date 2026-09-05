@@ -7,18 +7,27 @@ This document has two halves that deliberately do not agree with each other.
   comes from. It is defined by the offline replay driver in the sibling
   repository (`scovox_slot_rules/scovox_scenenn/src/replay_scenenn.cpp`) and
   by the archived write-up `docs/archive/design/best_method.md`.
-- **§2 The current code** is this repository at commit `33aa576`. The
-  `DirVoxel` total-basis change, the `nhit` removal and the `SCOVOX_BETA_U16`
-  default flip were committed in `1101e53`; the promoted-configuration file and
-  an off-lattice test fix in `33aa576`. They were uncommitted when this
-  document was first written.
+- **§2 The current code** is this repository at commit `32121f2`, re-pinned
+  and re-audited on 2026-09-05. It was first written against `33aa576` and the
+  pin was left behind for 27 commits, during which the code-review series moved
+  most of the addresses below. A second audit on 2026-09-05 re-read every
+  `file:line` against source and found the first pass had NOT: about thirty
+  pointers were off, several by the ±1 / ±10 signature of an offset rather than
+  a read. Those are corrected below. Treat any pointer here as an address that
+  drifts with the next edit — the symbol name beside it is the durable half, and
+  `grep -n` on that name is the way to re-find it.
+  Historically: the `DirVoxel` total-basis change, the `nhit` removal and the
+  `SCOVOX_BETA_U16` default flip were committed in `1101e53`; the
+  promoted-configuration file and an off-lattice test fix in `33aa576`.
 - **§3 The gap** lists every place where the code has not been brought up to
   the best method. The library defaults and the replay already match; the
   ROS node, its launch files and its config files do not.
 
 Everything in §2 and §3 was read from source, not from older docs. Line
-numbers are working-tree line numbers on 2026-09-04 and will drift; the
-function names will not. The previous version of this document is at
+numbers are working-tree line numbers at `32121f2` (2026-09-05) and will
+drift; the function names will not. When a pointer here disagrees with the
+tree, trust the name and not the number — and do not repair it by adding an
+offset, which is exactly how the 2026-09-04 set rotted. The previous version of this document is at
 `docs/archive/scovox_code_structure.md` and describes the pre-`d5da6a8` tree.
 
 ---
@@ -107,7 +116,7 @@ so the prior re-weights early observations against settled ones and nothing
 else.
 
 The cancellation argument above is confined to the **0.5** gate. Where a
-threshold is not 0.5 the prior is load-bearing: `dscovox_node.cpp:661`
+threshold is not 0.5 the prior is load-bearing: `dscovox_node.cpp:664`
 publishes at `p_occ() >= 0.7`, where Jeffreys admits a voxel after 2 hits
 against one miss and `Beta(1,1)` needed 3. The carve wall guard
 `carve_skip_occ_threshold` is the other such site, and is off by default.
@@ -116,7 +125,7 @@ against one miss and `Beta(1,1)` needed 3. The carve wall guard
 
 1. **Ray setup.** Origin `O`, endpoint `E`, direction `u`, depth `d`. The fused
    walker runs one exact DDA over `[E − max(d, trunc)·u, E + max(trunc, band)·u]`
-   (`scovox_map_split.hpp:183-582`). `tsdf_enabled=0` does **not** make `trunc`
+   (`scovox_map_split.hpp:183-618`). `tsdf_enabled=0` does **not** make `trunc`
    0: the node passes `sdf_trunc = 0` but `TsdfMap::sanitise` (`tsdf_map.cpp:25`)
    clamps any `<= 0` back to 0.15 m, and the walker reads the sanitised value.
    So `back_reach` (`:255`) is `max(0.15, 0.10) = 0.15 m`, not the band's 0.10 m,
@@ -156,9 +165,9 @@ against one miss and `Beta(1,1)` needed 3. The carve wall guard
    (`tsdf_enabled=0`, gate at `:421`); if the voxel is not the hit voxel and
    `−band < sdf ≤ band`, a **band deposit** is staged (`:439-441`); otherwise
    the voxel is **carved** (`:444-448`).
-4. **Hit voxel, Stream A** (`SemSplitMap::commitHit`, `sem_split_map.cpp:669-738`):
+4. **Hit voxel, Stream A** (`SemSplitMap::commitHit`, `sem_split_map.cpp:679-747`):
    `a_occ += w_occ` (1.5 → 12 lattice units). Under `batch_hits` only the
-   strongest ray per voxel per scan reaches here (`flushStagedHits` `:521-560`).
+   strongest ray per voxel per scan reaches here (`flushStagedHits` `:530-569`).
 5. **Hit voxel, Stream B**: gate `p_occ_post ≥ 0.5`; deposit
    `class_share = kappa0 · p_occ_post` into the `DirVoxel` through
    `dirichletUpdate` (`:60-231`): `s_total += class_share` once, then the
@@ -167,7 +176,13 @@ against one miss and `Beta(1,1)` needed 3. The carve wall guard
    Eviction compares the arrival's confidence against the weakest slot's
    `qmax`; an evicted slot's evidence falls back into the derived
    `other()` (`SCOVOX_EVICT_INHERIT=0`).
-6. **Band voxels, Stream B only** (`applyBandSemantic` `:844-892`): with
+   The gate reads `p_occ_post` and **nothing else** — `commitHit` never
+   inspects `sem_probs`, and `dirichletUpdate` books `s_total += class_share`
+   before any branch looks at the vector. A hit carrying no labels therefore
+   still deposits its whole share, as uncovered mass in `other()`. So
+   `s_total − C·α₀` counts *looks*, not *labelled looks*; anything reading it
+   as a count of class observations is over-counting by the unlabelled hits.
+6. **Band voxels, Stream B only** (`applyBandSemantic` `:854-901`): with
    `band_require_occ=false` a flat `kappa0` deposit with no Beta read, so a
    band voxel can hold a class before it holds occupancy evidence. **Not
    batched** — `batch_hits` stages the endpoint only (`:606-608`), and this is
@@ -177,7 +192,7 @@ against one miss and `Beta(1,1)` needed 3. The carve wall guard
    scorer excludes Dir-only voxels by `state`) and material for anything reading
    `s_total` as a Dirichlet concentration. See M9 in `code/code_review_2026_09_04.md`.
 7. **Carved voxels**: `a_free += w_free` per voxel, written once per voxel per
-   scan at `flushCarveFrame` (`:476-519`), block-ordered; occupied hits win
+   scan at `flushCarveFrame` (`:493-528`), block-ordered; occupied hits win
    over carves in the same scan.
 8. **Saturation** (`applyBetaSaturation` `:1088-1111`, `applyDirSaturation`
    `:1112-1143`): the opt-in cap is off; the unconditional u16 halving at 90 %
@@ -222,7 +237,7 @@ Four mechanisms involve a voxel's neighbours, and exactly one is promoted:
 
 | mechanism | shape | site | promoted |
 |---|---|---|---|
-| semantic band | a segment of the ray | `applyBandSemantic` (`sem_split_map.cpp:844-892`) | **yes**, 0.10 m |
+| semantic band | a segment of the ray | `applyBandSemantic` (`sem_split_map.cpp:854-901`) | **yes**, 0.10 m |
 | BKI ball | a sphere | `applyHitUpdateKernel` (`:711-717`) | no — `semantic_spread_radius` 0 |
 | three-voxel ray spread | ±1 voxel along the ray | `raySpreadDeposit` (`:759-829`) | no — `ray_spread` 0 |
 | spatial readout | 6-connected relaxation | `scripts/slot_readout.py`, scoring time | no |
@@ -326,13 +341,13 @@ scovox/
 └── src/
     ├── scovox_core/          zero-ROS mapping library + 11 gtest binaries + split_memory_demo
     ├── scovox_msgs/          5 msgs, 3 srvs
-    ├── scovox_mapping/       scovox_node, dscovox_node, scovoxmap lib, 9 launch files, 8 gtests
+    ├── scovox_mapping/       scovox_node, dscovox_node, scovoxmap lib, 9 launch files, 10 gtests
     └── seg_pipeline/         Python Mask2Former (Mapillary) → 14 outdoor classes
 ```
 
-Line counts (working tree): `scovox_node.cpp` 3396, `sem_split_map.cpp`
-1213, `dscovox_node.cpp` 994, `scovox_map_split.hpp` 959, `sem_split_map.hpp`
-829, `binary_serializer.hpp` 701, `dir_voxel.hpp` 470. Bonxai is vendored at
+Line counts at `32121f2`: `scovox_node.cpp` 3421, `sem_split_map.cpp`
+1223, `dscovox_node.cpp` 994, `scovox_map_split.hpp` 1020, `sem_split_map.hpp`
+852, `binary_serializer.hpp` 712, `dir_voxel.hpp` 477. Bonxai is vendored at
 `src/scovox_core/include/third_party/bonxai/`.
 
 ### 2.2 Build and run
@@ -364,8 +379,8 @@ Line counts (working tree): `scovox_node.cpp` 3396, `sem_split_map.cpp`
 | `SCOVOX_BETA_U16` | 1 | 2×u16 fixed-point Beta counters (`beta_voxel.hpp:69-70`) |
 | `SCOVOX_BETA_U16_SCALE` | 8 | lattice step ⅛ (`beta_voxel.hpp:79-80`) |
 | `SCOVOX_DEPOSIT_TRACE` | 0 | per-deposit trace sink; null unless one is installed (`sem_split_map.hpp:63-64`) |
-| `SCOVOX_E0_COUNTERS` | 0 | admission/eviction counters (`e0_counters.hpp:42-44`) |
-| `SCOVOX_EVICT_INHERIT` | must be 0 | any other value → `#error` (`dir_voxel.hpp:145-147`) |
+| `SCOVOX_E0_COUNTERS` | 0 | admission/eviction counters (`e0_counters.hpp:45-47`) |
+| `SCOVOX_EVICT_INHERIT` | must be 0 | any other value → `#error` (`dir_voxel.hpp:144-146`) |
 | `SCOVOX_VICTIM_MEAN`, `SCOVOX_VICTIM_QMAX`, `SCOVOX_ADMIT_NORM` | removed | `#error` (`dir_voxel.hpp:135-143`) |
 
 Size invariants are `static_assert`ed: `DirVoxel` 20 B at K=2 with QMAX
@@ -388,21 +403,59 @@ is exactly:
 `CMAKE_CXX_FLAGS` is empty; both C++ package `CMakeLists.txt` files
 (`scovox_core` and `scovox_mapping` — `scovox_msgs` is message generation only
 and sets neither) default `CMAKE_BUILD_TYPE` to `Release` (with the reason
-written down) and add `-Wall -Wextra`. There is no `-march`, no `-ffast-math`, and no LTO. Three
+written down) and add `-Wall -Wextra`. There is no `-march`, no `-ffast-math`,
+and no LTO — the last two are graded choices, not omissions (E14). Four
 consequences worth knowing:
 
-* **`-DNDEBUG` costs almost no checking.** Exactly one `assert()` exists outside
-  the tests (`carve_stage.hpp:78`); every other invariant is a `static_assert`,
-  which `NDEBUG` does not touch.
-* **`-march` is left off deliberately, not by omission.** The x86-64 baseline has
-  no FMA, so although `-std=gnu++17` leaves `-ffp-contract=fast` enabled, no
-  contraction actually happens. Turning on `-march=native` emits 76 `vfmadd` /
-  `vfmsub` instructions, which can change float results — and byte-identity of
-  the output map across builds is a contract this project leans on.
+Before any of them, a scoping fact that has bitten this project once already:
+**several build paths exist and they compile different subsets of the tree.**
+`scovox_slot_rules/docker/dev.sh` alone has four C++-building branches — `test)`
+(plain cmake over `scovox_core`), `scenenn)`, `verify)` (`verify_core` with
+`-DSCOVOX_SRC`) and `ros-test)` (colcon) — and `scovox/docker/build_and_test.sh`
+is a fifth, also colcon. An earlier revision of this section said there were two
+and that `dev.sh ros-test` was the only path with ament; both were wrong.
+
+What matters is the SUBSET, not the count. The offline harness
+(`scovox_slot_rules/scovox_scenenn`, the one every replay and every
+byte-identity check goes through) compiles four `scovox_core` translation units
+plus the harness, and cannot configure `scovox_mapping` at all. `scovox_core`
+non-test, non-vendored source is 8766 lines against `scovox_mapping`'s 5939, so
+even a whole-`scovox_core` claim covers about **three fifths** of the C++ — and
+the harness compiles well under that, since it takes 4 TUs, not the package.
+An earlier revision said "roughly two thirds"; the arithmetic did not support
+it. Three warnings lived in the gap until 2026-09-05 — and note that
+`./dev.sh test`, which builds all of `scovox_core`'s targets including
+`tools/split_memory_demo.cpp`, would have shown one of them, so "only the ROS
+build could see them" is also too strong.
+
+* **`-DNDEBUG` costs almost no checking.** Two `assert()`s exist outside the
+  tests, one of them ours (`carve_stage.hpp:78`) and one vendored
+  (`third_party/bonxai/bonxai/grid_allocator.hpp:155`); every other invariant is
+  a `static_assert`, which `NDEBUG` does not touch.
+* **`-march` is left off deliberately, not by omission, and the flag set has
+  been graded.** The x86-64 baseline has no FMA, so although `-std=gnu++17`
+  leaves `-ffp-contract=fast` enabled, no contraction actually happens.
+  `objdump -d` counts 76 `vfmadd`/`vfmsub` instructions in the `-march=native`
+  build and zero in `-O3`, `-O2` and LTO — so `native` really does change float
+  results, and byte-identity of the output map across builds is a contract this
+  project leans on. Measured on two scenes × two reps, interleaved
+  (`scovox_slot_rules` E14):
+
+  | arm | pooled wall vs `-O3` | map bytes |
+  |---|---:|---|
+  | `-O2` | +2.1 % | identical |
+  | `-O3 -march=native` | −6.3 % | **different** (FMA) |
+  | `-O3 -flto=auto` | −2.3 % | identical |
+
+  Within a single arm the run-to-run spread reaches 11.5 %, which is larger than
+  the LTO effect and larger than its sign flip between the two scenes, so **only
+  `native`'s effect is bigger than the noise — and `native` is the one arm that
+  is inadmissible.** `-O3` stands. See `REVIEW_LOG.md` E14 for the full table
+  and the conditions under which `native` would become worth re-scoring for.
 * **Every switch declares its own `#ifndef` default**, so `-Wundef` can be
   carried permanently at zero noise and an undeclared `#if` switch is impossible
   in source. `SCOVOX_E0_COUNTERS` was the last exception and now declares `0` at
-  `e0_counters.hpp:42-44`.
+  `e0_counters.hpp:45-47`.
 * **A misspelled `-D` on a build command line is a different hazard**, which no
   warning flag catches and no md5 distinguishes from an intended change. The
   binary reports its own compiled-in switch values instead:
@@ -438,17 +491,19 @@ actual compile line, read back from `build.ninja` rather than the one intended.
   `fine_region_margin` 0.15 / `fine_anchor_enable` true / `AnchorFitParams`.
 - **Ctor** (`:103-136`): copies shared geometry into both sub-maps; aborts if
   `semantic_band_length > 0 && !fused_walker` (`:129-136`).
-- **`integrateHitFused`** (`:183-565`): the single exact DDA described in
+- **`integrateHitFused`** (`:183-618`): the single exact DDA described in
   §1.3. `band_active` (`:232-234`) requires band > 0, not dynamic, not
   geometry-off, no BKI kernel, and semantic probabilities present. Far-skip
   and far-carve (`:273-276`, `:318-322`) are gated on
   `far_voxel_fast_paths_ && !space_carving && carveFrameOpen()`.
-  `exact_body` is `noinline` (`:369-449`) so the shortcuts can be diffed
+  `exact_body` is `noinline` (`:409-503`) so the shortcuts can be diffed
   against it.
-- **`integrateHitSplit`** (`:575-595`): two DDAs; calls `tsdf_.integrateRay`
-  gated only on `!is_dynamic && !geometry_off` — **no `tsdf_enabled_` test**
-  (`:587`, the comment at `:586-587` admits it). Only reached when
-  `fused_walker=false`.
+- **`integrateHitSplit`** (`:629-655`): two DDAs; calls `tsdf_.integrateRay`
+  gated on `tsdf_enabled_ && !is_dynamic && !geometry_off` (`:648`). Only
+  reached when `fused_walker=false`. The `tsdf_enabled_` term was missing until
+  `f2d535e`, so a split-path run paid in full for a TSDF the flag declared
+  unread; any fused-vs-split comparison taken before that commit with the flag
+  off had one walker doing that work and one not.
 - **Fine TSDF band** (`fine_ratio_log2 > 0`): a second `TsdfMap` at
   `resolution / 2^k`, written only inside registered refinement cylinders
   (`refinement_regions.hpp`; `RefinementRegion.msg`), with optional per-scan
@@ -483,14 +538,14 @@ actual compile line, read back from `build.ninja` rather than the one intended.
   `sanitise(HitWeights&)` snaps the fusion profiles the node builds.
 - **Per-ray entry** `integrateHit` (`:362-388`) → `carveRay` (`:399-430`,
   staged or direct via `applyCarveUpdate` `:435-471`) → hit staged
-  (`batch_hits`) or `applyHitUpdateOn` (`:583-665`) → `commitHit`
+  (`batch_hits`) or `applyHitUpdateOn` (`:593-674`) → `commitHit`
   (`:669-738`). Stageable only when no kernel, no spread, no ray_spread.
-- **Frame protocol**: `beginCarveFrame` / `flushCarveFrame` (`:476-519`)
-  around each scan; `flushStagedHits` (`:521-560`) runs first so occupied
+- **Frame protocol**: `beginCarveFrame` / `flushCarveFrame` (`:493-528`)
+  around each scan; `flushStagedHits` (`:530-569`) runs first so occupied
   wins over carve for the same voxel in the same scan.
 - **Other deposit modes**: BKI kernel `applyHitUpdateKernel` (`:943-977`,
   `spreadTable` `:918-942`), `raySpreadDeposit` (`:759-829`, modes 1-4),
-  `applyBandSemantic` (`:844-892`).
+  `applyBandSemantic` (`:854-901`).
 - **Queries / drains**: `getBetaVoxel`, `getDirVoxel`, `dominantClassAt`
   (`:1187-1212`), `drainTouchedBeta` / `drainTouchedDir` (`:1169-1181`,
   sort-unique, swap-scratch).
@@ -509,14 +564,15 @@ source files, not documents.
 
 #### Wire format (`binary_serializer.hpp`, `lz4_codec.hpp`)
 
-- `BinarySerializer::FORMAT_VERSION = 8` (`:168`). Payload: TSDF deltas,
+- `BinarySerializer::FORMAT_VERSION = 8` (`:171`; the separate ROS envelope
+  `ENVELOPE_VERSION = 5` is at `:179`). Payload: TSDF deltas,
   Beta deltas, Dir deltas, optional fine-TSDF deltas, block-run coordinate
   coding assuming 8×8×8 leaf blocks (`:518-519`, i.e. `leaf_bits = 3`).
 - Evidence is u8 sqrt-companded when the sender sets `quant_step =
-  evidence_saturation / 255²` (`scovox_node.cpp:2253-2255`); `quant_step = 0`
+  evidence_saturation / 255²` (`scovox_node.cpp:2294-2295`); `quant_step = 0`
   keeps f32 payloads. Class ids are u8 when `num_classes ≤ 255`.
-  `Frame::quant_step`'s comment (`:182-183`) still describes the older u16
-  scheme.
+  `Frame::quant_step`'s comment still describes the older u16 scheme, in two
+  places (`binary_serializer.hpp:40` and `:194`).
 - `MAX_NUM_CLASSES` 4096, `MAX_FINE_RATIO_LOG2` 8.
 - `lz4_codec.hpp`: 4-byte big-endian original-size header + LZ4 block,
   256 MB decode cap.
@@ -666,9 +722,21 @@ Outputs: `publishPointCloud` (`:623-731`, 11 fields), `publishFusedMap`
 #### `scovoxmap.hpp/.cpp` (`scovoxmap` library)
 
 Legacy `scovox::Map` over unified `Voxel`; the only consumer of
-`range_decay_length` as an exponential weight (`scovoxmap.cpp:67-68`,
-`:365-366`). Not instantiated by either node's mapping path; exercised by
+`range_decay_length` as an exponential weight (`scovoxmap.cpp:72-73`,
+`:367-368`). Not instantiated by either node's mapping path; exercised by
 `test_beta_update` and `test_consensus`.
+
+`integrateRay`'s two branches weight the carve differently, and both are
+deliberate. The **dynamic** branch calls the two-argument `carve_free`, which
+derives `range_w = exp(-|hit − origin| / range_decay_length)` itself from the
+geometry it was handed. The **static** branch runs `fused_integrate_ray_static`,
+which carves with `carve_w = range_w` — the value the *caller* supplied
+(`scovoxmap.cpp:260`), defaulting to `1.0f`, because the node computes that
+weight once from the full sensor→hit range and hands it down. Identical
+geometry therefore deposits different free mass on the two paths: a 3 m ray
+carves `1.0` per voxel when static and `exp(-0.6) = 0.5488` when dynamic. This
+is the only place in the tree where the same call weights the same ray two
+ways.
 
 #### Launch files (`src/scovox_mapping/launch/`)
 
@@ -700,13 +768,18 @@ defaults), `lidar_mapping.yaml`, `dscovox_params.yaml`, `scovox_bin_min.yaml`.
 `test_tsdf_map`, `test_voxel_layouts`, `test_scovox_map_split` (incl. the
 far-path bit-identity suite `ScovoxMapSplitFarCarve` and the
 `ScovoxMapSplitTsdfDisabled` pair that guards the `tsdf_enabled=0` walk), `test_sparse_add`,
-`test_uncertainty`, `test_sem_split_map`. `scovox_mapping` (8):
+`test_uncertainty`, `test_sem_split_map`. `scovox_mapping` (10 — nine in
+`SCOVOX_TEST_SOURCES` at `CMakeLists.txt:73-83` plus the separate
+`ament_add_gtest(test_topk_provider …)` at `:96`, which is why a reader counting
+only the list gets 9 and this document previously said 8):
 `test_beta_update`, `test_consensus`, `test_topk_provider`, `test_tsdf_band`,
 `test_marching_cubes`, `test_semantic_audit`, `test_dirichlet_update`,
-`test_heartbeat`. Last recorded run (archived `storage_defaults_2026_09_04.md`,
-`dir_total_basis_2026_09_04.md`): **180/181**, the one failure being
+`test_heartbeat`, `test_publish_gate`, `test_map_lock`. Last recorded run (archived `storage_defaults_2026_09_04.md`,
+`dir_total_basis_2026_09_04.md`): **180/181 under `./dev.sh test`** — the
+archive attributes that figure to the core-only path, so it is a `scovox_core`
+count, not a whole-tree one. The one failure is
 `ScovoxMapSplitFarCarve.FarCarveBitIdenticalToFullWalk`
-(`test_scovox_map_split.cpp:886`). Not re-run for this document.
+(`test_scovox_map_split.cpp:887`). For the current whole-tree figures see §5.
 
 ### 2.6 `seg_pipeline`
 
@@ -779,8 +852,9 @@ that struct line by line. The table above therefore still describes the *bare*
 node and is still the reason the config file has to exist — it is not stale.
 
 To verify the file took effect, read the node's log rather than the launch
-arguments: `scovox_node.cpp:309-322` prints a `deposit config:` line beside the
-existing TSDF line at `:288`, both read out of the **constructed map**. A binary
+arguments: `scovox_node.cpp:336-337` prints a `deposit config:` line beside the
+existing TSDF line at `:298` (and a `semantic deposit:` line at `:309-322`), all
+read out of the **constructed map**. A binary
 that predates a knob accepts the parameter and ignores it, and only the readback
 shows that.
 
@@ -867,10 +941,13 @@ in the consumer.
 - `evidence_saturation` caps Beta and, through `class_evidence_saturation
   = −1`, Dir as well; the node exposes only the shared value.
 - One known failing test, `FarCarveBitIdenticalToFullWalk`. Re-measured on the
-  full `./dev.sh ros-test` gate: **325 tests, 2 failures**, which is this one
-  failure counted twice (colcon reports the gtest case and the package's CTest
-  aggregate). It is still the only one. The count rose from 323 with the two
-  `ScovoxMapSplitTsdfDisabled` cases added for review items H3 and L7.
+  full `./dev.sh ros-test` gate. Counted from the gtest XML that gate leaves in
+  `.build/ros/build/*/test_results/` (`docker/count_tests.py`): **327 cases,
+  1 failure** — `scovox_core` 184 / 1, `scovox_mapping` 143 / 0, `scovox_msgs` 0.
+  Earlier revisions of this document said "325 tests, 2 failures"; the 2 was one
+  failure counted twice, because colcon reports both the gtest case and the
+  package's CTest aggregate, and the total was a colcon-console reading rather
+  than an XML count. It is still the only failure.
 - The numbers in §1.5 predate three commits to the deposit path and no longer
   describe this code. See the box in §1.5 and `code_review_2026_09_04.md` §H4;
   re-basing them is a re-run of the ablation ring, not a doc edit.
@@ -881,13 +958,19 @@ in the consumer.
 `sem_split_map.cpp:690` ("16 B DirVoxel"); `dir_voxel.hpp:4,26` ("16-byte",
 "16 B at K_TOP=2" — corrected further down at `:96`); `beta_voxel.hpp:17-20`
 ("16 B DirVoxel"); `tsdf_voxel.hpp:11` (`SemBetaVoxel`);
-`binary_serializer.hpp:182-183` (u16 quantisation); `wire_study.py:1-12` (v5
+`binary_serializer.hpp:40,194` (u16 quantisation); `wire_study.py:1-12` (v5
 layout, 28 B Dir records).
 
-The `.md` citations are a separate matter and are **done inside this
-repository**: `1101e53` swept `src`, `config` and `README.md` under the standing
-rule that code comments cite no document paths and carry no experiment results —
-those live in memory and `REVIEW_LOG.md`. Roughly 50 citations remain in
+The `.md` citations are a separate matter. `1101e53` swept `src` and
+`README.md` under the standing rule that code comments cite no document paths
+and carry no experiment results — those live in memory and `REVIEW_LOG.md` —
+but it did **not** finish `config`: three YAML comments survived it
+(`scovox_fine_band.yaml:9`, `scovox_lidar_raw_deskew.yaml:12`,
+`scovox_lidar_geometric.yaml:17`), and all three pointed at paths that no longer
+resolved. Repaired 2026-09-05: two now cite their `docs/archive/` locations and
+the third states the measurement instead of naming a deleted file. `src` is
+clean — `grep -rnE '[A-Za-z0-9_/.-]+\.md' --include=*.cpp --include=*.hpp src`
+returns nothing outside `third_party`. Roughly 50 citations remain in
 `scovox_slot_rules/scripts/*.py|*.sh` and are audited but not edited:
 `DESIGN.md` ×12 (never existed in either repo's history — deletion may be the
 right fix, not a repoint), `FINDINGS.md` ×9 and `PLAN.md` ×5 (simple
@@ -908,6 +991,6 @@ is bridgeable by loading `config/scovox_best_method.yaml`, with the node's
 Two caveats on "the library is the best method". First, "best method" here means
 the configuration the campaign selected, which is not the same as the
 configuration the published numbers were measured under: see the box in §1.5.
-Second, the storage state is verified by `./dev.sh ros-test` (325 cases), not by
-`./dev.sh test` — the 182-case core suite cannot see `scovox_mapping`, and a
-storage change graded only by it will pass while broken.
+Second, the storage state is verified by `./dev.sh ros-test` (327 cases), not by
+`./dev.sh test` — the core-only path cannot see `scovox_mapping`'s 143 cases at
+all, and a storage change graded only by it will pass while broken.
