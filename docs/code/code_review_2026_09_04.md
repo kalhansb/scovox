@@ -1496,3 +1496,46 @@ not validate the extraction, since no offline path calls it — the only callers
 are `scovox_node.cpp:2944` and `dscovox_node.cpp:725`. What covers the
 extraction is 18 assertions in `test_uncertainty.cpp`, three of them added for
 the guard's out-of-range and NaN behaviour, plus three in `test_beta_update.cpp`.
+
+## Addendum — 2026-09-05: the external baseline was untuned, and the claim it supported is retired
+
+No code in this review changed, and no scovox number moved — this addendum
+exists because a **claim** made alongside this batch did not survive checking,
+and the errata section above is where that kind of thing is recorded.
+
+The claim: *scovox beats SLIM-VDB by +0.0944 union mIoU, material, 7/8*
+(`scovox_slot_rules/REVIEW_LOG.md`, E-W16). It was measured against SLIM-VDB at
+its published SceneNN configuration, `sdf_trunc` 0.10 / `min_weight` 20. Nobody
+had checked whether that is a good configuration on this data. It is not.
+
+Three facts read out of `slim-vdb/src/slimvdb/slimvdb/VDBVolume.cpp` bound the
+tuning surface exactly, and all three are cheap to re-verify:
+
+- `min_weight` is consumed at one site only, `if (w < min_weight) continue;`
+  inside `ExtractPointCloud`. The `min_weight_` member the constructor stores has
+  exactly two occurrences under `src/` — that assignment and its declaration in
+  `VDBVolume.h`. It never reaches the map, so **every threshold is a free readout
+  off a single integration**.
+- `fill_holes` guards one `if (w == 0.0f) continue;` immediately above that test,
+  which any `min_weight > 0` subsumes. Inert.
+- `p_threshold` is read once, inside the `L == OPEN` branch. CLOSED argmaxes.
+
+So the CLOSED-mode surface is `(sdf_trunc, min_weight)` and nothing else.
+Sweeping it — 104 cells complete over all eight scenes, unmodified scorer — is
+worth **+0.1073 union mIoU** to SLIM-VDB (CI [+0.0600, +0.1546], p_exact 0.0078,
+8/8), which is larger than the margin the claim reported. At its optimum
+`(0.04, 800)` the paired result against the shipped scovox point is union
+−0.0129, **ambiguous** (p_exact 0.3828, 3/8); scovox keeps precision (+0.0914,
+7/8, material) and half the phantom voxels, and gives up 0.159 of recall (0/8).
+Against scovox's `w_occ` 6.0 arm — a matched operating point — every metric is
+ambiguous, union at p_exact 1.0000.
+
+The reading, and the reason it does not change any default here, is E-W17 in
+`scovox_slot_rules/REVIEW_LOG.md`; the grid is
+`scovox_slot_rules/results_e9/slimvdb_tuned_grid.json` and the harness is
+`scovox_slot_rules/slimvdb_scenenn/tune/`.
+
+The general lesson is the same one the errata section already records in a
+different form: a baseline that has not been tuned is not a baseline, it is an
+operating point, and a margin measured against one is a statement about the axis
+rather than about the mappers.

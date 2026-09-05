@@ -233,6 +233,14 @@ approximation of it. Where the two genuinely part is the ray range — SLIM-VDB
 walks `[depth − sdf_trunc, depth + sdf_trunc]` and so never enters free space,
 while scovox always walks from the sensor origin and carves it.
 
+One correction to that inheritance, from E-W17: 0.10 is SLIM-VDB's *published*
+`sdf_trunc`, not its best one on SceneNN. Swept on these eight scenes, SLIM-VDB's
+own optimum is **0.04** — 0.10 costs it 0.0555 union mIoU. scovox's 0.10 was
+separately re-selected by its own held-out sweep (E3/E4), so the value is earned
+here rather than borrowed; but the sentence "0.10 because SLIM-VDB uses 0.10" is
+no longer an argument for it, and whether scovox's band optimum is also below
+0.10 has not been re-tested since the deposit rule changed.
+
 Four mechanisms involve a voxel's neighbours, and exactly one is promoted:
 
 | mechanism | shape | site | promoted |
@@ -271,8 +279,23 @@ byte-identical without `nhit`. 20 B is the shipped size.
 | phantom voxels | 16 005 |
 | throughput | 6.2–6.7 fps |
 
-Union mIoU is the number to use for cross-mapper comparison (the SLIM-VDB
-baseline loses it 8/8).
+Union mIoU is the number to use for cross-mapper comparison: it is the only one
+of these that charges a mapper for the voxels it invents, and the two mappers
+sit at very different points on the precision/recall axis.
+
+> **Against SLIM-VDB, quote the tuned arm, not the published one.** SLIM-VDB at
+> its published SceneNN configuration (`sdf_trunc` 0.10, `min_weight` 20) loses
+> union mIoU 8/8, and that is a real number but not an informative one: tuning
+> its only two knobs — `(sdf_trunc, min_weight)`, which is the complete CLOSED-mode
+> surface, because `min_weight` is a readout filter, `fill_holes` is inert above
+> zero and `p_threshold` is OPEN-only — is worth **+0.1073 union mIoU** to it on
+> these eight scenes, more than the whole margin. At its tuned optimum
+> `(0.04, 800)` it scores union 0.2919 against the shipped scovox point's 0.2790,
+> and the paired verdict is **ambiguous** (p_exact 0.3828, 3/8). What scovox still
+> holds materially is precision (+0.0914, 7/8) and half the phantom voxels.
+> Placed at a matched operating point — scovox `w_occ` 6.0 — the two mappers are
+> **ambiguous on every metric measured**, union at p_exact 1.0000. See
+> `scovox_slot_rules/REVIEW_LOG.md` E-W17, which supersedes E-W16's headline.
 
 > **These scores do not describe the code in §2.** They were produced by
 > `.build/e5/k2_i0_evid/replay_scenenn`, md5 `60e17da907d0`, built
