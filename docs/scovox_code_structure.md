@@ -52,7 +52,7 @@ in:
 | `--stride` | 2 | replay only | depth subsample; must match the stored top-k payload |
 | `--min-depth` / `--max-depth` | 0.4 / 4.0 | replay only | Asus Xtion usable band |
 | `--num-classes` | 14 | `semsplit.num_classes` | sets the OTHER bucket as `C − K_TOP` |
-| `--alpha0` | 0.01 | `semsplit.alpha_0` | Dirichlet prior per class |
+| `--alpha0` | 0.01 | `semsplit.alpha_0` | Dirichlet prior per class. Settled: E10 swept it at readout, E13 (2026-09-05) re-ran the mapper so the `evict_by_confidence` path was live, and 1/14 (Perks) is exactly inert — union/inter mIoU and occupancy IoU delta `+0.000e+00` on 8/8, slot class residency differing on 6 voxels in 19.1 M and none of them past the `p_occ > 0.5` gate |
 | `--w-occ` | **1.5** | `semsplit.w_occ` | Stream A hit weight; on the ⅛ lattice |
 | `--w-free` | 1.0 | `semsplit.w_free` | full-ray carve weight |
 | `--beta-occ-prior` | **0.5** | `semsplit.beta_occ_prior` | Beta prior `a_occ` at first touch; `0.5 = 4/8`, on the ⅛ lattice |

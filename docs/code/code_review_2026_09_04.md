@@ -962,3 +962,49 @@ scan 0, 3043 vs 3040 on scan 3 — so the far-voxel reduction is not exact when
 voxels while the walk already reaches 6 behind the hit. The shipped
 configuration runs `--sem-band 0.10 < sdf_trunc 0.15`, which is why it went
 unnoticed. **The suite baseline is 183/184, not 184/184.**
+
+---
+
+## Addendum — 2026-09-05: the semantic prior `alpha_0` is settled at 0.01
+
+E10 swept `alpha_0` post hoc by reparameterising dumps that were all *built* at
+0.01. That leaves one path untested: `evict_by_confidence` compares a
+probability, so `alpha_0` can flip an eviction and change which classes hold the
+two slots — and slot residency is what `miss_rate` measures. E13 (2026-09-05)
+re-ran the mapper on all eight scenes at the Perks level 1/14 against the
+shipped 0.01, one binary, promoted configuration, frame order untouched, and
+dumped `.bin` and `.slots` from the same runs. Full write-up in
+`scovox_slot_rules/REVIEW_LOG.md`.
+
+**The build path fires, and it does not reach the scored set.** Over 19,116,481
+dumped voxels the two arms differ in slot class residency on **6** voxels
+(0.00003 %), **none** of which pass `p_occ > 0.5`; `cnt` differs by more than
+one count on **5** voxels, again none past the gate. The apparent 4.12 % of
+voxels with a nonzero `cnt` delta is the prior itself being stored — on every
+gate-passing voxel the difference is `1/14 − 0.01 = 0.0614285714` to within the
+count quantisation, which is the expected consequence of `cnt` holding
+`alpha_0 + evidence` (see the reparameterisation section above, `alpha_i =
+cnt[i]`, "already alpha0 + e_i").
+
+**Every map metric is exactly inert** — per-scene delta `+0.000e+00` on 8/8 for
+union mIoU, intersection mIoU and occupancy IoU, with `n_pred_occupied` and
+`n_intersection` integer-identical. Every E12 uncertainty functional is inert or
+mildly negative; `MI_epist` stays below chance on the miss task in both arms.
+
+**Consequence for this review.** The `alpha_0` axis is closed at both ends —
+readout (E10) and build (E13) — so the M10 basis work should not be revisited by
+moving the prior. `vacuity` remains retracted as a functional: it is
+`C·alpha_0/(S + C·alpha_0)`, a monotone function of `S`, and E13 confirms this
+directly — `vacuity` and `neg_S` have AUROCs identical to four decimal places in
+both arms, because a common factor on `alpha_0` cannot reorder a ranking.
+
+**Slot occupancy, measured.** 5.26 % of gate-passing voxels hold fewer than two
+resident classes (011 is the outlier at 15.05 %; the next scene is 5.63 %), so
+their query-time categorical is `{one class, OTHER}`. That is too small a share
+to explain `MI_epist` reading below chance — 94.7 % of scored voxels have both
+slots filled and MI is uninformative there too.
+
+**Provenance caveat.** E13 ran on the `Beta(1,1)` occupancy build, predating the
+Jeffreys promotion in the addendum above. Both arms share that binary so the
+comparison is internally valid, but its absolute numbers are not comparable to a
+post-promotion run.
