@@ -233,6 +233,15 @@ class ScovoxMapSplit {
                           && !(prof && prof->kernel_radius > 0.f)
                           && sem_probs && !sem_probs->empty();
 
+    // Is the free-space carve a guaranteed no-op for THIS ray? applyCarveUpdate
+    // returns on `w_inc <= 0` before it touches any state — no grid read, no
+    // carve_stage_ entry, no wall latch — and `w_inc` is exactly the expression
+    // below, per-ray profile override included. Decided once per ray because
+    // two things downstream turn on it: which far-voxel fast path arms, and how
+    // far back the walk has to start.
+    const bool carve_off =
+        (prof ? prof->w_free : semsplit_.params().w_free) <= 0.f;
+
     const float walk_back = tparams.space_carving
         ? depth
         : std::max(depth, trunc);
@@ -289,6 +298,67 @@ class ScovoxMapSplit {
     const auto k_far = grid.posToCoord(end_pos.x(),   end_pos.y(),   end_pos.z());
     const auto k_hit = grid.posToCoord(endpoint.x(),  endpoint.y(),  endpoint.z());
 
+    // SLIM-VDB-shaped walk for the carve-off pipeline.
+    //
+    // The walk reaches all the way back to the sensor origin for ONE reason:
+    // the free-space carve deposits on every voxel in front of the surface.
+    // With the carve a no-op for this ray, everything outside a short window
+    // around the hit is traversed in order to write nothing — and that window
+    // is the same span SLIM-VDB integrates over (depth ± trunc). Cutting to it
+    // is what puts the two mappers' traversal on the same footing.
+    //
+    // This does NOT weaken the traversal. The exact DDA still runs, one axis
+    // per step, over every voxel that can be written; what changes is where the
+    // segment starts. The cut is a true SUFFIX of the full walk, not a new
+    // shorter ray: the seed is placed ON the segment the full walk traverses —
+    // A = start_pos to B = centre(k_far), the line the aim caveat defines — so
+    // the boundary crossings from there on are the same events in the same
+    // order. exact_body reads only (c, origin, endpoint) and never the walk's
+    // start, so a surviving voxel computes exactly what it computed before; and
+    // with the carve off no latch (carve_blocked, ring_left) can be set by a
+    // dropped voxel. Held to byte-identical dumps against the full walk.
+    //
+    // How far back the window must reach. A dropped voxel is entered and left
+    // before the seed, so every point X of the segment inside it lies at least
+    // `front_reach` along the line before the foot of `endpoint`, and the
+    // voxel centre is within h·√3 of some such X. Hence
+    // `dist(centre, endpoint) >= front_reach − h·√3`, and no gate can fire once
+    // that clears the widest one still active:
+    //   TSDF band     sdf <= trunc + h   — only on a ray that writes TSDF
+    //   semantic band sdf <= sem_band_   — only while the band is active
+    //   carve         — the no-op that armed this in the first place
+    // Two half-diagonals, then, not one: the seed is placed by measuring back
+    // from B, and B is itself within h·√3 of end_pos, so the foot of
+    // `endpoint` sits `back_reach` from B only to that same tolerance. The
+    // margin is therefore G + 2·h·√3 = G + √3·res, plus one voxel of headroom
+    // so it clears the derivation rather than sitting on it.
+    // Everything the cut needs is computed INSIDE the branch: the carving
+    // pipeline is the shipped one and must not pay a flop for a window it
+    // never uses.
+    Eigen::Vector3d seed_pos = start_pos.cast<double>();
+    auto k_start = k0;
+    // Held OUT OF LINE for the same reason exact_body is: this is a ray-rate
+    // computation on a walker whose frame is sized for its voxel-rate one, and
+    // the carving pipeline never runs it at all. Inline, its Eigen temporaries
+    // widen that frame for every ray of every arm.
+    auto seed_carve_off_walk = [&]() __attribute__((noinline)) {
+      const float useful_front = std::max(tsdf_writes ? trunc + h : 0.f,
+                                          band_active ? sem_band_ : 0.f);
+      const float front_reach =
+          useful_front + static_cast<float>(res) * 2.7320508f;  // √3·res + res
+      const Eigen::Vector3d B((static_cast<double>(k_far.x) + 0.5) * res,
+                              (static_cast<double>(k_far.y) + 0.5) * res,
+                              (static_cast<double>(k_far.z) + 0.5) * res);
+      const Eigen::Vector3d AB = B - seed_pos;
+      const double len  = AB.norm();
+      const double keep = static_cast<double>(front_reach)
+                        + static_cast<double>(back_reach);
+      if (len <= keep) return;
+      seed_pos += AB * ((len - keep) / len);
+      k_start = grid.posToCoord(seed_pos.x(), seed_pos.y(), seed_pos.z());
+    };
+    if (carve_off) seed_carve_off_walk();
+
     // Far-voxel skip. When free-space carving is a guaranteed no-op — a carve
     // frame is open (the live pipeline) AND batch_free_carve=false, so
     // applyCarveUpdate returns before touching any state — and space_carving
@@ -307,10 +377,18 @@ class ScovoxMapSplit {
     // absorbing float rounding at the gate boundaries (endpoint-inside-voxel
     // offset is < h·√3 < res). Computed in double and clamped BEFORE the int
     // cast so an absurd sdf_trunc cannot overflow it into "skip everything".
+    //
+    // `carve_off` is the third way that no-op arises, and the only one that
+    // does not need a frame open: applyCarveUpdate returns on `w_inc <= 0`
+    // ahead of both the batched and the immediate branch. Routing those rays
+    // here rather than to the fast carve below writes nothing either way
+    // (semCarve returns true without touching state, so the carve_blocked
+    // latch is unmoved) and skips the call.
     const bool far_skip = far_voxel_fast_paths_
                        && !tparams.space_carving
-                       && semsplit_.carveFrameOpen()
-                       && !semsplit_.params().batch_free_carve;
+                       && (carve_off
+                           || (semsplit_.carveFrameOpen()
+                               && !semsplit_.params().batch_free_carve));
 
     // Far-voxel fast CARVE — the batch_free_carve=true counterpart of the skip
     // above (the two share every gate except that flag, so at most one arms per
@@ -354,6 +432,7 @@ class ScovoxMapSplit {
     // magnitude inside both.
     const bool far_carve = far_voxel_fast_paths_
                         && !tparams.space_carving
+                        && !carve_off          // far_skip owns those rays
                         && semsplit_.carveFrameOpen()
                         && semsplit_.params().batch_free_carve
                         && depth >= trunc;
@@ -568,19 +647,26 @@ class ScovoxMapSplit {
       exact_body(c);
     };
 
-    if (k0 == k_far) {
-      visit_one(k0);
+    // k_start is the full walk's k0 unless the carve-off seed moved it forward
+    // along the same segment; seed_pos tracks it so the iterator keeps the line.
+    if (k_start == k_far) {
+      visit_one(k_start);
+      // Degenerate span. On the full walk it forces k_hit into that same voxel
+      // (the hit lies between k0 and k_far), so this guard is inert there; the
+      // carve-off seed starts closer to k_far, so the hit is covered
+      // explicitly rather than by that argument.
+      if (k_hit != k_start) visit_one(k_hit);
     } else {
-      // k0 in, k_far out — hence the explicit visit_one(k_far) below. The
+      // k_start in, k_far out — hence the explicit visit_one(k_far) below. The
       // k_hit guard after it covers the near-endpoint deviation the walk's
       // centre-aiming caveat allows.
-      ExactRayIterator(start_pos.cast<double>(), k0, k_far, res,
+      ExactRayIterator(seed_pos, k_start, k_far, res,
                        [&](const CoordT& c) -> bool {
                          visit_one(c);
                          return !stop_walk;
                        });
       visit_one(k_far);
-      if (!k_hit_visited && k_hit != k_far && k_hit != k0) {
+      if (!k_hit_visited && k_hit != k_far && k_hit != k_start) {
         visit_one(k_hit);
       }
     }

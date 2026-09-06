@@ -1539,3 +1539,64 @@ The general lesson is the same one the errata section already records in a
 different form: a baseline that has not been tuned is not a baseline, it is an
 operating point, and a margin measured against one is a statement about the axis
 rather than about the mappers.
+
+## Addendum — 2026-09-06: what the mapper costs, measured in-process
+
+E-W17 (the previous addendum) closed the *quality* question against SLIM-VDB and
+found the two indistinguishable at a matched operating point. It said nothing
+about cost. E-W18 measures speed, RSS and grid bytes on the same eight scenes.
+The full method and result are in `REVIEW_LOG.md` E-W18; this addendum records
+only what the review of that instrumentation turned up, since the measuring
+apparatus is itself new code.
+
+### The instrumentation is shared, deliberately
+
+`scovox_scenenn/include/scovox_scenenn/bench.hpp` is compiled into **both**
+drivers. Two hand-placed pairs of `steady_clock` reads in two repositories would
+drift apart the first time either driver was edited; one header cannot. The
+four-phase split (`load` / `map` / `drain` / `dump`) and the `VmHWM` / `VmRSS`
+readers live there, and only `map` is a cross-mapper number.
+
+### Three defects an adversarial review found in it, all fixed
+
+1. **`replay_scenenn.cpp` — the `absorbed` counter's comment was false.** It
+   claimed `absorbed` is a subset of the printed carve counters. It is not:
+   `SemSplitMap::carveRay`'s inclusive-endpoint branch calls `applyCarveUpdate`
+   **without** incrementing `carve_voxels_`, and `carve_no_return` is on by
+   default, so a no-return ray can absorb an add that `carve` never counted. The
+   arithmetic was always right — `absorbed` was correctly kept out of `tot` — but
+   the justification given for keeping it out was wrong. Comment rewritten to
+   say it is a rate against adds, not a share of `tot`.
+
+   **Since superseded:** E-W20 graded the absorption this counter existed to
+   measure, found it exact but slower on every paired run, and removed it. The
+   counter and its comment are gone with it. The underlying fact survives the
+   removal and is the part worth carrying: `carveRay`'s inclusive endpoint
+   reaches `applyCarveUpdate` **without** incrementing `carve_voxels_`, so any
+   future per-voxel rate taken against `carve_voxels_` has a denominator that
+   under-counts by one voxel per no-return ray.
+
+2. **`replay_scenenn.cpp` — `s_wall` is not the whole process.** Its `t0` is
+   taken *after* argument parsing, the intrinsics load and `loadTrajectoryLog`,
+   so a scene with a slow trajectory read reports a wall short of the real one,
+   while the comment described the gap as teardown. A reported number that
+   contradicts its own documentation is worse than an absent one. Comment now
+   states the actual span; `s_map` remains the figure to quote.
+
+3. **`bench.hpp` — `dump` was documented as "readout + write".** The bracket
+   also spans the `--slots` and `--e0-counters` side files, which makes `s_dump`
+   depend on which flags a run was given and therefore not comparable even
+   between two scovox runs. Doc narrowed to say so. (Inert for the bench binary,
+   which is built without `SCOVOX_E0_COUNTERS`, but the doc was still wrong.)
+
+None of the three moves a measured number.
+
+### The design choice this measurement registers
+
+Free-space carve is **75.8% of all voxel traversal** (scene 016, tsdf on:
+4 924 579 371 of 6 493 044 570). Against that, the two mappers' semantic grids
+agree in size within ±2.4% on all eight scenes. The cost asymmetry between
+scovox and SLIM-VDB is therefore *entirely* the free-space model, and any future
+reader weighing a traversal optimisation should start from that number rather
+than from the walker's per-voxel cost, which is already ~3–4× better than the
+baseline's.
