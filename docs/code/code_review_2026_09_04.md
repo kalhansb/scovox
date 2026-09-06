@@ -1677,5 +1677,11 @@ Numbers and the side-by-side per-voxel read are in `scovox_code_structure.md`
 For anyone acting on this review: proposals that shave traversal have now been
 tested three separate ways and none of them reaches the gap. The deposit path is
 where the cost is — the per-non-zero-class loop (mean 2.79 classes per pixel),
-the `sparse_add_class` eviction scan, the per-band-voxel Beta read, the
-`touched_dir_` push.
+the `sparse_add_class` eviction scan, the five locked atomic branch counters
+inside `sparse_add_class` (~14 `lock`-prefixed RMWs per ray, read only by
+diagnostics), the `touched_dir_` push.
+
+Correction to the inventory as first written: there is no per-band-voxel Beta
+read (`semantic_band_require_occ` is false shipped and in every timed arm) and
+`dirichletUpdate` makes two passes, not three (the argmax pass is
+`SCOVOX_E0_COUNTERS`-only). See `REVIEW_LOG.md` E-W22a.

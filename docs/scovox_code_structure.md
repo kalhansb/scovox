@@ -1244,11 +1244,18 @@ centre, SDF, one gate, two accessor reads, Curless–Levoy, `alpha[label] += 1`
 into a **dense `VecXIGrid<14>`** where `label` is an argmax taken upstream,
 three `setValue`s. scovox (`exact_body` → `applyBandSemantic` →
 `dirichletUpdate`): coordToPos, norm, dot, degeneracy guard, `trim_tail`,
-`applyBandUpdate` into a **separate** TSDF grid, a **Beta-grid read** for
-`semantic_band_require_occ`, `getOrAllocateDirOn`, then three passes over the
-14-entry probability vector and one `sparse_add_class` — a `K_TOP` scan with
-eviction — per non-zero class, then `applyDirSaturation` and a
-`touched_dir_.push_back`. Measured on the SceneNN `.topk` blobs, the mean number
+`applyBandUpdate` into a **separate** TSDF grid, `getOrAllocateDirOn`, then
+two passes over the 14-entry probability vector and one `sparse_add_class` — a
+`K_TOP` scan with eviction, plus a locked atomic branch counter — per non-zero
+class, then `applyDirSaturation` and a `touched_dir_.push_back`.
+
+(An earlier draft of this list also named a per-band-voxel Beta read and a third
+`dirichletUpdate` pass. Neither runs: `semantic_band_require_occ` is false —
+see §4.2 line 74 — so the band takes the flat-`kappa0` branch, and the argmax
+pass is `SCOVOX_E0_COUNTERS`-only. The TSDF write listed here runs in the
+benchmark, which passes `--tsdf-enabled 1`, but not in the shipped ROS config,
+which sets `enable_tsdf: false`. All three corrections make the deposit
+*cheaper* than stated and none touches the 8.2% traversal ceiling.) Measured on the SceneNN `.topk` blobs, the mean number
 of non-zero classes per pixel is **2.79**.
 
 So: ~2.8 sparse evicting insertions plus ~42 vector iterations of
@@ -1259,5 +1266,6 @@ badly.** Three ablations, each removing a different traversal term, agree:
 carve out of the pipe is 5.04x fewer voxels for 1.54x time; the margin is 38% of
 the ray for 1.08x; and at matched span the gap is still 1.745x. Speed work
 belongs on the deposit — the per-non-zero-class loop, the eviction scan, the
-per-band-voxel Beta read, the `touched_dir_` push — not on the walk. Whether any
+per-deposit atomic branch counters, the `touched_dir_` push — not on the walk.
+Whether any
 of those can be cut without losing mIoU is untested.
