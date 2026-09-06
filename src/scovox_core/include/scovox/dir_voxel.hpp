@@ -353,7 +353,7 @@ inline void sparse_add_class(float*    cnt,
   // class unattributed — it stays in `other()` because no `cnt[]` claims it,
   // which keeps every slot's sentinel meaning intact.
   if (c == kEmptySlot) {
-    g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
+    SCOVOX_SPARSE_BUMP(g_sparse_drop_count);
     say(0);
     return;
   }
@@ -363,7 +363,7 @@ inline void sparse_add_class(float*    cnt,
       cnt[i] += inc;
       if (track && q_fx > qmax[i]) qmax[i] = q_fx;
       bump(i);
-      g_sparse_match_count.fetch_add(1, std::memory_order_relaxed);
+      SCOVOX_SPARSE_BUMP(g_sparse_match_count);
       say(1);
       return;
     }
@@ -375,7 +375,7 @@ inline void sparse_add_class(float*    cnt,
       cnt[i] = alpha_0 + inc;
       if (track) qmax[i] = q_fx;
       if (nhit) nhit[i] = 1;
-      g_sparse_empty_count.fetch_add(1, std::memory_order_relaxed);
+      SCOVOX_SPARSE_BUMP(g_sparse_empty_count);
       say(2);
       return;
     }
@@ -427,12 +427,12 @@ inline void sparse_add_class(float*    cnt,
     cnt[min_i] = alpha_0 + inc;
     if (track) qmax[min_i] = q_fx;
     if (nhit) nhit[min_i] = 1;
-    g_sparse_evict_count.fetch_add(1, std::memory_order_relaxed);
+    SCOVOX_SPARSE_BUMP(g_sparse_evict_count);
     say(3);
   } else {
     // Drop: incoming evidence smaller than every tracked class. Nothing is
     // attributed, so the deposit stays in `other()`.
-    g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
+    SCOVOX_SPARSE_BUMP(g_sparse_drop_count);
     say(4);
   }
 }

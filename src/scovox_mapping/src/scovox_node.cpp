@@ -837,6 +837,13 @@ private:
         evict_csv_ << "frame,match,empty,evict,drop\n";
         evict_csv_.flush();
         RCLCPP_INFO(get_logger(), "eviction_stats_csv → %s", evict_csv_path_.c_str());
+#if !SCOVOX_SPARSE_BRANCH_COUNTERS
+        // Refuse to hand back a file of zeros that looks like a measurement.
+        RCLCPP_WARN(get_logger(),
+            "eviction_stats_csv will be all zeros: the sparse_add branch "
+            "counters are compiled out. Rebuild with "
+            "-DSCOVOX_SPARSE_BRANCH_COUNTERS=1 to record them.");
+#endif
       } else {
         RCLCPP_WARN(get_logger(), "eviction_stats_csv: failed to open %s", evict_csv_path_.c_str());
       }
@@ -3405,6 +3412,7 @@ int main(int argc, char** argv) {
   // fix 2026-08-26): fprintf bypassed log capture. The g_sparse_* globals
   // themselves stay put — the E8.7 harnesses (e87_scan_count, e87_deposit_bench,
   // band_perf) reset and read them directly, so they are frozen experiment API.
+#if SCOVOX_SPARSE_BRANCH_COUNTERS
   const uint64_t evict = scovox::g_sparse_evict_count.load(std::memory_order_relaxed);
   const uint64_t drop  = scovox::g_sparse_drop_count.load(std::memory_order_relaxed);
   const uint64_t total = evict + drop;
@@ -3415,6 +3423,14 @@ int main(int argc, char** argv) {
       static_cast<unsigned long>(drop),
       static_cast<unsigned long>(total),
       scovox::K_TOP);
+#else
+  // Say so rather than printing zeros. The counters read 0 in this build
+  // because the increments are compiled out, not because no slot overflowed,
+  // and a reader cannot tell those apart from the number alone.
+  RCLCPP_INFO(node->get_logger(),
+      "sparse_add K_TOP overflow: not counted in this build "
+      "(SCOVOX_SPARSE_BRANCH_COUNTERS=0; K_TOP=%d)", scovox::K_TOP);
+#endif
   node.reset();
   rclcpp::shutdown();
   return 0;
