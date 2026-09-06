@@ -1267,7 +1267,8 @@ carve out of the pipe is 5.04x fewer voxels for 1.54x time; the margin is 38% of
 the ray for 1.08x; and at matched span the gap is still 1.745x. Speed work
 belongs on the deposit — the per-non-zero-class loop, the eviction scan, the
 per-deposit atomic branch counters, the `touched_dir_` push — not on the walk.
-The branch counters have since been cut; see §4.6. The rest is untested.
+The branch counters have since been cut (§4.6) and the soft-vs-argmax deposit
+has since been priced (§4.7). The rest is untested.
 
 ### 4.6 The `sparse_add` branch counters are compiled out (measured 2026-09-06)
 
@@ -1314,3 +1315,59 @@ Build harnesses that reset and read these globals directly must set
 `SCOVOX_SPARSE_BRANCH_COUNTERS=1` for the **whole** build: `sparse_add` and
 `sparse_add_class` are inline, so a mixed setting is an ODR violation rather
 than a partial measurement.
+
+### 4.7 Argmax on ingest is a runtime flag, and it is worth 3.5% (measured 2026-09-06)
+
+SLIM-VDB's closed-set `Integrate()` argmaxes the per-pixel class distribution
+before its timer starts: `alpha[labels[idx] & 0xFFFF] += 1`, one increment per
+pixel into a dense grid. scovox deposits every non-zero class — mean 2.79 on
+the SceneNN `.topk` blobs — so a ray issues roughly fourteen `sparse_add_class`
+calls where SLIM-VDB issues one per surface voxel. §4.5 and §4.6 leave that
+asymmetry standing as the last untested part of the gap.
+
+**scovox already implements the same choice.** `SemSplitParams::inc_mode`
+(`sem_split_map.hpp:248-263`) selects what one observation deposits:
+
+| value | flag | behaviour |
+|---|---|---|
+| 0 | `--inc-mode soft` | shipped: every class with `p > 0` gets `class_share * p_i` |
+| 1 | `--inc-mode hard` | the argmax takes `class_share` whole; runner-ups stay in `other()` |
+| 2 | `--inc-mode thresh` | soft, with a per-class probability floor `inc_thresh` |
+
+The hard branch is `sem_split_map.cpp:193-203`. Every deposit site passes
+`params_.inc_mode` — band `applyBandSemantic`, the batched endpoint in
+`commitHit`, `raySpreadDeposit`, `applyHitUpdateKernel` — and
+`IncMode.AllThreeModesConserveDirMassUnderEviction` covers all three.
+
+**`inc_mode` cannot move occupancy, by construction.** It enters neither
+Stream A, nor the carve, nor the `p_occ >= 0.5` label gate. Measured
+consequence: the entire occupancy block of the score JSON is bit-identical to
+the shipped arm on 8/8 scenes for `hard`, `flat` and `counts` alike. Only the
+label on an already-occupied voxel can change.
+
+**What it costs and what it buys.** Semantics, 8 scenes, shipped config: union
+mIoU −0.00006 (SE 0.00055, 4/8), intersection −0.00026 (SE 0.00103, 3/8) —
+below materiality at the mean, with an interval that still reaches it. Speed,
+scene 016 under the §4.6 paired-rep protocol with one binary and two argv,
+n=18: **+5.27 ms/frame saved, SE 0.92, 95% CI [+3.33, +7.20], p = 0.0001,
+faster in 16/18** — +7.43% of the carve frame, **+3.46% of the 152 ms shipped
+frame**, which clears the ~2% layout noise floor.
+
+Why the label barely moves is the same argument that bounds the whole
+candidate: `K_TOP = 2` already truncates to two tracked classes, and the
+readout argmaxes over those two `cnt` values without consulting `other()`.
+A runner-up deposit can only fill an empty second slot, win an eviction, or be
+dropped — so most of the soft distribution was already discarded downstream.
+`hard` discards it earlier, before the deposit loop pays for it.
+
+**Design choice: `inc_mode` stays 0, and stays out of the ROS interface.** It
+is deliberately harness-only — the three config yamls document the default
+rather than exposing a parameter — because the measurement above does not meet
+the promotion bar. It is faster by a real margin with no *detected* mIoU loss,
+but at n=8 the interval cannot exclude a material one, and re-running cannot
+tighten it. Exposing a ROS parameter is the prerequisite if that ever changes.
+
+**What this prices.** Adopting SLIM-VDB's exact deposit model closes 3.9% of
+the ~135 ms/frame gap at matched accuracy. The number of classes deposited was
+never the dominant cost; §4.5's per-surface-voxel model cost and the walk
+still hold the rest.
