@@ -1657,3 +1657,25 @@ that swapped two independent `posToCoord` calls — provably inert, byte-identic
 maps and byte-identical voxel counts — moved wall time ~2%, in the faster
 direction, against a within-arm spread of ~0.1%. Do not read a sub-3% delta on
 `integrateHitFused` as a cost until an inert control has been run alongside it.
+
+**4. The "Dirichlet deposit" claim in point 1 has since been controlled.** As
+written above it rested on the E-W21 arms alone, and those arms had a confound:
+the carve-off seed walks an exactness margin of 2.7320508 voxels in front of the
+deposit window, which at band 0.10 is 38% of every ray. scovox was therefore
+walking 1.808x SLIM-VDB's span for a 1.919x time ratio — indistinguishable from
+traversal-bound. E-W22 ablated the margin behind a guarded macro
+(`SCOVOX_WALK_MARGIN_VOX`; the default build is md5-identical to the E-W21
+binary, so the refactor is inert, and the zero build is a timing probe only —
+it breaks the suffix guarantee and its maps differ). Removing 38% of every ray
+bought **8.2%** of time against a 1.61x traversal-bound prediction, and at a
+near-matched span scovox is still **1.745x** slower. Traversal and gating price
+out at ~13.7% of the carve-off frame; the non-traversal work alone is 1.51x
+SLIM-VDB's whole frame. Point 1 stands, now on evidence rather than inference.
+Numbers and the side-by-side per-voxel read are in `scovox_code_structure.md`
+§4.5 and `REVIEW_LOG.md` E-W22.
+
+For anyone acting on this review: proposals that shave traversal have now been
+tested three separate ways and none of them reaches the gap. The deposit path is
+where the cost is — the per-non-zero-class loop (mean 2.79 classes per pixel),
+the `sparse_add_class` eviction scan, the per-band-voxel Beta read, the
+`touched_dir_` push.

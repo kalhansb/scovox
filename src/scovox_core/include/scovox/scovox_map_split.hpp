@@ -341,11 +341,21 @@ class ScovoxMapSplit {
     // computation on a walker whose frame is sized for its voxel-rate one, and
     // the carving pipeline never runs it at all. Inline, its Eigen temporaries
     // widen that frame for every ray of every arm.
+    // Margin in voxels between the deposit window and where the seeded walk
+    // starts. Two half-diagonals (a dropped voxel's centre may sit h*sqrt(3)
+    // off the segment, and the aim point centre(k_far) may sit h*sqrt(3) off
+    // end_pos) plus one voxel of headroom. Guarded, never bare: an unpassed
+    // -D would otherwise compile to 0 and silently break the suffix.
+#ifndef SCOVOX_WALK_MARGIN_VOX
+#define SCOVOX_WALK_MARGIN_VOX 2.7320508f
+#endif
+    constexpr float kWalkMarginVox = SCOVOX_WALK_MARGIN_VOX;
+
     auto seed_carve_off_walk = [&]() __attribute__((noinline)) {
       const float useful_front = std::max(tsdf_writes ? trunc + h : 0.f,
                                           band_active ? sem_band_ : 0.f);
       const float front_reach =
-          useful_front + static_cast<float>(res) * 2.7320508f;  // √3·res + res
+          useful_front + static_cast<float>(res) * kWalkMarginVox;
       const Eigen::Vector3d B((static_cast<double>(k_far.x) + 0.5) * res,
                               (static_cast<double>(k_far.y) + 0.5) * res,
                               (static_cast<double>(k_far.z) + 0.5) * res);
