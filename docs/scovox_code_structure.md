@@ -1131,7 +1131,9 @@ optimising the walk is therefore the small lever; the free-space model is the
 larger one — but **not the whole gap.** §4.4 removes free-space carve from the
 pipe entirely, traversal included, and finds SLIM-VDB still 1.92x faster at a
 matched band. Read the 75.8% as a share of *voxels*, which is what it measures,
-and not as a share of time.
+and not as a share of time. **§4.8 measures the share of time** — with
+`perf` and with flag ablation — and it is 38.1% of instructions and 55.8%
+of wall clock, not 75.8%.
 
 ### 4.3 What must not be quoted
 
@@ -1371,3 +1373,106 @@ tighten it. Exposing a ROS parameter is the prerequisite if that ever changes.
 the ~135 ms/frame gap at matched accuracy. The number of classes deposited was
 never the dominant cost; §4.5's per-surface-voxel model cost and the walk
 still hold the rest.
+
+### 4.8 The frame, block by block (measured 2026-09-06)
+
+§4.1 counts voxels. This section counts milliseconds, with two instruments that
+answer different questions and are meant to disagree.
+
+Scene 016, 400 frames, shipped config, **run natively on the host** — proved
+byte- and timing-equivalent to the container (identical dump md5, 136.3 vs
+136.0 ms/frame). Native execution is what makes `perf` available; it is not
+installed in the container image.
+
+**Baseline: 154.42 ms/frame** over 5,059,914 voxels walked = 30.52 ns/voxel.
+
+#### `perf` self time — what the CPU is executing (partition, sums to 100%)
+
+| block | self % | ms/frame |
+|---|---:|---:|
+| free-space carve (`applyCarveUpdate`, `carveRay`, `flushCarveFrame`) | 38.13% | 58.88 |
+| fused walker DDA (`integrateHitFused` + per-voxel lambda) | 32.25% | 49.80 |
+| semantics — Dirichlet deposit | 13.88% | 21.43 |
+| TSDF band | 5.21% | 8.05 |
+| input decode (libpng, libz, `TopkImage::fill`) | 2.50% | 3.86 |
+| walker timing brackets (clock reads) | 1.48% | 2.29 |
+| hit staging map | 1.32% | 2.04 |
+| per-pixel driver loop (`main`) | 1.04% | 1.61 |
+| other / unattributed | 2.03% | 3.13 |
+
+`SemSplitMap::applyCarveUpdate` alone is **33.76%** of the frame.
+
+#### Flag ablation — what we get back if the mechanism does not exist
+
+4 reps, arm order rotated per rep, paired by rep index.
+
+| mechanism off | flag | ms/frame | saved | 95% CI | walk changed? |
+|---|---|---:|---:|---|---|
+| free-space / occupancy stream | `--w-free 0` | 68.26 | +86.16 | [+81.27, +91.04] | **yes, −80.2%** |
+| semantic band | `--sem-band 0` | 127.80 | +26.62 | [+21.57, +31.66] | no (identical) |
+| TSDF band write | `--tsdf-enabled 0` | 146.43 | +7.99 | [+1.58, +14.39] | no (−0.17%) |
+| soft → argmax deposit | `--inc-mode hard` | 151.32 | +3.09 | [−2.95, +9.14] | no (identical) |
+
+**Calibration.** For the TSDF band the two instruments agree to 0.8% — perf
+8.05 ms, ablation 7.99 ms. That is the check that licenses reading the rest of
+the table.
+
+**Read `--w-free 0` carefully.** It is the only arm that changes the walk, and
+it changes more than the carve: the far segment stops carving and starts
+skipping (5.06× fewer voxels), and the Beta occupancy grid collapses from
+545,723 voxels to 10,465. It is a timing probe with a large accuracy
+consequence (§4.4, §4.5), not a candidate.
+
+#### The number that ranks the remaining work
+
+Subtracting the carve-off arm from the baseline splits the frame by voxel kind:
+
+| | ms/frame | voxels/frame | ns/voxel |
+|---|---:|---:|---:|
+| retained (surface voxels) | 68.26 | 999,904 | **68.27** |
+| removed (free-space voxels) | 86.16 | 4,060,010 | **21.22** |
+
+**A surface voxel costs 3.22× a free-space voxel.** Free-space voxels are 80.2%
+of the walk but 55.8% of the time. Deleting all of them still leaves 68.26 ms
+against SLIM-VDB's ~32 ms at a matched band and ~18 ms tuned — so the residual
+is the per-surface-voxel model cost, which is what §4.5 argued from ratios and
+this prices in nanoseconds.
+
+#### The frame is instruction-bound
+
+`perf stat` over the same run: IPC **2.45**, L1-dcache miss **0.28%**
+(130.4 M / 46.8 G), branch miss **0.92%** (250 M / 27.1 G), and **266
+instructions per voxel** (156.0 G instructions / 586.5 M voxels), 108.6
+cycles/voxel.
+
+Cache and branch prediction are both healthy, so **layout changes,
+cache-blocking and prefetching have nothing to recover here.** A candidate has
+to remove instructions. `perf annotate applyCarveUpdate` shows where they are:
+the function is not inlined, pays a full prologue and a stack-canary load on
+~3.7 M calls per frame, and its hot instructions are flat and dominated by
+shifts and masks recomputing the block key.
+
+#### The walker's timing brackets are ungated
+
+`scovox_map_split.hpp` contains six `std::chrono::steady_clock::now()` sites and
+none is behind a macro — the header's only `#if` is `SCOVOX_WALK_MARGIN_VOX`
+(:349). On the shipped fused path each hit ray pays two clock reads
+(`integrateHitFused` :193/:695, plus the degenerate-ray early return :205),
+each no-return ray two more (`integrateMiss` :757/:760), and the frame two in
+`flushCarveFrame` :789/:793. This is compiled into the ROS node, not only the
+replay harness.
+
+At 153,602 clock reads per frame and 16.89 ns per isolated
+`steady_clock::now()` on this host, that is 2.59 ms/frame; perf's clock symbols
+independently total 1.48% = 2.29 ms/frame. The arithmetic is an upper bound and
+perf a lower one, so the cost is **2.3–2.6 ms/frame, 1.5–1.7% of the frame** —
+the same class and size as the branch counters §4.6 compiled out, and gateable
+the same byte-identical way, since a clock read cannot change a map byte.
+
+Also note what the printed split is **not**: on the fused path
+`integrateHitFused` brackets the *whole* ray into `tsdf_ns_` by design
+(:694-713), so the log's `walker Xs (tsdf Ys + sem Zs)` is not a TSDF-versus-
+semantics split. The `--sem-band 0` ablation demonstrates it directly: it takes
+26.6 ms/frame off the frame and every one of those milliseconds leaves the
+`tsdf` bucket (50.14 s → 39.67 s over 400 frames) while `sem` does not move
+(8.89 s → 9.02 s). Quote `s_map`, not the bracket split.
