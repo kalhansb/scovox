@@ -1595,8 +1595,65 @@ None of the three moves a measured number.
 
 Free-space carve is **75.8% of all voxel traversal** (scene 016, tsdf on:
 4 924 579 371 of 6 493 044 570). Against that, the two mappers' semantic grids
-agree in size within ±2.4% on all eight scenes. The cost asymmetry between
-scovox and SLIM-VDB is therefore *entirely* the free-space model, and any future
-reader weighing a traversal optimisation should start from that number rather
-than from the walker's per-voxel cost, which is already ~3–4× better than the
-baseline's.
+agree in size within ±2.4% on all eight scenes.
+
+That number is a share of **voxels**, and an earlier draft of this paragraph
+over-read it as a share of **time** — it claimed the cost asymmetry between
+scovox and SLIM-VDB is *entirely* the free-space model. E-W21 has since removed
+free-space carve from the pipe outright, traversal and all, and measured the
+result: voxels traversed fall 5.04x, walker time falls only 1.54x, and a scovox
+that builds no free-space model at all is still **1.92x slower than SLIM-VDB at
+a matched 0.10 band, 8/8 scenes**. The carve's voxels were the cheap ones — a
+Beta miss increment on a grid carrying no semantics. The claim is corrected in
+the addendum below; a reader weighing a traversal optimisation should note that
+the traversal term has already been cut 5x for a 1.5x return, and that the
+walker's per-voxel cost was never the problem either (it is ~3–4x better than
+the baseline's). What is left is the Dirichlet deposit at the surface.
+
+---
+
+## Addendum (2026-09-06) — the carve-off pipeline
+
+Three things landed after this review was written, and two of them change what
+it says.
+
+**1. The free-space claim above is corrected.** This document read "75.8% of
+traversal" as "the cost asymmetry is entirely the free-space model". E-W21
+tested that directly by removing free-space carve from the pipe — the write and
+the traversal — and the reading does not hold. Voxels traversed fall 5.04x;
+walker time falls 1.54x; a scovox building no free-space model at all is still
+1.92x slower than SLIM-VDB at a matched 0.10 band, unanimously over eight
+scenes. Free-space carve is most of scovox's voxels and about a third of its
+time. The gap that remains is the Dirichlet deposit at the surface, and no
+traversal work will reach it. The corrected numbers live in
+`scovox_code_structure.md` §4.4.
+
+**2. `--w-free 0` now removes the walk, not just the write.** Previously
+`applyCarveUpdate` returned early on `w_inc <= 0` while `walk_back` kept
+traversing the full ray to write nothing. The fused walker now seeds the exact
+DDA a window in front of the surface when the carve is a guaranteed no-op for
+that ray, `far_skip` gains carve-off as a third arming case with `far_carve`
+standing down so the two stay exclusive, and `SemSplitMap::carveRay` early-outs
+for the inclusive endpoint too. The shipped pipeline carves, so `carve_off` is
+false on every one of its rays and the carve-on map is byte-identical on 8/8
+scenes — that gate was the precondition for merging this at all.
+
+The suffix gate is 7/8 byte-identical. Scene 273 holds the same 88 889 voxels
+with bit-identical `cls`, `pad` and `p_occ`, and differs only in `conf` on 10 of
+them, by 2.4e-7 to 1.2e-5 with signs both ways — float summation order in
+`cnt[best]/s_class`, reachable because a mid-segment seed can perturb the DDA's
+`tMax` by a ULP at a boundary crossing. Scored with the unmodified scorer, 252
+keys agree and the only difference is the recorded path of the input dump.
+Nothing the pipeline consumes moves.
+
+**3. Carve-off is not promoted.** It is a trade — 2.24x the frame rate and half
+the grid, against intersection mIoU −0.0417 (0/8) at the shipped readout. E-W19c
+shows most of that is the readout gate (matched to the shipped occupied count it
+is −0.0106, 2/8, CI straddling zero), but the bar is "fast without losing mIoU"
+and this does not clear it. It ships as a switch.
+
+**Not a finding, but worth recording for anyone timing this walker.** An edit
+that swapped two independent `posToCoord` calls — provably inert, byte-identical
+maps and byte-identical voxel counts — moved wall time ~2%, in the faster
+direction, against a within-arm spread of ~0.1%. Do not read a sub-3% delta on
+`integrateHitFused` as a cost until an inert control has been run alongside it.

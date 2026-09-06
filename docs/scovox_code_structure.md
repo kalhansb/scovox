@@ -1128,7 +1128,10 @@ Per ray, scovox costs 2.115 µs against SLIM-VDB's 0.302/0.545 µs while walking
 an estimated 12–31× more voxels, so **the walker is roughly 3–4× cheaper per
 voxel than the baseline's and loses on volume, not on efficiency.** Micro-
 optimising the walk is therefore the small lever; the free-space model is the
-large one.
+larger one — but **not the whole gap.** §4.4 removes free-space carve from the
+pipe entirely, traversal included, and finds SLIM-VDB still 1.92x faster at a
+matched band. Read the 75.8% as a share of *voxels*, which is what it measures,
+and not as a share of time.
 
 ### 4.3 What must not be quoted
 
@@ -1136,3 +1139,54 @@ large one.
 the `--slots` and `--e0-counters` side files, so it varies with flags. The
 whole-process RSS peak (127.4 MB) measures the driver's dump buffer — one record
 per voxel, 2.4 M of them — not the map. Quote `s_map` and `peak_rss_kb_map`.
+
+### 4.4 What removing free-space carve is actually worth (measured 2026-09-06)
+
+§4.1 found free-space carve to be 75.8% of all voxel traversal. This section
+records what happens when it is removed from the pipe — not just its write, but
+its traversal — so that scovox walks the same `depth ± trunc` window SLIM-VDB
+walks. Method, gates and statistics are in `scovox_slot_rules/REVIEW_LOG.md`
+E-W21; all seven arms ran back to back in one session, with the scovox
+carve-off arms bracketing the SLIM-VDB pair so drift is shared rather than
+loaded onto one mapper.
+
+`--w-free 0` alone does not do this. `applyCarveUpdate` returns on `w_inc <= 0`
+so the write disappears, but `walk_back = max(depth, trunc)` never reads
+`w_free`, so the walker still traverses the whole ray to write nothing. The
+carve-off pipeline seeds the exact DDA a short window in front of the surface
+instead — see §1.3 for why seeding is a true suffix of the same walk where
+shortening `k_far` would not be.
+
+Frames per second (`frames / s_map`), mean of the eight scenes:
+
+| shipped | carve write off | carve off the pipe | ditto, band 0.10 | SLIM-VDB 0.10 | SLIM-VDB 0.04 |
+|---|---|---|---|---|---|
+| 6.56 | 9.34 | **14.68** | **16.44** | 31.52 | 56.05 |
+
+| comparison | ratio | scenes | p |
+|---|---|---|---|
+| short walk vs full walk, carve off | 1.574x | 8/8 | 0.0078 |
+| carve-off pipeline vs shipped | 2.242x | 8/8 | 0.0078 |
+| **SLIM-VDB vs carve-off scovox, band matched at 0.10** | **1.919x** | 8/8 | 0.0078 |
+
+**Traversal is not the remaining gap.** Removing the carve cuts voxels
+traversed 5.04x (1 509 616 973 to 299 285 094 on the 300-frame gate; `carve_dda`
+407 777 267 to 0) and walker time only 1.54x; nanoseconds per traversed voxel
+rise 19.52 to 66.13. The carve's voxels were the cheap ones, a Beta miss
+increment on a grid with no semantics. With the free-space model gone entirely
+and the band matched, SLIM-VDB is still 1.92x faster — 60.8 ms/frame against
+31.7. The residual is per-surface-voxel model cost: the Dirichlet deposit.
+
+Memory runs the other way, and by more:
+
+| mean of 8 | shipped | carve off | band 0.10 | SLIM-VDB 0.10 |
+|---|---|---|---|---|
+| grid MB | 21.8 | **10.9** | **10.9** | 42.4 |
+| peak RSS @ mapping, MB | 45.4 | 31.4 | **28.8** | 57.0 |
+
+**This is a switch, not a default.** At the shipped readout the carve-off map
+loses intersection mIoU −0.0417 (0/8, p 0.0078) and union −0.0258 (3/8,
+ambiguous). E-W19c shows most of the intersection number is the readout gate
+rather than the model — matched to the shipped map's occupied count it falls to
+−0.0106, 2/8, CI straddling zero — but ambiguous-at-a-0.99-threshold is not
+"fast without losing mIoU", so the default keeps the carve.
