@@ -63,9 +63,46 @@ inline constexpr uint16_t kEmptySlot = 0xFFFF;
 constexpr float kDefaultDirichletPrior = 0.01f;
 
 // Process-wide counters for the four sparse_add branches. All paths are
-// instrumented for E5.2 — match/empty are common (hot) and slow the path
-// negligibly (one relaxed atomic add per integration). Read at any time via
-// dumpEvictStats() or sampled per-frame from scovox_node.
+// instrumented for E5.2. Read at any time via dumpEvictStats() or sampled
+// per-frame from scovox_node.
+//
+// COMPILED OUT BY DEFAULT, and the default is the design choice.
+//
+// These are `std::atomic`, and on x86-64 every atomic read-modify-write is a
+// `lock`-prefixed instruction whatever the memory order — `relaxed` relaxes the
+// compiler's reordering, not the CPU's bus. It costs tens of cycles and it
+// drains the store buffer, so it does not overlap with the work either side of
+// it. An earlier comment here called that negligible "per integration", which
+// was true when a deposit happened once per hit ray. That is not the shape of
+// the path any more: the semantic band deposits once per NON-ZERO CLASS per
+// BAND VOXEL, so a single ray issues a double-digit number of these and a frame
+// issues them by the million. Nothing on any code path reads the counters to
+// make a decision, and they are members of no voxel struct, so they reach no
+// dump — the deposit is bit-identical either way.
+//
+// The declarations stay unconditional so every reader still compiles; only the
+// increments are switched. E0 builds force this on: dumpEvictStats() writes
+// these four as a cross-check against its own outcome tally, and a cross-check
+// that silently reads zero is worse than no cross-check at all.
+//
+// External deposit-bench harnesses that reset and read these globals directly
+// must be built with SCOVOX_SPARSE_BRANCH_COUNTERS=1. Set it for the whole
+// build, never per translation unit: sparse_add / sparse_add_class are inline,
+// so a mixed setting is an ODR violation rather than a partial measurement.
+#ifndef SCOVOX_SPARSE_BRANCH_COUNTERS
+#  if defined(SCOVOX_E0_COUNTERS) && SCOVOX_E0_COUNTERS
+#    define SCOVOX_SPARSE_BRANCH_COUNTERS 1
+#  else
+#    define SCOVOX_SPARSE_BRANCH_COUNTERS 0
+#  endif
+#endif
+
+#if SCOVOX_SPARSE_BRANCH_COUNTERS
+#  define SCOVOX_SPARSE_BUMP(c_) (c_).fetch_add(1, std::memory_order_relaxed)
+#else
+#  define SCOVOX_SPARSE_BUMP(c_) ((void)0)
+#endif
+
 inline std::atomic<uint64_t> g_sparse_match_count{0};  // incoming class matched a tracked slot
 inline std::atomic<uint64_t> g_sparse_empty_count{0};  // incoming class filled an empty slot
 inline std::atomic<uint64_t> g_sparse_evict_count{0};  // incoming evicted a smaller slot
@@ -132,14 +169,14 @@ inline void sparse_add(float* sem_cnt, uint16_t* sem_cls, uint16_t cls, float in
   for (int i = 0; i < K_TOP; ++i) {
     if (sem_cnt[i] > 0.0f && sem_cls[i] == cls) {
       sem_cnt[i] += inc;
-      g_sparse_match_count.fetch_add(1, std::memory_order_relaxed);
+      SCOVOX_SPARSE_BUMP(g_sparse_match_count);
       return;
     }
   }
   for (int i = 0; i < K_TOP; ++i) {
     if (sem_cnt[i] <= 0.0f) {
       sem_cls[i] = cls; sem_cnt[i] = inc;
-      g_sparse_empty_count.fetch_add(1, std::memory_order_relaxed);
+      SCOVOX_SPARSE_BUMP(g_sparse_empty_count);
       return;
     }
   }
@@ -181,10 +218,10 @@ inline void sparse_add(float* sem_cnt, uint16_t* sem_cls, uint16_t cls, float in
   if (inc > sem_cnt[min_i]) {
     if (a_unk) *a_unk += sem_cnt[min_i];  // conserve evicted mass
     sem_cls[min_i] = cls; sem_cnt[min_i] = inc;
-    g_sparse_evict_count.fetch_add(1, std::memory_order_relaxed);
+    SCOVOX_SPARSE_BUMP(g_sparse_evict_count);
   } else {
     if (a_unk) *a_unk += inc;  // conserve dropped mass
-    g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
+    SCOVOX_SPARSE_BUMP(g_sparse_drop_count);
   }
 }
 

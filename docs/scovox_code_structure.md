@@ -1267,5 +1267,50 @@ carve out of the pipe is 5.04x fewer voxels for 1.54x time; the margin is 38% of
 the ray for 1.08x; and at matched span the gap is still 1.745x. Speed work
 belongs on the deposit — the per-non-zero-class loop, the eviction scan, the
 per-deposit atomic branch counters, the `touched_dir_` push — not on the walk.
-Whether any
-of those can be cut without losing mIoU is untested.
+The branch counters have since been cut; see §4.6. The rest is untested.
+
+### 4.6 The `sparse_add` branch counters are compiled out (measured 2026-09-06)
+
+**Design choice, and the default is the choice.** `SCOVOX_SPARSE_BRANCH_COUNTERS`
+defaults to **0**, so the four process-wide `std::atomic<uint64_t>` counters in
+`sparse_add` / `sparse_add_class` are declared but never incremented. Nine sites
+switch (`voxel.hpp:135,142,184,187`, `dir_voxel.hpp:356,366,378,430,435`). The
+declarations stay unconditional so every reader still compiles.
+
+**Why they were costing anything.** On x86-64 an atomic read-modify-write is a
+`lock`-prefixed instruction whatever the memory order — `relaxed` relaxes the
+compiler's reordering, not the CPU's. It costs tens of cycles and drains the
+store buffer, so it does not overlap with the work either side of it. That was
+negligible when a deposit happened once per hit ray, which is what the old
+comment at this declaration assumed. It is not the shape of the path now: the
+semantic band deposits once per **non-zero class** per **band voxel**, and the
+SceneNN `.topk` blobs carry a mean 2.79 non-zero classes per pixel, so a single
+ray issues roughly fourteen of these and a frame issues them by the million.
+
+**Why it is inert.** Nothing on any code path reads a counter to make a
+decision, and they are members of no voxel struct, so they reach no dump. Proved
+twice: the counters-ON build is md5 `8bddc9bbb999`, byte-identical to the E-W22
+control binary, so the macro rewrite emits the program it replaced; and scene
+016 at full length dumps byte-identically with counters on and off, in both the
+shipped and the carve-off configs.
+
+**What it is worth.** Repeated measures on scene 016, carve config, 18 paired
+reps with the arm order flipped every rep: **+2.31 ms/frame saved**, 95% CI
+[+0.62, +4.00], exact signed-rank p 0.0208, faster in 13/18. Real but small —
+3.2% of the 66 ms carve frame and only **1.45% of the 152 ms shipped frame**,
+which is under this walker's own ~2% layout noise floor. Against the ~135
+ms/frame deficit to SLIM-VDB at its tuned optimum (§4.5) it is not a step
+toward parity; it is kept because it is free.
+
+**Two honesty guards, and they are load-bearing.** A counters-off build reads
+zero because the increments are gone, not because no slot ever overflowed, and
+nothing in the number distinguishes those. So `scovox_node.cpp:840` warns that a
+requested `eviction_stats_csv` will be all zeros, and `:3415` prints "not
+counted in this build" instead of `0`. `SCOVOX_E0_COUNTERS` forces the gate back
+on, because `dumpEvictStats()` reads these four as a cross-check against its own
+outcome tally and a cross-check that silently reads zero is worse than none.
+
+Build harnesses that reset and read these globals directly must set
+`SCOVOX_SPARSE_BRANCH_COUNTERS=1` for the **whole** build: `sparse_add` and
+`sparse_add_class` are inline, so a mixed setting is an ODR violation rather
+than a partial measurement.
