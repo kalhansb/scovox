@@ -149,10 +149,39 @@ against one miss and `Beta(1,1)` needed 3. The carve wall guard
    DDA step adds `res·|u_i| ≥ 0`) and `dist ≥ t` always, so every remaining
    voxel is decided: the carve needs `sdf > 0`, the band needs `dist ≤ sem_band_`.
    Verified as **byte identity** of the dumped map, not as equal mIoU.
+
+   The **near** end is shortened the other way, and only when the free-space
+   carve is off. `--w-free 0` does not shorten anything by itself: it removes
+   the carve WRITE (`applyCarveUpdate` returns on `w_inc <= 0` before touching
+   state) while `walk_back` keeps traversing the whole ray to write nothing —
+   which is why a carve-off arm still walks from the sensor. When the write is a
+   guaranteed no-op for the ray, the walker instead **seeds the DDA in front of
+   the surface** (`scovox_map_split.hpp`, `seed_carve_off_walk`), so carve-off
+   integrates over the same window SLIM-VDB does.
+
+   Unlike the far end, moving the near end is safe: `ExactRayIterator`'s visited
+   sequence depends only on the start point, the direction and the `t ≤ 1`
+   bound, so seeding at a point **on the same segment** yields a true SUFFIX of
+   the full walk rather than a different walk. `exact_body` is a pure function of
+   `(c, origin, endpoint)` — it never reads where the walk began — so with the
+   carve off no latch (`carve_blocked`, `ring_left`, `k_hit_visited`,
+   `stop_walk`) can be set by a dropped prefix voxel. The kept front window is
+
+       front_reach = max(tsdf ? trunc + h : 0, band ? sem_band : 0)
+                   + 2.7320508 · res
+
+   where the `√3·res` term is **two** half-diagonals — a dropped voxel's centre
+   may sit `h·√3` off the segment, and the aim point `centre(k_far)` may sit
+   `h·√3` off `end_pos` — and the remaining `1·res` is headroom. This is also
+   verified as byte identity, against the same arguments on the pre-change
+   library.
 2. **Far voxels** (further than `trunc + h` before the hit) take the far-skip
    or far-carve shortcut (`:273-276`, `:318-322`): carve staged into
    `CarveStage`, no per-voxel float body. Both shortcuts are asserted
-   bit-identical to the exact body by `test_scovox_map_split`.
+   bit-identical to the exact body by `test_scovox_map_split`. `far_skip` arms
+   on three separate ways the far body can be a no-op; the third, carve-off, is
+   the only one that does not need a carve frame open, and `far_carve` stands
+   down for it so the two remain mutually exclusive.
 3. **Near voxels** run `exact_body` (`:369-449`). `sdf` is **not** the along-ray
    offset and **not** a true signed distance: `dist = |endpoint − voxel_centre|`
    with the sign taken from `(voxel_centre − origin)·(endpoint − voxel_centre)`
@@ -1043,3 +1072,67 @@ configuration the published numbers were measured under: see the box in §1.5.
 Second, the storage state is verified by `./dev.sh ros-test` (327 cases), not by
 `./dev.sh test` — the core-only path cannot see `scovox_mapping`'s 143 cases at
 all, and a storage change graded only by it will pass while broken.
+
+---
+
+## 4. What the best method costs (measured 2026-09-06)
+
+§1–§3 describe what the code computes. This section records what it costs, so a
+reader weighing a change against "faster without losing mIoU" starts from
+measured proportions rather than intuition. Method, statistics and caveats are
+in `scovox_slot_rules/REVIEW_LOG.md` E-W18; the numbers are quotable because
+`--tsdf-enabled 1` was proven to leave the semantic dump byte-identical (scene
+016 at tsdf 0, tsdf 1 and the goal8 reference all md5
+`483483456709d3ff76932aaeda009ac1`).
+
+Eight SceneNN scenes, single-threaded, both mappers instrumented inside their
+own process by one shared header. Mean of 8:
+
+| | scovox tsdf on | scovox tsdf off | SLIM-VDB 0.04/800 | SLIM-VDB 0.10/20 |
+|---|---|---|---|---|
+| mapping, ms/frame | 164.2 | 148.3 | **19.9** | 35.8 |
+| grid memory, MB | **21.8** | 17.9 | 40.0 | 42.4 |
+| peak RSS @ integration, MB | **45.4** | 33.2 | 54.6 | 57.0 |
+
+Scovox is **4.6–8.3× slower and holds half the map**, both unanimous over the
+eight scenes (p 0.0078, the exact signed-rank floor at n = 8).
+
+### 4.1 Where the time goes
+
+Scene 016, `--tsdf-enabled 1`, per-voxel traversal accounting:
+
+| term | voxels | share |
+|---|---|---|
+| `fused_far` (all of it carve) | 3 216 401 557 | 49.5% |
+| `carve_dda` | 1 708 177 814 | 26.3% |
+| `fused_exact` | 1 568 465 199 | 24.2% |
+| `band_dda` | 0 | — |
+| **total** | **6 493 044 570** | |
+
+**Free-space carve is 75.8% of all traversal.** `skip` reads 0 and structurally
+must: the fused walker's far-voxel skip requires `!batch_free_carve`, and the
+shipped pipeline batches, so its counterpart `far_carve` takes every one of
+those 3.2 B voxels instead. That is not a bug and should not be "fixed" by
+reading the counter as a failure.
+
+### 4.2 The two mappers build the same surface
+
+Scovox's Dirichlet voxel count against SLIM-VDB's at `sdf_trunc` 0.10, per
+scene: −1.63, −2.11, −0.45, −0.15, +0.24, +2.33, −0.10, +0.82 %. All eight
+within ±2.4%. What scovox additionally holds is the Beta free-space grid —
+1.3–3.5 M voxels against 53–150 k semantic, a factor of 15 to 39 — which
+SLIM-VDB does not build at all (`space_carving` off means `VDBVolume.cpp:176`
+starts each ray at `depth − sdf_trunc`).
+
+Per ray, scovox costs 2.115 µs against SLIM-VDB's 0.302/0.545 µs while walking
+an estimated 12–31× more voxels, so **the walker is roughly 3–4× cheaper per
+voxel than the baseline's and loses on volume, not on efficiency.** Micro-
+optimising the walk is therefore the small lever; the free-space model is the
+large one.
+
+### 4.3 What must not be quoted
+
+`s_wall` excludes argument parsing and the trajectory read. `s_dump` also spans
+the `--slots` and `--e0-counters` side files, so it varies with flags. The
+whole-process RSS peak (127.4 MB) measures the driver's dump buffer — one record
+per voxel, 2.4 M of them — not the map. Quote `s_map` and `peak_rss_kb_map`.

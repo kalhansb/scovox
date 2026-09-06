@@ -420,7 +420,13 @@ void SemSplitMap::carveRay(const Eigen::Vector3f& origin,
   // Beta grid — matching applyCarveUpdate's own w_inc<=0 no-op per voxel.
   const float w_free = prof ? prof->w_free : params_.w_free;
   const float w_inc  = w_free;
-  if (w_inc <= 0.f && !inclusive_endpoint) return;
+  // The inclusive endpoint is no exception: it reaches the grid through the
+  // same applyCarveUpdate, which returns on `w_inc <= 0` before touching
+  // anything. So with the carve off the whole ray — walk included — is dead,
+  // and a no-return ray (integrateMiss, the one caller that asks for the
+  // inclusive endpoint) does no work at all rather than traversing to write
+  // nothing. Only carve_voxels_, an instrumentation counter, moves.
+  if (w_inc <= 0.f) return;
 
   const auto walk_body = [&](const CoordT& c) -> bool {
     ++carve_voxels_;
