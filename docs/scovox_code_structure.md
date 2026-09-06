@@ -1175,7 +1175,8 @@ traversed 5.04x (1 509 616 973 to 299 285 094 on the 300-frame gate; `carve_dda`
 rise 19.52 to 66.13. The carve's voxels were the cheap ones, a Beta miss
 increment on a grid with no semantics. With the free-space model gone entirely
 and the band matched, SLIM-VDB is still 1.92x faster — 60.8 ms/frame against
-31.7. The residual is per-surface-voxel model cost: the Dirichlet deposit.
+31.7. The residual is per-surface-voxel model cost: the Dirichlet deposit —
+established by ablation in §4.5, which is where that claim's evidence lives.
 
 Memory runs the other way, and by more:
 
@@ -1190,3 +1191,73 @@ ambiguous). E-W19c shows most of the intersection number is the readout gate
 rather than the model — matched to the shipped map's occupied count it falls to
 −0.0106, 2/8, CI straddling zero — but ambiguous-at-a-0.99-threshold is not
 "fast without losing mIoU", so the default keeps the carve.
+
+### 4.5 Why scovox is slower than SLIM-VDB (measured 2026-09-06)
+
+§4.4 asserts the residual gap is the per-surface-voxel deposit. That assertion
+had a confound. The carve-off seed does not start at the deposit window; it
+starts `kWalkMarginVox = 2.7320508` voxels in front of it, two half-diagonals
+plus a voxel of headroom, so the walk is a guaranteed superset of every voxel
+the deposit window can touch (§1.3). At band 0.10 that margin is **38% of every
+ray**:
+
+| band-matched arm, res 0.05, trunc 0.10, band 0.10 | m | voxels |
+|---|---|---|
+| useful front window | 0.1250 | 2.50 |
+| exactness margin — traversed, never deposits | 0.1366 | **2.73** |
+| back window | 0.1000 | 2.00 |
+| **scovox span** | **0.3616** | **7.23** |
+| **SLIM-VDB span** (`depth ± trunc`) | **0.2000** | **4.00** |
+
+1.808x the span against a 1.919x time ratio is what a traversal-bound mapper
+looks like, so §4.4's conclusion could not stand on the E-W21 arms alone.
+
+E-W22 settles it. `SCOVOX_WALK_MARGIN_VOX` is a guarded macro — `#ifndef` /
+`#define`, never bare, because an unpassed `-D` compiles to 0 and would silently
+break the suffix — and the default build is md5-identical to the binary E-W21
+timed, so the refactor is provably inert. A `margin0` build sets it to 0 purely
+to price those voxels. **It is a timing probe, not a candidate**: it destroys
+the suffix guarantee and its maps DIFFER from the control on all three scenes.
+
+Three scenes, 8200 frames, scovox arms bracketing SLIM-VDB:
+
+| | span (vox) | FPS | ms/frame |
+|---|---|---|---|
+| control (real binary) | 7.23 | 14.78 | 67.7 |
+| margin removed | 4.50 | 15.99 | 62.5 |
+| SLIM-VDB @ 0.10 | 4.00 | 27.90 | 35.8 |
+
+**Cutting 38% of every ray's traversal buys 8.2% of time**, where a
+traversal-bound mapper would give 1.61x. At a near-matched span — 4.50 against
+4.00 — SLIM-VDB is still **1.745x** faster.
+
+The margin voxels reach `exact_body` and fail every deposit gate, so they price
+reach-and-gate directly: `(67.7 − 62.5) / (7.23 − 4.50)` = 1.905 ms/frame per
+span-voxel. Assuming a useful voxel costs the same to reach and gate as a margin
+one, traversal and gating is 4.50 x 1.905 = **8.6 ms of 62.5, or 13.7%**, and
+scovox's non-traversal work alone (53.9 ms/frame) is **1.51x SLIM-VDB's entire
+frame**. That last step is an extrapolation, but the directly measured 8.2%
+already caps how much traversal can be worth.
+
+**What the per-voxel work is.** SLIM-VDB (`VDBVolume.cpp:180-206`): voxel
+centre, SDF, one gate, two accessor reads, Curless–Levoy, `alpha[label] += 1`
+into a **dense `VecXIGrid<14>`** where `label` is an argmax taken upstream,
+three `setValue`s. scovox (`exact_body` → `applyBandSemantic` →
+`dirichletUpdate`): coordToPos, norm, dot, degeneracy guard, `trim_tail`,
+`applyBandUpdate` into a **separate** TSDF grid, a **Beta-grid read** for
+`semantic_band_require_occ`, `getOrAllocateDirOn`, then three passes over the
+14-entry probability vector and one `sparse_add_class` — a `K_TOP` scan with
+eviction — per non-zero class, then `applyDirSaturation` and a
+`touched_dir_.push_back`. Measured on the SceneNN `.topk` blobs, the mean number
+of non-zero classes per pixel is **2.79**.
+
+So: ~2.8 sparse evicting insertions plus ~42 vector iterations of
+normalise/argmax, against one dense integer increment.
+
+**scovox is slow because it maintains a richer model, not because it walks
+badly.** Three ablations, each removing a different traversal term, agree:
+carve out of the pipe is 5.04x fewer voxels for 1.54x time; the margin is 38% of
+the ray for 1.08x; and at matched span the gap is still 1.745x. Speed work
+belongs on the deposit — the per-non-zero-class loop, the eviction scan, the
+per-band-voxel Beta read, the `touched_dir_` push — not on the walk. Whether any
+of those can be cut without losing mIoU is untested.
