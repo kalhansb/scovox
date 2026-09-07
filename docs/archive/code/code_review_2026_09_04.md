@@ -1329,12 +1329,12 @@ trust the symbol name and re-read, never add an offset.
 
 ### Fixed forward in code, because the commit message cannot be amended
 
-- **`e04b76d`: "prints `buildSwitches()` before it does anything else."** It
+- **`bc872d4`: "prints `buildSwitches()` before it does anything else."** It
   printed at `replay_scenenn.cpp:414`, *after* `Args a;` and after the `parse()`
   failure branch that `return 2`s — so the one run that most needs to say which
   binary it is, a run killed by a malformed command line, said nothing. The
   print is now the first statement of `main`, which makes the claim true.
-- **`e04b76d`: "the gate for the whole review series."** `verify_fixes.sh` gated
+- **`bc872d4`: "the gate for the whole review series."** `verify_fixes.sh` gated
   nothing. It ran `set -uo pipefail` with no `-e`; it *printed* the warning count
   instead of comparing it to the stated zero bar; a package that failed to
   configure or build was `continue`d past; a missing reference dump was
@@ -1481,7 +1481,7 @@ code-review batch"*.
   batch.
 - **Byte identity against HEAD itself.** `scripts/pristine_head_replay.sh`
   compiles a `git archive HEAD` snapshot of both trees — submodule `32121f2`,
-  toplevel `e04b76d` — at a flag line character-identical to the reviewed
+  toplevel `bc872d4` — at a flag line character-identical to the reviewed
   build, and replays all eight scenes. **8/8 identical**, 458.8 MB of map
   matching byte for byte from two different binaries.
 - **The metrics.** `cells/goal8.tsv` regrades the shipped candidate on all

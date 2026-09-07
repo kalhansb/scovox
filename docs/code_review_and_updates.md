@@ -12,7 +12,7 @@ same day, carries that review's open items forward with their status
 re-checked; the cross-references stand.
 
 **Addendum 2026-09-06, same day.** Tier F re-verifies
-`scovox_slot_rules/scovox_cleanup.md` (last edited 2026-09-04, `4b84ece`)
+`scovox_slot_rules/scovox_cleanup.md` (last edited 2026-09-04, `64e8aa3`)
 against the tree at `77b99da`, which differs from `703eb7b` by one docs
 commit; `scovox_node.cpp` is byte-identical between the two. That document is
 a work list for the core deposit path, scoped to the SceneNN replay. Three
