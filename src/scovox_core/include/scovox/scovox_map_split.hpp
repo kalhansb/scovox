@@ -30,6 +30,19 @@
 #include "scovox/sem_split_map.hpp"
 #include "scovox/tsdf_map.hpp"
 #include "scovox/tsdf_voxel.hpp"
+#include "scovox/walker_timers.hpp"
+
+// Margin in voxels between the deposit window and where the seeded carve-off
+// walk starts. Two half-diagonals (a dropped voxel's centre may sit h*sqrt(3)
+// off the segment, and the aim point centre(k_far) may sit h*sqrt(3) off
+// end_pos) plus one voxel of headroom. Guarded, never bare: an unpassed -D
+// would otherwise compile to 0 and silently break the suffix. It sits at file
+// scope, rather than beside its only reader, so `version.cpp` can include this
+// header and report the compiled value: a build that widens the margin to
+// measure what it buys must not print the same banner as the shipped default.
+#ifndef SCOVOX_WALK_MARGIN_VOX
+#define SCOVOX_WALK_MARGIN_VOX 2.7320508f
+#endif
 
 namespace scovox {
 
@@ -190,8 +203,7 @@ class ScovoxMapSplit {
     // stays 100% LiDAR. Null prof / geometry_off=false keeps TSDF exactly as
     // before. Combined with the existing is_dynamic suppression below.
     const bool geometry_off = (prof && prof->geometry_off);
-    using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
+    const auto t0 = walkNow();
 
     const Eigen::Vector3f d = endpoint - origin;
     const float depth = d.norm();
@@ -202,8 +214,8 @@ class ScovoxMapSplit {
       // one bucket. (Routing this to sem_ns_ would be doubly wrong: it does
       // no semantic work, and it splits the fused path's time across two
       // accumulators whose per-substrate split is meaningless on this path.)
-      const auto t1 = clk::now();
-      tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+      const auto t1 = walkNow();
+      tsdf_ns_ += walkNs(t0, t1);
       return;
     }
     const Eigen::Vector3f u = d / depth;
@@ -343,20 +355,12 @@ class ScovoxMapSplit {
     // never uses.
     Eigen::Vector3d seed_pos = start_pos.cast<double>();
     auto k_start = k0;
+    constexpr float kWalkMarginVox = SCOVOX_WALK_MARGIN_VOX;
+
     // Held OUT OF LINE for the same reason exact_body is: this is a ray-rate
     // computation on a walker whose frame is sized for its voxel-rate one, and
     // the carving pipeline never runs it at all. Inline, its Eigen temporaries
     // widen that frame for every ray of every arm.
-    // Margin in voxels between the deposit window and where the seeded walk
-    // starts. Two half-diagonals (a dropped voxel's centre may sit h*sqrt(3)
-    // off the segment, and the aim point centre(k_far) may sit h*sqrt(3) off
-    // end_pos) plus one voxel of headroom. Guarded, never bare: an unpassed
-    // -D would otherwise compile to 0 and silently break the suffix.
-#ifndef SCOVOX_WALK_MARGIN_VOX
-#define SCOVOX_WALK_MARGIN_VOX 2.7320508f
-#endif
-    constexpr float kWalkMarginVox = SCOVOX_WALK_MARGIN_VOX;
-
     auto seed_carve_off_walk = [&]() __attribute__((noinline)) {
       const float useful_front = std::max(tsdf_writes ? trunc + h : 0.f,
                                           band_active ? sem_band_ : 0.f);
@@ -455,9 +459,32 @@ class ScovoxMapSplit {
     int64_t far_thr = 0;
     int64_t far_thr_sq = 0;
     if (far_skip || far_carve) {
-      const double thr_vox =
-          (std::max(static_cast<double>(trunc) + h,
-                    static_cast<double>(sem_band_)) + h) / res + 1.0;
+      // The two fast paths need DIFFERENT radii, because they are different
+      // reductions.
+      //
+      // far_skip claims a voxel writes nothing, so its radius is the widest
+      // gate that can still FIRE on this ray -- not the widest that exists. A
+      // ray whose TSDF is switched off (or which is dynamic / geometry-off)
+      // can never take the `sdf <= trunc + h` branch, so carrying `trunc`
+      // there reserves the exact body for voxels already decided, and
+      // `sanitise` re-clamps a non-positive sdf_trunc back to 0.15 m, so that
+      // reservation survives switching the TSDF off. These are the same two
+      // terms, for the same reason, as `useful_front` above: front and back
+      // halves of one window, which must not disagree about its size.
+      //
+      // far_carve CARVES out there instead of returning, and only a voxel in
+      // FRONT of the surface may be carved -- the exact body decides that with
+      // `sdf > 0`, the fast path instead relies on no behind-surface voxel
+      // ever reaching the far side of the radius. That holds only while the
+      // radius clears the walk's reach behind the hit, which is a second
+      // precondition the skip does not have and which shrinking would break.
+      // So far_carve keeps the widest-gate-that-exists form unchanged.
+      const double gate_reach = far_skip
+          ? std::max(tsdf_writes ? static_cast<double>(trunc) + h : 0.0,
+                     band_active ? static_cast<double>(sem_band_) : 0.0)
+          : std::max(static_cast<double>(trunc) + h,
+                     static_cast<double>(sem_band_));
+      const double thr_vox = (gate_reach + h) / res + 1.0;
       far_thr = (thr_vox >= static_cast<double>(std::numeric_limits<int64_t>::max()))
           ? std::numeric_limits<int64_t>::max()
           : static_cast<int64_t>(thr_vox);
@@ -590,7 +617,12 @@ class ScovoxMapSplit {
       }
 
       // (2) semantic carve (interior of carve band, not the hit voxel).
-      if (c != k_hit && !carve_blocked && sdf > 0.f && sdf <= carve_band) {
+      // `carve_off` short-circuits the whole branch: applyCarveUpdate returns
+      // on the identical `w_inc <= 0` test before it reads any state, and it
+      // returns TRUE, so `carve_blocked` cannot latch either. The call is
+      // out-of-line, so declining to make it is worth more than the test.
+      if (!carve_off && c != k_hit && !carve_blocked
+          && sdf > 0.f && sdf <= carve_band) {
         if (!semCarve(c, prof)) {
           carve_blocked = true;
         }
@@ -697,7 +729,7 @@ class ScovoxMapSplit {
       semsplit_.raySpreadDeposit(origin, endpoint, k_hit, obs, prof);
     }
 
-    const auto t1 = clk::now();
+    const auto t1 = walkNow();
     // Fused walker: TSDF band updates and semantic hit/carve are interleaved in
     // ONE per-voxel loop, so wall-clock cannot be cleanly attributed per
     // substrate without bracketing every applyBandUpdate vs semHit/semCarve with
@@ -715,7 +747,7 @@ class ScovoxMapSplit {
     // unchanged log token, and double-counts on the non-fused path, whose own
     // brackets sit inside it. Scope comparability with SLIM-VDB's
     // Integrate+Prune column depends on this staying per-walker.
-    tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    tsdf_ns_ += walkNs(t0, t1);
   }
 
   /// Non-fused split walker (two DDAs). Kept for A/B parity testing.
@@ -732,8 +764,7 @@ class ScovoxMapSplit {
                          const std::vector<float>* sem_probs,
                          bool                      is_dynamic = false,
                          const HitWeights*         prof = nullptr) {
-    using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
+    const auto t0 = walkNow();
     // Dynamic rays write no persistent TSDF (no ghost surface); the carve inside
     // semsplit_.integrateHit stays persistent, only the endpoint routes. A
     // geometry-off source (RGB-D overlay) also writes no TSDF — geometry stays
@@ -748,22 +779,21 @@ class ScovoxMapSplit {
     // had one walker doing that work and one not.
     if (tsdf_enabled_ && !is_dynamic && !(prof && prof->geometry_off))
       tsdf_.integrateRay(origin, endpoint);
-    const auto t1 = clk::now();
+    const auto t1 = walkNow();
     semsplit_.integrateHit(origin, endpoint, sem_probs, is_dynamic, prof);
-    const auto t2 = clk::now();
-    tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    sem_ns_  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+    const auto t2 = walkNow();
+    tsdf_ns_ += walkNs(t0, t1);
+    sem_ns_  += walkNs(t1, t2);
   }
 
   /// No-return: semantic carve only; no TSDF update.
   void integrateMiss(const Eigen::Vector3f& origin,
                      const Eigen::Vector3f& endpoint,
                      const HitWeights*      prof = nullptr) {
-    using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
+    const auto t0 = walkNow();
     semsplit_.integrateMiss(origin, endpoint, prof);
-    const auto t1 = clk::now();
-    sem_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    const auto t1 = walkNow();
+    sem_ns_ += walkNs(t0, t1);
   }
 
   /// Per-frame decay of the transient (dynamic-class) substrate. Call once per
@@ -791,12 +821,11 @@ class ScovoxMapSplit {
   /// flush). Returns the number of voxels written (carve only — fine-band ray
   /// count is reported via fineLastFrameRays()).
   std::size_t flushCarveFrame() {
-    using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
+    const auto t0 = walkNow();
     const std::size_t n = semsplit_.flushCarveFrame();
     flushFineFrame();
-    const auto t1 = clk::now();
-    tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    const auto t1 = walkNow();
+    tsdf_ns_ += walkNs(t0, t1);
     return n;
   }
 
