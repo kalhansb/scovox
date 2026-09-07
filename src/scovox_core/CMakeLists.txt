@@ -114,6 +114,12 @@ target_link_libraries(test_mesh_labelling scovox_core Eigen3::Eigen)
 scovox_add_gtest(test_scovox_map_split test/test_scovox_map_split.cpp)
 target_link_libraries(test_scovox_map_split scovox_core Eigen3::Eigen)
 
+# Per-ray semantic observation (SemObs): the compact form the deposit path
+# reads. Cap off is a pure change of representation; cap on drops classes and
+# does not renormalize onto the survivors.
+scovox_add_gtest(test_sem_obs test/test_sem_obs.cpp)
+target_link_libraries(test_sem_obs scovox_core Eigen3::Eigen)
+
 # Split Beta/Dirichlet substrate (SemSplitMap): de-unifies SemDir into a
 # BetaVoxel occupancy grid + DirVoxel semantics grid. Layout/prior, two-stream
 # update, STRICT per-grid mass conservation, gate + sparse-semantics memory win.

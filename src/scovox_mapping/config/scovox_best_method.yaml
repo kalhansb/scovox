@@ -102,14 +102,15 @@
 
     # ---- Knobs deliberately left at their library defaults --------------
     # inc_mode 0, hit_flat_share false, inc_thresh 0.10,
-    # class_evidence_saturation -1 (follow the shared cap), ray_spread 0.
-    # These five have no ROS parameter, and the promoted configuration wants
+    # class_evidence_saturation -1 (follow the shared cap), ray_spread 0,
+    # sem_top_k K_TOP (cap ingest at the number of classes a voxel holds).
+    # These six have no ROS parameter, and the promoted configuration wants
     # exactly the value `SemSplitMap::Params` already declares for each, so
     # this file does not need them. That is a property of THIS config, not a
-    # general one: a sweep that moves any of the five cannot be expressed
+    # general one: a sweep that moves any of the six cannot be expressed
     # here and has to go through the replay harness.
     #
-    # One of the five is only conditionally at its promoted value. The replay
+    # One of the six is only conditionally at its promoted value. The replay
     # that produced the promoted run passed `--class-evidence-saturation 0`
     # explicitly; the library default is -1, which means "share whatever
     # `evidence_saturation` is". Those agree here ONLY because
@@ -119,3 +120,13 @@
     # that moves semantics. Cap occupancy alone by adding an explicit
     # `class_evidence_saturation: 0` here first, which needs the parameter to
     # be exposed on the node.
+
+    # `sem_top_k` deserves a word because it is the one of the six whose
+    # library default changed rather than merely being inherited. Ingest used
+    # to deposit every class with a positive probability; it now keeps the
+    # `K_TOP` largest and lets the rest fall into OTHER, which is the same
+    # truncation rule `semantic_topk_trunc` applies on the observation side.
+    # That node parameter is not set in this file and defaults to 0 (off);
+    # note the interaction if it is ever set, because it can now only make the
+    # cap TIGHTER than K_TOP -- any value at or above K_TOP is a no-op, since
+    # ingest already caps there.

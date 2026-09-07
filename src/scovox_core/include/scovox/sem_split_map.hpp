@@ -43,6 +43,7 @@
 #include "scovox/ray_iterator.hpp"
 #include "scovox/carve_stage.hpp"
 #include "scovox/dir_voxel.hpp"
+#include "scovox/sem_obs.hpp"
 #include "scovox/semantics.hpp"  // SemanticMode
 
 namespace scovox {
@@ -262,6 +263,28 @@ class SemSplitMap {
     int     inc_mode                   = 0;
     float   inc_thresh                 = 0.10f;  ///< only read when inc_mode == 2
 
+    /// Keep only the `sem_top_k` most probable classes of each observation;
+    /// `0` keeps them all.
+    ///
+    /// Defaults to `K_TOP`, the number of classes a voxel can hold. Beyond that
+    /// an observation's classes compete for a slot they cannot all have, so a
+    /// class past the K_TOP-th is inserted, compared against the slots, and in
+    /// most cases evicted — paid for and then discarded. Capping ingest at the
+    /// slot count declines to pay that.
+    ///
+    /// This is NOT free, and the cap is not a pure saving. Deposits go in
+    /// ascending class order, not in probability order, so an unlikely class
+    /// can take an empty slot early and hold it against a likelier one that
+    /// arrives later. Dropping it at ingest therefore changes which class ends
+    /// up in a slot, not only how many are tried — the map moves, and whether
+    /// it moves for the better is a measured question, not a structural one.
+    ///
+    /// The dropped mass is not renormalized onto the survivors — it becomes
+    /// OTHER, so a capped observation reads as "these classes, and I decline to
+    /// guess about the rest". This is TopkProvider's `semantic_topk_trunc` rule,
+    /// applied where it also shortens the per-voxel deposit loop.
+    int     sem_top_k                  = K_TOP;
+
     /// Semantic spread radius `l` in metres for the SINGLE-SENSOR path. When
     /// `> 0`, Stream A still commits occupancy at the endpoint voxel alone, but
     /// Stream B's class evidence is spread over every already-occupied voxel
@@ -444,6 +467,16 @@ class SemSplitMap {
                     bool                      is_dynamic,
                     const HitWeights*         prof = nullptr);
 
+  /// Prepare one ray's observation into the map's reusable buffer and return
+  /// it. The `integrateHit` overloads do this internally; it is public for
+  /// `ScovoxMapSplit::integrateHitFused`, which drives its own walk and so must
+  /// do the once-per-ray work the split path does for itself. The result stays
+  /// valid until the next call on this map.
+  const SemObs& prepareRayObs(const std::vector<float>* sem_probs) {
+    prepareSemObs(sem_probs, params_.sem_top_k, sem_obs_);
+    return sem_obs_;
+  }
+
   /// No-return: carve free (Beta) along [origin, endpoint] inclusive. No hit.
   void integrateMiss(const Eigen::Vector3f& origin,
                      const Eigen::Vector3f& endpoint,
@@ -504,7 +537,7 @@ class SemSplitMap {
   /// the Beta grid always; allocates + touches the Dir grid only when a class
   /// is actually committed (the sparse-semantics memory win).
   void applyHitUpdate(const CoordT&             c,
-                      const std::vector<float>* sem_probs,
+                      const SemObs&             obs,
                       const HitWeights*         prof = nullptr);
 
   /// Dynamic-aware per-voxel hit. When `is_dynamic` is true the endpoint's
@@ -516,7 +549,7 @@ class SemSplitMap {
   /// it records no touched-set (transient is local-only, never drained to the
   /// fusion wire). `is_dynamic == false` is byte-identical to the 3-arg form.
   void applyHitUpdate(const CoordT&             c,
-                      const std::vector<float>* sem_probs,
+                      const SemObs&             obs,
                       bool                      is_dynamic,
                       const HitWeights*         prof = nullptr);
 
@@ -549,7 +582,7 @@ class SemSplitMap {
   /// here (see `integrateHitFused`): a moving object must not smear its class
   /// across the static surfaces behind it.
   void applyBandSemantic(const CoordT&             c,
-                         const std::vector<float>* sem_probs,
+                         const SemObs&             obs,
                          const HitWeights*         prof = nullptr);
 
   /// Per-frame multiplicative decay of the transient grids toward their priors
@@ -690,11 +723,11 @@ class SemSplitMap {
   /// internally; `ScovoxMapSplit::integrateHitFused` calls it from outside
   /// after its walk — which is why it is public. Callers own the
   /// `ray_spread != 0 && !is_dynamic` gate; every other guard (DIRICHLET
-  /// only, kernel path excluded, empty sem_probs) is internal.
+  /// only, kernel path excluded, empty observation) is internal.
   void raySpreadDeposit(const Eigen::Vector3f&    origin,
                         const Eigen::Vector3f&    endpoint,
                         const CoordT&             k_hit,
-                        const std::vector<float>* sem_probs,
+                        const SemObs&             obs,
                         const HitWeights*         prof);
 
   BetaVoxel defaultBeta() const noexcept {
@@ -747,20 +780,30 @@ class SemSplitMap {
     float    w_occ_share = 0.f;  ///< max `w_occ` of the scan's rays here
     float    kappa0      = 0.f;  ///< that ray's class gain
     float    min_p_occ   = 0.f;  ///< that ray's Stream B admission gate
-    uint32_t probs_off   = kNoHitProbs;  ///< start of its softmax in hit_probs_
+    uint32_t probs_off   = kNoHitProbs;  ///< start of its entries in hit_obs_
     uint32_t probs_len   = 0;
+    uint32_t probs_cap     = 0;      ///< entries its block holds, >= probs_len
+    int      probs_argmax  = -1;     ///< index into the block, carried not recomputed
+    bool     probs_present = false;  ///< a look happened, even if it named no class
     bool     staged      = false;  ///< false => the hit was written immediately
   };
   static constexpr uint32_t kNoHitProbs = 0xFFFFFFFFu;
 
+  /// This ray's observation, prepared by the public entry points and read by
+  /// every voxel the ray deposits into. Reused so the preparation does not
+  /// allocate once the first ray has sized it.
+  SemObs                              sem_obs_;
+
   CarveStage                          carve_stage_;
   std::unordered_map<CoordT, HitStage> carve_hits_;
-  /// Flat pool of staged softmaxes, one contiguous `probs_len` block per staged
-  /// voxel. A voxel's block is overwritten in place when a stronger ray
+  /// Flat pool of staged observations, one contiguous `probs_len` block per
+  /// staged voxel. A voxel's block is overwritten in place when a stronger ray
   /// supersedes it, so the pool is bounded by the staged voxel count, not by
-  /// the ray count. Retains capacity across beginCarveFrame.
-  std::vector<float>                  hit_probs_;
-  std::vector<float>                  hit_probs_scratch_;  ///< flush-time view
+  /// the ray count. Retains capacity across beginCarveFrame. It holds PREPARED
+  /// entries, so a staged hit costs the observation's positive classes rather
+  /// than the taxonomy's full width.
+  std::vector<SemObsEntry>            hit_obs_;
+  SemObs                              staged_obs_;         ///< flush-time view
   std::vector<CoordT>                 hit_order_;          ///< flush-time sort
   bool                       carve_frame_open_ = false;
   std::uint64_t carve_voxels_ = 0;
@@ -790,7 +833,7 @@ class SemSplitMap {
   /// plain floats so a staged entry can replay a ray whose `HitWeights` is
   /// long gone.
   void       commitHit(const CoordT&             c,
-                       const std::vector<float>* sem_probs,
+                       const SemObs&             obs,
                        float                     w_occ_share,
                        float                     kappa0,
                        float                     min_p_occ,
@@ -806,7 +849,7 @@ class SemSplitMap {
   BetaVoxel* getOrAllocateBetaOn(BetaGrid::Accessor& acc, const CoordT& c);
   DirVoxel*  getOrAllocateDirOn(DirGrid::Accessor& acc, const CoordT& c);
   void       applyHitUpdateOn(const CoordT&             c,
-                              const std::vector<float>* sem_probs,
+                              const SemObs&             obs,
                               BetaGrid::Accessor&       bacc,
                               DirGrid::Accessor&        dacc,
                               std::vector<CoordT>*      touched_beta,
@@ -815,8 +858,8 @@ class SemSplitMap {
 
   /// BKI (S-BKI) semantic spread for a semantics-only source with
   /// `prof->kernel_radius > 0` — the RGB-D→LiDAR fusion path. Deposits the
-  /// observed class (`sem_probs`) onto every LiDAR-occupied voxel within the
-  /// kernel radius of endpoint `c`, weighted by the compact-support kernel and
+  /// observed class onto every LiDAR-occupied voxel within the kernel radius of
+  /// endpoint `c`, weighted by the compact-support kernel and
   /// gated on the PERSISTENT Beta occupancy (LiDAR authority), regardless of
   /// which Dir grid (`dacc`) is the deposit target. Touches only the Dir grid —
   /// RGB-D deposits zero occupancy, so no Beta allocation/carve here.
@@ -824,7 +867,7 @@ class SemSplitMap {
   /// the map-global weights instead of a source profile's; the kernel itself is
   /// identical either way, and in both cases occupancy is read, never written.
   void       applyHitUpdateKernel(const CoordT&             c,
-                                  const std::vector<float>* sem_probs,
+                                  const SemObs&             obs,
                                   DirGrid::Accessor&        dacc,
                                   std::vector<CoordT>*      touched_dir,
                                   float                     l,

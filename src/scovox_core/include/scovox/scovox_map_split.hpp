@@ -228,10 +228,16 @@ class ScovoxMapSplit {
     //   kernel_radius  — an RGB-D overlay source owns the BKI ball path
     //                    (applyHitUpdateKernel). Running the band as well would
     //                    deposit that source's class twice per hit.
-    //   no sem_probs   — a bare geometric return has no opinion to pool.
+    //   no observation — a bare geometric return has no opinion to pool.
+    //
+    // The observation itself is prepared once here too, for the same reason the
+    // branch is decided once: the walk below deposits into many more voxels
+    // than the frame has pixels, and nothing about the preparation depends on
+    // which voxel it lands in.
+    const SemObs& obs = semsplit_.prepareRayObs(sem_probs);
     const bool band_active = sem_band_ > 0.f && !is_dynamic && !geometry_off
                           && !(prof && prof->kernel_radius > 0.f)
-                          && sem_probs && !sem_probs->empty();
+                          && obs.present;
 
     // Is the free-space carve a guaranteed no-op for THIS ray? applyCarveUpdate
     // returns on `w_inc <= 0` before it touches any state — no grid read, no
@@ -524,7 +530,7 @@ class ScovoxMapSplit {
       // applies the hit unconditionally. The TSDF band update below may still
       // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
       if (c == k_hit) {
-        semHit(c, sem_probs, is_dynamic, prof);
+        semHit(c, obs, is_dynamic, prof);
       }
 
       if (std::fabs(proj) < 1e-12f) return;
@@ -580,7 +586,7 @@ class ScovoxMapSplit {
       // mid-scan and the two orders coincide — but they must not diverge
       // between paths, so the order is pinned here rather than left to luck.
       if (band_active && c != k_hit && sdf > -sem_band_ && sdf <= sem_band_) {
-        semBand(c, sem_probs, prof);
+        semBand(c, obs, prof);
       }
 
       // (2) semantic carve (interior of carve band, not the hit voxel).
@@ -688,8 +694,7 @@ class ScovoxMapSplit {
     // applyHitUpdate. Dynamic endpoints route to the transient substrate and
     // must not smear persistent neighbours (same rule as the TSDF gate).
     if (semsplit_.params().ray_spread != 0 && !is_dynamic) {
-      semsplit_.raySpreadDeposit(origin, endpoint, k_hit, sem_probs,
-                                 prof);
+      semsplit_.raySpreadDeposit(origin, endpoint, k_hit, obs, prof);
     }
 
     const auto t1 = clk::now();
@@ -1066,13 +1071,13 @@ class ScovoxMapSplit {
   /// Per-voxel semantic hit dispatch (SPLIT substrate). `is_dynamic` routes the
   /// endpoint to the transient grids (see SemSplitMap::applyHitUpdate). `prof`
   /// carries the per-source w_occ/kappa0/min_p_occ (null => global params_).
-  void semHit(const CoordT& c, const std::vector<float>* sem_probs,
+  void semHit(const CoordT& c, const SemObs& obs,
               bool is_dynamic, const HitWeights* prof = nullptr) {
-    semsplit_.applyHitUpdate(c, sem_probs, is_dynamic, prof);
+    semsplit_.applyHitUpdate(c, obs, is_dynamic, prof);
   }
-  void semBand(const CoordT& c, const std::vector<float>* sem_probs,
+  void semBand(const CoordT& c, const SemObs& obs,
                const HitWeights* prof = nullptr) {
-    semsplit_.applyBandSemantic(c, sem_probs, prof);
+    semsplit_.applyBandSemantic(c, obs, prof);
   }
 
   TsdfMap     tsdf_;       ///< TSDF surface (band-only)
