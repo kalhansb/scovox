@@ -16,7 +16,7 @@ namespace scovox {
 /// The compiled-in value of every live `SCOVOX_*` build switch, as one stable
 /// line of `NAME=value` pairs.
 ///
-/// "Live" means the seven switches that declare an `#ifndef` default and can
+/// "Live" means the ten switches that declare an `#ifndef` default and can
 /// therefore hold any value in a binary that exists. The four removed-arm traps
 /// (`SCOVOX_VICTIM_MEAN`, `SCOVOX_VICTIM_QMAX`, `SCOVOX_ADMIT_NORM` and
 /// `SCOVOX_EVICT_INHERIT`, all in `dir_voxel.hpp`) are deliberately absent:

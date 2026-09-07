@@ -2,11 +2,12 @@
 /// @brief Assembles the compiled-in build-switch line declared in version.hpp.
 ///
 /// Lives in a .cpp rather than the header for one reason: reading a switch's
-/// value requires including the header that declares its default, and one of
-/// those (`sem_split_map.hpp`, for `SCOVOX_DEPOSIT_TRACE`) is the heaviest
-/// header in the library. Every translation unit in the tree would pay for it
-/// to answer a question that is asked once, at startup. Here the cost is paid
-/// by exactly one TU.
+/// value requires including the header that declares its default, and the two
+/// heaviest headers in the library are both on that list — `sem_split_map.hpp`
+/// for `SCOVOX_DEPOSIT_TRACE`, and `scovox_map_split.hpp`, which pulls it in
+/// again along with the mesher, for `SCOVOX_WALK_MARGIN_VOX`. Every
+/// translation unit in the tree would pay for them to answer a question that
+/// is asked once, at startup. Here the cost is paid by exactly one TU.
 ///
 /// Including the owning headers — rather than restating the `#ifndef` defaults
 /// locally — is the whole point. A local copy of a default would report what
@@ -15,11 +16,15 @@
 
 #include "scovox/version.hpp"
 
-#include "scovox/beta_voxel.hpp"     // SCOVOX_BETA_U16, SCOVOX_BETA_U16_SCALE
-#include "scovox/dir_voxel.hpp"      // SCOVOX_TRACK_QMAX, SCOVOX_TRACK_NHIT
-#include "scovox/e0_counters.hpp"    // SCOVOX_E0_COUNTERS
-#include "scovox/sem_split_map.hpp"  // SCOVOX_DEPOSIT_TRACE
-#include "scovox/voxel.hpp"          // SCOVOX_K_TOP
+#include "scovox/beta_voxel.hpp"        // SCOVOX_BETA_U16,
+                                        // SCOVOX_BETA_U16_SCALE
+#include "scovox/dir_voxel.hpp"         // SCOVOX_TRACK_QMAX, SCOVOX_TRACK_NHIT
+#include "scovox/e0_counters.hpp"       // SCOVOX_E0_COUNTERS
+#include "scovox/scovox_map_split.hpp"  // SCOVOX_WALK_MARGIN_VOX
+#include "scovox/sem_split_map.hpp"     // SCOVOX_DEPOSIT_TRACE
+#include "scovox/voxel.hpp"             // SCOVOX_K_TOP,
+                                        // SCOVOX_SPARSE_BRANCH_COUNTERS
+#include "scovox/walker_timers.hpp"     // SCOVOX_WALKER_TIMERS
 
 // Two-step stringification: the inner macro must see the argument already
 // expanded, or `SCOVOX_STR(SCOVOX_K_TOP)` yields the literal "SCOVOX_K_TOP".
@@ -46,6 +51,9 @@ const char* buildSwitches() {
          " TRACK_NHIT=" SCOVOX_STR(SCOVOX_TRACK_NHIT)
          " DEPOSIT_TRACE=" SCOVOX_STR(SCOVOX_DEPOSIT_TRACE)
          " E0_COUNTERS=" SCOVOX_STR(SCOVOX_E0_COUNTERS)
+         " WALKER_TIMERS=" SCOVOX_STR(SCOVOX_WALKER_TIMERS)
+         " SPARSE_BRANCH_COUNTERS=" SCOVOX_STR(SCOVOX_SPARSE_BRANCH_COUNTERS)
+         " WALK_MARGIN_VOX=" SCOVOX_STR(SCOVOX_WALK_MARGIN_VOX)
          " NDEBUG=" SCOVOX_NDEBUG_STR;
 }
 
