@@ -25,6 +25,16 @@ constexpr float kRes   = 0.05f;
 constexpr float kAlpha = scovox::kDefaultDirichletPrior;  // 0.01
 constexpr int   kC     = 14;                              // num_classes (NYU13)
 
+/// The per-voxel deposit entry points read a PREPARED observation, not a raw
+/// softmax: `integrateHit` does that preparation once per ray, because nothing
+/// about it depends on which voxel the ray lands in. A test that reaches past
+/// `integrateHit` to a single voxel does the same preparation here.
+scovox::SemObs obsOf(const std::vector<float>* probs, int top_k = 0) {
+  scovox::SemObs obs;
+  scovox::prepareSemObs(probs, top_k, obs);
+  return obs;
+}
+
 scovox::SemSplitMap makeMap() {
   scovox::SemSplitMap::Params p;
   p.resolution          = kRes;
@@ -389,13 +399,13 @@ TEST(SemSplitMap, EvictionConservesMassToOther) {
   auto m = makeMap();
   auto coord = m.betaGrid().posToCoord(2.0f, 0.f, 0.f);
   // Drive p_occ above the gate first.
-  m.applyHitUpdate(coord, nullptr);   // Stream A only (nullptr probs)
+  m.applyHitUpdate(coord, obsOf(nullptr));   // Stream A only (nullptr probs)
 
   auto inject = [&](int cls, float strength) {
     std::vector<float> probs(kC, 0.f);
     probs[cls] = 1.0f;
     // one hit is one class_share; use repeated hits to build distinct evidence.
-    for (int i = 0; i < (int)strength; ++i) m.applyHitUpdate(coord, &probs);
+    for (int i = 0; i < (int)strength; ++i) m.applyHitUpdate(coord, obsOf(&probs));
   };
   inject(1, 5);   // strong
   inject(2, 3);   // medium
@@ -455,6 +465,74 @@ TEST(SemSplitMap, EvictionConservesMassToOther) {
 }
 
 // ===========================================================================
+// Ingest cap (Params::sem_top_k)
+// ===========================================================================
+
+TEST(SemSplitMap, CapDropsTheTailIntoOtherRatherThanOntoTheSurvivors) {
+  // The cap is a claim about what was OBSERVED, not a rescaling of it. Two
+  // maps see the identical three-class softmax; one is allowed to read all of
+  // it, the other only the largest class. Both must take the same total mass
+  // (`class_share` is a geometry term and the cap does not touch geometry) and
+  // the capped one must park the difference in OTHER.
+  auto base = makeMap().params();
+  auto off_params = base; off_params.sem_top_k = 0;  // the default is K_TOP, so say so
+  auto cap_params = base; cap_params.sem_top_k = 1;
+  scovox::SemSplitMap uncapped(off_params);
+  scovox::SemSplitMap capped(cap_params);
+  ASSERT_EQ(uncapped.params().sem_top_k, 0);
+  ASSERT_EQ(capped.params().sem_top_k, 1);
+
+  std::vector<float> probs(kC, 0.f);
+  probs[1] = 0.5f; probs[2] = 0.3f; probs[3] = 0.2f;
+  const Eigen::Vector3f o(0, 0, 0), h(1.0f, 0, 0);
+  uncapped.integrateHit(o, h, &probs);
+  capped.integrateHit(o, h, &probs);
+
+  const auto du = uncapped.getDirVoxel(h);
+  const auto dc = capped.getDirVoxel(h);
+  ASSERT_TRUE(du.has_value());
+  ASSERT_TRUE(dc.has_value());
+
+  EXPECT_FLOAT_EQ(dc->s_total, du->s_total)
+      << "the cap must not change how much mass the hit deposits";
+  EXPECT_GT(dc->other(), du->other())
+      << "the classes outside the cap are unattributed, not deleted";
+
+  // Class 1 survived the cut, so it keeps the probability it actually had.
+  // Renormalising onto it would have handed it the whole share.
+  float cnt_u = 0.f, cnt_c = 0.f;
+  for (int i = 0; i < scovox::K_TOP; ++i) {
+    if (du->cls[i] == 1) cnt_u = du->cnt[i];
+    if (dc->cls[i] == 1) cnt_c = dc->cnt[i];
+  }
+  EXPECT_FLOAT_EQ(cnt_c, cnt_u)
+      << "a surviving class must be deposited at its own probability";
+}
+
+TEST(SemSplitMap, TheDefaultCapIsTheSlotCount) {
+  // A voxel holds K_TOP classes. Ingesting more than that inserts a class,
+  // compares it, and evicts it -- work paid for and then discarded -- so the
+  // shipped default caps ingest at the number of classes a voxel can keep.
+  EXPECT_EQ(scovox::SemSplitMap::Params{}.sem_top_k, scovox::K_TOP);
+  EXPECT_EQ(makeMap().params().sem_top_k, scovox::K_TOP);
+}
+
+TEST(SemSplitMap, ACapAtOrAboveTheTaxonomyWidthIsOff) {
+  // Truncation selects into a fixed buffer, so a cap the observation can never
+  // reach is indistinguishable from no cap. sanitise() collapses both ends
+  // rather than leaving a setting that silently does nothing.
+  auto p = makeMap().params();
+  p.sem_top_k = kC;
+  EXPECT_EQ(scovox::SemSplitMap(p).params().sem_top_k, 0);
+
+  p.sem_top_k = scovox::SemObs::kMaxTopK + 1;
+  EXPECT_EQ(scovox::SemSplitMap(p).params().sem_top_k, 0);
+
+  p.sem_top_k = -3;
+  EXPECT_EQ(scovox::SemSplitMap(p).params().sem_top_k, 0);
+}
+
+// ===========================================================================
 // Gating + sparse-semantics memory win
 // ===========================================================================
 
@@ -494,7 +572,7 @@ TEST(SemSplitMap, BelowGateCommitsNoClassAndNoDirVoxel) {
     acc.setValue(coord, pre);
   }
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(coord, &probs);
+  m.applyHitUpdate(coord, obsOf(&probs));
 
   // Occupancy evidence still landed in Beta...
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
@@ -801,7 +879,7 @@ TEST(SemSplitMap, EvidenceSaturationCapsEachGrid) {
 
   std::vector<float> probs(kC, 0.f); probs[2] = 1.0f;
   for (int i = 0; i < 100; ++i) {
-    m.applyHitUpdate(m.betaGrid().posToCoord(1.0f, 0.f, 0.f), &probs);
+    m.applyHitUpdate(m.betaGrid().posToCoord(1.0f, 0.f, 0.f), obsOf(&probs));
   }
   auto b = m.getBetaVoxel(Eigen::Vector3f(1.0f, 0, 0));
   auto d = m.getDirVoxel(Eigen::Vector3f(1.0f, 0, 0));
@@ -838,7 +916,7 @@ TEST(SemSplitTransient, DynamicHitRoutesToTransientNotPersistent) {
   const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
 
   // Nothing in the persistent grids.
   EXPECT_FALSE(m.getBetaVoxel(pos).has_value());
@@ -858,7 +936,7 @@ TEST(SemSplitTransient, DynamicHitRecordsNoTouchedSet) {
   auto m = makeMap();
   const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
   // Transient is local-only: never enters the fusion-wire touched-sets.
   EXPECT_EQ(m.touchedBetaCount(), 0u);
   EXPECT_EQ(m.touchedDirCount(), 0u);
@@ -870,8 +948,8 @@ TEST(SemSplitTransient, NonDynamicOverloadMatchesThreeArg) {
   const auto c = ma.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  ma.applyHitUpdate(c, &probs);                        // 3-arg
-  mb.applyHitUpdate(c, &probs, /*is_dynamic=*/false);  // 4-arg, persistent
+  ma.applyHitUpdate(c, obsOf(&probs));                        // 3-arg
+  mb.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/false);  // 4-arg, persistent
 
   const Eigen::Vector3f pos(1.0f, 0, 0);
   auto ba = ma.getBetaVoxel(pos); auto bb = mb.getBetaVoxel(pos);
@@ -892,8 +970,8 @@ TEST(SemSplitTransient, TransientHitUsesSameTwoStreamMath) {
   const auto c = md.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  md.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
-  mp.applyHitUpdate(c, &probs);
+  md.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
+  mp.applyHitUpdate(c, obsOf(&probs));
 
   auto td = md.getTransientBetaVoxel(pos);
   auto tp = mp.getBetaVoxel(pos);
@@ -910,7 +988,7 @@ TEST(SemSplitTransient, DecayMovesEvidenceTowardPrior) {
   const Eigen::Vector3f pos(1.0f, 0, 0);
   const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
 
   m.decayTransient(0.5f);
   auto b = m.getTransientBetaVoxel(pos);
@@ -929,7 +1007,7 @@ TEST(SemSplitTransient, DecayRateOneIsNoOp) {
   const Eigen::Vector3f pos(1.0f, 0, 0);
   const auto c = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
   const float a_occ_before = m.getTransientBetaVoxel(pos)->a_occ;
 
   m.decayTransient(1.0f);  // clamp-safe no-op
@@ -944,7 +1022,7 @@ TEST(SemSplitTransient, DecayRateZeroClearsTransient) {
   auto m = makeMap();
   const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
   ASSERT_EQ(m.transientBetaVoxelCount(), 1u);
 
   m.decayTransient(0.0f);        // collapse to prior → prune
@@ -960,7 +1038,7 @@ TEST(SemSplitTransient, RepeatedDecayPrunesTransientGrids) {
   auto m = makeMap();
   const auto c = m.betaGrid().posToCoord(1.0f, 0.f, 0.f);
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
-  m.applyHitUpdate(c, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(c, obsOf(&probs), /*is_dynamic=*/true);
 
   // 0.5^n falls below the 1e-3 prune epsilon after ~11 frames.
   for (int i = 0; i < 20; ++i) m.decayTransient(0.5f);
@@ -976,8 +1054,8 @@ TEST(SemSplitTransient, DecayLeavesPersistentUntouched) {
   const auto cd = m.betaGrid().posToCoord(pos_d.x(), pos_d.y(), pos_d.z());
   std::vector<float> probs(kC, 0.f); probs[3] = 1.0f;
 
-  m.applyHitUpdate(cp, &probs, /*is_dynamic=*/false);
-  m.applyHitUpdate(cd, &probs, /*is_dynamic=*/true);
+  m.applyHitUpdate(cp, obsOf(&probs), /*is_dynamic=*/false);
+  m.applyHitUpdate(cd, obsOf(&probs), /*is_dynamic=*/true);
   const float persistent_a_occ = m.getBetaVoxel(pos_p)->a_occ;
 
   for (int i = 0; i < 20; ++i) m.decayTransient(0.5f);
@@ -1045,7 +1123,7 @@ float injectAccumulatingShare(scovox::SemSplitMap& m,
   const auto coord = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   float total = 0.f;
   for (int i = 0; i < n; ++i) {
-    m.applyHitUpdate(coord, probs);
+    m.applyHitUpdate(coord, obsOf(probs));
     auto b = m.getBetaVoxel(pos);
     EXPECT_TRUE(b.has_value());
     // Below the gate Stream B deposits nothing, so counting a share there
@@ -1111,7 +1189,7 @@ TEST(DirTotalBasis, FlatShareKeepsTheLookCountExactAtSceneScale) {
 
   const auto coord = m.betaGrid().posToCoord(pos.x(), pos.y(), pos.z());
   const int  kLooks = 330000;
-  for (int i = 0; i < kLooks; ++i) m.applyHitUpdate(coord, &probs);
+  for (int i = 0; i < kLooks; ++i) m.applyHitUpdate(coord, obsOf(&probs));
 
   auto d = m.getDirVoxel(pos);
   ASSERT_TRUE(d.has_value());
