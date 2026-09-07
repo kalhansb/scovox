@@ -1685,3 +1685,20 @@ Correction to the inventory as first written: there is no per-band-voxel Beta
 read (`semantic_band_require_occ` is false shipped and in every timed arm) and
 `dirichletUpdate` makes two passes, not three (the argmax pass is
 `SCOVOX_E0_COUNTERS`-only). See `REVIEW_LOG.md` E-W22a.
+
+### Addendum point 5 — the branch counters are gone (2026-09-06)
+
+The five locked atomic RMWs named in point 4 are now behind
+`SCOVOX_SPARSE_BRANCH_COUNTERS`, default 0. Byte-identity is proved at the
+binary (counters-ON is md5-identical to the E-W22 control) and at the dump
+(scene 016, full length, both configs). Priced at **+2.31 ms/frame** (95% CI
+[+0.62, +4.00], p 0.0208, 13/18 reps) — 3.2% of the carve frame, 1.45% of the
+shipped one. Real, kept, and not a step toward SLIM-VDB parity. Details in
+`scovox_code_structure.md` §4.6 and `REVIEW_LOG.md` E-W24.
+
+A note on method for anyone pricing the remaining deposit-path candidates: the
+8-scene single-rep sweep is the wrong instrument below ~5%. It put run position
+into the estimate hard enough that the two configs disagreed on the sign of this
+effect. Use repeated measures on one scene with the arm order flipped every rep,
+and read the absolute ms rather than the percentage — the removed work is
+config-independent, the frame it sits in is not.
