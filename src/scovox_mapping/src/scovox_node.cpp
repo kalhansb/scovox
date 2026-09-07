@@ -1269,7 +1269,7 @@ private:
       // The range cull has always been gated on range_decay_length > 0; it kept
       // that shape when the decay weight itself was removed.
       if (P.range_decay_length > 0 && (rng<P.min_range||rng>P.max_range)) continue;
-      integrateHit(O, Hp, rng, vs ? &cp : nullptr, rgbdProf());
+      integrateHit(O, Hp, vs ? &cp : nullptr, rgbdProf());
     }
     carveNoReturnRays(O, nr_eps, rgbdProf());
     split_map_->flushCarveFrame();
@@ -1569,13 +1569,12 @@ private:
     // the observer O instead — off by the static base->sensor offset plus the
     // v*dt translation-deskew term — and let out-of-range points into the
     // downsample medoid statistics, where a just-out-of-range medoid dropped
-    // its voxel's valid returns. `rng` (range-decay weight / carve) is still
-    // taken lazily from (Hp-O).norm() only when a consumer needs it. The
+    // its voxel's valid returns. Nothing after the gate needs the range: the
+    // carve window is a reach the walker measures from the hit itself. The
     // (>0?sq:raw) guard keeps the degenerate negative-threshold case
     // bit-identical: x->x^2 is monotonic only on [0,inf), and range>=0 always,
     // so a negative min/max threshold must be compared as-is (it can only ever
     // always-pass/always-fail).
-    const bool need_rng = (P.range_decay_length > 0) || (carve_band_ > 0);
     const float min_r2 = (P.min_range > 0.f) ? P.min_range * P.min_range : P.min_range;
     const float max_r2 = (P.max_range > 0.f) ? P.max_range * P.max_range : P.max_range;
 
@@ -1775,8 +1774,7 @@ private:
       for (const DsAcc& a : accs) {
         Eigen::Vector3f Hp = T_oi * a.best_p;
         if (apply_trans) Hp += v_odom * a.best_off;
-        const float rng = need_rng ? (Hp - O).norm() : 0.f;
-        integrateHit(O, Hp, rng, nullptr, lidarProf());
+        integrateHit(O, Hp, nullptr, lidarProf());
       }
     } else {
     std::vector<float> cp(max_sem_, 0.f);
@@ -1801,7 +1799,6 @@ private:
       }
       Eigen::Vector3f Hp = T_oi * praw;
       if (apply_trans) Hp += v_odom * off_i;
-      const float rng = need_rng ? (Hp - O).norm() : 0.f;
 
       bool vs = false;
       if (use_topk) {
@@ -1820,7 +1817,7 @@ private:
         if (lbl > 0 && lbl < max_sem_) { std::fill(cp.begin(), cp.end(), 0.f); cp[lbl] = 1.f; vs = true; }
       }
 
-      integrateHit(O, Hp, rng, vs ? &cp : nullptr, lidarProf());
+      integrateHit(O, Hp, vs ? &cp : nullptr, lidarProf());
     }
     }  // end else (per-point path)
     split_map_->flushCarveFrame();  // one Beta write per carved voxel, block-ordered
@@ -2003,22 +2000,20 @@ private:
     });
   }
 
-  void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp, float rng,
+  void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
                     const std::vector<float>* cp,
                     const scovox::HitWeights* prof = nullptr) {
     // Split-grid path. TsdfMap walks the SDF band, SemSplitMap walks the carve
     // band leading up to the hit. Every admitted return contributes the same
     // count: `a_occ += w_occ`, with no per-ray confidence factor.
     //
-    // carve_band: when `carve_band_ > 0` (Replica / KITTI launch default =
-    // 0.1), walk the semantic carve along only the last `carve_band` metres
-    // before the surface, matching the production mIoU baselines. carve_band
-    // <= 0 falls back to full-ray.
-    Eigen::Vector3f co = O;
-    if (carve_band_ > 0) {
-      const float d = rng - static_cast<float>(carve_band_);
-      if (d > 0) co = O + (Hp - O).normalized() * d;
-    }
+    // carve_band: when `carve_band_ > 0`, carve free space along only the
+    // last `carve_band` metres before the surface; <= 0 carves the whole ray.
+    // The window is handed to the walker as a reach, and the ray keeps its
+    // true origin: the walker signs every voxel's TSDF against the sensor, so
+    // a voxel between the sensor and the window reads as in front of the
+    // surface, which it is.
+    const float carve_reach = carve_band_ > 0 ? static_cast<float>(carve_band_) : 0.f;
     // Dynamic routing: a hit whose winning class is configured dynamic writes
     // its surface evidence into the transient decaying grid instead of the
     // persistent map (the free-space carve up to the hit stays persistent).
@@ -2030,7 +2025,7 @@ private:
         if ((*cp)[i] > best_p) { best_p = (*cp)[i]; best = (int)i; }
       if (best >= 0 && dyn_cls_.count((uint16_t)best)) is_dynamic = true;
     }
-    split_map_->integrateHit(co, Hp, cp, is_dynamic, prof);
+    split_map_->integrateHit(O, Hp, cp, is_dynamic, prof, carve_reach);
     markMapDirty();
   }
   // Decay the transient (dynamic-class) grid one step toward the prior. Called

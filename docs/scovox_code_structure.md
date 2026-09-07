@@ -133,8 +133,23 @@ against one miss and `Beta(1,1)` needed 3. The carve wall guard
 ### 1.3 Per-ray algorithm (what one depth pixel does)
 
 1. **Ray setup.** Origin `O`, endpoint `E`, direction `u`, depth `d`. The fused
-   walker runs one exact DDA over `[E − max(d, trunc)·u, E + max(trunc, band)·u]`
-   (`scovox_map_split.hpp:183-714`). `tsdf_enabled=0` does **not** make `trunc`
+   walker runs one exact DDA over `[E − max(c, trunc)·u, E + max(trunc, band)·u]`
+   (`scovox_map_split.hpp:183-714`), where `c` is the **carve window**: `d`
+   itself by default (full-ray free-space carve, the promoted configuration),
+   or the `carve_reach` argument when the caller passes one shorter than the
+   ray (the KITTI launch's `carve_band` 0.1). The window bounds the carve gate
+   (`0 < sdf <= c`) and where the walk starts; it never moves the ray's
+   origin, which stays the sensor, so every voxel's `sdf` is signed against
+   the sensor. Until 2026-09-07 the node applied the same window by handing
+   the walker a ray that *started* at `E − c·u`. That had two effects the
+   reach removes: the strip between `c` and `trunc` in front of the hit read
+   as behind the surface in the TSDF, and off-axis voxels near the window's
+   far edge were signed against the moved origin, read as behind the surface,
+   and were neither carved nor written. Under the reach the Beta carve set
+   and the TSDF voxel set can only grow and a stored TSDF distance can only
+   rise; the hit deposit never reads the origin, but it is admitted on the
+   voxel's Beta occupancy (`dirichlet_min_p_occ`), so Dir follows Beta where
+   the extra carves push a voxel under that gate. `tsdf_enabled=0` does **not** make `trunc`
    0: the node passes `sdf_trunc = 0` but `TsdfMap::sanitise` (`tsdf_map.cpp:25`)
    clamps any `<= 0` back to 0.15 m, and the walker reads the sanitised value.
    So `back_reach` (`:264`) is `max(0.15, 0.10) = 0.15 m`, not the band's 0.10 m,
@@ -625,15 +640,20 @@ actual compile line, read back from `build.ninja` rather than the one intended.
   §1.3. `band_active` (`:232-234`) requires band > 0, not dynamic, not
   geometry-off, no BKI kernel, and semantic probabilities present. Far-skip
   and far-carve (`:397-401`, `:443-448`) are gated on
-  `far_voxel_fast_paths_ && !space_carving && carveFrameOpen()`.
-  `exact_body` is `noinline` (`:498-592`) so the shortcuts can be diffed
-  against it.
+  `far_voxel_fast_paths_ && !space_carving && carveFrameOpen()`; far-carve
+  additionally needs the full-ray window, because its reduction relies on the
+  walk starting at the sensor. `exact_body` is `noinline` (`:498-592`) so the
+  shortcuts can be diffed against it. The trailing `carve_reach` argument
+  (public `integrateHit`, default 0 = full ray) sets the carve window of
+  §1.3 step 1.
 - **`integrateHitSplit`** (`:725-751`): two DDAs; calls `tsdf_.integrateRay`
   gated on `tsdf_enabled_ && !is_dynamic && !geometry_off` (`:744`). Only
   reached when `fused_walker=false`. The `tsdf_enabled_` term was missing until
   `f2d535e`, so a split-path run paid in full for a TSDF the flag declared
   unread; any fused-vs-split comparison taken before that commit with the flag
-  off had one walker doing that work and one not.
+  off had one walker doing that work and one not. A `carve_reach` here is a
+  start point: `carveRay` walks `[origin, hit)`, so the carve is started
+  `carve_reach` before the hit while the TSDF keeps the true origin.
 - **Fine TSDF band** (`fine_ratio_log2 > 0`): a second `TsdfMap` at
   `resolution / 2^k`, written only inside registered refinement cylinders
   (`refinement_regions.hpp`; `RefinementRegion.msg`), with optional per-scan
@@ -834,6 +854,11 @@ at `SemSplitMap::Params` / `ScovoxMapSplit::Params` defaults.
   helpers), optional translation deskew, medoid voxel downsample
   (`:1703-1781`), per-point label / top-k path (`:1782-1825`), one carve frame
   per scan (`:1702`, `:1826`).
+- Both paths end in the node's `integrateHit(O, Hp, cp, prof)`, which passes
+  the true origin and, when `carve_band > 0`, the band as the walker's
+  `carve_reach`. The node no longer moves the ray origin to the window's
+  near edge, so the LiDAR loop no longer computes a range for the carve; the
+  only range it takes is the one the RGB-D cull reads.
 - Fusion (`fuse_lidar_rgbd`): both streams, LiDAR profile = global weights,
   RGB-D profile `w_occ 0 / w_free 0 / geometry_off / min_p_occ 0.55` (`:860-903`).
 - Gates: `tfGatePass` (`:1110-1152`: startup stability + runtime jump),
@@ -1040,7 +1065,7 @@ in the consumer.
 - `default_params.yaml` documents the node defaults (so it is internally
   consistent with §3.1) and describes `range_decay_length` as exponential
   range weighting, which the split path never applies (the node uses it only
-  as the on/off switch for the range cull, `:1271`, `:1578`;
+  as the on/off switch for the range cull, `:1271`;
   `lidar_mapping.yaml` was already corrected to say so in the uncommitted
   diff).
 - The LiDAR configs (`w_occ` 8, `w_free` 4, res 0.10) are a different

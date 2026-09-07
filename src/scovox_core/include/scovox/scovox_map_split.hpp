@@ -171,11 +171,17 @@ class ScovoxMapSplit {
   /// the transient substrate and suppresses the persistent TSDF surface for this
   /// ray, so moving objects leave no permanent geometry; the free-space carve
   /// stays persistent. See SemSplitMap::applyHitUpdate / decayTransient.
+  /// `carve_reach` bounds the free-space carve to the last `carve_reach`
+  /// metres of the ray before the hit; <= 0, or a reach at least the ray
+  /// length, carves the whole ray. `origin` is always the TRUE sensor origin:
+  /// the reach only shortens the carve, it never moves where the ray starts,
+  /// so the TSDF sign of every voxel is taken against the sensor.
   void integrateHit(const Eigen::Vector3f&         origin,
                     const Eigen::Vector3f&         endpoint,
                     const std::vector<float>*      sem_probs,
                     bool                           is_dynamic = false,
-                    const HitWeights*              prof = nullptr) {
+                    const HitWeights*              prof = nullptr,
+                    float                          carve_reach = 0.f) {
     // Fine TSDF band routing — walker-independent, so the fused and split
     // paths stay in parity. Dynamic rays leave no fine surface (same rule
     // as the coarse TSDF); geometry-off sources (RGB-D overlay) never
@@ -184,9 +190,11 @@ class ScovoxMapSplit {
       stageFineHit(origin, endpoint);
     }
     if (fused_walker_) {
-      integrateHitFused(origin, endpoint, sem_probs, is_dynamic, prof);
+      integrateHitFused(origin, endpoint, sem_probs, is_dynamic, prof,
+                        carve_reach);
     } else {
-      integrateHitSplit(origin, endpoint, sem_probs, is_dynamic, prof);
+      integrateHitSplit(origin, endpoint, sem_probs, is_dynamic, prof,
+                        carve_reach);
     }
   }
 
@@ -197,7 +205,8 @@ class ScovoxMapSplit {
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
                          bool                      is_dynamic = false,
-                         const HitWeights*         prof = nullptr) {
+                         const HitWeights*         prof = nullptr,
+                         float                     carve_reach = 0.f) {
     // A geometry-off source (RGB-D semantics overlay) writes NO TSDF band this
     // ray, so its noisy depth never enters the Curless–Levoy surface — geometry
     // stays 100% LiDAR. Null prof / geometry_off=false keeps TSDF exactly as
@@ -219,7 +228,15 @@ class ScovoxMapSplit {
       return;
     }
     const Eigen::Vector3f u = d / depth;
-    const float carve_band = depth;
+    // The carve window. Full-ray by default: every voxel in front of the
+    // surface is free space, so the carve gate below is `sdf <= depth`. A
+    // positive reach shorter than the ray carves only its last `carve_reach`
+    // metres. The window shortens the WALK too (see `walk_back`), but never
+    // the ray: `origin` stays the sensor, so `sdf` keeps its sign against the
+    // sensor for every voxel — a voxel between the sensor and the window is
+    // in FRONT of the surface, and its TSDF says so.
+    const bool  windowed   = carve_reach > 0.f && carve_reach < depth;
+    const float carve_band = windowed ? carve_reach : depth;
 
     const auto& tparams = tsdf_.params();
     const float trunc = tparams.sdf_trunc;
@@ -260,9 +277,14 @@ class ScovoxMapSplit {
     const bool carve_off =
         (prof ? prof->w_free : semsplit_.params().w_free) <= 0.f;
 
+    // How far in front of the hit the walk starts. `carve_band` is `depth`
+    // unless a window is set, so the full-ray walk starts at the sensor. A
+    // windowed walk starts at the window's near edge, or at `trunc` when the
+    // TSDF band reaches further: the band is written from the same walk, and
+    // every voxel it can write must be stepped on.
     const float walk_back = tparams.space_carving
-        ? depth
-        : std::max(depth, trunc);
+        ? carve_band
+        : std::max(carve_band, trunc);
     // The band is symmetric about the surface, but the walk behind it normally
     // stops at `trunc`. Extend the far end when the band reaches deeper, else
     // the behind-surface half is silently clipped and the knob stops meaning
@@ -450,11 +472,17 @@ class ScovoxMapSplit {
     // computes proj < 0). The map frame must keep |world coord|/res ≲ 8×10⁷
     // and ray length/res ≲ 3×10⁷; local/odometry frames sit 3–4 orders of
     // magnitude inside both.
+    // The arming guard is really `walk_back == depth`: start_pos IS the sensor
+    // origin, so nothing walked lies behind it. That needs BOTH `depth >=
+    // trunc` (the max() picks depth) and no carve window (`carve_band` is
+    // depth). A windowed walk starts `max(carve_band, trunc)` short of the
+    // hit, which is inside far_thr, so it has no far voxel to offer anyway.
     const bool far_carve = far_voxel_fast_paths_
                         && !tparams.space_carving
                         && !carve_off          // far_skip owns those rays
                         && semsplit_.carveFrameOpen()
                         && semsplit_.params().batch_free_carve
+                        && !windowed
                         && depth >= trunc;
     int64_t far_thr = 0;
     int64_t far_thr_sq = 0;
@@ -579,9 +607,9 @@ class ScovoxMapSplit {
       }
 
       // (1) TSDF band update — gate + clamp + Curless–Levoy. The fused walker
-      // always walks back to the origin (walk_back = max(depth, trunc)), so the
-      // upper gate here must MATCH the non-fused TsdfMap::integrateRay band,
-      // which depends on space_carving:
+      // walks the whole carve window (walk_back = max(carve_band, trunc)), so
+      // the upper gate here must MATCH the non-fused TsdfMap::integrateRay
+      // band, which depends on space_carving:
       //   - space_carving=false (Replica/KITTI default): the non-fused path
       //     walks only [hit−trunc, hit+trunc], so we keep the `sdf <= trunc + h`
       //     band gate; dropping it would write the whole front ray that the
@@ -763,7 +791,8 @@ class ScovoxMapSplit {
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
                          bool                      is_dynamic = false,
-                         const HitWeights*         prof = nullptr) {
+                         const HitWeights*         prof = nullptr,
+                         float                     carve_reach = 0.f) {
     const auto t0 = walkNow();
     // Dynamic rays write no persistent TSDF (no ghost surface); the carve inside
     // semsplit_.integrateHit stays persistent, only the endpoint routes. A
@@ -780,7 +809,18 @@ class ScovoxMapSplit {
     if (tsdf_enabled_ && !is_dynamic && !(prof && prof->geometry_off))
       tsdf_.integrateRay(origin, endpoint);
     const auto t1 = walkNow();
-    semsplit_.integrateHit(origin, endpoint, sem_probs, is_dynamic, prof);
+    // The carve window is a start point on this path: carveRay walks
+    // [origin, hit), so the carve covers the last `carve_reach` metres when
+    // the walk is started there. The TSDF above kept the true origin — its
+    // band is placed about the hit and signed against the sensor either way.
+    Eigen::Vector3f carve_from = origin;
+    if (carve_reach > 0.f) {
+      const Eigen::Vector3f d = endpoint - origin;
+      const float depth = d.norm();
+      if (carve_reach < depth)
+        carve_from = origin + d.normalized() * (depth - carve_reach);
+    }
+    semsplit_.integrateHit(carve_from, endpoint, sem_probs, is_dynamic, prof);
     const auto t2 = walkNow();
     tsdf_ns_ += walkNs(t0, t1);
     sem_ns_  += walkNs(t1, t2);

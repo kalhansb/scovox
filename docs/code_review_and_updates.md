@@ -126,6 +126,7 @@ no negative results; those go to memory and `REVIEW_LOG.md`.
 | C3 | C | `publishFineTSDFPointCloud` has no dirty gate at all | open |
 | C4 | C | `publish_pointcloud:=false` still advertises the topic | open |
 | C5 | C | `have_di_` is an atomic guarding a non-atomic copy | open |
+| C6 | C | `carve_band` was applied by moving the ray origin: TSDF sign wrong in the strip before the hit, carve set clipped at the window's far edge | **closed 2026-09-07** — a `carve_reach` argument on the true origin; E-W34 |
 | D1 | D | one class does eleven jobs; four methods are 280–430 lines | open |
 | D2 | D | extract the gyro deskew into its own class | open |
 | D3 | D | extract the frame-admission gate | open |
@@ -314,6 +315,39 @@ no negative results; those go to memory and `REVIEW_LOG.md`.
   ever moved to `viz_cb_group_` or a reentrant group. Recommend (a); it
   states the actual invariant.
 
+- [x] **C6 — `carve_band` was applied by moving the ray origin; it is now a
+  carve reach measured from the hit, on the true origin.** *Closed
+  2026-09-07.* The node's `integrateHit` used to build
+  `co = O + (Hp − O)·(rng − carve_band)/rng` and pass `co` as the ray origin,
+  so the walker signed every voxel's TSDF against a point `carve_band` before
+  the hit. Two consequences, both confined to the KITTI launch
+  (`semantickitti_eval.launch.py` defaults `carve_band` to 0.1; every other
+  yaml and launch file is −1.0 = full ray, where the mechanism is inert): the
+  strip between `carve_band` and `sdf_trunc` in front of the hit was written
+  with a negative distance, and off-axis voxels near the window's far edge
+  read as behind the surface and were neither carved nor written.
+  *Change:* `ScovoxMapSplit::integrateHit` takes a trailing `carve_reach`
+  (default 0 = full ray). The fused walker bounds the carve gate and the walk
+  start with it and keeps `origin` as the sensor; `far_carve` stands down when
+  a window is set, since its reduction assumes the walk starts at the sensor.
+  The split walker starts `carveRay` at the window's near edge and keeps the
+  TSDF origin. The node passes `carve_band_` as the reach and no longer
+  computes a range for it; the RGB-D cull keeps its own. `replay_kitti` gained
+  `--carve-band`, `--carve-band-origin-trick` (the former mechanism, kept only
+  so the two can be diffed) and `--dump-tsdf`.
+  *Proof:* full-ray dumps byte-identical to pristine HEAD, readout and slots
+  (KITTI 08, 100 frames, res 0.05, TSDF on). At `carve_band` 0.1 the Beta
+  carve set and the TSDF voxel set are supersets of the old result, no stored
+  TSDF distance falls beyond a rounding tail, and the Dir grid follows Beta
+  through the `dirichlet_min_p_occ` deposit gate; the counts are in
+  `scovox_slot_rules/REVIEW_LOG.md` E-W34. Tests:
+  `ScovoxMapSplitCarveReach.*` in `test_scovox_map_split.cpp` assert the
+  containments, the full-ray inertness and the far-carve stand-down.
+  *Consequence, not yet decided:* the old mechanism under-carved by accident,
+  and the window the parameter names costs union mIoU on KITTI 08 at 10 cm
+  (E-W34), on a scorer that cannot reward a carve. Whether the launch keeps
+  `carve_band` 0.1 is a configuration decision, open.
+
 ## D — Structure (moves code; prove byte-identical)
 
 - [ ] **D1 — Acknowledge the shape before cutting.**
@@ -477,7 +511,7 @@ exists. That is F1 and F3.
 - [ ] **F1 — Rename or restore `range_decay_length`; fix the header that
   claims a caller applies it.** Pairs with M3 of the 2026-09-04 review and
   should be decided with it. Today the parameter is a boolean in disguise: the
-  node reads it at `:1271` and `:1578` only as `> 0` to enable the
+  node reads it at `:1271` only as `> 0` to enable the
   `min_range`/`max_range` cull, and copies it into `SP.semsplit` at `:128`
   where the core clamps it (`sem_split_map.cpp:269`) and reads it nowhere
   else. `sem_split_map.hpp:406` still documents `exp(-r/L)` "caller-applied";

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -1069,4 +1070,280 @@ TEST(ScovoxMapSplitTsdfDisabled, TrimmedTailIsDeadForSemBeta) {
   EXPECT_TRUE(dumpGrid(m_on.semsplit().dirGrid()) ==
               dumpGrid(m_off.semsplit().dirGrid()))
       << "trimming the dead tail moved Dir state";
+}
+
+// ===========================================================================
+// Carve reach — the window bounds the carve, it does not shorten the ray
+// ===========================================================================
+//
+// `integrateHit(..., carve_reach)` carves only the last `carve_reach` metres
+// before the hit. The node used to get the same window by handing the walker
+// a ray that STARTED at the window's near edge (`truncateOrigin` above). The
+// two are not byte-identical, and the difference is the point:
+//
+//   - The hit deposit never reads the origin. It is admitted on the voxel's
+//     Beta occupancy (dirichlet_min_p_occ), though, so with the gate on the
+//     Dir grid follows the carve: with the gate off it is identical, with
+//     the gate on the new cell set is contained in the old one.
+//   - The old form signed `sdf` against the moved origin. For a voxel centre
+//     just past that origin and off the ray axis, `(vc − co)·(Hp − vc)` is
+//     `a·(band − a) − |p|²` with `a` the along-ray offset and `p` the
+//     perpendicular one: the perpendicular term wins, the voxel reads as
+//     behind the surface, and it is neither carved nor written — although it
+//     lies between the sensor and the surface, inside the carve sphere. With
+//     the true origin the along-ray term is the whole ray length and the sign
+//     is unambiguous. So the old carve set is a SUBSET of the new one, and the
+//     voxels added are exactly those near the window's far edge.
+//   - In the strip between the window's edge and the truncation distance the
+//     old form wrote a negative TSDF for a voxel in front of the surface. The
+//     true origin makes it positive, so a stored distance can only rise, and
+//     a voxel whose |sdf| lies in (trunc, trunc + h] — dropped by the lower
+//     band gate when negative — is now written, so the TSDF voxel set can
+//     only grow.
+//
+// The assertions below are those three containments, plus the requirement
+// that each one is exercised (something must actually differ), so a walker
+// that quietly kept the moved origin would fail here rather than pass.
+
+namespace {
+
+scovox::ScovoxMapSplit::Params carveReachParams(float band, bool tsdf_on) {
+  scovox::ScovoxMapSplit::Params p;
+  p.resolution                    = 0.05;
+  p.tsdf.sdf_trunc                = 0.15f;
+  p.tsdf_enabled                  = tsdf_on;
+  p.semsplit.kappa0               = 1.0f;
+  // Gate off, so a Dir comparison sees the deposit itself; the one test
+  // about the gate turns it back on.
+  p.semsplit.dirichlet_min_p_occ  = 0.0f;
+  p.semsplit.num_classes          = 14;
+  p.semsplit.semantic_band_length = band;
+  return p;
+}
+
+// Field types follow the voxel structs: under SCOVOX_BETA_U16 the Beta
+// counts are 16-bit integers, and serialiseCell wrote exactly those bytes.
+struct BetaRec {
+  decltype(scovox::BetaVoxel::a_occ)  a_occ;
+  decltype(scovox::BetaVoxel::a_free) a_free;
+};
+struct TsdfRec { float distance, weight; };
+
+// Both records are two equal-width fields, so they carry no padding and the
+// serialised bytes are the struct's bytes.
+template <typename Rec>
+Rec unpack(const std::vector<uint8_t>& bytes) {
+  Rec r{};
+  EXPECT_EQ(bytes.size(), sizeof r) << "serialiseCell layout drifted";
+  std::memcpy(&r, bytes.data(), std::min(bytes.size(), sizeof r));
+  return r;
+}
+
+void runCarveReachContainment(float band, bool tsdf_on) {
+  const auto p = carveReachParams(band, tsdf_on);
+  auto legacy = std::make_unique<scovox::ScovoxMapSplit>(p);
+  auto reach  = std::make_unique<scovox::ScovoxMapSplit>(p);
+  const float window = 0.10f;   // the KITTI launch's carve_band, < trunc
+
+  uint32_t s = 0xBEEF01u;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, bool dyn) {
+    legacy->integrateHit(truncateOrigin(O, Hp, window), Hp, probs, dyn);
+    reach->integrateHit(O, Hp, probs, dyn, nullptr, window);
+  };
+
+  std::size_t extra_carves = 0;
+  for (int scan = 0; scan < 5; ++scan) {
+    legacy->beginCarveFrame();
+    reach->beginCarveFrame();
+    fireScanRays(fire, scan, s);
+    const std::size_t n_old = legacy->flushCarveFrame();
+    const std::size_t n_new = reach->flushCarveFrame();
+    EXPECT_GE(n_new, n_old) << "reach carved fewer voxels, scan " << scan;
+    extra_carves += n_new - n_old;
+    // The hit deposit is origin-blind (gate off): Dir identical, scan by scan.
+    expectCoordListsEqual(legacy->drainTouchedDir(), reach->drainTouchedDir(),
+                          "dir", scan);
+    EXPECT_TRUE(dumpGrid(legacy->semsplit().dirGrid()) ==
+                dumpGrid(reach->semsplit().dirGrid()))
+        << "Dir grid diverged, scan " << scan << ", band " << band;
+    legacy->drainTouchedBeta(); reach->drainTouchedBeta();
+    legacy->drainTouchedTsdf(); reach->drainTouchedTsdf();
+  }
+  EXPECT_GT(extra_carves, 0u) << "no voxel gained a carve: window edge not exercised";
+
+  // Beta: every voxel the old form wrote is written by the new one, with the
+  // same occupied count and no fewer free counts.
+  {
+    const auto a = dumpGrid(legacy->semsplit().betaGrid());
+    const auto b = dumpGrid(reach->semsplit().betaGrid());
+    EXPECT_GE(b.size(), a.size());
+    std::size_t j = 0, raised = 0;
+    for (const auto& va : a) {
+      while (j < b.size() && !(b[j].c == va.c)) ++j;
+      ASSERT_LT(j, b.size()) << "Beta voxel carved by the moved origin only";
+      const auto ra = unpack<BetaRec>(va.bytes);
+      const auto rb = unpack<BetaRec>(b[j].bytes);
+      EXPECT_EQ(ra.a_occ, rb.a_occ) << "a_occ moved: the hit path read the origin";
+      EXPECT_GE(rb.a_free, ra.a_free) << "a_free fell under the true origin";
+      if (rb.a_free != ra.a_free) ++raised;
+    }
+    EXPECT_GT(raised + (b.size() - a.size()), 0u);
+  }
+
+  // TSDF: same containment; on a shared voxel the weight cannot fall and the
+  // distance cannot fall.
+  const auto a = dumpGrid(legacy->tsdf().grid());
+  const auto b = dumpGrid(reach->tsdf().grid());
+  if (!tsdf_on) {
+    EXPECT_EQ(a.size(), 0u) << "TSDF written with the TSDF off";
+    EXPECT_EQ(b.size(), 0u) << "TSDF written with the TSDF off";
+    return;
+  }
+  EXPECT_GE(b.size(), a.size());
+  std::size_t j = 0, raised = 0, lowered = 0;
+  for (const auto& va : a) {
+    while (j < b.size() && !(b[j].c == va.c)) ++j;
+    ASSERT_LT(j, b.size()) << "TSDF voxel written by the moved origin only";
+    const auto ra = unpack<TsdfRec>(va.bytes);
+    const auto rb = unpack<TsdfRec>(b[j].bytes);
+    EXPECT_GE(rb.weight, ra.weight);
+    if (rb.weight == ra.weight) {
+      if (rb.distance > ra.distance) ++raised;
+      if (rb.distance < ra.distance) ++lowered;
+    }
+  }
+  EXPECT_EQ(lowered, 0u) << "a TSDF distance fell: a sign went the wrong way";
+  EXPECT_GT(raised, 0u) << "no strip voxel changed sign: window not walked";
+}
+
+}  // namespace
+
+TEST(ScovoxMapSplitCarveReach, ContainsTheMovedOriginResult) {
+  runCarveReachContainment(/*band=*/0.0f,  /*tsdf_on=*/true);
+  runCarveReachContainment(/*band=*/0.10f, /*tsdf_on=*/true);
+  runCarveReachContainment(/*band=*/0.10f, /*tsdf_on=*/false);
+}
+
+TEST(ScovoxMapSplitCarveReach, DirFollowsTheCarveThroughTheGate) {
+  // With the deposit gate on, a voxel the reach carves and the moved origin
+  // does not can refuse a later hit under the reach only, so the reach's Dir
+  // cell set is contained in the old one. Four scans of one ray set carve
+  // the window's far-edge voxels four times under the reach and never under
+  // the moved origin; a fifth scan of the same rays with the surface 0.075 m
+  // nearer then hits exactly those voxels.
+  auto p = carveReachParams(0.0f, true);
+  p.semsplit.dirichlet_min_p_occ = 0.5f;
+  auto legacy = std::make_unique<scovox::ScovoxMapSplit>(p);
+  auto reach  = std::make_unique<scovox::ScovoxMapSplit>(p);
+  const float    window = 0.10f;
+  const uint32_t seed   = 0xD15C0u;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, bool dyn) {
+    legacy->integrateHit(truncateOrigin(O, Hp, window), Hp, probs, dyn);
+    reach->integrateHit(O, Hp, probs, dyn, nullptr, window);
+  };
+  for (int k = 0; k < 4; ++k) {
+    uint32_t s = seed;
+    legacy->beginCarveFrame();
+    reach->beginCarveFrame();
+    fireScanRays(fire, 0, s);
+    legacy->flushCarveFrame();
+    reach->flushCarveFrame();
+  }
+  {
+    uint32_t s = seed;
+    auto pulled = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                      const std::vector<float>* probs, bool dyn) {
+      const Eigen::Vector3f d = Hp - O;
+      const float n = d.norm();
+      if (n <= 0.2f) return;
+      fire(O, Hp - d * (0.075f / n), probs, dyn);
+    };
+    legacy->beginCarveFrame();
+    reach->beginCarveFrame();
+    fireScanRays(pulled, 0, s);
+    legacy->flushCarveFrame();
+    reach->flushCarveFrame();
+  }
+  const auto a = dumpGrid(legacy->semsplit().dirGrid());
+  const auto b = dumpGrid(reach->semsplit().dirGrid());
+  std::size_t j = 0;
+  for (const auto& vb : b) {
+    while (j < a.size() && !(a[j].c == vb.c)) ++j;
+    ASSERT_LT(j, a.size()) << "Dir cell admitted under the reach only";
+  }
+  EXPECT_LT(b.size(), a.size()) << "no deposit was refused: gate not exercised";
+}
+
+TEST(ScovoxMapSplitCarveReach, FullRayIsInert) {
+  // A reach of 0, and one longer than every ray, are both the full-ray walk
+  // — byte for byte, on all three grids.
+  const auto p = carveReachParams(0.10f, true);
+  auto zero = std::make_unique<scovox::ScovoxMapSplit>(p);
+  auto huge = std::make_unique<scovox::ScovoxMapSplit>(p);
+  uint32_t s = 0x5EED5u;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, bool dyn) {
+    zero->integrateHit(O, Hp, probs, dyn);
+    huge->integrateHit(O, Hp, probs, dyn, nullptr, 100.f);
+  };
+  for (int scan = 0; scan < 3; ++scan) {
+    zero->beginCarveFrame();
+    huge->beginCarveFrame();
+    fireScanRays(fire, scan, s);
+    EXPECT_EQ(zero->flushCarveFrame(), huge->flushCarveFrame());
+  }
+  EXPECT_TRUE(dumpGrid(zero->tsdf().grid()) == dumpGrid(huge->tsdf().grid()));
+  EXPECT_TRUE(dumpGrid(zero->semsplit().betaGrid()) ==
+              dumpGrid(huge->semsplit().betaGrid()));
+  EXPECT_TRUE(dumpGrid(zero->semsplit().dirGrid()) ==
+              dumpGrid(huge->semsplit().dirGrid()));
+  EXPECT_GT(zero->farCarvedVoxels(), 0u) << "full-ray walk must keep far_carve";
+  EXPECT_EQ(zero->farCarvedVoxels(), huge->farCarvedVoxels());
+}
+
+TEST(ScovoxMapSplitCarveReach, WindowDisarmsFarCarve) {
+  // A windowed walk starts short of the sensor, which is the precondition
+  // far_carve's reduction needs; it must stand down rather than fast-carve.
+  const auto p = carveReachParams(0.0f, true);
+  auto m = std::make_unique<scovox::ScovoxMapSplit>(p);
+  uint32_t s = 0x1234567u;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, bool dyn) {
+    m->integrateHit(O, Hp, probs, dyn, nullptr, 0.10f);
+  };
+  m->beginCarveFrame();
+  fireScanRays(fire, 0, s);
+  m->flushCarveFrame();
+  EXPECT_EQ(m->farCarvedVoxels(), 0u);
+  EXPECT_GT(m->exactBodyVoxels(), 0u);
+  EXPECT_GT(m->betaVoxelCount(), 0u);
+}
+
+TEST(ScovoxMapSplitCarveReach, SplitWalkerCarvesTheSameWindow) {
+  // On the non-fused path the reach is a carve start point on the same DDA
+  // the moved origin used, so the Beta and Dir grids match it exactly.
+  auto p = carveReachParams(0.0f, true);
+  p.fused_walker = false;
+  auto legacy = std::make_unique<scovox::ScovoxMapSplit>(p);
+  auto reach  = std::make_unique<scovox::ScovoxMapSplit>(p);
+  const float window = 0.10f;
+  uint32_t s = 0xA5A5A5u;
+  auto fire = [&](const Eigen::Vector3f& O, const Eigen::Vector3f& Hp,
+                  const std::vector<float>* probs, bool dyn) {
+    legacy->integrateHit(truncateOrigin(O, Hp, window), Hp, probs, dyn);
+    reach->integrateHit(O, Hp, probs, dyn, nullptr, window);
+  };
+  for (int scan = 0; scan < 3; ++scan) {
+    legacy->beginCarveFrame();
+    reach->beginCarveFrame();
+    fireScanRays(fire, scan, s);
+    EXPECT_EQ(legacy->flushCarveFrame(), reach->flushCarveFrame());
+  }
+  EXPECT_TRUE(dumpGrid(legacy->semsplit().betaGrid()) ==
+              dumpGrid(reach->semsplit().betaGrid()));
+  EXPECT_TRUE(dumpGrid(legacy->semsplit().dirGrid()) ==
+              dumpGrid(reach->semsplit().dirGrid()));
+  EXPECT_GT(legacy->betaVoxelCount(), 0u);
 }
