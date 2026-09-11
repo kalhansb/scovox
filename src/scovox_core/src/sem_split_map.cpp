@@ -698,8 +698,13 @@ void SemSplitMap::commitHit(const CoordT&             c,
   const float p_occ_post = b->p_occ();
 
   // ---- Stream B: class commit (Dir grid), gated. ----
-  // The Dir voxel is allocated lazily, only when a class is actually
-  // committed — free / below-gate voxels never allocate a 16 B DirVoxel.
+  // The Dir voxel is allocated lazily, on the occupancy gate alone: a return
+  // below the gate never allocates one, and free space never reaches this
+  // function. A return above the gate allocates one whether or not the
+  // observation carries a class — `dirichletUpdate` books `class_share` into
+  // `s_total` before it reads the entries, so an unlabelled return leaves a
+  // DirVoxel whose whole mass sits in OTHER. `sizeof(DirVoxel)` is set in
+  // dir_voxel.hpp by K_TOP and the tracking macros.
   switch (params_.semantic_mode) {
     case SemanticMode::NAIVE:
       if (p_occ_post > 0.5f) {

@@ -38,11 +38,14 @@ struct SemObs {
   int                      argmax{-1};  ///< index into `e`, ties to lowest class
 
   /// Whether the caller supplied a softmax at all, as opposed to supplying one
-  /// with no positive class in it. The two are NOT the same to the deposit
-  /// path: an all-zero observation still commits its `class_share` (which then
-  /// sits in OTHER, unattributed), whereas an absent one commits nothing. Only
-  /// `e` can tell you what was attributed; only this can tell you whether a
-  /// look happened.
+  /// with no positive class in it. The endpoint deposit does not distinguish
+  /// the two: `commitHit` calls `dirichletUpdate` whenever the return passes
+  /// the occupancy gate, and that adds `class_share` to `s_total` before it
+  /// looks at `e`, so an absent observation still allocates the DirVoxel and
+  /// grows OTHER exactly as an all-zero one does. Only the off-endpoint paths
+  /// read this flag: the semantic band, the spread kernel and the ray spread
+  /// each return before depositing when it is false. Only `e` can tell you
+  /// what was attributed; only this can tell you whether a look happened.
   bool                     present{false};
 
   bool empty() const { return e.empty(); }
