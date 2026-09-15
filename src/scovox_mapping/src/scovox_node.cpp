@@ -119,6 +119,10 @@ public:
     SP.semsplit.carve_skip_occ_threshold = P.carve_skip_occ_threshold;
     SP.semsplit.batch_free_carve        = P.batch_free_carve;
     SP.semsplit.batch_hits              = P.batch_hits;
+    SP.semsplit.batch_band              = P.batch_band;
+    SP.semsplit.inc_mode                = P.inc_mode;
+    SP.semsplit.inc_thresh              = P.inc_thresh;
+    SP.semsplit.hit_flat_share          = P.hit_flat_share;
     SP.semsplit.evidence_saturation     = static_cast<float>(P.evidence_saturation);
     SP.semsplit.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
     SP.semsplit.evict_by_confidence     = evict_by_confidence_;
@@ -335,9 +339,12 @@ public:
       // an ignored parameter and a working one produce the same output.
       RCLCPP_INFO(get_logger(),
         "deposit config: res=%.3f m w_occ=%.2f w_free=%.2f batch_hits=%d "
+        "batch_band=%d inc_mode=%d inc_thresh=%.2f hit_flat_share=%d "
         "kappa0=%.2f min_p_occ=%.2f evid_sat=%.1f cls_evid_sat=%.1f "
         "evict_by_conf=%d num_classes=%u",
-        sp.resolution, sp.w_occ, sp.w_free, (int)sp.batch_hits, sp.kappa0,
+        sp.resolution, sp.w_occ, sp.w_free, (int)sp.batch_hits,
+        (int)sp.batch_band, sp.inc_mode, sp.inc_thresh,
+        (int)sp.hit_flat_share, sp.kappa0,
         sp.dirichlet_min_p_occ, sp.evidence_saturation,
         sp.class_evidence_saturation, (int)sp.evict_by_confidence,
         (unsigned)sp.num_classes);
@@ -397,6 +404,23 @@ private:
     P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.0);  // <=0 = guard off (trust recent scan)
     P.batch_free_carve = dp("batch_free_carve", true);
     P.batch_hits = dp("batch_hits", true);
+    P.batch_band = dp("batch_band", false);
+    {
+      // Deposit rule. `inc_mode` is named rather than numbered so a config
+      // cannot select a mode by an integer that later means something else.
+      const std::string im = dp("inc_mode", std::string("soft"));
+      if      (im == "soft")   P.inc_mode = 0;
+      else if (im == "hard")   P.inc_mode = 1;
+      else if (im == "thresh") P.inc_mode = 2;
+      else {
+        RCLCPP_WARN(get_logger(),
+                    "inc_mode='%s' is not one of soft|hard|thresh; using soft",
+                    im.c_str());
+        P.inc_mode = 0;
+      }
+    }
+    P.inc_thresh     = dp("inc_thresh", 0.10);
+    P.hit_flat_share = dp("hit_flat_share", false);
     {
       // uint16_t storage: an out-of-range request would otherwise wrap silently
       // (70000 → 4464, a far TIGHTER cap than asked for; -1 → 65535). Clamp to

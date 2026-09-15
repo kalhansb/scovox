@@ -1347,3 +1347,103 @@ TEST(ScovoxMapSplitCarveReach, SplitWalkerCarvesTheSameWindow) {
               dumpGrid(reach->semsplit().dirGrid()));
   EXPECT_GT(legacy->betaVoxelCount(), 0u);
 }
+
+// ===========================================================================
+// SemSplitParams::batch_band — one band deposit per voxel per scan
+// ===========================================================================
+//
+// The immediate band writes once per ray that passes a voxel, so a voxel's
+// class evidence tracks pixel density. Staged, the scan's most confident look
+// holds the voxel and flushCarveFrame() writes it once. These two tests fix
+// both halves of that: the staged band must be inert on a one-ray scan, and
+// it must not grow with ray count on a many-ray one.
+namespace {
+
+scovox::ScovoxMapSplit::Params bandParams(bool batched) {
+  scovox::ScovoxMapSplit::Params p;
+  p.resolution                       = 0.05;
+  p.tsdf_enabled                     = false;
+  p.semsplit.kappa0                  = 1.0f;
+  p.semsplit.dirichlet_min_p_occ     = 0.5f;
+  p.semsplit.num_classes             = 14;
+  p.semsplit.semantic_band_length    = 0.10f;
+  p.semsplit.semantic_band_require_occ = false;  // flat kappa0, no Beta read
+  p.semsplit.batch_band              = batched;
+  return p;
+}
+
+/// Total stored Dir mass, which is what a repeated band deposit inflates.
+float dirMass(const scovox::ScovoxMapSplit& m) {
+  float s = 0.f;
+  m.semsplit().dirGrid().forEachCell(
+      [&](const scovox::DirVoxel& v, const Bonxai::CoordT&) { s += v.s_total; });
+  return s;
+}
+
+}  // namespace
+
+TEST(ScovoxMapSplitBatchBand, OneRayScanIsBitIdentical) {
+  scovox::ScovoxMapSplit off(bandParams(/*batched=*/false));
+  scovox::ScovoxMapSplit on(bandParams(/*batched=*/true));
+
+  std::vector<float> probs{0.f, 1.f, 0.f, 0.f};
+  const Eigen::Vector3f O(0.f, 0.025f, 0.025f);
+  const Eigen::Vector3f Hp(0.325f, 0.025f, 0.025f);
+
+  for (auto* m : {&off, &on}) {
+    m->beginCarveFrame();
+    m->integrateHit(O, Hp, &probs);
+    m->flushCarveFrame();
+  }
+
+  ASSERT_GT(on.semdirVoxelCount(), 1u) << "vacuous: the band wrote nothing";
+  EXPECT_TRUE(dumpGrid(off.semsplit().dirGrid()) ==
+              dumpGrid(on.semsplit().dirGrid()))
+      << "staging changed a scan that has one look per voxel anyway";
+  EXPECT_TRUE(dumpGrid(off.semsplit().betaGrid()) ==
+              dumpGrid(on.semsplit().betaGrid()))
+      << "the staged band moved occupancy, which it never writes";
+}
+
+TEST(ScovoxMapSplitBatchBand, ManyRayScanDepositsOnce) {
+  scovox::ScovoxMapSplit off(bandParams(/*batched=*/false));
+  scovox::ScovoxMapSplit on(bandParams(/*batched=*/true));
+
+  // Eight rays a quarter-voxel apart in y: neighbours in the same band, so
+  // the band voxels between them are visited by several rays each.
+  std::vector<float> probs{0.f, 1.f, 0.f, 0.f};
+  const Eigen::Vector3f O(0.f, 0.025f, 0.025f);
+  for (auto* m : {&off, &on}) {
+    m->beginCarveFrame();
+    for (int i = 0; i < 8; ++i) {
+      const float y = 0.025f + 0.0125f * static_cast<float>(i);
+      m->integrateHit(O, Eigen::Vector3f(0.325f, y, 0.025f), &probs);
+    }
+    m->flushCarveFrame();
+  }
+
+  ASSERT_GT(on.semdirVoxelCount(), 1u) << "vacuous: the band wrote nothing";
+  EXPECT_LT(dirMass(on), dirMass(off))
+      << "the staged band deposited as often as the immediate one";
+
+  // Staging changes how much a voxel takes, not which voxels the band
+  // reaches: the same scan touches the same cells either way.
+  const auto cells_off = dumpGrid(off.semsplit().dirGrid());
+  const auto cells_on  = dumpGrid(on.semsplit().dirGrid());
+  ASSERT_EQ(cells_off.size(), cells_on.size()) << "the staged band changed the band's extent";
+  for (std::size_t i = 0; i < cells_off.size(); ++i)
+    EXPECT_TRUE(cells_off[i].c == cells_on[i].c) << "band coord " << i << " differs";
+
+  // And the heaviest voxel is lighter for it — the immediate band let one
+  // voxel take a look from every ray that passed through it.
+  auto maxCell = [](const scovox::ScovoxMapSplit& m) {
+    float mx = 0.f;
+    m.semsplit().dirGrid().forEachCell(
+        [&](const scovox::DirVoxel& v, const Bonxai::CoordT&) {
+          mx = std::max(mx, v.s_total);
+        });
+    return mx;
+  };
+  EXPECT_LT(maxCell(on), maxCell(off))
+      << "the busiest band voxel took as much staged as it did immediate";
+}

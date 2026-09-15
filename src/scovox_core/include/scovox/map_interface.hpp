@@ -92,6 +92,10 @@ struct Params {
   // occupancy + class deposit per scan — the scan's strongest ray — instead of
   // one per pixel that landed in it. See SemSplitParams::batch_hits.
   bool batch_hits = true;
+  // Batched semantic band toggle. When true a band voxel takes one class
+  // deposit per scan — the scan's most confident look — instead of one per
+  // depth pixel whose ray passed through it. See SemSplitParams::batch_band.
+  bool batch_band = false;
 
   // -- Production knobs --
   // These two carry the load between them: the cap bounds how confident a
@@ -99,6 +103,16 @@ struct Params {
   // evidence out of voxels not yet believed occupied.
   uint16_t evidence_saturation = 1000;       ///< Cap on (a_occ, a_free, sem_cnt). 0 = disabled.
   float    dirichlet_min_p_occ = 0.5f;       ///< Skip Dirichlet update when p_occ below this. 0 = disabled.
+
+  // -- Deposit rule --
+  // How a look's class_share is split between the voxel's slots. Soft (0)
+  // splits it by the observation's probabilities; hard (1) gives it all to the
+  // argmax class; thresh (2) gives it to every class above `inc_thresh`.
+  // `hit_flat_share` deposits a flat kappa0 at the endpoint instead of
+  // kappa0 * p_occ, so a look is worth the same wherever it lands.
+  int      inc_mode       = 0;
+  float    inc_thresh     = 0.10f;           ///< only read when inc_mode == 2
+  bool     hit_flat_share = false;
 
   // -- Semantics --
   SemanticMode semantic_mode = SemanticMode::DIRICHLET;

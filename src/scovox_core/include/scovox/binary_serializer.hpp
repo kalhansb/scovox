@@ -102,6 +102,27 @@
 ///     self-describing. Serialize throws on a real id ≥ 0xFF when packing
 ///     (sender invariant violation: ids are < num_classes ≤ 255).
 ///
+/// Revision 9 is an EXACT integer payload, selected per frame by
+/// `Frame::exact` (the VERSION byte says which layout a blob is on; a receiver
+/// decodes either). Under fixed-increment accumulation every parameter is the
+/// prior plus a whole number of lattice steps — Beta counts are `uint16`
+/// eighths (beta_voxel.hpp), Dir slots are `α₀ + deposits` — so the sender
+/// ships those integers, LEB128 varint-coded, and the receiver rebuilds the
+/// parameters from them with no companding, no cap and no dead band:
+///   Beta:  [v_occ: varint][v_free: varint]      a = prior + v·beta_unit/lattice
+///   Dir:   [v_other: varint][v_cnt: varint ×K]  cnt = α₀ + v·dir_unit,
+///          [cls: u8|u16 ×K]                      other = (C−K)·α₀ + v·dir_unit
+/// `beta_unit` / `dir_unit` are the gcd of every value in the stream (header
+/// fields, ≥ 1), so a map whose looks all weigh 12 and 8 eighths ships them as
+/// 3 and 2. The header also carries the sender's lattice (counts per unit of
+/// Beta evidence) and the receiver refuses a lattice it cannot hold exactly.
+/// Serialize throws on a value that is not on the lattice — a map with any
+/// fractional deposit cannot use this layout, and that is the invariant, not
+/// a rounding.
+///   Extra header (after fine_ratio_log2):
+///   [beta_lattice: u8] [beta_unit: u32] [dir_unit: u32]
+/// Coordinates, class ids and the TSDF streams are as in revision 8.
+///
 /// Frame layout (uncompressed, little-endian):
 ///   [MAGIC: u32 = "SCVX"] [VERSION: u8 = 8]
 ///   [resolution: f32]
@@ -169,6 +190,17 @@ class BinarySerializer {
   // rejects the VERSION byte and the frame is dropped with a warning) instead
   // of silently misparsing.
   static constexpr uint8_t  FORMAT_VERSION = 8;
+  // Revision 9: the exact integer payload (see the revision-9 block in the
+  // file header). Written when `Frame::exact` is set; deserialize accepts
+  // both revisions and reports which one it read in `Frame::exact`.
+  static constexpr uint8_t  FORMAT_VERSION_EXACT = 9;
+  // Largest value a payload varint may carry. Beta lattice counts are u16,
+  // Dir deposit counts are whole floats; five LEB128 bytes cover u32.
+  static constexpr int      MAX_VARINT_BYTES = 5;
+  // How far a Dir slot may sit off its integer for the exact payload to
+  // accept it: float accumulation of whole deposits drifts by ulps, never by
+  // a fraction of a deposit, so anything beyond this is a fractional deposit.
+  static constexpr float    EXACT_TOL = 1.0f / 16.0f;
   // ROS envelope version, carried in ScovoxMapBinary::version. It answers a
   // different question from FORMAT_VERSION: the envelope says which codec the
   // message body belongs to, the codec revision says which layout that codec
@@ -196,6 +228,9 @@ class BinarySerializer {
     /// Fine-lattice ratio k (res_fine = resolution / 2^k); 0 = the sender
     /// has no fine grid. Coords in `fine_tsdf_deltas` index the FINE lattice.
     uint8_t  fine_ratio_log2 = 0;
+    /// Write (or, after deserialize, was read as) the revision-9 exact
+    /// integer payload instead of the revision-8 f32 / u8 one.
+    bool     exact = false;
     std::vector<TsdfDelta> tsdf_deltas;
     std::vector<BetaDelta> beta_deltas;
     std::vector<DirDelta>  dir_deltas;
@@ -213,6 +248,7 @@ class BinarySerializer {
   }
 
   static std::string serialize(const Frame& frame, const Options& opts) {
+    if (frame.exact) return serializeExact(frame, opts);
     if (!std::isfinite(frame.quant_step) || frame.quant_step < 0.f)
       throw std::runtime_error(
           "BinarySerializer: quant_step must be finite and >= 0");
@@ -358,8 +394,9 @@ class BinarySerializer {
       throw std::runtime_error("BinarySerializer: bad MAGIC");
 
     const uint8_t version = r.get<uint8_t>();
-    if (version != FORMAT_VERSION)
+    if (version != FORMAT_VERSION && version != FORMAT_VERSION_EXACT)
       throw std::runtime_error("BinarySerializer: bad VERSION");
+    f.exact = version == FORMAT_VERSION_EXACT;
 
     f.resolution  = r.get<float>();
     f.num_classes = r.get<uint16_t>();
@@ -415,10 +452,30 @@ class BinarySerializer {
     }
 
     const float step  = f.quant_step;
-    const bool  quant = step > 0.f;
+    const bool  quant = !f.exact && step > 0.f;
     const int   residual_dims = static_cast<int>(f.num_classes) - K_TOP;
     const float other_prior = residual_dims > 0
         ? static_cast<float>(residual_dims) * f.alpha_0 : 0.f;
+
+    // Revision 9: the sender's Beta lattice and the two per-stream units.
+    // The receiver stores Beta counts on ITS lattice, so a sender on a
+    // different one could hand it values it cannot hold exactly; refuse
+    // rather than round. A zero unit would zero every payload.
+    uint32_t beta_unit = 1, dir_unit = 1;
+    if (f.exact) {
+      const uint8_t lattice = r.get<uint8_t>();
+      if (lattice != betaLattice())
+        throw std::runtime_error(
+            "BinarySerializer: Beta lattice mismatch — receiver stores " +
+            std::to_string(betaLattice()) + " counts per unit, wire says " +
+            std::to_string(lattice));
+      beta_unit = r.get<uint32_t>();
+      dir_unit  = r.get<uint32_t>();
+      if (beta_unit == 0 || dir_unit == 0)
+        throw std::runtime_error("BinarySerializer: zero payload unit");
+    }
+    const float beta_step = static_cast<float>(beta_unit) * kBetaLatticeStep;
+    const float dir_step  = static_cast<float>(dir_unit);
 
     // TSDF stream (flat records, unchanged from revision 5).
     const uint32_t tsdf_count = r.get<uint32_t>();
@@ -454,7 +511,8 @@ class BinarySerializer {
     // Beta stream. Same DoS guard as TSDF: every record carries at least
     // payload_bytes on the wire (block headers only add more), so a count
     // exceeding the remaining byte budget is rejected before the reserve.
-    const std::size_t beta_payload = quant ? 2u : 8u;
+    // An exact record is at least two one-byte varints.
+    const std::size_t beta_payload = f.exact ? 2u : (quant ? 2u : 8u);
     const uint32_t beta_count = r.get<uint32_t>();
     if (beta_count > r.remaining() / beta_payload)
       throw std::runtime_error("BinarySerializer: truncated frame");
@@ -462,7 +520,12 @@ class BinarySerializer {
     readBlockStream(r, beta_count, [&](const Bonxai::CoordT& c) {
       BetaDelta d{};
       d.coord = c;
-      if (quant) {
+      if (f.exact) {
+        // v·unit is a whole number of lattice steps, so this lands exactly
+        // on the receiver's storage lattice (dyadic step, whole multiple).
+        d.data.a_occ  = kBetaOccPrior  + static_cast<float>(r.getVarint()) * beta_step;
+        d.data.a_free = kBetaFreePrior + static_cast<float>(r.getVarint()) * beta_step;
+      } else if (quant) {
         d.data.a_occ  = dequantize8(r.get<uint8_t>(), kBetaOccPrior,  step);
         d.data.a_free = dequantize8(r.get<uint8_t>(), kBetaFreePrior, step);
       } else {
@@ -475,8 +538,8 @@ class BinarySerializer {
     // Dir stream.
     const std::size_t cls_w = cls8 ? 1u : 2u;
     const std::size_t dir_payload =
-        (quant ? (1u + 1u * static_cast<std::size_t>(K_TOP))
-               : (4u + 4u * static_cast<std::size_t>(K_TOP)))
+        ((quant || f.exact) ? (1u + 1u * static_cast<std::size_t>(K_TOP))
+                            : (4u + 4u * static_cast<std::size_t>(K_TOP)))
         + cls_w * static_cast<std::size_t>(K_TOP);
     const uint32_t dir_count = r.get<uint32_t>();
     if (dir_count > r.remaining() / dir_payload)
@@ -489,7 +552,11 @@ class BinarySerializer {
       // Only the in-memory basis moved, so `other` is buffered until the slots
       // are read and then installed with set_other().
       float other_in = 0.f;
-      if (quant) {
+      if (f.exact) {
+        other_in = other_prior + static_cast<float>(r.getVarint()) * dir_step;
+        for (int j = 0; j < K_TOP; ++j)
+          d.data.cnt[j] = f.alpha_0 + static_cast<float>(r.getVarint()) * dir_step;
+      } else if (quant) {
         other_in = dequantize8(r.get<uint8_t>(), other_prior, step);
         for (int j = 0; j < K_TOP; ++j)
           d.data.cnt[j] = dequantize8(r.get<uint8_t>(), f.alpha_0, step);
@@ -548,6 +615,160 @@ class BinarySerializer {
     return prior + qf * qf * step;
   }
 
+  // Counts per unit of Beta evidence at this build (the reciprocal of the
+  // weight lattice step, which is the same constant under both storage
+  // modes). Carried in the revision-9 header.
+  static uint8_t betaLattice() {
+    return static_cast<uint8_t>(std::lround(1.0f / kBetaLatticeStep));
+  }
+
+  static void putVarint(std::string& out, uint32_t v) {
+    while (v >= 0x80u) {
+      const uint8_t b = static_cast<uint8_t>((v & 0x7Fu) | 0x80u);
+      out.push_back(static_cast<char>(b));
+      v >>= 7;
+    }
+    out.push_back(static_cast<char>(static_cast<uint8_t>(v)));
+  }
+
+  // The whole number of `step`-sized increments above `prior` that `a`
+  // holds. Throws when `a` is not within EXACT_TOL·step of one — a value
+  // that is not on the lattice has no exact integer and the revision-9
+  // payload refuses to invent one — or when it sits below the prior.
+  static uint32_t exactUnits(float a, float prior, float step, const char* what) {
+    const double x = (static_cast<double>(a) - static_cast<double>(prior)) / step;
+    const double n = std::nearbyint(x);
+    if (std::fabs(x - n) > EXACT_TOL || n < 0.0 || n > 4294967295.0)
+      throw std::runtime_error(
+          std::string("BinarySerializer: ") + what + " " + std::to_string(a) +
+          " is not prior + a whole number of increments; the exact payload "
+          "needs integer counts");
+    return static_cast<uint32_t>(n);
+  }
+
+  static uint32_t gcdU32(uint32_t a, uint32_t b) {
+    while (b) { const uint32_t t = a % b; a = b; b = t; }
+    return a;
+  }
+
+  // Revision 9. Same header prefix, TSDF streams and block-run coordinate
+  // coding as revision 8; the Beta and Dir payloads are varint integers.
+  static std::string serializeExact(const Frame& frame, const Options& opts) {
+    const int   residual_dims = static_cast<int>(frame.num_classes) - K_TOP;
+    const float other_prior = residual_dims > 0
+        ? static_cast<float>(residual_dims) * frame.alpha_0 : 0.f;
+    const bool        cls8  = frame.num_classes <= 255;
+    const std::size_t cls_w = cls8 ? 1u : 2u;
+    const std::size_t tsdf_n = opts.share_tsdf ? frame.tsdf_deltas.size() : 0;
+    if (frame.fine_ratio_log2 > MAX_FINE_RATIO_LOG2)
+      throw std::runtime_error(
+          "BinarySerializer: fine_ratio_log2 > " +
+          std::to_string(MAX_FINE_RATIO_LOG2));
+    if (frame.fine_ratio_log2 == 0 && !frame.fine_tsdf_deltas.empty())
+      throw std::runtime_error(
+          "BinarySerializer: fine_tsdf_deltas without fine_ratio_log2");
+
+    // Project every record onto its integers first: the stream units are
+    // the gcd over the whole stream and go in the header, ahead of the
+    // payloads they divide.
+    struct BetaInts { uint32_t occ, free; };
+    struct DirInts  { uint32_t other; uint32_t cnt[K_TOP]; };
+    std::vector<BetaInts> bi(frame.beta_deltas.size());
+    std::vector<DirInts>  di(frame.dir_deltas.size());
+    uint32_t beta_unit = 0, dir_unit = 0;
+    for (std::size_t i = 0; i < bi.size(); ++i) {
+      const auto& v = frame.beta_deltas[i].data;
+      bi[i].occ  = exactUnits(v.a_occ,  kBetaOccPrior,  kBetaLatticeStep, "a_occ");
+      bi[i].free = exactUnits(v.a_free, kBetaFreePrior, kBetaLatticeStep, "a_free");
+      beta_unit = gcdU32(gcdU32(beta_unit, bi[i].occ), bi[i].free);
+    }
+    for (std::size_t i = 0; i < di.size(); ++i) {
+      const auto& v = frame.dir_deltas[i].data;
+      di[i].other = exactUnits(v.other(), other_prior, 1.0f, "other");
+      dir_unit = gcdU32(dir_unit, di[i].other);
+      for (int k = 0; k < K_TOP; ++k) {
+        di[i].cnt[k] = exactUnits(v.cnt[k], frame.alpha_0, 1.0f, "cnt");
+        dir_unit = gcdU32(dir_unit, di[i].cnt[k]);
+      }
+    }
+    if (beta_unit == 0) beta_unit = 1;   // every value at the prior
+    if (dir_unit  == 0) dir_unit  = 1;
+
+    std::string out;
+    // Upper bound: five varint bytes per integer, every record in its own
+    // block (17 B of overhead); real streams are far below both.
+    out.reserve(31 + 4 + tsdf_n * 20
+                + 4 + frame.beta_deltas.size() * (10u + 17u)
+                + 4 + frame.dir_deltas.size()
+                      * (5u * (1u + static_cast<std::size_t>(K_TOP))
+                         + cls_w * static_cast<std::size_t>(K_TOP) + 17u)
+                + 4 + frame.fine_tsdf_deltas.size() * 20);
+
+    appendBytes(out, &MAGIC, sizeof(MAGIC));
+    appendBytes(out, &FORMAT_VERSION_EXACT, sizeof(FORMAT_VERSION_EXACT));
+    appendBytes(out, &frame.resolution, sizeof(frame.resolution));
+    appendBytes(out, &frame.num_classes, sizeof(frame.num_classes));
+    const uint8_t k_top_wire = static_cast<uint8_t>(K_TOP);
+    appendBytes(out, &k_top_wire, sizeof(k_top_wire));
+    appendBytes(out, &frame.alpha_0, sizeof(frame.alpha_0));
+    const float no_quant = 0.f;   // rev 8 field, unused by this layout
+    appendBytes(out, &no_quant, sizeof(no_quant));
+    appendBytes(out, &frame.fine_ratio_log2, sizeof(frame.fine_ratio_log2));
+    const uint8_t lattice = betaLattice();
+    appendBytes(out, &lattice, sizeof(lattice));
+    appendBytes(out, &beta_unit, sizeof(beta_unit));
+    appendBytes(out, &dir_unit, sizeof(dir_unit));
+
+    const uint32_t tsdf_count = static_cast<uint32_t>(tsdf_n);
+    appendBytes(out, &tsdf_count, sizeof(tsdf_count));
+    if (opts.share_tsdf) {
+      for (const auto& d : frame.tsdf_deltas) {
+        appendBytes(out, &d.coord.x,       sizeof(int32_t));
+        appendBytes(out, &d.coord.y,       sizeof(int32_t));
+        appendBytes(out, &d.coord.z,       sizeof(int32_t));
+        appendBytes(out, &d.data.distance, sizeof(float));
+        appendBytes(out, &d.data.weight,   sizeof(float));
+      }
+    }
+
+    auto writeCls = [&](uint16_t cls) {
+      if (cls8) {
+        if (cls != kEmptySlot && cls >= 0xFF)
+          throw std::runtime_error(
+              "BinarySerializer: class id " + std::to_string(cls) +
+              " does not fit u8 packing (num_classes ≤ 255)");
+        const uint8_t c = (cls == kEmptySlot) ? 0xFF : static_cast<uint8_t>(cls);
+        appendBytes(out, &c, sizeof(c));
+      } else {
+        appendBytes(out, &cls, sizeof(cls));
+      }
+    };
+
+    // The payload writers take the record's index in the frame, so the
+    // projected integers are looked up rather than recomputed.
+    writeBlockStreamIndexed(out, frame.beta_deltas, [&](std::size_t i) {
+      putVarint(out, bi[i].occ  / beta_unit);
+      putVarint(out, bi[i].free / beta_unit);
+    });
+    writeBlockStreamIndexed(out, frame.dir_deltas, [&](std::size_t i) {
+      putVarint(out, di[i].other / dir_unit);
+      for (int k = 0; k < K_TOP; ++k) putVarint(out, di[i].cnt[k] / dir_unit);
+      for (int k = 0; k < K_TOP; ++k) writeCls(frame.dir_deltas[i].data.cls[k]);
+    });
+
+    const uint32_t fine_count =
+        static_cast<uint32_t>(frame.fine_tsdf_deltas.size());
+    appendBytes(out, &fine_count, sizeof(fine_count));
+    for (const auto& d : frame.fine_tsdf_deltas) {
+      appendBytes(out, &d.coord.x,       sizeof(int32_t));
+      appendBytes(out, &d.coord.y,       sizeof(int32_t));
+      appendBytes(out, &d.coord.z,       sizeof(int32_t));
+      appendBytes(out, &d.data.distance, sizeof(float));
+      appendBytes(out, &d.data.weight,   sizeof(float));
+    }
+    return out;
+  }
+
   /// Emit one stream as [count:u32] followed by block runs. Records are
   /// sorted by (block, bit) — deterministic output — and deduplicated
   /// last-wins on coord (the receiver ingest is replace-per-coord). The
@@ -556,6 +777,15 @@ class BinarySerializer {
   static void writeBlockStream(std::string& out,
                                const std::vector<DeltaT>& deltas,
                                PayloadWriter&& write_payload) {
+    writeBlockStreamIndexed(out, deltas,
+                            [&](std::size_t i) { write_payload(deltas[i]); });
+  }
+
+  /// Same, with the payload writer handed the record's index in `deltas`.
+  template <typename DeltaT, typename PayloadWriter>
+  static void writeBlockStreamIndexed(std::string& out,
+                                      const std::vector<DeltaT>& deltas,
+                                      PayloadWriter&& write_payload) {
     struct Entry { int32_t bx, by, bz; uint16_t bit; uint32_t src; };
     std::vector<Entry> entries;
     entries.reserve(deltas.size());
@@ -621,7 +851,7 @@ class BinarySerializer {
           appendBytes(out, &entries[k].bit, sizeof(uint16_t));
       }
       for (std::size_t k = i; k < j; ++k)
-        write_payload(deltas[entries[k].src]);
+        write_payload(static_cast<std::size_t>(entries[k].src));
       i = j;
     }
   }
@@ -646,6 +876,20 @@ class BinarySerializer {
       need(n);
       std::memcpy(dst, d.data() + off, n);
       off += n;
+    }
+    // LEB128 unsigned, at most MAX_VARINT_BYTES; a fifth byte may only
+    // carry the top four bits of a u32, anything longer or wider is a
+    // corrupt frame.
+    uint32_t getVarint() {
+      uint32_t v = 0;
+      for (int i = 0; i < MAX_VARINT_BYTES; ++i) {
+        const uint8_t b = get<uint8_t>();
+        if (i == MAX_VARINT_BYTES - 1 && (b & 0xF0u))
+          throw std::runtime_error("BinarySerializer: varint overflow");
+        v |= static_cast<uint32_t>(b & 0x7Fu) << (7 * i);
+        if (!(b & 0x80u)) return v;
+      }
+      throw std::runtime_error("BinarySerializer: varint too long");
     }
   };
 

@@ -478,6 +478,8 @@ void SemSplitMap::beginCarveFrame() {
   carve_stage_.beginFrame();  // retains all capacity → no per-scan realloc churn
   carve_hits_.clear();
   hit_obs_.clear();           // capacity retained; see SemSplitParams::batch_hits
+  band_hits_.clear();
+  band_obs_.clear();
   carve_frame_open_ = true;
 }
 
@@ -496,6 +498,7 @@ std::size_t SemSplitMap::flushCarveFrame() {
   // its occupancy before the carve walk decides what to skip, exactly as on the
   // immediate path where the hit wrote during the ray loop.
   flushStagedHits();
+  flushStagedBand();
 
   std::size_t n = 0;
   carve_stage_.forEachStagedBlockOrdered([&](const CoordT& c, float inc) {
@@ -878,6 +881,30 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
   const float kappa0    = prof ? prof->kappa0              : params_.kappa0;
   const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
 
+  // Staged band (SemSplitParams::batch_band): the scan's most confident look
+  // holds the voxel until flushStagedBand writes it, one deposit per voxel.
+  if (carve_frame_open_ && params_.batch_band) {
+    BandStage& st = band_hits_[c];
+    const float q = (obs.argmax >= 0 && obs.argmax < static_cast<int>(obs.e.size()))
+                  ? obs.e[static_cast<std::size_t>(obs.argmax)].p : 0.f;
+    if (st.q >= 0.f && q <= st.q) return;
+    st.q         = q;
+    st.kappa0    = kappa0;
+    st.min_p_occ = min_p_occ;
+    const uint32_t n = static_cast<uint32_t>(obs.e.size());
+    if (n != 0) {
+      if (st.probs_off == kNoHitProbs || st.probs_cap < n) {
+        st.probs_off = static_cast<uint32_t>(band_obs_.size());
+        st.probs_cap = n;
+        band_obs_.resize(band_obs_.size() + n);
+      }
+      std::copy(obs.e.begin(), obs.e.end(), band_obs_.begin() + st.probs_off);
+    }
+    st.probs_len    = n;
+    st.probs_argmax = obs.argmax;
+    return;
+  }
+
   float class_share;
   if (params_.semantic_band_require_occ) {
     // LiDAR authority, read-only: no Beta voxel here means no beam has ever
@@ -906,6 +933,58 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
                   params_.inc_mode, params_.inc_thresh, c.x, c.y, c.z);
   applyDirSaturation(d);
   touched_dir_.push_back(c);
+}
+
+// The staged band, written once per voxel in the same leaf-block order the
+// staged hits use, so the Dir grid is first-touched in one reproducible
+// sequence whichever path deposited.
+std::size_t SemSplitMap::flushStagedBand() {
+  if (band_hits_.empty()) return 0;
+  band_order_.clear();
+  for (const auto& kv : band_hits_) band_order_.push_back(kv.first);
+  const int lb = static_cast<int>(params_.leaf_bits);
+  std::sort(band_order_.begin(), band_order_.end(),
+            [lb](const CoordT& a, const CoordT& b) {
+              const int32_t abx = a.x >> lb, bbx = b.x >> lb;
+              if (abx != bbx) return abx < bbx;
+              const int32_t aby = a.y >> lb, bby = b.y >> lb;
+              if (aby != bby) return aby < bby;
+              const int32_t abz = a.z >> lb, bbz = b.z >> lb;
+              if (abz != bbz) return abz < bbz;
+              if (a.x != b.x) return a.x < b.x;
+              if (a.y != b.y) return a.y < b.y;
+              return a.z < b.z;
+            });
+  std::size_t n = 0;
+  for (const CoordT& c : band_order_) {
+    const BandStage& st = band_hits_.find(c)->second;
+    float class_share;
+    if (params_.semantic_band_require_occ) {
+      const BetaVoxel* b = beta_acc_.value(c, /*create_if_missing=*/false);
+      if (!b) continue;
+      const float p_occ = b->p_occ();
+      if (p_occ < st.min_p_occ) continue;
+      class_share = st.kappa0 * p_occ;
+    } else {
+      class_share = st.kappa0;
+    }
+    if (class_share <= 0.f) continue;
+    staged_obs_.clear();
+    staged_obs_.present = true;
+    if (st.probs_len != 0u) {
+      staged_obs_.e.assign(band_obs_.begin() + st.probs_off,
+                           band_obs_.begin() + st.probs_off + st.probs_len);
+      staged_obs_.argmax = st.probs_argmax;
+    }
+    DirVoxel* d = getOrAllocateDirOn(dir_acc_, c);
+    dirichletUpdate(d, staged_obs_, class_share, params_.alpha_0,
+                    params_.evict_by_confidence,
+                    params_.inc_mode, params_.inc_thresh, c.x, c.y, c.z);
+    applyDirSaturation(d);
+    touched_dir_.push_back(c);
+    ++n;
+  }
+  return n;
 }
 
 // ===========================================================================

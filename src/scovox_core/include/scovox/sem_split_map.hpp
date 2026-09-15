@@ -426,6 +426,19 @@ class SemSplitMap {
     /// Both streams land at flush BEFORE the staged carves, so occupied-wins
     /// holds exactly as on the immediate path.
     bool    batch_hits                 = true;
+    /// Batched semantic band: one band deposit per voxel per scan, staged like
+    /// the surface hit and applied by flushCarveFrame() right after the staged
+    /// hits. The band otherwise writes once per depth pixel whose ray passes
+    /// the voxel, so a band voxel's class evidence grows with pixel density
+    /// rather than with the number of scans that saw it. Staged, the scan's
+    /// most confident look (largest argmax probability; the first one on a
+    /// tie) wins the voxel and deposits the same flat `kappa0` the immediate
+    /// band does, so one scan is one look here too and a voxel's class
+    /// evidence is bounded by twice the scan count (its endpoint look and its
+    /// band look). Under `semantic_band_require_occ` the occupancy read moves
+    /// from the ray to the flush, after the scan's hits landed. Off, the band
+    /// path is untouched.
+    bool    batch_band                 = false;
     float   range_decay_length         = 50.0f;  ///< exp(-r/L); 0 disables (caller-applied)
 
     /// Dataset class count `C`. Sets the semantic OTHER prior `(C − K_TOP)·α₀`.
@@ -805,6 +818,20 @@ class SemSplitMap {
   std::vector<SemObsEntry>            hit_obs_;
   SemObs                              staged_obs_;         ///< flush-time view
   std::vector<CoordT>                 hit_order_;          ///< flush-time sort
+  /// One scan's staged band look for a voxel (see `batch_band`).
+  struct BandStage {
+    float    kappa0       = 0.f;
+    float    min_p_occ    = 0.f;
+    float    q            = -1.f;         ///< argmax probability of the look that holds the voxel
+    uint32_t probs_off    = kNoHitProbs;  ///< start of its entries in band_obs_
+    uint32_t probs_len    = 0;
+    uint32_t probs_cap    = 0;
+    int      probs_argmax = -1;
+  };
+  std::unordered_map<CoordT, BandStage> band_hits_;
+  std::vector<SemObsEntry>              band_obs_;
+  std::vector<CoordT>                   band_order_;
+  std::size_t flushStagedBand();
   bool                       carve_frame_open_ = false;
   std::uint64_t carve_voxels_ = 0;
 

@@ -1,0 +1,53 @@
+# =======================================================================
+# SCovox — the COUNT MAP deposit rule (overlay)
+# =======================================================================
+# Load this ON TOP of a base config to make the node deposit whole-number
+# looks instead of a soft posterior:
+#
+#   ros2 run scovox_mapping scovox_mapping_node --ros-args \
+#     --params-file /scovox/config/scovox_fused_lidar_rgbd.yaml \
+#     --params-file /scovox/config/scovox_count_map.yaml
+#
+# A voxel's `cnt[k]` then counts the scans that argmaxed to class k, rather
+# than accumulating fractions of a probability. Confirm it took by reading
+# the node's `deposit config:` line, which prints inc_mode, batch_band and
+# hit_flat_share alongside the weights.
+#
+# The rule is four knobs and they only mean the count map together:
+#   inc_mode=hard        a look's whole class_share goes to its argmax class
+#   hit_flat_share=true  an endpoint look is worth kappa0, not kappa0*p_occ
+#   batch_band=true      one band deposit per voxel per scan, not per pixel
+#   evidence_saturation=0  no cap, so a count stays a count
+#
+# The occupancy weights below are the other half, and they are per sensor —
+# this file carries the LiDAR point. For an RGB-D base use w_occ 3.0 with
+# the same w_free 0.0, and read the map out at 0.99 rather than 0.5.
+#
+# CARVE-OFF HAS A PLANNING CONSEQUENCE. w_free 0 stops the free-space
+# carve, so the map holds occupied evidence and unknown space, not swept
+# free space. A planner that reads free space from this map will see far
+# less of it. Keep the carve by dropping the w_free line (and, on the fused
+# base, the lidar_w_free line) from this overlay; the count map's deposit
+# rule is independent of it.
+# =======================================================================
+
+/**:
+  ros__parameters:
+    # --- Deposit rule ------------------------------------------------------
+    inc_mode:       "hard"     # soft | hard | thresh
+    hit_flat_share: true
+    batch_band:     true
+    batch_hits:     true       # prerequisite for both: one look per scan
+    evidence_saturation: 0     # no cap on (a_occ, a_free, sem_cnt)
+    semantic_evict_by_confidence: true
+
+    # --- Occupancy point (LiDAR) -------------------------------------------
+    w_occ:        1.5
+    w_free:       0.0
+    lidar_w_occ:  1.5          # read by the fused base; ignored by the others
+    lidar_w_free: 0.0
+    semantic_occ_gate: 0.5     # RGB-D reads out at 0.99 instead
+
+    # --- Semantic band ------------------------------------------------------
+    semantic_band_length:  0.10
+    semantic_spread_radius: 0.0   # the band and the ball are alternatives

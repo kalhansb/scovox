@@ -532,3 +532,105 @@ TEST(BinarySerializer, MalformedBlockRunsThrow) {
     EXPECT_THROW(scovox::BinarySerializer::deserialize(bad), std::runtime_error);
   }
 }
+
+// ===========================================================================
+// Revision 9 — the exact integer payload
+// ===========================================================================
+//
+// Revision 9 ships the deposit COUNTS rather than a companded parameter, so
+// its contract is stronger than rev 8's: a count map round-trips bit for bit,
+// and a map carrying any fractional deposit is refused rather than rounded.
+// Both halves are tested here because the alternative — a silent rounding —
+// would look exactly like a lossless wire until someone diffed two maps.
+namespace {
+
+/// A frame whose every value sits on its lattice: Beta counts are whole
+/// eighths, Dir slots are `α₀ + whole deposits`, which is what fixed-increment
+/// accumulation produces.
+scovox::BinarySerializer::Frame makeExactFrame() {
+  scovox::BinarySerializer::Frame f;
+  f.resolution  = 0.05f;
+  f.num_classes = 14;
+  f.alpha_0     = scovox::kDefaultDirichletPrior;
+  f.exact       = true;
+
+  // prior + w·n with w = 1.5 (twelve eighths) and w = 3.0.
+  f.beta_deltas.push_back({Bonxai::CoordT{1, 2, 3},
+                           scovox::BetaVoxel{scovox::kBetaOccPrior + 1.5f * 4.f,
+                                             scovox::kBetaFreePrior}});
+  f.beta_deltas.push_back({Bonxai::CoordT{4, 5, 6},
+                           scovox::BetaVoxel{scovox::kBetaOccPrior + 3.0f * 7.f,
+                                             scovox::kBetaFreePrior + 1.5f * 2.f}});
+
+  const float other_prior =
+      static_cast<float>(14 - scovox::K_TOP) * scovox::kDefaultDirichletPrior;
+  scovox::DirVoxel a = scovox::defaultDirVoxel(14, scovox::kDefaultDirichletPrior);
+  a.cls[0] = 5; a.cnt[0] = scovox::kDefaultDirichletPrior + 6.f;   // six looks
+  a.cls[1] = 9; a.cnt[1] = scovox::kDefaultDirichletPrior + 2.f;
+  a.set_other(other_prior + 3.f);
+  f.dir_deltas.push_back({Bonxai::CoordT{1, 2, 3}, a});
+
+  scovox::DirVoxel b = scovox::defaultDirVoxel(14, scovox::kDefaultDirichletPrior);
+  b.cls[0] = 7; b.cnt[0] = scovox::kDefaultDirichletPrior + 1.f;
+  b.set_other(other_prior);                                        // prior only
+  f.dir_deltas.push_back({Bonxai::CoordT{4, 5, 6}, b});
+  return f;
+}
+
+}  // namespace
+
+TEST(BinarySerializerExact, CountsRoundTripBitForBit) {
+  const auto f = makeExactFrame();
+  scovox::BinarySerializer::Options opts;
+  const std::string blob = scovox::BinarySerializer::serialize(f, opts);
+
+  // The VERSION byte, not a flag on the side, is what tells a receiver which
+  // layout it is holding.
+  ASSERT_GE(blob.size(), 5u);
+  EXPECT_EQ(static_cast<uint8_t>(blob[4]),
+            scovox::BinarySerializer::FORMAT_VERSION_EXACT);
+
+  const auto g = scovox::BinarySerializer::deserialize(blob);
+  EXPECT_TRUE(g.exact) << "the receiver did not report the exact layout";
+  ASSERT_EQ(g.beta_deltas.size(), f.beta_deltas.size());
+  ASSERT_EQ(g.dir_deltas.size(), f.dir_deltas.size());
+
+  for (std::size_t i = 0; i < f.beta_deltas.size(); ++i) {
+    EXPECT_EQ(g.beta_deltas[i].data.a_occ,  f.beta_deltas[i].data.a_occ);
+    EXPECT_EQ(g.beta_deltas[i].data.a_free, f.beta_deltas[i].data.a_free);
+  }
+  for (std::size_t i = 0; i < f.dir_deltas.size(); ++i) {
+    const auto& want = f.dir_deltas[i].data;
+    const auto& got  = g.dir_deltas[i].data;
+    EXPECT_EQ(got.s_total, want.s_total);
+    for (int k = 0; k < scovox::K_TOP; ++k) {
+      EXPECT_EQ(got.cnt[k], want.cnt[k]) << "slot " << k << " of record " << i;
+      EXPECT_EQ(got.cls[k], want.cls[k]) << "slot " << k << " of record " << i;
+    }
+  }
+}
+
+TEST(BinarySerializerExact, FractionalDepositIsRefused) {
+  auto f = makeExactFrame();
+  // A soft deposit: 0.35 of a look is not a whole number of them, so this map
+  // has no exact representation. Refusing is the invariant; rounding it would
+  // make a soft map masquerade as a count map on the wire.
+  f.dir_deltas[0].data.cnt[0] += 0.35f;
+  scovox::BinarySerializer::Options opts;
+  EXPECT_THROW(scovox::BinarySerializer::serialize(f, opts), std::runtime_error);
+}
+
+TEST(BinarySerializerExact, Revision8IsUntouched) {
+  // The rev-8 path must not have moved: same frame, exact off, still a rev-8
+  // blob that round-trips as before.
+  auto f = makeExactFrame();
+  f.exact = false;
+  scovox::BinarySerializer::Options opts;
+  const std::string blob = scovox::BinarySerializer::serialize(f, opts);
+  ASSERT_GE(blob.size(), 5u);
+  EXPECT_EQ(static_cast<uint8_t>(blob[4]),
+            scovox::BinarySerializer::FORMAT_VERSION);
+  const auto g = scovox::BinarySerializer::deserialize(blob);
+  EXPECT_FALSE(g.exact);
+  ASSERT_EQ(g.dir_deltas.size(), f.dir_deltas.size());
+}
