@@ -9,19 +9,32 @@
 #     --params-file /scovox/config/scovox_count_map.yaml
 #
 # A voxel's `cnt[k]` then counts the scans that argmaxed to class k, rather
-# than accumulating fractions of a probability. Confirm it took by reading
-# the node's `deposit config:` line, which prints inc_mode, batch_band and
-# hit_flat_share alongside the weights.
+# than accumulating fractions of a probability.
 #
-# The rule is four knobs and they only mean the count map together:
-#   inc_mode=hard        a look's whole class_share goes to its argmax class
-#   hit_flat_share=true  an endpoint look is worth kappa0, not kappa0*p_occ
-#   batch_band=true      one band deposit per voxel per scan, not per pixel
-#   evidence_saturation=0  no cap, so a count stays a count
+# The rule is five knobs and they only mean the count map together:
+#   inc_mode=hard            a look's whole class_share goes to its argmax
+#   hit_flat_share=true      an ENDPOINT look is worth kappa0, not kappa0*p_occ
+#   band_require_occ=false   a BAND look is worth kappa0 too — this is the
+#                            band's half of the same rule, and hit_flat_share
+#                            does not reach it
+#   batch_band=true          one band deposit per voxel per scan, not per pixel
+#   evidence_saturation=0    no cap, so a count stays a count
+#
+# Leaving band_require_occ at its default (true) is not a smaller version of
+# the count map: the band then weights by p_occ AND drops every voxel with no
+# Beta entry, which under w_free 0 is most of the band.
 #
 # The occupancy weights below are the other half, and they are per sensor —
-# this file carries the LiDAR point. For an RGB-D base use w_occ 3.0 with
-# the same w_free 0.0, and read the map out at 0.99 rather than 0.5.
+# this file carries the LiDAR point. For an RGB-D sensor use w_occ 3.0 with
+# the same w_free 0.0, and read the map out at 0.99 rather than 0.5. There is
+# no RGB-D-only base config in this package; on the fused base the RGB-D
+# stream is semantics-only and takes the LiDAR occupancy point.
+#
+# READING THE LOG. The node's `semantic deposit:` line prints the GLOBAL band
+# parameters, so it reports the band as active whether or not a given stream
+# actually walks one — `band_active` is decided per ray from the source
+# profile. The `deposit config:` line does confirm inc_mode, batch_band and
+# hit_flat_share, which are global.
 #
 # CARVE-OFF HAS A PLANNING CONSEQUENCE. w_free 0 stops the free-space
 # carve, so the map holds occupied evidence and unknown space, not swept
@@ -50,4 +63,26 @@
 
     # --- Semantic band ------------------------------------------------------
     semantic_band_length:  0.10
+    semantic_band_require_occ: false  # flat kappa0 per look; see header
     semantic_spread_radius: 0.0   # the band and the ball are alternatives
+
+    # --- The band needs the TSDF off ---------------------------------------
+    # `sdf_trunc` is the walk's reach behind the surface, and enable_tsdf=true
+    # sets it to sdf_trunc_voxels * resolution. Off, TsdfMap re-clamps it to
+    # 0.15 m, which is the reach the count map is built around. Leaving the
+    # TSDF on lengthens every ray's tail and changes the map.
+    enable_tsdf: false
+
+    # --- Fused base only: give the RGB-D stream the band -------------------
+    # `band_active` is false for any source with kernel_radius > 0 or
+    # geometry_off, so on the fused base the RGB-D stream takes the BKI ball
+    # and the band above never runs on it. These two lines substitute the band
+    # for the ball. With the TSDF off, geometry_off gates nothing else.
+    #
+    # The cost is real: an ungated band deposits RGB-D classes without
+    # consulting LiDAR occupancy, so pure LiDAR authority holds at the RGB-D
+    # ENDPOINT (rgbd_dirichlet_min_p_occ still gates it) but not along its
+    # band. Drop these two lines to keep the ball and the authority; the
+    # LiDAR stream still runs the count map.
+    rgbd_kernel_radius: 0.0
+    rgbd_geometry_off:  false
