@@ -1,0 +1,92 @@
+# =======================================================================
+# SCovox — KITTI sensor base for the NODE profile (EXPERIMENT_JETBOT §11)
+# =======================================================================
+# Load AFTER scovox_count_map.yaml, and before the per-unit file:
+#
+#   --params-file config/scovox_count_map.yaml \
+#   --params-file config/node_profile_kitti.yaml \
+#   --params-file <unit>.yaml
+#
+# EVERY value below exists to make the node build the same map as
+# replay_kitti under run_frontier_cells.sh. Three of them are node defaults
+# that DIVERGE from the replay and would otherwise change the map silently;
+# they are marked PARITY and each says what the replay does.
+# =======================================================================
+
+/**:
+  ros__parameters:
+    # --- Input path --------------------------------------------------------
+    input_pointcloud_topic: "/ouster/points"
+    fuse_lidar_rgbd:        false     # single sensor; also makes every
+                                      # lidar_*/rgbd_* profile key inert
+    dataset_mode:           true
+    input_reliable_qos:     true      # a 2 MB PointCloud2 loses fragments over
+                                      # a best-effort localhost link; reliable
+                                      # retransmits them
+    dataset_queue_depth:    256       # the LiDAR subscription is KeepLast(10)
+                                      # on a robot, where only the newest scan
+                                      # matters; a replay must integrate every
+                                      # scan or the map is not the one the x86
+                                      # tables describe
+    deskew_mode:            "off"     # the driver does not deskew, and there
+                                      # is no IMU on this wire
+    map_frame:         "map"
+    integration_frame: "map"
+    base_frame:        "velodyne"     # ray origin; the publisher's TF child
+
+    # --- Geometry (driver: --resolution 0.10) ------------------------------
+    resolution: 0.10
+    downsample_voxel_size: 0.0        # PARITY: node default 0.5. Non-zero
+                                      # selects a separate per-scan voxel
+                                      # decimation branch that integrates with
+                                      # NO semantics at all (it passes a null
+                                      # class vector), so the default would
+                                      # have built a geometry-only map.
+
+    # --- Range band (driver: --min-range 5.0 --max-range 30.0) -------------
+    min_range: 5.0
+    max_range: 30.0
+
+    # --- Semantics off disk ------------------------------------------------
+    num_classes: 20                   # SemanticKITTI; sizes the map
+    max_semantic_classes: 20          # PARITY: node default 10 — see the
+                                      # SceneNN file; it sizes the
+                                      # TopkProvider and the class vector
+    # topk_probs_dir is per unit.
+
+    # --- Occupancy point (KITTI tuned) -------------------------------------
+    w_occ:  1.5
+    w_free: 0.0
+    kappa0: 1.0                       # PARITY: node default 2.0, replay 1.0
+    dirichlet_min_p_occ: 0.5          # build-time deposit gate
+
+    # --- TF ----------------------------------------------------------------
+    # PARITY: the node's TF stability gate is a localization guard, and these
+    # poses are ground truth. Left on it costs the first frame unconditionally
+    # (no previous pose to measure a jump against) and, on a vehicle dataset,
+    # every frame — which is not a small bias, it is a different map.
+    # The publisher broadcasts every pose before the first frame, so the TF
+    # buffer must hold the whole trajectory at once: at a calibrated rate a
+    # 1300-frame unit spans well past the node's 600 s default cache, and tf2
+    # evicts the oldest entries as the newest arrive -- which shows up as the
+    # FIRST frames failing to look up a pose, not the last. A day of cache is
+    # 1300 transforms, and on a robot the poses arrive live so none of this
+    # applies.
+    tf_cache_time_sec:      86400.0
+
+    tf_gate_enabled: false
+    runtime_tf_gate: false
+
+    # --- Readout -----------------------------------------------------------
+    map_dump_gate: 0.5                # KITTI reads out at 0.5
+    map_dump_below_as_unknown: true
+    semantic_occ_gate: 0.5
+
+    # --- Publishers (see the SceneNN file) ---------------------------------
+    publish_tsdf_pointcloud:      false
+    publish_fine_tsdf_pointcloud: false
+    publish_planning_map:         false
+    publish_pointcloud:           true
+
+    # --- Diagnostics -------------------------------------------------------
+    log_mem_usage: true

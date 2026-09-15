@@ -64,6 +64,16 @@ ament_target_dependencies(scovox_mapping_node
 target_link_libraries(scovox_mapping_node scovoxmap ${LZ4_LIBRARIES})
 target_include_directories(scovox_mapping_node PRIVATE ${LZ4_INCLUDE_DIRS})
 
+# scovox_replay_pub — dataset publisher for profiling the node itself.
+# libpng only, and only here: it reads SceneNN's 16-bit depth PNGs. The mapping
+# library stays free of it.
+pkg_check_modules(PNG REQUIRED libpng)
+add_executable(scovox_replay_pub src/replay_pub_node.cpp)
+ament_target_dependencies(scovox_replay_pub
+  rclcpp sensor_msgs geometry_msgs tf2 tf2_ros)
+target_link_libraries(scovox_replay_pub Eigen3::Eigen ${PNG_LIBRARIES})
+target_include_directories(scovox_replay_pub PRIVATE ${PNG_INCLUDE_DIRS})
+
 # ==================================================================
 # Tests
 # ==================================================================
@@ -109,7 +119,7 @@ install(TARGETS scovoxmap
   RUNTIME DESTINATION bin
 )
 
-install(TARGETS dscovox_mapping_node scovox_mapping_node
+install(TARGETS dscovox_mapping_node scovox_mapping_node scovox_replay_pub
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/scovox

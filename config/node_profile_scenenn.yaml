@@ -1,0 +1,114 @@
+# =======================================================================
+# SCovox — SceneNN sensor base for the NODE profile (EXPERIMENT_JETBOT §11)
+# =======================================================================
+# Load AFTER scovox_count_map.yaml, and before the per-unit file:
+#
+#   --params-file config/scovox_count_map.yaml \
+#   --params-file config/node_profile_scenenn.yaml \
+#   --params-file <unit>.yaml
+#
+# The overlay carries the count-map deposit rule at the LiDAR occupancy
+# point; this file overrides the occupancy point with SceneNN's and adds
+# everything that is per sensor. Last file wins, which is why the order is
+# not free.
+#
+# EVERY value below exists to make the node build the same map as
+# replay_scenenn under run_frontier_cells.sh. Three of them are node
+# defaults that DIVERGE from the replay and would otherwise change the map
+# silently; they are marked PARITY and each says what the replay does.
+# =======================================================================
+
+/**:
+  ros__parameters:
+    # --- Input path --------------------------------------------------------
+    input_pointcloud_topic: ""        # empty => RGB-D, not LiDAR
+    fuse_lidar_rgbd:        false     # single sensor; also makes every
+                                      # lidar_*/rgbd_* profile key inert, since
+                                      # both profile selectors return null when
+                                      # fusion is off and the map falls back to
+                                      # its global params
+    dataset_mode:           true      # exact-stamp matching + the reliable
+                                      # KeepLast(1000) queue that makes an
+                                      # open-loop replay lossless
+    depth_topic:       "/camera/depth/image_raw"
+    seg_topic:         "/seg/labels"
+    depth_info_topic:  "/camera/depth/camera_info"
+    map_frame:         "map"
+    integration_frame: "map"          # node default is "odom"
+    base_frame:        "camera_optical"   # ray origin; the publisher's TF child
+
+    # --- Geometry (driver: --stride 2 --resolution 0.05) -------------------
+    # stride is 1 HERE because scovox_replay_pub already publishes the stride-2
+    # image with stride-2 intrinsics. The staged .topk blobs are at that
+    # subsampled size and the node indexes them with its own loop variables, so
+    # the node must not subsample a second time.
+    stride:     1
+    resolution: 0.05
+
+    # --- Depth band (replay_scenenn defaults; the driver passes no flags) ---
+    min_depth: 0.4
+    max_depth: 4.0
+    trace_no_return_rays: true        # matches the replay's carve_no_return.
+                                      # Inert here: w_free 0 makes carveRay
+                                      # return before it writes.
+
+    # --- Semantics off disk, not off a network -----------------------------
+    num_classes: 14                   # NYU13 + unknown; sizes the map
+    max_semantic_classes: 14          # PARITY: node default 10. This sizes the
+                                      # TopkProvider and the per-pixel class
+                                      # vector, so leaving it at 10 truncates a
+                                      # 14-class blob instead of failing.
+    # topk_probs_dir is per unit.
+
+    # --- Occupancy point (SceneNN tuned; overrides the overlay's LiDAR one) -
+    w_occ:  3.0
+    w_free: 0.0
+    kappa0: 1.0                       # PARITY: node default 2.0, replay 1.0.
+                                      # This is the class-evidence gain per
+                                      # look — at 2.0 every count is doubled.
+    dirichlet_min_p_occ: 0.5          # build-time deposit gate (NOT the
+                                      # readout); replay default, restated
+                                      # because it is easy to confuse with the
+                                      # 0.99 below
+
+    # --- TF ----------------------------------------------------------------
+    # PARITY: the node's TF stability gate is a localization guard, and these
+    # poses are ground truth. Left on it costs the first frame unconditionally
+    # (no previous pose to measure a jump against) and, on a vehicle dataset,
+    # every frame — which is not a small bias, it is a different map.
+    # The publisher broadcasts every pose before the first frame, so the TF
+    # buffer must hold the whole trajectory at once: at a calibrated rate a
+    # 1300-frame unit spans well past the node's 600 s default cache, and tf2
+    # evicts the oldest entries as the newest arrive -- which shows up as the
+    # FIRST frames failing to look up a pose, not the last. A day of cache is
+    # 1300 transforms, and on a robot the poses arrive live so none of this
+    # applies.
+    tf_cache_time_sec:      86400.0
+
+    tf_gate_enabled: false
+    runtime_tf_gate: false
+
+    # --- Readout -----------------------------------------------------------
+    # The DUMP gate is 0.5 on both sensors, as the cell row builds it: the
+    # unit's readout gate (0.99 here) is the scorer's `--p-occ`, applied to the
+    # dump afterwards, not a mapping or dump flag. Dumping at 0.99 with
+    # below-as-unknown would move voxels out of the occupied set as well as
+    # relabel them, and the replay driver refuses that combination outright.
+    map_dump_gate: 0.5
+    map_dump_below_as_unknown: true
+    semantic_occ_gate: 0.99           # publish-side threshold only; set to the
+                                      # readout so the published cloud and the
+                                      # dump agree
+
+    # --- Publishers --------------------------------------------------------
+    # The TSDF publishers are dead weight with enable_tsdf false, and the
+    # planning map is a 2D projection the replay never builds; both would land
+    # in publish_ms as cost the comparison cannot attribute.
+    publish_tsdf_pointcloud:      false
+    publish_fine_tsdf_pointcloud: false
+    publish_planning_map:         false
+    publish_pointcloud:           true   # the node's real map output; its cost
+                                         # belongs in publish_ms
+
+    # --- Diagnostics -------------------------------------------------------
+    log_mem_usage: true               # [memUsage]/[memSplit]/[memBlocks]

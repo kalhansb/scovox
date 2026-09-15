@@ -46,6 +46,7 @@
 #include "scovox/binary_serializer.hpp"
 #include "scovox/lz4_codec.hpp"
 #include "scovox/marching_cubes.hpp"
+#include "scovox/scvxnn_dump.hpp"
 #include "scovox/mesh_labelling.hpp"
 #include "scovox_msgs/srv/extract_mesh.hpp"
 
@@ -359,6 +360,40 @@ public:
     // here makes shutdown deterministic; the worker is read-only and bounded
     // by one grid walk, so the join is short.
     if (mem_log_thread_.joinable()) mem_log_thread_.join();
+    writeMapDump();
+  }
+
+  // SCVXNN01 dump of the finished map, once, at shutdown. Written here rather
+  // than on a timer because the comparison it exists for is against a replay
+  // driver's END-of-run dump; a mid-run snapshot would not be that map. The
+  // memlog worker is already joined above, so nothing else is walking the
+  // grids and no lock is needed.
+  void writeMapDump() {
+    if (map_dump_path_.empty() || !split_map_) return;
+    auto& beta = split_map_->semsplit().betaGrid();
+    auto& dir  = split_map_->semsplit().dirGrid();
+    auto& fdir = split_map_->semsplit().fallbackDirGrid();
+    const float gate = static_cast<float>(
+        map_dump_gate_ < 0.0 ? static_cast<double>(split_map_->semsplit().params().dirichlet_min_p_occ)
+                             : map_dump_gate_);
+    std::vector<scovox_scenenn::DumpRec> recs;
+    const auto n = scovox_scenenn::collectDump(
+        beta, dir, &fdir, gate, map_dump_below_as_unknown_,
+        [&](const scovox_scenenn::DumpRec& r, const scovox::DirVoxel*) {
+          recs.push_back(r);
+        });
+    if (!scovox_scenenn::writeDump(map_dump_path_, split_map_->resolution(), recs)) {
+      RCLCPP_ERROR(get_logger(), "[map_dump] cannot write %s (open failed or short write)",
+                   map_dump_path_.c_str());
+      return;
+    }
+    RCLCPP_INFO(get_logger(),
+                "[map_dump] wrote %zu voxels to %s (gate=%.3f below_as_unknown=%d, "
+                "%lld unknown-but-labelled, %lld fallback-labelled, %lld dropped as free, "
+                "%lld below-gate as unknown)",
+                recs.size(), map_dump_path_.c_str(), gate, (int)map_dump_below_as_unknown_,
+                n.unknown_labelled, n.fallback_labelled, n.free_labels_dropped,
+                n.below_gate_as_unknown);
   }
 private:
   scovox::Params declareMapParams() {
@@ -750,6 +785,18 @@ private:
     //   set against SLIM-VDB's voxels.bin after a Tr_inv frame conversion
     //   (see tools/tsdf_parity_test.py). Empty default → no-op.
     tsdf_dump_path_ = dp("tsdf_dump_path", std::string{});
+    // Map dump (SCVXNN01), written ONCE at shutdown. The replay drivers write
+    // this format and the scorers read it, so a node run can be scored like any
+    // other cell and checked against a replay dump voxel for voxel. The
+    // collector lives in scovox/scvxnn_dump.hpp precisely so the node and the
+    // drivers are not two writers of one format. Empty default -> no-op.
+    //
+    // `map_dump_gate` is the dump's LABEL gate, which is not the deposit gate:
+    // the drivers separate them so one can move while the other is pinned, and
+    // the sentinel -1 keeps the driver default of reusing dirichlet_min_p_occ.
+    map_dump_path_ = dp("map_dump_path", std::string{});
+    map_dump_gate_ = dp("map_dump_gate", -1.0);
+    map_dump_below_as_unknown_ = dp("map_dump_below_as_unknown", true);
     pointcloud_mode_ = !input_pc_topic_.empty();
     // ── Intra-scan deskew (gyro-based rotation correction) ──────────────────
     // deskew_mode: "auto" (deskew iff the cloud has a per-point time field),
@@ -827,6 +874,15 @@ private:
     // startup-only behaviour. The runtime threshold should sit above real
     // frame-to-frame motion (walking ~0.1-0.15 m at 10 Hz) so normal travel
     // never trips it.
+    // Bypass BOTH stages. A dataset replay is driven by ground-truth poses:
+    // there is no localizer to diverge, no warm-up transient to guard against,
+    // and the startup stage costs the first frame unconditionally because it
+    // has no previous pose to measure a jump against -- one frame is enough to
+    // make the node's map differ from the replay driver's. A vehicle dataset
+    // loses every frame instead: KITTI at 10 Hz moves further per scan than
+    // startup_tf_jump_threshold, so the stability clock never accumulates.
+    // Default true keeps every robot deployment exactly as it was.
+    tf_gate_enabled_ = dp("tf_gate_enabled", true);
     runtime_tf_gate_ = dp("runtime_tf_gate", true);
     runtime_tf_jump_thresh_ = dp("runtime_tf_jump_threshold", 1.0);
     // Localization reject gate. A frame-to-frame jump gate cannot see a pose
@@ -969,8 +1025,20 @@ private:
       // selects a reliable sub so a reliable publisher retransmits lost
       // fragments — full frame delivery for offline eval.
       const bool reliable_input = this->declare_parameter<bool>("input_reliable_qos", false);
-      auto qos = reliable_input ? rclcpp::QoS(rclcpp::KeepLast(10)).reliable()
-                                : rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
+      // Queue depth: 10 on a robot, where the newest scan is the only one that
+      // matters. On a dataset replay the opposite holds -- every scan must be
+      // integrated or the map is not the one the offline tables describe -- and
+      // 10 is far too shallow to hold even a brief backlog, so dataset_mode
+      // shares the RGB-D path's dataset_queue_depth. Reliable QoS does NOT make
+      // this lossless on its own: a KEEP_LAST reader acks samples as it
+      // substitutes them out, so the writer never blocks and the drop is silent.
+      int pc_depth = 10;
+      if (dataset_mode_)
+        pc_depth = std::max(1, static_cast<int>(
+            this->declare_parameter("dataset_queue_depth", 1000)));
+      auto qos = reliable_input
+          ? rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(pc_depth))).reliable()
+          : rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(pc_depth))).best_effort();
       input_pc_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(input_pc_topic_, qos,
         std::bind(&SCovoxNode::onPointCloud, this, std::placeholders::_1));
       RCLCPP_INFO(get_logger(), "PointCloud2 input mode: topic=%s", input_pc_topic_.c_str());
@@ -1001,7 +1069,9 @@ private:
         // every current eval. Shrinking below ~200 silently drops frames on
         // runs that pass today — lower this only with replay-side pacing.
         const int ds_depth = static_cast<int>(
-            this->declare_parameter("dataset_queue_depth", 1000));
+            this->has_parameter("dataset_queue_depth")
+                ? this->get_parameter("dataset_queue_depth").as_int()
+                : this->declare_parameter("dataset_queue_depth", 1000));
         auto qos = rclcpp::QoS(rclcpp::KeepLast(
             static_cast<size_t>(std::max(1, ds_depth)))).reliable();
         ds_depth_sub_ = create_subscription<sensor_msgs::msg::Image>(depth_topic_, qos,
@@ -1132,6 +1202,7 @@ private:
   // measured against the immediately preceding pose (the legacy code froze
   // tf_prev_pos_ once stable).
   bool tfGatePass(const Eigen::Vector3f& O) {
+    if (!tf_gate_enabled_) return true;
     const rclcpp::Time now = this->now();
     // Jump vs the previous pose; record O now so all paths update the reference
     // exactly once.
@@ -3207,6 +3278,7 @@ private:
   std::string topk_probs_dir_;
   int topk_topk_max_{5};
   std::unique_ptr<scovox::TopkProvider> topk_;
+  bool tf_gate_enabled_{true};
   bool trace_nr_{false}, pub_pc_, pub_plan_{false}, pub_tsdf_{true};
   // ── Fine TSDF band (fine_ratio_log2 = 0 → everything below is inert) ──
   int    fine_ratio_log2_{0}, fine_trunc_voxels_{3};
@@ -3321,6 +3393,9 @@ private:
   int   num_classes_{14};
   float alpha_0_{scovox::kDefaultDirichletPrior};
   std::string tsdf_dump_path_{};  // audit hook — see [tsdf_dump] memlog branch
+  std::string map_dump_path_{};   // SCVXNN01 dump at shutdown; empty = off
+  double      map_dump_gate_{-1.0};
+  bool        map_dump_below_as_unknown_{true};
   std::vector<std_msgs::msg::ColorRGBA> sem_col_;
   // Class ids whose argmax routes a hit to the transient decaying grid rather
   // than the persistent map. Parsed from the `dynamic_classes` launch param;
