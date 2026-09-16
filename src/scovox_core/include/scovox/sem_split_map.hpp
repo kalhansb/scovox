@@ -41,6 +41,7 @@
 
 #include "scovox/beta_voxel.hpp"
 #include "scovox/ray_iterator.hpp"
+#include "scovox/band_stage.hpp"
 #include "scovox/carve_stage.hpp"
 #include "scovox/dir_voxel.hpp"
 #include "scovox/sem_obs.hpp"
@@ -818,19 +819,14 @@ class SemSplitMap {
   std::vector<SemObsEntry>            hit_obs_;
   SemObs                              staged_obs_;         ///< flush-time view
   std::vector<CoordT>                 hit_order_;          ///< flush-time sort
-  /// One scan's staged band look for a voxel (see `batch_band`).
-  struct BandStage {
-    float    kappa0       = 0.f;
-    float    min_p_occ    = 0.f;
-    float    q            = -1.f;         ///< argmax probability of the look that holds the voxel
-    uint32_t probs_off    = kNoHitProbs;  ///< start of its entries in band_obs_
-    uint32_t probs_len    = 0;
-    uint32_t probs_cap    = 0;
-    int      probs_argmax = -1;
-  };
-  std::unordered_map<CoordT, BandStage> band_hits_;
+  /// One scan's staged band looks (see `batch_band`), keyed by leaf block in a
+  /// dense slot pool rather than per voxel in a hash map. `BandStage::Rec` is
+  /// the retired `SemSplitMap::BandStage` field for field, and the flush order
+  /// is the retired per-voxel sort's exactly — block-ascending, then (x, y, z)
+  /// within a block — so the Dir grid is first-touched in the same sequence
+  /// and the serialized bytes are unchanged. See band_stage.hpp.
+  BandStage                             band_stage_;
   std::vector<SemObsEntry>              band_obs_;
-  std::vector<CoordT>                   band_order_;
   std::size_t flushStagedBand();
   bool                       carve_frame_open_ = false;
   std::uint64_t carve_voxels_ = 0;

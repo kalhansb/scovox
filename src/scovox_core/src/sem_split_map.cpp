@@ -313,6 +313,9 @@ SemSplitMap::SemSplitMap(const Params& p)
     // Beta-grid block geometry: the flush walk must reproduce the accessor's
     // own leaf order, so the stage is keyed by the SAME (sanitised) leaf_bits.
     , carve_stage_(params_.leaf_bits)
+    // Same block geometry for the band stage: its flush must reproduce the
+    // retired per-voxel sort, which keyed on `leaf_bits` (not dir_leaf_bits).
+    , band_stage_(params_.leaf_bits)
     // Occupancy prior, cached out of the sanitised Params. Its default is the
     // shipped symmetric Beta(0.5,0.5) → p_occ=0.5, decoupled from the semantic
     // (num_classes, α₀).
@@ -478,7 +481,7 @@ void SemSplitMap::beginCarveFrame() {
   carve_stage_.beginFrame();  // retains all capacity → no per-scan realloc churn
   carve_hits_.clear();
   hit_obs_.clear();           // capacity retained; see SemSplitParams::batch_hits
-  band_hits_.clear();
+  band_stage_.beginFrame();  // retains all capacity, like carve_stage_
   band_obs_.clear();
   carve_frame_open_ = true;
 }
@@ -884,7 +887,7 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
   // Staged band (SemSplitParams::batch_band): the scan's most confident look
   // holds the voxel until flushStagedBand writes it, one deposit per voxel.
   if (carve_frame_open_ && params_.batch_band) {
-    BandStage& st = band_hits_[c];
+    BandStage::Rec& st = band_stage_.slotFor(c);
     const float q = (obs.argmax >= 0 && obs.argmax < static_cast<int>(obs.e.size()))
                   ? obs.e[static_cast<std::size_t>(obs.argmax)].p : 0.f;
     if (st.q >= 0.f && q <= st.q) return;
@@ -939,36 +942,27 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
 // staged hits use, so the Dir grid is first-touched in one reproducible
 // sequence whichever path deposited.
 std::size_t SemSplitMap::flushStagedBand() {
-  if (band_hits_.empty()) return 0;
-  band_order_.clear();
-  for (const auto& kv : band_hits_) band_order_.push_back(kv.first);
-  const int lb = static_cast<int>(params_.leaf_bits);
-  std::sort(band_order_.begin(), band_order_.end(),
-            [lb](const CoordT& a, const CoordT& b) {
-              const int32_t abx = a.x >> lb, bbx = b.x >> lb;
-              if (abx != bbx) return abx < bbx;
-              const int32_t aby = a.y >> lb, bby = b.y >> lb;
-              if (aby != bby) return aby < bby;
-              const int32_t abz = a.z >> lb, bbz = b.z >> lb;
-              if (abz != bbz) return abz < bbz;
-              if (a.x != b.x) return a.x < b.x;
-              if (a.y != b.y) return a.y < b.y;
-              return a.z < b.z;
-            });
+  if (band_stage_.empty()) return 0;
   std::size_t n = 0;
-  for (const CoordT& c : band_order_) {
-    const BandStage& st = band_hits_.find(c)->second;
+  // Block-ordered by construction: `BandStage` stages into dense per-leaf
+  // slots, so the retired `std::sort` of EVERY staged voxel is gone and only
+  // the block keys are ordered. The visit sequence is the retired sort's
+  // exactly — block-ascending, then (x, y, z) within a block — so the Dir
+  // grid's first-touch order, and therefore the serialized bytes, are
+  // unchanged (see band_stage.hpp).
+  band_stage_.forEachStagedBlockOrdered([&](const CoordT& c,
+                                            const BandStage::Rec& st) {
     float class_share;
     if (params_.semantic_band_require_occ) {
       const BetaVoxel* b = beta_acc_.value(c, /*create_if_missing=*/false);
-      if (!b) continue;
+      if (!b) return;
       const float p_occ = b->p_occ();
-      if (p_occ < st.min_p_occ) continue;
+      if (p_occ < st.min_p_occ) return;
       class_share = st.kappa0 * p_occ;
     } else {
       class_share = st.kappa0;
     }
-    if (class_share <= 0.f) continue;
+    if (class_share <= 0.f) return;
     staged_obs_.clear();
     staged_obs_.present = true;
     if (st.probs_len != 0u) {
@@ -983,7 +977,7 @@ std::size_t SemSplitMap::flushStagedBand() {
     applyDirSaturation(d);
     touched_dir_.push_back(c);
     ++n;
-  }
+  });
   return n;
 }
 
