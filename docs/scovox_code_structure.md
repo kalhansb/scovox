@@ -319,6 +319,81 @@ Only the fourth is a *vote* in the literal sense — a voxel reading its
 neighbours' state; the other three are one measurement written to several
 voxels, and no voxel ever reads another.
 
+#### The evidence model — what one deposit is allowed to count
+
+`dirichletUpdate` (`sem_split_map.cpp:60`) has exactly one deposit,
+`d->s_total += class_share`, and its own comment states the intent: under
+`--hit-share flat` the quantity `s_total − C·alpha_0` is an **exact integer
+count of looks**. That is the premise the count map is built on and the reason
+its saturation cap can be switched off — a counter bounded by construction
+needs no cap. Everything after that line only attributes the mass to slots.
+
+A Dirichlet update `alpha += 1` is the conjugate update for **one
+conditionally-independent draw**, so the question each deposit has to answer is
+what an independent draw of this quantity actually is. The answer is **not the
+same for the two grids**, because the noise enters in two different places.
+
+| grid | where the error comes from | independent unit | so a deposit counts |
+|---|---|---|---|
+| Beta (occupancy) | the **sensor** — each pixel is its own depth return with its own noise, and two rays on one voxel can disagree for independent reasons | the **ray** | once per ray |
+| Dir (semantics) | the **network** — Mask2Former predicts *(class, mask)* pairs, so every pixel inside a mask reads out one query embedding and two rays on one voxel *cannot* disagree | the **frame** | once per scan |
+
+The semantic case is architectural, not statistical. When the segmenter is
+wrong it is wrong for a whole region at once, in one direction, with no
+independent per-pixel component for averaging to cancel. `N` rays through a
+voxel whose pixels sit in one predicted mask are one decision copied `N` times.
+Counting `N` models draws that do not exist; the posterior concentrates by a
+factor the evidence never supplied.
+
+So the correct policy is asymmetric: **sum rays for occupancy, one look per
+scan for semantics.**
+
+**How much the two units differ is a property of the sensor, not of the code.**
+On RGB-D at `fx` 544.47 / stride 2 / res 0.05, a fronto-parallel surface puts
+~46 rays through a voxel column at 2 m and ~185 at 1 m, scaling as 1/d^2, so
+per-ray and per-scan differ by one to two orders of magnitude and vary with
+standoff distance. On LiDAR the beams diverge and roughly one passes through a
+given voxel per scan beyond a few metres, so the two units **coincide
+numerically** and batching is redundant there. That is an empirical property of
+the scan pattern which a denser sensor, accumulated or stacked scans, or a
+longer `semantic_band_length` would each silently break. **The batching is
+therefore kept ON for both sensors**, so the bound is enforced by the code
+rather than inherited from the beam geometry.
+
+Note also that the 1/d^2 growth is *correct* on the Beta grid and spurious on
+the Dir grid: standing closer genuinely buys more independent depth samples of
+a surface, and buys no additional opinion about what the surface is.
+
+**What the flags can and cannot express.** Both batching paths combine with a
+per-voxel **MAX** (`CarveStage::add`, `carve_stage.hpp:81`; the hit's
+`w > st.w_occ_share`, `sem_split_map.cpp:619`), so batching discards ray
+multiplicity rather than averaging it away.
+
+| flag | channel | against the model |
+|---|---|---|
+| `batch_band` | class only | `1` is **correct**; the only flag the model decides outright |
+| `batch_hits` | class **and** occupancy, welded in one `HitStage` | correct on the class half, wrong on the occupancy half, and the two cannot be set apart |
+| `batch_free_carve` | occupancy only | batches a channel whose unit is the ray |
+
+`batch_hits` and `batch_free_carve` are kept on regardless. The occupancy error
+they carry is second-order — depth evidence saturates, so the truth is well
+short of linear in `N`, and a tuned `w_occ` absorbs most of the remainder
+(measured ambiguous on all six metrics, n=8). What a global weight *cannot*
+restore is the per-voxel variation: after MAX-batching a voxel seen by 185 rays
+and one seen by 3 carry the same deposit. **Splitting `batch_hits` into a class
+half (batched) and an occupancy half (summed) is the outstanding change that
+would make the model exact rather than approximate.**
+
+**mIoU cannot adjudicate any of this.** A band voxel with a Dir entry and no
+Beta evidence dumps as `state=1` with `p_occ` at the prior, and the scorer's
+occupied set is `p_occ >= 0.5 && (state == 0 || state == 2)`
+(`replay_scenenn.cpp`), which excludes it. The over-counted mass sits precisely
+in the voxels the metric never scores, on **both** sensors — the batched and
+un-batched maps scored ambiguous 16/16. An unchanged mIoU is a property of the
+scorer, and is never evidence that the batching is unnecessary. The exposure is
+the uncertainty readout and the wire's look counts. See
+`EXPERIMENT_FUSION.md` §14 and `RESULTS_UNC.md`.
+
 ### 1.4 Storage
 
 | grid | voxel | bytes | fields |
