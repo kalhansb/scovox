@@ -313,6 +313,10 @@ SemSplitMap::SemSplitMap(const Params& p)
     // Beta-grid block geometry: the flush walk must reproduce the accessor's
     // own leaf order, so the stage is keyed by the SAME (sanitised) leaf_bits.
     , carve_stage_(params_.leaf_bits)
+    // Same block geometry for the staged hits: flushStagedHits must reproduce
+    // the retired per-voxel sort, and the carve's occupied-wins probe is
+    // block-coherent only if it blocks the way the carve walk does.
+    , carve_hits_(params_.leaf_bits)
     // Same block geometry for the band stage: its flush must reproduce the
     // retired per-voxel sort, which keyed on `leaf_bits` (not dir_leaf_bits).
     , band_stage_(params_.leaf_bits)
@@ -479,7 +483,7 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c,
 
 void SemSplitMap::beginCarveFrame() {
   carve_stage_.beginFrame();  // retains all capacity → no per-scan realloc churn
-  carve_hits_.clear();
+  carve_hits_.beginFrame();  // retains all capacity, like carve_stage_
   hit_obs_.clear();           // capacity retained; see SemSplitParams::batch_hits
   band_stage_.beginFrame();  // retains all capacity, like carve_stage_
   band_obs_.clear();
@@ -505,7 +509,7 @@ std::size_t SemSplitMap::flushCarveFrame() {
 
   std::size_t n = 0;
   carve_stage_.forEachStagedBlockOrdered([&](const CoordT& c, float inc) {
-    if (carve_hits_.count(c)) return;  // occupied-wins
+    if (carve_hits_.contains(c)) return;  // occupied-wins
     BetaVoxel* v = beta_acc_.value(c, /*create_if_missing=*/false);
     if (!v) {
       BetaVoxel nv = defaultBetaVoxel(beta_occ_prior_, beta_free_prior_);
@@ -525,33 +529,22 @@ std::size_t SemSplitMap::flushCarveFrame() {
 }
 
 std::size_t SemSplitMap::flushStagedHits() {
-  hit_order_.clear();
-  for (const auto& kv : carve_hits_)
-    if (kv.second.staged) hit_order_.push_back(kv.first);
-  if (hit_order_.empty()) return 0;
-
-  // Leaf-block order, blocks ascending then voxels x-major within a block —
-  // the sequence CarveStage::forEachStagedBlockOrdered walks. Hits and carves
-  // then first-touch Beta root-map blocks in one consistent order, and the
-  // flush is reproducible run to run, which an unordered_map walk is not.
-  const int lb = static_cast<int>(params_.leaf_bits);
-  std::sort(hit_order_.begin(), hit_order_.end(),
-            [lb](const CoordT& a, const CoordT& b) {
-              const int32_t abx = a.x >> lb, bbx = b.x >> lb;
-              if (abx != bbx) return abx < bbx;
-              const int32_t aby = a.y >> lb, bby = b.y >> lb;
-              if (aby != bby) return aby < bby;
-              const int32_t abz = a.z >> lb, bbz = b.z >> lb;
-              if (abz != bbz) return abz < bbz;
-              if (a.x != b.x) return a.x < b.x;
-              if (a.y != b.y) return a.y < b.y;
-              return a.z < b.z;
-            });
-
-  for (const CoordT& c : hit_order_) {
-    const auto it = carve_hits_.find(c);
-    if (it == carve_hits_.end()) continue;
-    const HitStage& st = it->second;
+  if (carve_hits_.empty()) return 0;
+  std::size_t n = 0;
+  // Block-ordered by construction: `carve_hits_` stages into dense per-leaf
+  // slots, so the retired `std::sort` of EVERY staged voxel is gone and only
+  // the block keys are ordered. The visit sequence is that sort's exactly --
+  // blocks ascending, then (x, y, z) within a block -- which is also the
+  // sequence CarveStage::forEachStagedBlockOrdered walks, so hits and carves
+  // first-touch Beta root-map blocks in one consistent order and the flush is
+  // reproducible run to run, which an unordered_map walk was not.
+  carve_hits_.forEachStagedBlockOrdered([&](const CoordT& c, const HitStage& st) {
+    // An entry exists for EVERY persistent hit, staged or not: a hit that took
+    // the immediate write still registers one so `contains` can answer
+    // occupied-wins for it. Only the staged ones still owe a deposit.
+    // Filtering here rather than before the sort visits the same voxels in the
+    // same order -- a subsequence of an ordered walk is ordered.
+    if (!st.staged) return;
     // The staged entries were normalised by the ray that staged them, and its
     // argmax came along, so the replay restores the observation whole.
     staged_obs_.clear();
@@ -561,10 +554,13 @@ std::size_t SemSplitMap::flushStagedHits() {
                            hit_obs_.begin() + st.probs_off + st.probs_len);
       staged_obs_.argmax = st.probs_argmax;
     }
+    // Safe to hold `st` across this call: commitHit writes grids only, it
+    // never re-enters the stage, so the record pool cannot reallocate here.
     commitHit(c, staged_obs_, st.w_occ_share, st.kappa0, st.min_p_occ,
               beta_acc_, dir_acc_, &touched_beta_, &touched_dir_);
-  }
-  return hit_order_.size();
+    ++n;
+  });
+  return n;
 }
 
 void SemSplitMap::applyHitUpdate(const CoordT&             c,
@@ -605,7 +601,7 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
   const bool kernel_ray = prof && prof->kernel_radius > 0.f;
 
   if (carve_frame_open_ && touched_beta) {
-    HitStage& st = carve_hits_[c];
+    HitStage& st = carve_hits_.slotFor(c);
 
     // Batched surface hit (SemSplitParams::batch_hits): keep the scan's
     // strongest ray for this voxel and defer both streams to flushCarveFrame,

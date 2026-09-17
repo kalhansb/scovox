@@ -35,13 +35,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "scovox/beta_voxel.hpp"
 #include "scovox/ray_iterator.hpp"
-#include "scovox/band_stage.hpp"
+#include "scovox/block_record_stage.hpp"
 #include "scovox/carve_stage.hpp"
 #include "scovox/dir_voxel.hpp"
 #include "scovox/sem_obs.hpp"
@@ -784,9 +783,9 @@ class SemSplitMap {
   // one write); flush then walks blocks in ascending block-key order — the
   // same block order the retired per-voxel std::sort produced — without ever
   // sorting individual voxels (see carve_stage.hpp for the identity argument).
-  // `carve_hits_` holds voxels observed as a surface this scan so flush can
-  // honour occupied-wins. Both retain capacity across beginCarveFrame, so
-  // steady-state framing allocates nothing.
+  // `carve_hits_` stages the scan's surface observations the same way, so flush
+  // can honour occupied-wins and write each hit once. All three retain capacity
+  // across beginCarveFrame, so steady-state framing allocates nothing.
   /// One scan's staged surface observation for a voxel (see `batch_hits`).
   /// The per-source gains are carried per entry because the winning ray may
   /// come from a different sensor than the previous one.
@@ -809,7 +808,13 @@ class SemSplitMap {
   SemObs                              sem_obs_;
 
   CarveStage                          carve_stage_;
-  std::unordered_map<CoordT, HitStage> carve_hits_;
+  /// The scan's staged surface hits, keyed by leaf block in a dense slot pool
+  /// rather than per voxel in a hash map — the same structure, block geometry
+  /// and flush order as `band_stage_` below. It answers the two questions the
+  /// carve frame asks of the hits: `contains` is the occupied-wins membership
+  /// test, run once per staged carve voxel, and the block-ordered walk drives
+  /// flushStagedHits. See block_record_stage.hpp.
+  BlockRecordStage<HitStage>          carve_hits_;
   /// Flat pool of staged observations, one contiguous `probs_len` block per
   /// staged voxel. A voxel's block is overwritten in place when a stronger ray
   /// supersedes it, so the pool is bounded by the staged voxel count, not by
@@ -818,13 +823,12 @@ class SemSplitMap {
   /// than the taxonomy's full width.
   std::vector<SemObsEntry>            hit_obs_;
   SemObs                              staged_obs_;         ///< flush-time view
-  std::vector<CoordT>                 hit_order_;          ///< flush-time sort
-  /// One scan's staged band looks (see `batch_band`), keyed by leaf block in a
-  /// dense slot pool rather than per voxel in a hash map. `BandStage::Rec` is
-  /// the retired `SemSplitMap::BandStage` field for field, and the flush order
-  /// is the retired per-voxel sort's exactly — block-ascending, then (x, y, z)
-  /// within a block — so the Dir grid is first-touched in the same sequence
-  /// and the serialized bytes are unchanged. See band_stage.hpp.
+  /// One scan's staged band looks (see `batch_band`), staged the same way.
+  /// `BandStage::Rec` is the retired `SemSplitMap::BandStage` field for field,
+  /// and the flush order is the retired per-voxel sort's exactly —
+  /// block-ascending, then (x, y, z) within a block — so the Dir grid is
+  /// first-touched in the same sequence and the serialized bytes are
+  /// unchanged. See block_record_stage.hpp.
   BandStage                             band_stage_;
   std::vector<SemObsEntry>              band_obs_;
   std::size_t flushStagedBand();

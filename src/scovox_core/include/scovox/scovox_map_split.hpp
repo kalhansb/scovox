@@ -540,8 +540,9 @@ class ScovoxMapSplit {
     // per-voxel std::function indirect call (weight_fn(sdf) ≡ 1.0f here).
     constexpr float tsdf_weight = 1.0f;
     bool carve_blocked = false;
-    // Set by the behind-surface tail trim; ends the DDA loop, never the
-    // explicit visit_one(k_far)/visit_one(k_hit) that follow it.
+    // Set by the behind-surface tail trim; ends the DDA loop, and ALSO skips
+    // the explicit visit_one(k_far) that follows it -- provably a no-op once
+    // latched, see the skip site. visit_one(k_hit) still runs unguarded.
     bool stop_walk = false;
     // Latched once the walk is provably clear of the origin guard ring
     // for the rest of THIS ray; see the latch site below.
@@ -741,7 +742,17 @@ class ScovoxMapSplit {
                          visit_one(c);
                          return !stop_walk;
                        });
-      visit_one(k_far);
+      // `stop_walk` means the tail trim already fired on a voxel behind the
+      // surface. k_far lies further back along the same ray, so its exact body
+      // would recompute dist/proj only to take the same `t_back >= useful_back`
+      // return -- it can deposit nothing, so skipping it cannot change the map.
+      // Safe against k_far == k_hit too: the trim latches only on sdf < 0, so
+      // if k_far were the hit voxel every DDA voxel would lie in FRONT of the
+      // surface and nothing could have latched -- stop_walk would be false and
+      // this guard would not fire. The one observable difference is the
+      // `exact_body_voxels_` counter, which no longer counts these dead visits
+      // (~1 per ray).
+      if (!stop_walk) visit_one(k_far);
       if (!k_hit_visited && k_hit != k_far && k_hit != k_start) {
         visit_one(k_hit);
       }

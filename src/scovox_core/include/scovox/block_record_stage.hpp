@@ -1,20 +1,22 @@
 #pragma once
 
-/// @file band_stage.hpp
-/// @brief Per-scan batched semantic-band accumulator keyed by leaf block —
-/// the sort-free replacement for `SemSplitMap`'s
-/// `unordered_map<CoordT, BandStage>` staging, and the band's counterpart to
-/// `CarveStage`.
+/// @file block_record_stage.hpp
+/// @brief Per-scan record accumulator keyed by leaf block — the sort-free
+/// replacement for `SemSplitMap`'s `unordered_map<CoordT, …>` staging, and the
+/// record-carrying counterpart to `CarveStage`.
 ///
-/// The batched band path (`SemSplitParams::batch_band`) stages the scan's most
-/// confident look per voxel during the walk and writes each voxel once at
-/// flush, leaf-block-ordered. The retired implementation hashed every
-/// individual voxel coordinate on every band visit and then recovered the
-/// flush order with a per-scan `std::sort` of EVERY staged voxel — the same
-/// pattern `CarveStage` was introduced to remove from the carve, left behind on
-/// the band because the band stages a record rather than a float.
+/// Two of `SemSplitMap`'s three batched paths stage a RECORD per voxel rather
+/// than `CarveStage`'s single float: the semantic band
+/// (`SemSplitParams::batch_band`) keeps the scan's most confident look, and the
+/// surface hits (`SemSplitParams::batch_hits`) keep its strongest ray. Both
+/// retired implementations hashed every individual voxel coordinate on every
+/// visit and then recovered the flush order with a per-scan `std::sort` of
+/// EVERY staged voxel — the same pattern `CarveStage` was introduced to remove
+/// from the carve, left behind on the two paths that stage a record rather
+/// than a float. The record is the only thing that differed between them, so
+/// the machinery is parameterised on it and the pattern is retired once.
 ///
-/// `BandStage` stages by construction instead, exactly as `CarveStage` does:
+/// `BlockRecordStage` stages by construction, exactly as `CarveStage` does:
 ///   - voxels are keyed by leaf block (`coord >> leaf_bits`) into a small
 ///     open-addressed index (Teschner-prime hash, linear probe, load <= 1/2,
 ///     grown by doubling), with a last-leaf cache for ray-coherent adds;
@@ -23,33 +25,33 @@
 ///     bit test + an array index — no node allocation, no per-voxel rehash;
 ///   - the records themselves live in one flat, frame-local pool, so a cell
 ///     costs 4 B here rather than the record's full width. That keeps a slot
-///     the same size as `CarveStage`'s (≈2.1 KB at leaf_bits=3) instead of
-///     seven times it, which matters because a slot is paid in full even for a
-///     block a single ray grazed;
+///     the same size as `CarveStage`'s (≈2.1 KB at leaf_bits=3) whatever `RecT`
+///     weighs, which matters because a slot is paid in full even for a block a
+///     single ray grazed;
 ///   - flush sorts only the BLOCK keys (thousands, not hundreds of thousands)
 ///     and walks each block's bitmask.
 ///
 /// ORDER IDENTITY with the retired staging — stronger than `CarveStage`'s,
-/// which had to give up within-block order. The retired band sort was
+/// which had to give up within-block order. Both retired sorts were
 /// `(x>>lb, y>>lb, z>>lb)` ascending and then `(x, y, z)` ascending within a
 /// block; walking a slot's bitmask by ascending cell index yields x-major, then
 /// y, then z over the in-block low bits, and within one block the high bits are
 /// equal, so ascending low-bit order IS ascending global order. The flush
 /// therefore visits the identical voxel sequence, not merely the identical
 /// block sequence: the staged set, the per-voxel record and the visit order all
-/// match, so the Dir grid is first-touched in the same order and the serialized
+/// match, so the grids are first-touched in the same order and the serialized
 /// bytes are unchanged.
 ///
-/// Per-voxel record semantics are unchanged from the retired map: the first
-/// look at a voxel claims it, and a later look supersedes it only on a strictly
-/// greater `q` (`slotFor` returns the existing record and the caller applies
-/// its own comparison), so ties keep the first look exactly as before.
+/// Per-voxel record semantics are unchanged from the retired maps: `slotFor`
+/// default-constructs on first touch and returns the existing record after
+/// that, applying no comparison of its own, so each caller keeps the
+/// supersede-vs-tie rule it already had.
 ///
 /// All capacity — index table, slot pool, record pool, sort scratch — is
 /// retained across `beginFrame()`, so steady-state per-scan framing allocates
 /// nothing. The trade is `CarveStage`'s: the pool holds its high-water
 /// footprint for the map's lifetime, bounded by the peak per-scan distinct
-/// band-block count, which is a subset of the carve's.
+/// block count for that path, which is a subset of the carve's.
 ///
 /// Not thread-safe (same contract as the SemSplitMap members it replaces).
 
@@ -63,31 +65,22 @@
 
 namespace scovox {
 
-class BandStage {
+template <typename RecT>
+class BlockRecordStage {
  public:
   using CoordT = Bonxai::CoordT;
+  using Rec    = RecT;
 
-  /// Sentinel for `Rec::probs_off` — no block claimed in the observation pool.
+  /// Sentinel for a record's `probs_off` — no block claimed in the caller's
+  /// observation pool.
   static constexpr uint32_t kNoProbs = 0xFFFFFFFFu;
-
-  /// One scan's staged band look for a voxel. Field-for-field the retired
-  /// `SemSplitMap::BandStage`, so the flush arithmetic is untouched.
-  struct Rec {
-    float    kappa0       = 0.f;
-    float    min_p_occ    = 0.f;
-    float    q            = -1.f;      ///< argmax probability of the holding look
-    uint32_t probs_off    = kNoProbs;  ///< start of its entries in the caller's pool
-    uint32_t probs_len    = 0;
-    uint32_t probs_cap    = 0;
-    int      probs_argmax = -1;
-  };
 
   /// @param leaf_bits block edge = 2^leaf_bits voxels — MUST equal the
   /// `leaf_bits` the retired per-voxel sort used, so the block order
-  /// reproduced at flush is the one the Dir grid was first-touched in.
+  /// reproduced at flush is the one the grids were first-touched in.
   /// Precondition: 1..10 (a slot's dense arrays are ≈4⅛·8^leaf_bits bytes —
   /// 4 B of record index per cell + 1 bit of mask, so ~2.1 KB at leaf_bits=3).
-  explicit BandStage(int leaf_bits)
+  explicit BlockRecordStage(int leaf_bits)
       : lb_(leaf_bits),
         cells_(1u << (3 * leaf_bits)),
         // Round UP: at leaf_bits=1 a block has 8 cells — one partial word.
@@ -102,7 +95,7 @@ class BandStage {
   ///
   /// The reference is valid until the NEXT `slotFor` call — the record pool can
   /// reallocate — which is the same contract the retired `operator[]` on an
-  /// `unordered_map` gave, and matches the caller's use (claim, write, return).
+  /// `unordered_map` gave, and matches the callers' use (claim, write, return).
   Rec& slotFor(const CoordT& c, bool* created = nullptr) {
     // Arithmetic >> on int32 is floor division by 2^lb (two's complement) —
     // the same block key the retired sort's comparator derived for `c`.
@@ -120,11 +113,7 @@ class BandStage {
       last_slot_ = slot;
       have_last_ = true;
     }
-    // In-block cell index, x-major. `c & low_mask_` is the floor remainder
-    // (non-negative) for any sign of `c`, pairing with the >> above.
-    const uint32_t idx = (uint32_t(c.x & low_mask_) << (2 * lb_)) |
-                         (uint32_t(c.y & low_mask_) << lb_) |
-                         uint32_t(c.z & low_mask_);
+    const uint32_t idx  = cellIndex(c);
     uint64_t&      word = mask_[std::size_t(slot) * words_ + (idx >> 6)];
     const uint64_t bit  = uint64_t(1) << (idx & 63u);
     uint32_t&      ri   = rec_idx_[std::size_t(slot) * cells_ + idx];
@@ -140,6 +129,33 @@ class BandStage {
     return recs_[ri];
   }
 
+  /// Is `c` staged this frame? Read-only — unlike `slotFor` it never claims a
+  /// block, so probing a voxel the scan never touched costs no slot.
+  ///
+  /// This is the membership test the hit path's occupied-wins rule needs, and
+  /// it is asked once per staged CARVE voxel — the hot query in the map. It
+  /// keeps its own last-block cache rather than sharing `slotFor`'s, because
+  /// what it must remember is usually an ABSENT block (most carved blocks hold
+  /// no hit at all) and a slot-id cache cannot represent absence. The carve
+  /// flush walks block-ordered, so consecutive queries land in the same block
+  /// and the cache answers nearly all of them without a probe.
+  [[nodiscard]] bool contains(const CoordT& c) noexcept {
+    const int32_t kx = c.x >> lb_;
+    const int32_t ky = c.y >> lb_;
+    const int32_t kz = c.z >> lb_;
+    if (!have_q_ || kx != q_kx_ || ky != q_ky_ || kz != q_kz_) {
+      q_slot_ = findSlot(kx, ky, kz);
+      q_kx_ = kx;
+      q_ky_ = ky;
+      q_kz_ = kz;
+      have_q_ = true;
+    }
+    if (q_slot_ == kNoSlot) return false;
+    const uint32_t idx = cellIndex(c);
+    return (mask_[std::size_t(q_slot_) * words_ + (idx >> 6)] >>
+            (idx & 63u)) & 1u;
+  }
+
   /// Drop all staged state; every buffer keeps its capacity. A reused slot's
   /// mask words are re-zeroed when the slot is claimed (newSlot), so nothing
   /// per-cell is touched here.
@@ -150,6 +166,7 @@ class BandStage {
     n_slots_ = 0;
     staged_ = 0;
     have_last_ = false;
+    have_q_ = false;
   }
 
   /// Visit every staged (voxel, record) pair in the retired sort's exact
@@ -207,6 +224,15 @@ class BandStage {
   };
 
   static constexpr std::size_t kInitialIndexCap = 1024;  // power of two
+  static constexpr uint32_t    kNoSlot = 0xFFFFFFFFu;
+
+  /// In-block cell index, x-major. `c & low_mask_` is the floor remainder
+  /// (non-negative) for any sign of `c`, pairing with the `>> lb_` above.
+  [[nodiscard]] uint32_t cellIndex(const CoordT& c) const noexcept {
+    return (uint32_t(c.x & low_mask_) << (2 * lb_)) |
+           (uint32_t(c.y & low_mask_) << lb_) |
+           uint32_t(c.z & low_mask_);
+  }
 
   [[nodiscard]] static uint64_t hashKey(int32_t kx, int32_t ky, int32_t kz) noexcept {
     // Teschner et al. spatial-hash primes; cast through uint32 so negative
@@ -214,6 +240,18 @@ class BandStage {
     return (uint64_t(uint32_t(kx)) * 73856093u) ^
            (uint64_t(uint32_t(ky)) * 19349663u) ^
            (uint64_t(uint32_t(kz)) * 83492791u);
+  }
+
+  /// Probe only — `kNoSlot` if this block was never staged. The table always
+  /// holds an empty entry (load <= 1/2), so the loop terminates.
+  [[nodiscard]] uint32_t findSlot(int32_t kx, int32_t ky, int32_t kz) const noexcept {
+    const std::size_t capmask = index_.size() - 1;
+    std::size_t       i = std::size_t(hashKey(kx, ky, kz)) & capmask;
+    for (;; i = (i + 1) & capmask) {
+      const IndexEntry& e = index_[i];
+      if (e.slot1 == 0) return kNoSlot;
+      if (e.kx == kx && e.ky == ky && e.kz == kz) return e.slot1 - 1;
+    }
   }
 
   uint32_t findOrCreateSlot(int32_t kx, int32_t ky, int32_t kz) {
@@ -247,6 +285,11 @@ class BandStage {
       std::fill(mask_.begin() + wbase, mask_.begin() + wbase + words_, uint64_t(0));
     }
     if (rec_idx_.size() < cbase + cells_) rec_idx_.resize(cbase + cells_);
+    // A cached ABSENT answer for this key is now wrong. Staging and querying
+    // are disjoint phases in today's callers, so this never actually fires —
+    // it is here so that interleaving them stays correct rather than subtly
+    // stale.
+    have_q_ = false;
     return slot;
   }
 
@@ -283,6 +326,27 @@ class BandStage {
   bool     have_last_ = false;
   int32_t  last_kx_ = 0, last_ky_ = 0, last_kz_ = 0;
   uint32_t last_slot_ = 0;
+
+  // `contains`'s own cache — holds `kNoSlot` for an absent block, which the
+  // slot-id cache above cannot.
+  bool     have_q_ = false;
+  int32_t  q_kx_ = 0, q_ky_ = 0, q_kz_ = 0;
+  uint32_t q_slot_ = kNoSlot;
 };
+
+/// One scan's staged band look for a voxel (see `SemSplitParams::batch_band`).
+/// Field-for-field the retired `SemSplitMap::BandStage`, so the flush
+/// arithmetic is untouched.
+struct BandRec {
+  float    kappa0       = 0.f;
+  float    min_p_occ    = 0.f;
+  float    q            = -1.f;      ///< argmax probability of the holding look
+  uint32_t probs_off    = 0xFFFFFFFFu;  ///< start of its entries in the caller's pool
+  uint32_t probs_len    = 0;
+  uint32_t probs_cap    = 0;
+  int      probs_argmax = -1;
+};
+
+using BandStage = BlockRecordStage<BandRec>;
 
 }  // namespace scovox

@@ -56,37 +56,35 @@ inline void ExactRayIterator(const Eigen::Vector3d& from,
   const Eigen::Vector3d delta = to - from;
 
   Bonxai::CoordT coord = coord_from;
-  int32_t        step[3];
-  double         t_max[3];
-  double         t_delta[3];
-  // parametrized along the unnormalized segment: t = 1 at the endpoint center
-  for (int i = 0; i < 3; i++) {
-    if (delta[i] != 0.0) {
-      const double inv_delta = 1.0 / delta[i];
-      step[i] = (delta[i] > 0.0) ? 1 : -1;
-      const double boundary = (coord[i] + (step[i] > 0 ? 1 : 0)) * resolution;
-      t_max[i] = (boundary - from[i]) * inv_delta;
-      t_delta[i] = resolution * std::abs(inv_delta);
-    } else {
-      step[i] = 0;
-      t_max[i] = std::numeric_limits<double>::infinity();
-      t_delta[i] = std::numeric_limits<double>::infinity();
-    }
+  int32_t  step_x, step_y, step_z;
+  double   tmax_x, tmax_y, tmax_z;
+  double   tdel_x, tdel_y, tdel_z;
+#define SCOVOX_DDA_AXIS_SETUP(I, C, S, M, D)                                  \
+  if (delta[I] != 0.0) {                                                      \
+    const double inv_delta = 1.0 / delta[I];                                  \
+    S = (delta[I] > 0.0) ? 1 : -1;                                            \
+    const double boundary = (C + (S > 0 ? 1 : 0)) * resolution;               \
+    M = (boundary - from[I]) * inv_delta;                                     \
+    D = resolution * std::abs(inv_delta);                                     \
+  } else {                                                                    \
+    S = 0;                                                                    \
+    M = std::numeric_limits<double>::infinity();                              \
+    D = std::numeric_limits<double>::infinity();                              \
   }
+  SCOVOX_DDA_AXIS_SETUP(0, coord.x, step_x, tmax_x, tdel_x)
+  SCOVOX_DDA_AXIS_SETUP(1, coord.y, step_y, tmax_y, tdel_y)
+  SCOVOX_DDA_AXIS_SETUP(2, coord.z, step_z, tmax_z, tdel_z)
+#undef SCOVOX_DDA_AXIS_SETUP
   while (true) {
-    const int axis = (t_max[0] < t_max[1]) ? ((t_max[0] < t_max[2]) ? 0 : 2)
-                                           : ((t_max[1] < t_max[2]) ? 1 : 2);
-    if (t_max[axis] > 1.0) {
-      return;  // no boundary crossing left before the end of the segment
+    if (tmax_x < tmax_y) {
+      if (tmax_x < tmax_z) { if (tmax_x > 1.0) return; coord.x += step_x; tmax_x += tdel_x; }
+      else                 { if (tmax_z > 1.0) return; coord.z += step_z; tmax_z += tdel_z; }
+    } else {
+      if (tmax_y < tmax_z) { if (tmax_y > 1.0) return; coord.y += step_y; tmax_y += tdel_y; }
+      else                 { if (tmax_z > 1.0) return; coord.z += step_z; tmax_z += tdel_z; }
     }
-    coord[axis] += step[axis];
-    t_max[axis] += t_delta[axis];
-    if (coord == coord_to) {
-      return;  // the endpoint voxel is excluded
-    }
-    if (!func(coord)) {
-      return;
-    }
+    if (coord == coord_to) return;
+    if (!func(coord)) return;
   }
 }
 

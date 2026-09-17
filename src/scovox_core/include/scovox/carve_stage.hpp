@@ -89,7 +89,25 @@ class CarveStage {
     if (have_last_ && kx == last_kx_ && ky == last_ky_ && kz == last_kz_) {
       slot = last_slot_;  // ray-coherent fast path: same leaf as previous add
     } else {
-      slot = findOrCreateSlot(kx, ky, kz);
+      int dir = -1;
+      if (have_last_) {
+        const int32_t ax = kx - last_kx_, ay = ky - last_ky_, az = kz - last_kz_;
+        if (ay == 0 && az == 0) { if (ax == 1) dir = 0; else if (ax == -1) dir = 1; }
+        else if (ax == 0 && az == 0) { if (ay == 1) dir = 2; else if (ay == -1) dir = 3; }
+        else if (ax == 0 && ay == 0) { if (az == 1) dir = 4; else if (az == -1) dir = 5; }
+      }
+      if (dir >= 0) {
+        const uint32_t prev = last_slot_;
+        const uint32_t link = nbr_[std::size_t(prev) * 6 + std::size_t(dir)];
+        if (link != kNoLink) { slot = link; }
+        else {
+          slot = findOrCreateSlot(kx, ky, kz);
+          nbr_[std::size_t(prev) * 6 + std::size_t(dir)] = slot;
+          nbr_[std::size_t(slot) * 6 + std::size_t(dir ^ 1)] = prev;
+        }
+      } else {
+        slot = findOrCreateSlot(kx, ky, kz);
+      }
       last_kx_ = kx;
       last_ky_ = ky;
       last_kz_ = kz;
@@ -103,7 +121,15 @@ class CarveStage {
                          uint32_t(c.z & low_mask_);
     uint64_t&      word = mask_[std::size_t(slot) * words_ + (idx >> 6)];
     const uint64_t bit  = uint64_t(1) << (idx & 63u);
-    float&         cell = w_[std::size_t(slot) * cells_ + idx];
+    if (uniform_) {
+      if (staged_ == 0) uw_ = w;
+      if (w == uw_) {                       // pool untouched: value is implied
+        if (!(word & bit)) { word |= bit; ++staged_; }
+        return;
+      }
+      materializeUniform();                 // first differing w this frame
+    }
+    float& cell = w_[std::size_t(slot) * cells_ + idx];
     if (word & bit) {
       if (w > cell) cell = w;
     } else {
@@ -122,6 +148,7 @@ class CarveStage {
     n_slots_ = 0;
     staged_ = 0;
     have_last_ = false;
+    uniform_ = true;
   }
 
   /// Visit every staged (voxel, weight) pair, blocks in ascending
@@ -157,7 +184,7 @@ class CarveStage {
           const CoordT   c{bx + int32_t(idx >> (2 * lb_)),
                            by + int32_t((idx >> lb_) & uint32_t(low_mask_)),
                            bz + int32_t(idx & uint32_t(low_mask_))};
-          fn(c, w_[cbase + idx]);
+          fn(c, uniform_ ? uw_ : w_[cbase + idx]);
         }
       }
     }
@@ -187,6 +214,27 @@ class CarveStage {
     return (uint64_t(uint32_t(kx)) * 73856093u) ^
            (uint64_t(uint32_t(ky)) * 19349663u) ^
            (uint64_t(uint32_t(kz)) * 83492791u);
+  }
+
+  /// Leave the uniform-weight fast path: write `uw_` into every cell already
+  /// staged this frame so the dense pool reads back exactly what the
+  /// always-dense form would hold, then continue in the dense mode.
+  void materializeUniform() {
+    const std::size_t need = std::size_t(n_slots_) * cells_;
+    if (w_.size() < need) w_.resize(need);
+    for (uint32_t s2 = 0; s2 < n_slots_; ++s2) {
+      const std::size_t wbase = std::size_t(s2) * words_;
+      const std::size_t cbase = std::size_t(s2) * cells_;
+      for (uint32_t wi = 0; wi < words_; ++wi) {
+        uint64_t bits = mask_[wbase + wi];
+        while (bits) {
+          const uint32_t b = uint32_t(__builtin_ctzll(bits));
+          bits &= bits - 1;
+          w_[cbase + ((wi << 6) | b)] = uw_;
+        }
+      }
+    }
+    uniform_ = false;
   }
 
   uint32_t findOrCreateSlot(int32_t kx, int32_t ky, int32_t kz) {
@@ -219,6 +267,9 @@ class CarveStage {
       std::fill(mask_.begin() + wbase, mask_.begin() + wbase + words_, uint64_t(0));
     }
     if (w_.size() < cbase + cells_) w_.resize(cbase + cells_);
+    const std::size_t nbase = std::size_t(slot) * 6u;
+    if (nbr_.size() < nbase + 6u) nbr_.resize(nbase + 6u, kNoLink);
+    else std::fill(nbr_.begin() + nbase, nbr_.begin() + nbase + 6, kNoLink);
     return slot;
   }
 
@@ -245,9 +296,13 @@ class CarveStage {
   std::vector<float>      w_;          ///< slot pool: cells_ weights per slot
   std::vector<uint64_t>   mask_;       ///< slot pool: words_ mask words per slot
   std::vector<uint32_t>   order_;      ///< flush sort scratch (slot ids)
+  static constexpr uint32_t kNoLink = 0xFFFFFFFFu;
+  std::vector<uint32_t>   nbr_;        ///< 6 face-neighbour slot links per slot
 
   uint32_t    n_slots_ = 0;
   std::size_t staged_ = 0;
+  bool        uniform_ = true;   ///< no differing w seen this frame
+  float       uw_ = 0.f;         ///< the one weight, while uniform_
 
   // Last-leaf cache: consecutive adds along a ray usually land in one block.
   // Survives index growth (slot ids are stable); invalidated per frame.
