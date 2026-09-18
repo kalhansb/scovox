@@ -28,6 +28,7 @@
 #include <optional>
 #include <scovox/uncertainty.hpp>
 #include <shared_mutex>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -201,8 +202,11 @@ public:
     // sub-counts) — the group is MutuallyExclusive, so the timer never races
     // itself. All other callbacks stay in the DEFAULT group, also mutually
     // exclusive, which preserves the serialization the plain-member comments
-    // below rely on (loc_* gate state, ds caches, imu_buf_, ...) exactly as
-    // the old SingleThreadedExecutor did.
+    // below rely on (loc_* gate state, ds caches, ...) exactly as the old
+    // SingleThreadedExecutor did. EXCEPTION: onImu was moved to its own group
+    // (it was starved to ~2 buffered samples behind the 88 ms scan callback,
+    // which silently disabled deskew); imu_buf_ is guarded by imu_mx_ instead
+    // of by group serialization.
     viz_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     sm_timer_ = rclcpp::create_timer(this, get_clock(), std::chrono::duration<double>(1.0/sm_rate),
       [this]{
@@ -812,7 +816,22 @@ private:
     imu_frame_ = dp("imu_frame", std::string(""));   // empty → take from first /imu msg
     deskew_window_sec_ = dp("deskew_window_sec", 0.2);
     imu_retention_sec_ = dp("imu_retention_sec", 1.0);
-    deskew_min_angle_deg_ = dp("deskew_min_angle_deg", 0.0);  // skip scans rotating < this
+    // IMU intake depth. SensorDataQoS() is KeepLast(5); at a 400 Hz gyro the
+    // ~35 samples that arrive during one integration are dropped down to 5
+    // before onImu (same mutually-exclusive group as onPointCloud) gets a
+    // slot, so buildDeskewTable never spans a scan and deskew silently
+    // falls back. Deep enough to hold imu_retention_sec of gyro.
+    imu_queue_depth_ = (int)dp("imu_queue_depth", 400.0);
+    deskew_min_angle_deg_ = dp("deskew_min_angle_deg", 0.0);
+    // Reference frame the deskewed scan is expressed in, as a fraction of the
+    // scan span: 0.0 = scan start (the header stamp), 0.5 = mid-scan, 1.0 = end.
+    // This MUST match the convention of the pose that transforms the scan. A
+    // localizer that registers the RAW (skewed) cloud produces a rigid fit of a
+    // cloud swept over the whole scan, so its pose tracks the sweep's mean
+    // attitude -- mid-scan, not scan start. Deskewing to 0.0 and then applying
+    // such a pose leaves a systematic half-scan rotation offset, which is worse
+    // than not deskewing at all. Set 0.5 when the pose source does not deskew.
+    deskew_ref_frac_ = dp("deskew_ref_frac", 0.0);
     // Phase 2: also shift endpoints by the sensor's odom-frame velocity × the
     // per-point time offset (intra-scan translation). Velocity is differenced
     // from consecutive scan poses — no IMU accel, no latency. Off by default;
@@ -1046,9 +1065,19 @@ private:
         // Best-effort sensor QoS: connects to BOTH reliable and best-effort IMU
         // publishers (a reliable sub would refuse a best-effort publisher and we
         // would silently get no gyro → deskew permanently falls back).
+        // Own callback group: in the DEFAULT (mutually exclusive) group onImu
+        // could only run between scans, and onPointCloud holds that group ~88%
+        // of the time at 10 Hz. Measured effect: imu_buf_ never exceeded 2
+        // samples against a verified 400 Hz publisher, so buildDeskewTable
+        // always bailed and deskew silently never engaged. With its own group
+        // the second executor thread services gyro while integration runs.
+        // imu_buf_ is therefore now shared across threads -> imu_mx_.
+        imu_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        rclcpp::SubscriptionOptions imu_opts;
+        imu_opts.callback_group = imu_cb_group_;
         imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-          imu_topic_, rclcpp::SensorDataQoS(),
-          std::bind(&SCovoxNode::onImu, this, std::placeholders::_1));
+          imu_topic_, rclcpp::SensorDataQoS(rclcpp::KeepLast((size_t)std::max(1, imu_queue_depth_))),
+          std::bind(&SCovoxNode::onImu, this, std::placeholders::_1), imu_opts);
         RCLCPP_INFO(get_logger(), "deskew=%s: subscribing IMU %s (gyro-only)",
                     deskew_mode_.c_str(), imu_topic_.c_str());
       }
@@ -1545,6 +1574,8 @@ private:
     s.t = rclcpp::Time(m->header.stamp, RCL_ROS_TIME).seconds();
     s.w = Eigen::Vector3f((float)m->angular_velocity.x, (float)m->angular_velocity.y,
                           (float)m->angular_velocity.z) - gyro_bias_;
+    // Runs in imu_cb_group_, concurrently with integration -> lock required.
+    std::lock_guard<std::mutex> lk(imu_mx_);
     imu_buf_.push_back(s);
     const double cutoff = s.t - imu_retention_sec_;
     while (!imu_buf_.empty() && imu_buf_.front().t < cutoff) imu_buf_.pop_front();
@@ -1581,6 +1612,10 @@ private:
   // false (→ no deskew) when the buffer can't cover the scan.
   bool buildDeskewTable(double t0, double window) {
     deskew_table_.clear();
+    // Scan-thread reader of imu_buf_, which onImu now writes from its own
+    // callback group. Held for the whole walk (<= window*rate samples, ~80 at
+    // 0.2 s / 400 Hz), so onImu stalls for microseconds at most.
+    std::lock_guard<std::mutex> lk(imu_mx_);
     if (imu_buf_.size() < 2 || !extrinsic_valid_) return false;
     if (imu_buf_.back().t <= t0) return false;   // whole buffer precedes the scan
     const double t_end = t0 + window;
@@ -1730,15 +1765,49 @@ private:
         }
       } else {
         ++deskew_fallback_;
+        size_t imu_n;
+        { std::lock_guard<std::mutex> lk(imu_mx_); imu_n = imu_buf_.size(); }
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
           "deskew on but IMU/extrinsic not ready (imu_buf=%zu extrinsic=%d frame=%s); "
-          "integrating raw scan", imu_buf_.size(), (int)extrinsic_valid_,
+          "integrating raw scan", imu_n, (int)extrinsic_valid_,
           cloud->header.frame_id.c_str());
       }
     } else if (deskew_mode_ == "on" && off_t < 0) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "deskew_mode=on but cloud '%s' has no per-point time field; integrating raw scan",
         cloud->header.frame_id.c_str());
+    }
+
+    // Reference-frame rotation: q_ref = ΔR(t0 → t0 + frac·span). Every point is
+    // then expressed in the frame at t_ref instead of at t0 (see deskew_ref_frac).
+    // The span is sampled rather than scanned in full: a stride over the buffer
+    // is layout-agnostic (beam-major or azimuth-major) and costs ~4k reads.
+    Eigen::Quaternionf q_ref_inv = Eigen::Quaternionf::Identity();
+    if (do_deskew && deskew_ref_frac_ > 0.0) {
+      float span = 0.f;
+      const size_t stride = std::max<size_t>(1, N / 4096);
+      for (size_t i = 0; i < N; i += stride) {
+        const float o = decodePointTimeOffset(data + i * step + off_t, t_type, t0_sec);
+        if (std::isfinite(o) && o > span) span = o;
+      }
+      const float ref_off = span * (float)deskew_ref_frac_;
+      if (ref_off > 0.f) {
+        // Same slerp the per-point lookup uses, evaluated once at ref_off.
+        size_t k = 0;
+        while (k + 1 < deskew_table_.size() && deskew_table_[k + 1].dt <= ref_off) ++k;
+        Eigen::Quaternionf q_ref;
+        if (ref_off <= deskew_table_.front().dt)     q_ref = deskew_table_.front().q;
+        else if (ref_off >= deskew_table_.back().dt) q_ref = deskew_table_.back().q;
+        else {
+          const auto& a = deskew_table_[k]; const auto& b = deskew_table_[k + 1];
+          const float den = b.dt - a.dt;
+          q_ref = a.q.slerp(den > 1.0e-9f ? (ref_off - a.dt) / den : 0.f, b.q);
+        }
+        q_ref_inv = q_ref.conjugate();
+        RCLCPP_INFO_ONCE(get_logger(),
+          "deskew: reference frame at frac=%.2f of span (%.4f s -> off %.4f s)",
+          deskew_ref_frac_, span, ref_off);
+      }
     }
 
     // ── Phase 2: intra-scan translation deskew (optional) ─────────────────
@@ -1770,15 +1839,15 @@ private:
     Eigen::Quaternionf dk_last_q = Eigen::Quaternionf::Identity();
     auto deskewRot = [&](float off) -> Eigen::Quaternionf {
       if (std::abs(off - dk_last_off) < 1.0e-4f) return dk_last_q;
-      if (off <= deskew_table_.front().dt) { dk_last_off = off; dk_last_q = deskew_table_.front().q; return dk_last_q; }
-      if (off >= deskew_table_.back().dt)  { dk_last_off = off; dk_last_q = deskew_table_.back().q;  return dk_last_q; }
+      if (off <= deskew_table_.front().dt) { dk_last_off = off; dk_last_q = q_ref_inv * deskew_table_.front().q; return dk_last_q; }
+      if (off >= deskew_table_.back().dt)  { dk_last_off = off; dk_last_q = q_ref_inv * deskew_table_.back().q;  return dk_last_q; }
       if (off < deskew_table_[dk_cursor].dt) dk_cursor = 0;   // non-monotonic guard
       while (dk_cursor + 1 < deskew_table_.size() && deskew_table_[dk_cursor + 1].dt <= off) ++dk_cursor;
       const auto& a = deskew_table_[dk_cursor];
       const auto& b = deskew_table_[dk_cursor + 1];
       const float denom = b.dt - a.dt;
       const float fr = denom > 1.0e-9f ? (off - a.dt) / denom : 0.f;
-      dk_last_off = off; dk_last_q = a.q.slerp(fr, b.q);
+      dk_last_off = off; dk_last_q = q_ref_inv * a.q.slerp(fr, b.q);
       return dk_last_q;
     };
 
@@ -3422,11 +3491,17 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr input_pc_sub_;
   // ── Intra-scan deskew (gyro-based rotation correction) ──────────────────
   std::string deskew_mode_{"auto"}, imu_topic_, imu_frame_;
-  double deskew_window_sec_{0.2}, imu_retention_sec_{1.0}, deskew_min_angle_deg_{0.0};
+  int imu_queue_depth_{400};
+  double deskew_window_sec_{0.2}, deskew_ref_frac_{0.0}, imu_retention_sec_{1.0}, deskew_min_angle_deg_{0.0};
   Eigen::Vector3f gyro_bias_{Eigen::Vector3f::Zero()};
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  // onImu lives in its own callback group (see the subscription site) so gyro
+  // keeps arriving while a scan integrates; imu_mx_ guards the buffer it shares
+  // with the scan thread's buildDeskewTable.
+  rclcpp::CallbackGroup::SharedPtr imu_cb_group_;
+  mutable std::mutex imu_mx_;
   struct ImuSample { double t; Eigen::Vector3f w; };
-  std::deque<ImuSample> imu_buf_;          // rolling gyro buffer (no lock: default cb group serializes IMU + scan callbacks)
+  std::deque<ImuSample> imu_buf_;          // rolling gyro buffer (guarded by imu_mx_)
   Eigen::Matrix3f R_lidar_imu_{Eigen::Matrix3f::Identity()};  // rotates gyro from imu frame → cloud frame
   bool extrinsic_valid_{false};
   struct DeskewKnot { float dt; Eigen::Quaternionf q; };       // dt since scan-start, ΔR(t0→t0+dt)
