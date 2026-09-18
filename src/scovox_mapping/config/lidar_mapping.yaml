@@ -64,6 +64,76 @@
     range_decay_length: -1.0        # >0 gates the min/max range cull only
     grazing_angle_threshold: -1.0   # unused; kept so existing configs still load
 
+    # --- Intra-scan deskew (motion compensation) -------------------------
+    # A spinning LiDAR sweeps the scene over one rotation (~0.1 s at 10 Hz), so
+    # points on opposite sides of a scan were measured up to a full scan period
+    # apart. If the platform rotated during that window the cloud comes out
+    # smeared. Deskew integrates the gyro and rotates every point back so the
+    # scan reads as though it were captured at a single instant.
+    #
+    # Prerequisites: a per-point time field on the cloud (t / time / time_stamp
+    # / timestamp), an IMU on imu_topic, and TF from imu_frame to the cloud's
+    # frame. If any is missing, "auto" silently integrates the raw scan and "on"
+    # does the same with a throttled warning.
+    #
+    # "auto" (default) deskews whenever the prerequisites are met; "on" is the
+    # same but warns when they are not; "off" never deskews — use it for feeds
+    # already deskewed upstream. "gyro" is accepted as an alias for "on".
+    # NOTE the default is "auto", i.e. deskew is ON by default on any feed that
+    # carries a time field and an IMU. Read deskew_ref_frac below before relying
+    # on that: the default reference frame is only correct for some pose sources.
+    deskew_mode: "auto"
+    imu_topic:   "/imu/data"
+    imu_frame:   ""             # empty -> taken from the first IMU message
+    deskew_window_sec:    0.2   # gyro integration window from scan start [s]
+    imu_retention_sec:    1.0   # how long IMU samples are retained [s]
+    imu_queue_depth:      400.0 # subscription depth; must span a full window
+                                # (declared double in the node — keep the .0)
+    deskew_min_angle_deg: 0.0   # skip deskew if the scan rotated less than this
+    deskew_translation:   false # also shift endpoints by the platform velocity
+
+    # WHICH INSTANT the deskewed scan is frozen at, as a fraction of the scan
+    # span: 0.0 = scan start (the cloud header stamp), 0.5 = mid-scan, 1.0 = end.
+    #
+    # Every value is internally consistent on its own. What matters is that it
+    # MATCHES the convention of the pose used to place the scan in the world.
+    #
+    # The trap: a localizer that does NOT deskew (e.g. lidar_localization_ros2
+    # with use_continuous_time_deskew: false) registers the whole smeared sweep
+    # rigidly against its map. That best fit averages over the entire rotation,
+    # so the pose it returns describes the platform near MID-scan — yet it is
+    # published stamped with the cloud header time, which is scan START. Deskew
+    # at 0.0 then applies a mid-scan pose to a start-referenced cloud, leaving a
+    # systematic half-scan rotation on every point of every scan.
+    #
+    # That is worse than not deskewing at all. Undeskewed, the per-point errors
+    # straddle the sweep mean and largely cancel (RMS = theta/sqrt(12) =
+    # 0.289*theta, for theta = per-scan rotation). Deskew at 0.0 removes the
+    # scatter but biases every point identically (RMS = 0.500*theta) — 1.73x
+    # worse. This is why enabling deskew can measurably degrade a map.
+    #
+    # Measured on the bunker bag against full-density GT, deskew on, only this
+    # value varied (% of voxels within 0.30 m / median error / voxel count):
+    #   frac 0.00 -> 83.72 %   0.1241 m   77016     <- the mismatch above
+    #   frac 0.25 -> 87.32 %   0.1148 m   69532
+    #   frac 0.50 -> 89.04 %   0.1110 m   66508     <- best; also beats deskew off
+    #   frac 0.75 -> 87.90 %   0.1156 m   71154
+    #   frac 1.00 -> 84.44 %   0.1257 m   78351
+    #   deskew off   88.35 %   0.1140 m   69097
+    # The curve is a symmetric V about 0.5 (residual ~ |f - 0.5| * theta): being
+    # half a sweep early costs the same as half a sweep late. That symmetry is
+    # the fingerprint of a reference-frame mismatch, not a gyro fault — the
+    # lidar<-imu extrinsic and the gyro integration both check out independently
+    # (axes agree with the pose-derived rotation, no swap, no sign flip).
+    #
+    #   SET 0.5  when the pose source does not deskew — the common case.
+    #   KEEP 0.0 when the cloud is already deskewed upstream, or the pose source
+    #            deskews to scan start itself.
+    # Left at 0.0 here because this file is generic and the correct value is a
+    # property of your pose source, not of the sensor. The Jetson bunker stack
+    # passes deskew_ref_frac:=0.5 explicitly.
+    deskew_ref_frac: 0.0
+
     # --- Frames ----------------------------------------------------------
     base_frame:        "base_link"  # sensor / robot base frame
     integration_frame: "odom"       # fixed frame rays are integrated in

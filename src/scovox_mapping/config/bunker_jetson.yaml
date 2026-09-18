@@ -1,0 +1,119 @@
+# =======================================================================
+# SCovox — bunker bag on the Jetson (LiDAR geometry only)
+# =======================================================================
+# The verified field-experiment configuration for the `bunker_jetson`
+# Hesai bag, with odometry from hmr_localisation `lidar_localization_ros2`
+# (SMALL_VGICP registration against gt_map_us050.pcd).
+#
+# Every value here is the one actually loaded by the benchmarked runs —
+# taken from the node's own startup dump, not reconstructed:
+#   res=0.200  frame=map  w_occ=8.00 w_free=4.00  sdf_trunc=0.000 (TSDF off)
+#   deskew=on  reference frame at frac=0.50 of span (0.1006 s -> 0.0503 s)
+#
+# Run:
+#   ros2 run scovox_mapping scovox_mapping_node --ros-args \
+#     --params-file <path>/bunker_jetson.yaml -p use_sim_time:=true
+# (use_sim_time is a bag-replay concern and is passed on the command line,
+#  not stored here, so the same file serves a live sensor.)
+#
+# Measured on this config, CycloneDDS, n=3, mean ± sd:
+#   FPS 8.08 ± 0.07 Hz   CPU 0.99 ± 0.00 cores   RSS 153.6 ± 1.4 MB
+# On FastDDS+SHM: FPS 8.39, CPU 0.96, RSS 222.5 MB. Both are compute-bound
+# (CPU at the ~0.94-core lock cap; tf_ms ~0.1, publish_ms ~0.0), so the
+# transport choice is a memory decision, not a throughput one.
+#
+# Map quality vs full-density GT (gt_map.ply, 3,059,991 pts):
+#   median error 0.111 m,  89.04 % of voxels within 0.30 m,  66,508 voxels
+# =======================================================================
+
+/**:
+  ros__parameters:
+
+    # --- Input -----------------------------------------------------------
+    input_pointcloud_topic: "/hesai/points"   # Hesai, 128 beams x 1800 az
+
+    # --- Voxel grid ------------------------------------------------------
+    resolution: 0.20          # voxel edge length [m]
+    inner_bits: 2
+    leaf_bits:  3
+
+    # --- Occupancy (Beta) evidence weights -------------------------------
+    w_occ:  8.0
+    w_free: 4.0
+    carve_band: -1.0          # <0 = full-ray free-space carving
+
+    # --- TSDF ------------------------------------------------------------
+    enable_tsdf: false        # occupancy only on this bag (no semantics either:
+    sdf_trunc_voxels: 3       # the cloud carries no semantic_label field, so the
+    tsdf_space_carving: false # Dirichlet grid stays empty)
+    band_only_integration: false
+
+    # --- Range gating ----------------------------------------------------
+    # max_range 20.0 is a deliberate cost/coverage trade, not a sensor limit
+    # (the Hesai returns to 64 m; range p50 5.60 / p90 20.67 m). Raising it to
+    # 50 m adds the 20-50 m shell — completeness there goes 1.4 % -> 67.6 %
+    # (20-30 m) and 0.0 % -> 52.6 % (30-50 m), and voxels 69k -> 135k — but
+    # costs integrate 106.5 -> 134.5 ms, RSS 230 -> 312 MB, CPU 0.76 -> 0.93
+    # cores, capping the sustainable rate near 7.4 Hz. Accuracy is unchanged
+    # either way (median 0.114 m both). The trajectory is only a 19.5 m path
+    # inside a 7.8 x 3.4 m footprint, so the far shell buys little here.
+    min_range: 1.0
+    max_range: 20.0
+    range_decay_length: -1.0
+    grazing_angle_threshold: -1.0
+
+    # Uniform voxel-grid downsample in the sensor frame, applied after the
+    # range gate. Keeps ~22k of 230,400 raw points per scan.
+    downsample_voxel_size: 0.20
+
+    # --- Frames ----------------------------------------------------------
+    # integration_frame MUST be `map` here: the localizer publishes map->base_link
+    # and there is no odom link in this stack, so integrating in `odom` silently
+    # falls back to a stale pose.
+    base_frame:        "base_link"
+    integration_frame: "map"
+    map_frame:         "map"
+
+    # --- TF startup gate -------------------------------------------------
+    startup_tf_stable_sec:     0.0
+    startup_tf_jump_threshold: 10.0
+
+    # --- Intra-scan deskew -----------------------------------------------
+    # Deskew is ON: it is the robust method, and at ref_frac 0.5 it beats
+    # running without it (89.04 % vs 88.35 % of voxels within 0.30 m, median
+    # 0.111 vs 0.114 m, and 66,508 vs 69,097 voxels — i.e. less smear).
+    #
+    # ref_frac 0.5 is REQUIRED on this stack, not a tuning preference.
+    # lidar_localization_ros2 runs use_continuous_time_deskew: false, so it
+    # registers the raw smeared sweep and its pose describes the platform near
+    # mid-scan, while being stamped with the scan-start header time. Deskewing
+    # to 0.0 against that pose leaves a systematic half-scan rotation on every
+    # point and scores WORSE than no deskew at all (83.72 %). See the full
+    # explanation and the measured 0.0/0.25/0.5/0.75/1.0 sweep in
+    # lidar_mapping.yaml. If the localizer's own deskew is ever enabled, this
+    # must go back to 0.0.
+    #
+    # "on" is the canonical spelling; the bench harness passes deskew_mode:=gyro,
+    # which the node normalises to "on" — identical behaviour.
+    deskew_mode: "on"
+    imu_topic:   "/imu/data"
+    imu_frame:   ""             # resolved from the first IMU message -> `imu`
+    deskew_ref_frac:      0.5
+    deskew_window_sec:    0.2
+    imu_retention_sec:    1.0
+    imu_queue_depth:      400.0 # declared double in the node — keep the .0
+    deskew_min_angle_deg: 0.0
+    deskew_translation:   false # rotation-only; at 0.167 m/s the intra-scan
+                                # translation is ~8 mm and not worth the pass
+
+    # --- Mode ------------------------------------------------------------
+    mode: "persistent"
+    dataset_mode: false
+
+    # --- Outputs ---------------------------------------------------------
+    publish_pointcloud:      true
+    occupancy_vis_threshold: 0.6
+    scovox_publish_rate:     1.0
+    pointcloud_topic:        "~/pointcloud"
+    scovox_topic:            "~/scovox"
+    publish_planning_map:    false
