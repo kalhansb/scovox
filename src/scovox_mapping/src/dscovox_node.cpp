@@ -255,6 +255,8 @@ public:
     {
       auto plg_t = declare_parameter<std::string>("global_planning_map_topic",
                                                  std::string("~/global_planning_map"));
+      auto plc_t = declare_parameter<std::string>("global_coverage_map_topic",
+                                                 std::string("~/global_coverage_map"));
       if (pub_plan_glob_) {
         pl_glob_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
           plg_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
@@ -263,6 +265,11 @@ public:
           "(origin %.1f, %.1f), z in [%.2f, %.2f], inflation %.2f m, period %.2f s",
           plan_glob_sz_, plan_glob_res_, plan_glob_ox_, plan_glob_oy_,
           plan_glob_zmin_, plan_glob_zmax_, plan_glob_infl_, plan_glob_period_);
+        pl_cov_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+          plc_t, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+        RCLCPP_INFO(get_logger(),
+          "dscovox global_coverage_map: same grid, inflation 0.00 m "
+          "(the DONE coverage test reads this one)");
       }
     }
 
@@ -885,7 +892,8 @@ private:
     // Nothing subscribed ⇒ nothing to pay for. transient_local still replays
     // the last sample to a late joiner, and the first subscriber pulls a fresh
     // one on the next tick.
-    if (pl_glob_pub_->get_subscription_count() == 0) return;
+    if (pl_glob_pub_->get_subscription_count() == 0 &&
+        (!pl_cov_pub_ || pl_cov_pub_->get_subscription_count() == 0)) return;
     const auto now = std::chrono::steady_clock::now();
     if (plan_glob_period_ > 0.0 &&
         plan_glob_last_.time_since_epoch().count() != 0 &&
@@ -926,6 +934,10 @@ private:
       if (v.p_occ() >= ot) g.data[i] = 100;
       else if (g.data[i] != 100) g.data[i] = 0;
     });
+
+    // Coverage first: this is the only point at which g still carries exactly
+    // what was sensed. Everything below dilates it.
+    if (pl_cov_pub_) pl_cov_pub_->publish(g);
 
     // Dilate occupied cells by the body radius: the planner does a single-cell
     // free check and relies on the map already carrying the clearance.
@@ -1064,6 +1076,14 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_glob_pub_;
+  // Same grid as pl_glob_pub_ but WITHOUT the obstacle inflation. Inflation
+  // writes 100 over cells that were never sensed, so a coverage measure taken
+  // on the inflated grid counts invented cells as known: on off_rep1 the
+  // inflated map ends at 10473 occupied ROI cells against 1351 real ones and
+  // reads 0.9445 known where the truth is 0.9386. The planner's DONE test must
+  // never read that, so the un-inflated grid is published separately rather
+  // than reconstructed by subtracting inflation (which is not invertible).
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_cov_pub_;
   rclcpp::Service<scovox_msgs::srv::GetRegion>::SharedPtr get_region_srv_;
   rclcpp::Service<scovox_msgs::srv::GetOccupancyGrid>::SharedPtr get_occ_srv_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
