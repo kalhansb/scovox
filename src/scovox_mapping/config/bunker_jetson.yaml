@@ -6,15 +6,24 @@
 # (SMALL_VGICP registration against gt_map_us050.pcd).
 #
 # Every value here is the one actually loaded by the benchmarked runs —
-# taken from the node's own startup dump, not reconstructed:
+# taken from the node's own startup dump, not reconstructed — EXCEPT the two
+# exploration-stack values added after those runs, `mode` and `share_rate_hz`
+# (see the Mode block for what they do and do not change):
 #   res=0.200  frame=map  w_occ=8.00 w_free=4.00  sdf_trunc=0.000 (TSDF off)
 #   deskew=on  reference frame at frac=0.50 of span (0.1006 s -> 0.0503 s)
 #
-# Run:
+# Run (exploration stack — namespace and node name are NOT optional):
 #   ros2 run scovox_mapping scovox_mapping_node --ros-args \
-#     --params-file <path>/bunker_jetson.yaml -p use_sim_time:=true
-# (use_sim_time is a bag-replay concern and is passed on the command line,
-#  not stored here, so the same file serves a live sensor.)
+#     --params-file <path>/bunker_jetson.yaml -p use_sim_time:=true \
+#     -r __ns:=/robot1 -r __node:=scovox_node
+# The share topic is built from both: `<ns>/<node>/scovox_bin`. dscovox_node
+# subscribes to /robot1/scovox_node/scovox_bin and /robot2/... by default
+# (dscovox_node.cpp input_topic_1/2, config/dscovox_params.yaml), so a node
+# left in the root namespace publishes /scovox_node/scovox_bin and the merger
+# matches nothing. The mapper warns about that ("No subscriber on ...", every
+# 30 s), but nothing downstream does: dscovox simply never fuses. Mapper-only
+# runs (no merger) can drop both -r flags. use_sim_time is a bag-replay concern and is passed on the command
+# line, not stored here, so the same file serves a live sensor.
 #
 # Measured on this config, CycloneDDS, n=3, mean ± sd:
 #   FPS 8.08 ± 0.07 Hz   CPU 0.99 ± 0.00 cores   RSS 153.6 ± 1.4 MB
@@ -107,7 +116,41 @@
                                 # translation is ~8 mm and not worth the pass
 
     # --- Mode ------------------------------------------------------------
-    mode: "persistent"
+    # "rolling" is REQUIRED by the exploration stack: it is the only mode that
+    # creates the `~/scovox_bin` (ScovoxMapBinary) publisher, which is the sole
+    # input dscovox_node subscribes to. Under "persistent" that publisher does
+    # not exist, the merger never receives a delta, never publishes a fused
+    # map, and the planner waits in WAIT_FOR_MAP for the whole run. The mapper
+    # itself warns at startup, but nothing downstream reports anything: no
+    # error, no dropped message, no failed lookup — just a fused map that
+    # never appears.
+    #
+    # The voxel grid is fully persistent in BOTH modes (no pruning) and `mode`
+    # is never read on the integrate path, so MAPPING and its accuracy are
+    # unchanged — the header's map-quality numbers still hold.
+    #
+    # COST is not unchanged once a merger actually attaches. With no subscriber
+    # on scovox_bin the share tick discards via an O(n) clear and costs about
+    # what persistent mode did, so the header's FPS/CPU/RSS (a mapper-only run)
+    # should still be about right — with one unmeasured caveat: at 2 Hz the
+    # touched-coord vectors are cleared by the tick rather than per scan, so
+    # they hold ~4 scans instead of 1. Expected to be worth a few MB against a
+    # 153.6 MB baseline, but it was not re-measured after this mode change. With dscovox subscribed, each 2 Hz tick additionally
+    # takes the map WRITE lock to drain/sort/unique ~4-5 scans of touched
+    # coords, serialize and LZ4 them, on a node already lock-capped near 0.94
+    # cores; share_change_gate (default true) also allocates two shadow grids.
+    # Treat the header numbers as the mapper-only reference, not as the
+    # with-merger figure.
+    #
+    # The other rolling-mode difference is that planning_map publication
+    # becomes a robot-centred crop instead of a fixed envelope. That is inert
+    # here because publish_planning_map is false below — this stack takes its
+    # planning map from an external publisher, not from scovox.
+    mode: "rolling"
+    # Coalesce binary deltas to 2 Hz instead of the 0.0 default (= publish on
+    # every scan, ~8-10 Hz of full delta payloads). Matches the value the
+    # dscovox launches and the pinned bench harness use.
+    share_rate_hz: 2.0
     dataset_mode: false
 
     # --- Outputs ---------------------------------------------------------
