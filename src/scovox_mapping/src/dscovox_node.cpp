@@ -52,6 +52,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <scovox_msgs/msg/scovox_map_binary.hpp>
 #include <scovox_msgs/msg/scovox_map.hpp>
+#include <scovox_msgs/msg/scovox_fusion_counters.hpp>
 #include <scovox/binary_serializer.hpp>
 #include <scovox/consensus_merge.hpp>
 #include <scovox/lz4_codec.hpp>
@@ -102,6 +103,15 @@ struct SourceGrid {
   // ablations_punch_list.md.
   Eigen::Isometry3d T_map_source{Eigen::Isometry3d::Identity()};
   bool pose_cached{false};
+  // What this source has delivered, cumulatively, since this node started.
+  // Published as ScovoxFusionCounters so a consumer can ask "have the maps
+  // exchanged with THIS robot?" — a question the fused map's own voxel total
+  // cannot answer, because it sums own sensing and every peer into one number.
+  // See the message for what each counts and why arrival is the load-bearing
+  // one. Written under the unique_lock in the ingest path; read under a shared
+  // lock from the publish timer.
+  uint64_t deltas_received{0};   // voxel deltas ingested from this source
+  uint64_t cells_touched{0};     // fused cells written while integrating them
 };
 
 inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::Transform& tf) {
@@ -264,6 +274,35 @@ public:
           plan_glob_sz_, plan_glob_res_, plan_glob_ox_, plan_glob_oy_,
           plan_glob_zmin_, plan_glob_zmax_, plan_glob_infl_, plan_glob_period_);
       }
+    }
+
+    // Per-source integration counters — "have the maps exchanged, and with
+    // whom?". Reliable and latched for the same reason as the fused map: a
+    // consumer that connects late must receive the current totals rather than
+    // wait for the next tick to learn a peer exists.
+    //
+    // ITS OWN TIMER, NOT THE PUBLISH TIMER, and that is the point rather than
+    // an implementation detail. Everything on publish_timer_ is gated on the
+    // fused map having changed (publishFusedMap consumes fused_dirty_) or on
+    // having subscribers, so all of it falls silent in exactly the case a
+    // consumer most needs a sample: nothing is arriving from a peer. Hanging
+    // these counters off that timer would make "this peer is quiet" and
+    // "dscovox is quiet" the same observation, which is the ambiguity the
+    // counters exist to remove. Rate is independent of publish_rate_hz for the
+    // same reason.
+    fusion_counters_pub_ =
+      create_publisher<scovox_msgs::msg::ScovoxFusionCounters>(
+        declare_parameter<std::string>("fusion_counters_topic",
+                                       std::string("~/fusion_counters")),
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    const double fc_hz =
+      declare_parameter<double>("fusion_counters_hz", 2.0);
+    if (fc_hz > 0.0) {
+      fusion_counters_timer_ = rclcpp::create_timer(
+        this, get_clock(),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::duration<double>(1.0 / fc_hz)),
+        [this] { publishFusionCounters(); });
     }
 
     // Reliable + deeper queue for binary submap deltas. The old
@@ -587,6 +626,20 @@ private:
       n_touched_beta = touched_beta.size();
       n_touched_dir  = touched_dir.size();
       n_sources      = sources_.size();
+
+      // Accumulate this source's running totals while the write lock is still
+      // held. Deliberately AFTER the reject paths above: a frame that returned
+      // early (bad prior, num_classes==0) never became map and is not counted
+      // as delivery.
+      //
+      // ARRIVAL IS COUNTED AS PRESENTED, NOT AS STORED — the deltas the frame
+      // carried, before the shared-ROI z-band clip drops the ones outside the
+      // band. That is the right measure for the question this counter answers:
+      // a clipped delta still crossed the radio, and the clip is this robot's
+      // own policy rather than anything about whether the peer is reaching it.
+      // cells_touched, being about the fused map, is counted post-clip.
+      src.deltas_received += n_beta_deltas + n_dir_deltas;
+      src.cells_touched   += n_touched_beta + n_touched_dir;
     }  // unique_lock released
 
     // Announce the integration of this source's map update into the fused map.
@@ -862,6 +915,44 @@ private:
     scovox_map_pub_->publish(rs->map);
   }
 
+  // Publish the per-source integration counters. Driven by its own timer, and
+  // unlike every other publisher here it takes its own shared lock, has no
+  // dirty gate, and does not check the subscription count.
+  //
+  // NO GATES, ON PURPOSE. The message is a handful of integers, so the cost of
+  // publishing one nobody reads is nothing, while the cost of NOT publishing is
+  // that a consumer cannot tell a peer that has gone quiet from a dscovox that
+  // has gone quiet — and those two need different responses. Every skip
+  // condition the other publishers carry (map unchanged, nobody subscribed)
+  // correlates with exactly the silence this is here to make legible.
+  //
+  // Sorted by source frame so successive samples are positionally comparable
+  // (sources_ is an unordered_map and its iteration order is not stable across
+  // rehashes). Entries are never removed: a source that stops sending keeps its
+  // frozen counts, because dropping it would restore the ambiguity between
+  // "silent" and "never heard of".
+  void publishFusionCounters()
+  {
+    if (!fusion_counters_pub_) return;
+    scovox_msgs::msg::ScovoxFusionCounters msg;
+    msg.header.stamp    = now();
+    msg.header.frame_id = map_frame_;
+    {
+      std::shared_lock<std::shared_mutex> lk(mu_);
+      msg.source_frame.reserve(sources_.size());
+      for (const auto& [k, sg] : sources_) msg.source_frame.push_back(k);
+      std::sort(msg.source_frame.begin(), msg.source_frame.end());
+      msg.deltas_received.reserve(msg.source_frame.size());
+      msg.cells_touched.reserve(msg.source_frame.size());
+      for (const auto& k : msg.source_frame) {
+        const auto& sg = sources_.at(k);
+        msg.deltas_received.push_back(sg.deltas_received);
+        msg.cells_touched.push_back(sg.cells_touched);
+      }
+    }
+    fusion_counters_pub_->publish(msg);
+  }
+
   // World-fixed 2D projection of the FUSED grid for the exploration planner.
   // Caller must already hold mu_ (shared) — the publish timer does.
   //
@@ -1064,9 +1155,12 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr scovox_map_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pl_glob_pub_;
+  rclcpp::Publisher<scovox_msgs::msg::ScovoxFusionCounters>::SharedPtr
+      fusion_counters_pub_;
   rclcpp::Service<scovox_msgs::srv::GetRegion>::SharedPtr get_region_srv_;
   rclcpp::Service<scovox_msgs::srv::GetOccupancyGrid>::SharedPtr get_occ_srv_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
+  rclcpp::TimerBase::SharedPtr fusion_counters_timer_;
 };
 
 int main(int argc, char** argv) {
