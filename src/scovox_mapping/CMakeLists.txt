@@ -97,6 +97,18 @@ ament_target_dependencies(test_topk_provider rclcpp)
 target_include_directories(test_topk_provider PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# Fusion-counter liveness (gen-33 test-plan 9). Black box: runs the built
+# dscovox_mapping_node as a child process, so it depends on that target and
+# is handed its path rather than compiling any of the node's source.
+ament_add_gtest(test_fusion_counters_liveness test/test_fusion_counters_liveness.cpp
+  TIMEOUT 90)
+add_dependencies(test_fusion_counters_liveness dscovox_mapping_node)
+ament_target_dependencies(test_fusion_counters_liveness rclcpp scovox_msgs scovox_core)
+target_include_directories(test_fusion_counters_liveness PRIVATE ${LZ4_INCLUDE_DIRS})
+target_link_libraries(test_fusion_counters_liveness ${LZ4_LIBRARIES})
+target_compile_definitions(test_fusion_counters_liveness PRIVATE
+  DSCOVOX_NODE_EXE="$<TARGET_FILE:dscovox_mapping_node>")
+
 # ==================================================================
 # Install
 # ==================================================================
