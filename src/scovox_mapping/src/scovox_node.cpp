@@ -543,7 +543,9 @@ private:
     min_d_ = dp("min_depth", 0.1);  max_d_ = dp("max_depth", 10.0);
     trace_nr_ = dp("trace_no_return_rays", false);
     carve_band_ = dp("carve_band", -1.0);
-    // mode = "persistent": single-robot, no binary publish to dscovox.
+    // mode = "persistent": mapper-only, no binary publish to dscovox. Not a
+    //                      single-vs-multi-robot switch — a single robot that
+    //                      feeds a merger still needs "rolling".
     // mode = "rolling":    publishes ScovoxMapBinary updates for the merger
     //                      and the planning_map is a rolling crop around the
     //                      robot (Phase 2). The underlying voxel grid is
@@ -1145,6 +1147,22 @@ private:
       auto bin_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
       bin_pub_ = create_publisher<scovox_msgs::msg::ScovoxMapBinary>(
         sm_t + std::string("_bin"), bin_qos);
+    } else {
+      // Expected and correct for a mapper-only run (most shipped persistent
+      // configs and every offline dataset eval), so this states the fact and
+      // leaves the consequence conditional — an unconditional "your stack is
+      // broken" here would cry wolf on those runs and train operators to skip
+      // the one case that matters. dscovox_node subscribes to
+      // ScovoxMapBinary and nothing else, so when a merger IS in the graph the
+      // starvation is total and completely silent downstream. Name the topic
+      // that is missing so the operator can diff it against `ros2 topic list`.
+      RCLCPP_WARN(get_logger(),
+        "mode=%s: no ScovoxMapBinary publisher — %s_bin does not exist. That "
+        "is correct for a mapper-only run. If a merger (dscovox_node) is in "
+        "your graph, it subscribes to that topic and nothing else: it would "
+        "receive no delta, publish no fused map, and any downstream planner "
+        "would wait for a fused map forever. Set mode=rolling for that case.",
+        mode_.c_str(), sm_pub_->get_topic_name());
     }
     // Queue depth 1 (was 10): on KITTI 10 cm a single PointCloud2 can be
     // 2 GB. With reliable QoS + a slow subscriber the publisher would
@@ -2389,6 +2407,17 @@ private:
       split_map_->clearTouchedTsdf();
       split_map_->clearTouchedSemDir();
       split_map_->clearTouchedFine();
+      // The other half of the silent-death pair (the mode gate warns at
+      // startup): the publisher exists but nothing is attached, so every delta
+      // is discarded. Usually a namespace / node-name mismatch against
+      // dscovox_node's input_topics, or a merger that never came up. Expected
+      // and harmless for a mapper-only run, hence throttled rather than
+      // per-tick.
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+        "No subscriber on %s — every binary delta is being discarded. If a "
+        "merger should be running, check its input_topics against this exact "
+        "topic path (namespace + node name).",
+        bin_pub_->get_topic_name());
       return {0, 0};
     }
 
