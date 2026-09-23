@@ -8,13 +8,12 @@
 # The workspace source is bind-mounted, so build/install/log land in the repo
 # (git-ignored) and edits on the host are picked up without rebuilding the image.
 #
-# Resource bounds: the C++ build is template-heavy (Bonxai/Eigen), so an
-# unbounded colcon fans out one g++ per host core and can exhaust RAM and hard-
-# freeze the host. We cap the container's CPUs/RAM and serialise packages so at
-# most SCOVOX_BUILD_JOBS compilers run at once. --memory-swap == --memory means
-# no swap, so a runaway TU is OOM-killed inside the container (clean build
-# failure) instead of dragging the host into swap-thrash. Override via env:
+# Container CPUs/RAM are capped and packages serialised, so at most
+# SCOVOX_BUILD_JOBS compilers run; no swap (--memory-swap equals --memory), so a
+# runaway TU is OOM-killed in-container. Env overrides below.
+# (notes: build-resource-caps)
 #   SCOVOX_BUILD_CPUS=6  SCOVOX_BUILD_MEM=12g  SCOVOX_BUILD_JOBS=6
+# Moved comments: docs/code_notes/scovox_code_notes.md
 set -euo pipefail
 
 IMAGE="${SCOVOX_IMAGE:-scovox:jazzy}"

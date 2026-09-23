@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """B6 full experiment — per-voxel semantic flip churn across 4 update rules.
 
 Mechanism test for the paper's claim "Dirichlet stabilises noisy semantics."
@@ -76,12 +77,9 @@ KAPPA0 = 2.0
 SEMANTIC_MIN_CONFIDENCE = 0.1
 K_TOP = 2
 
-# Log-odds-semantic rule (OctoMap-style):
-#   L[obs] += L_HIT;   L[c' seen] += L_MISS  for c' != obs
-# L_HIT  = log(0.7/0.3)  ≈ +0.847  (consistent with log_odds_map.hpp `l_hit=0.85`)
-# L_MISS = log(0.4/0.6)  ≈ -0.405  (consistent with `l_miss=-0.40`)
-# These match the geometric log-odds parameters scovox uses elsewhere, so the
-# semantic baseline is "the natural per-class extension" rather than tuned.
+# OctoMap-style per-class rule: L[obs] += L_HIT, and L[c'] += L_MISS for every
+# other class c' already seen in the voxel. The values are not tuned.
+# (notes: b6-log-odds-semantic-rule)
 L_HIT  = float(np.log(0.7 / 0.3))
 L_MISS = float(np.log(0.4 / 0.6))
 
@@ -112,24 +110,9 @@ def voxelize_pack(points: np.ndarray, res: float) -> np.ndarray:
 
 
 # ----- Per-voxel state machines for the four rules -------------------------
-#
-# State per voxel:
-#   d_cnt   : float[K_TOP]    Dirichlet sem counts
-#   d_cls   : uint16[K_TOP]   Dirichlet sem class IDs
-#   d_unk   : float           Dirichlet a_unk residual
-#   m_cnt   : float[K_TOP]    MV sem counts
-#   m_cls   : uint16[K_TOP]   MV sem class IDs
-#   np_cls  : uint16          NP last-class (0 = no obs yet)
-#   lo_L    : dict[cls -> L]  log-odds per class
-#
-# Plus per-rule:
-#   {rule}_argmax  : uint16   current argmax class (0 = unknown / no obs)
-#   {rule}_flips   : uint32
-#
-# We also track total observation count per voxel (same across rules).
-#
-# We use parallel numpy arrays keyed by a per-voxel index. The
-# voxel-key→index map is built lazily as we encounter new keys.
+# Per-voxel state lives in parallel lists indexed by a voxel index built lazily
+# from voxel keys. Argmax 0 means unknown or no observation; np_cls 0 means no
+# observation yet. (notes: b6-per-voxel-state)
 
 
 class FlipSim:

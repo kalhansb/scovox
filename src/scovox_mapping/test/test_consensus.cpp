@@ -1,5 +1,6 @@
 /// @file test_consensus.cpp
 /// Task 1.9 + 2.3: Beta-principled consensus fusion (>=10 tests).
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <gtest/gtest.h>
 #include <cmath>
@@ -111,10 +112,8 @@ TEST(Consensus, HighEvidenceDominatesLow) {
 }
 
 // =====================================================================
-// Beta-KL utility (the function itself is preserved in scovox_core for
-// callers that want an explicit disagreement metric; consensusMerge no
-// longer consults it — return value used to be a discarded `conflict`
-// bool, removed 2026-05-03)
+// Beta-KL utility, kept for callers that want an explicit disagreement metric;
+// consensusMerge does not consult it. (notes: test-betakl-utility-banner)
 // =====================================================================
 
 TEST(Consensus, BetaKLSymmetryProperty) {
@@ -155,11 +154,9 @@ TEST(Consensus, SemanticAdditiveMerge) {
   EXPECT_NEAR(cls3, 3.0f, 0.01f);   // 2 + 1
 }
 
-// 2026-05-03: gate removed from consensusMerge — Dirichlet evidence is
-// additive under conditional independence given the latent (occ, class).
-// This test now asserts the *new* invariant: semantics merge regardless of
-// post-merge occupancy. Even when the merged Beta says "free", the source's
-// semantic counts must still be folded into dst.
+// Dirichlet evidence is additive under conditional independence, so src's
+// semantic counts are folded into dst even when the merged Beta reads free.
+// (notes: test-semantic-merge-ignores-occupancy)
 TEST(Consensus, SemanticMergedRegardlessOfOccupancy) {
   Params p = makeParams();
   p.consensus_tau_occ_gate = 0.9f;  // would have blocked the merge pre-2026-05-03
@@ -190,14 +187,9 @@ TEST(Consensus, SemanticMergedRegardlessOfOccupancy) {
 // Split-substrate consensus: receiver-side refold idempotency + the
 // RPC projection's raw-evidence convention.
 //
-// Findings 18/19/20 flagged that the receiver path in dscovox_node.cpp had
-// ZERO symbol-level coverage. Its helpers — projectBetaDirToVoxel /
-// isPriorBeta / isPriorDir + the refold core (refoldBeta / refoldDir) — were
-// extracted from dscovox_node.cpp's anonymous namespace into
-// scovox/dscovox_consensus.hpp, so the tests below now call the REAL functions
-// the node runs (refoldCellBeta/refoldCellDir are thin Bonxai-accessor wrappers
-// over refoldBeta/refoldDir). Coverage includes the Dir==null occupancy-only
-// branch and the num_classes <= K_TOP edge (finding 19).
+// These call the real helpers in scovox/dscovox_consensus.hpp that
+// dscovox_node.cpp runs; refoldCellBeta/refoldCellDir are thin wrappers over
+// refoldBeta/refoldDir. (notes: test-split-helpers-real-code)
 // =====================================================================
 
 namespace {
@@ -211,11 +203,9 @@ scovox::BetaVoxel betaPrior() {
 scovox::DirVoxel dirPrior() { return scovox::defaultDirVoxel(kC, kAlpha); }
 }  // namespace
 
-// Finding 20: the refold safeguard rests on "reset fused[c] to prior, then fold
-// each source's CURRENT value once". A single-source refold therefore reproduces
-// the source exactly (the reset-to-prior is seed-copied over). These call the
-// REAL scovox::refoldBeta / refoldDir cores the node runs (refoldCellBeta/Dir are
-// thin Bonxai-accessor wrappers over them).
+// Refold resets fused[c] to prior, then folds each source's current value once,
+// so a single-source refold reproduces the source exactly.
+// (notes: test-refold-reset-then-fold)
 TEST(SplitRefold, BetaFoldIntoPriorReproducesSource) {
   scovox::BetaVoxel src{kC * kAlpha + 5.0f, kAlpha + 2.0f};  // observed voxel
   auto f = scovox::refoldBeta({&src}, kC, kAlpha);
@@ -234,12 +224,10 @@ TEST(SplitRefold, DirFoldIntoPriorReproducesSource) {
   EXPECT_FLOAT_EQ(f.other, src.other);
 }
 
-// Finding 20 (idempotency, end-to-end): a source re-publishes the SAME snapshot
-// twice. A re-sent snapshot overwrites that source's grid in place — it does NOT
-// append a second source — so both receipts refold the same current set {A}, and
-// because refoldBeta/refoldDir reset-to-prior before folding, the fused state is
-// a pure function of {A} and cannot drift. Pinning Beta and Dir together because
-// the two grids refold separately.
+// A re-sent snapshot overwrites its source's grid rather than adding a source,
+// and refold resets to prior first, so the fused state depends only on the
+// source set. Beta and Dir refold separately.
+// (notes: test-refold-duplicate-snapshot)
 TEST(SplitRefold, DuplicateSnapshotIsIdempotent) {
   scovox::BetaVoxel betaA{kC * kAlpha + 4.0f, kAlpha + 1.0f};
   auto dirA = dirPrior();
@@ -269,14 +257,9 @@ TEST(SplitRefold, DuplicateSnapshotIsIdempotent) {
 // =====================================================================
 // E6.3 — consistency of the receiver under network reordering/duplication.
 //
-// The idempotence test above is SINGLE-source. The three below cover what the
-// merger actually runs: several sources refolded together, in an order the node
-// chooses rather than the network. Read together they say:
-//
-//   Beta  (addition only)          — order-free up to float rounding
-//   Dir   at 2 sources             — order-free EXACTLY  (the shipped rig)
-//   Dir   at ≥3 sources            — NOT order-free; the node pins the order
-//   duplicate receipt, any N       — a no-op, because refold resets first
+// Multi-source refold: Beta is order-free up to float rounding; Dir is exactly
+// order-free at 2 sources but not at 3 or more, where the node fixes the order;
+// a duplicate receipt is a no-op. (notes: test-refold-order-summary)
 // =====================================================================
 
 namespace {
@@ -331,29 +314,10 @@ TEST(SplitRefold, DirRefoldIsOrderFreeAtTwoSources) {
             scovox::dominantClass(ba, kAlpha, kC));
 }
 
-// ⚠ At three or more sources the refold is NOT order-independent, and this test
-// PINS THAT LIMITATION rather than asserting it away. mergeDir truncates at each
-// pairwise step and a class dumped to OTHER can never climb back, so the fused
-// slots depend on which sources met first (consensus_merge.hpp says so in situ).
-//
-// Fixture: classes 7 and 2 compete for the top slot. Folding A+B first keeps
-// {2, 7}, so C's extra 1.5 lands ON class 7 and carries it past class 2 → 7.
-// Folding A+C first evicts class 7 (its 1.5 loses to class 4's 2.5 and class 0's
-// 1.9), and evicted evidence cannot come back, so class 2 keeps the slot → 2.
-// Both are *confident* labels, not abstentions: this is a real label flip, not a
-// degradation to OTHER. A 500k-draw random search over 3-source configurations
-// put these at ~1.0% of draws (with a further ~13.5% flipping class↔abstain and
-// 20.6% differing in the fused slots), so the fixture is representative, not a
-// hand-built pathology.
-//
-// The node's mitigation is to fix the order, NOT to make the merge commutative:
-// dscovox_node.cpp sorts sources by id before folding Dir, so the fused result
-// is reproducible across runs and rehashes even though it is not permutation-
-// invariant. The last two assertions are that actual guarantee.
-//
-// Scope: every E6 cell ran N=2, where the fold is exactly order-free
-// (DirRefoldIsOrderFreeAtTwoSources above), so no campaign result depends on
-// this. E6.5's N∈{3,4} scaling arm was dropped 2026-08-06.
+// Pins a limitation: at 3+ sources the Dir refold depends on source order,
+// since mergeDir truncates pairwise and evicted classes never return.
+// dscovox_node.cpp sorts sources by id before folding Dir.
+// (notes: test-dir-refold-order-limitation)
 //
 // If a future change makes mergeDir truly commutative (accumulate every source,
 // then truncate once), THIS TEST SHOULD FAIL. Replace it with an equality
@@ -378,13 +342,10 @@ TEST(SplitRefold, DirRefoldDependsOnSourceOrderAtThreeSources) {
   EXPECT_TRUE(sameDir(acb, scovox::refoldDir({&A, &C, &B}, kC, kAlpha)));
 }
 
-// Beta carries no truncation, so it is order-free semantically — but float
-// addition is not associative, so it is NOT bit-exact across fold orders. The
-// node folds Beta in unordered_map order (unsorted, unlike Dir), which is safe
-// precisely because the spread is rounding-scale: measured at ≤2 ULP
-// (relative ~1.5e-7) over 200k random 4-source draws in all 24 orders.
-// EXPECT_FLOAT_EQ's 4-ULP tolerance is the right assertion here; EXPECT_EQ on
-// the bits would be wrong and would flake.
+// Beta has no truncation, so fold order only changes float rounding; results
+// are not bit-exact and the node folds Beta unsorted. Assert with
+// EXPECT_FLOAT_EQ; EXPECT_EQ on the bits would flake.
+// (notes: test-beta-refold-float-order)
 TEST(SplitRefold, BetaRefoldOrderInvariantToFloatTolerance) {
   scovox::BetaVoxel a{4.0f, 1.5f}, b{2.0f, 3.0f}, c{1.2f, 6.0f};
   const auto abc = scovox::refoldBeta({&a, &b, &c}, kC, kAlpha);
@@ -428,12 +389,10 @@ TEST(SplitRefold, RefoldingAtPriorVoxelIsNoOp) {
   EXPECT_FLOAT_EQ(da_and_prior.other, only_da.other);
 }
 
-// Finding 18: the split RPC projection must hand the planner the SAME raw
-// semantic evidence the unified fused voxel would carry for the identical
-// observation history. Build a unified voxel via the sparse_add path and a
-// split Dir voxel via the sparse_add_class path for the same two observations,
-// project the split voxel, and assert the raw evidence matches slot-for-slot
-// (and that a_unk is the OTHER bucket's observed mass, prior subtracted).
+// The split RPC projection must give the planner the same raw semantic evidence
+// as the unified fused voxel for the same observations; a_unk is the OTHER
+// bucket's observed mass, prior subtracted.
+// (notes: test-split-projection-raw-evidence)
 TEST(SplitProjection, RawEvidenceMatchesFused) {
   // Observation history: class 5 seen with weight 1.0, class 3 with weight 0.5.
   // --- unified fused substrate (raw evidence: prior applied at query time) ---

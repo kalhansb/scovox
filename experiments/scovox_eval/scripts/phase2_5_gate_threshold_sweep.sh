@@ -6,13 +6,10 @@
 # occupancy gate itself, separate from K_TOP (Phase 1) and the update
 # strategy (Phase 2).
 #
-# Note on naming: NEW_EXPERIMENT_PLAN.md Phase 2.5 spec calls this knob
-# `dirichlet_min_p_occ`, but in the code that name is the INTEGRATION-
-# time semantic-commit gate (semdir_map.cpp:applyHitUpdate). The publish-
-# time / labelling-envelope gate — which is what Phase 2.5 actually
-# ablates per the spec text ("the publish-time threshold for `is this
-# voxel occupied?`") — is `occupancy_vis_threshold` / `min_occ_`
-# (scovox_node.cpp:publishPointCloud). This script varies the latter.
+# Varies the publish-time gate occupancy_vis_threshold (min_occ_ in
+# scovox_node.cpp publishPointCloud), not dirichlet_min_p_occ, which is the
+# integration-time semantic-commit gate in applyHitUpdate.
+# (notes: gate-sweep-publish-vs-integration)
 #
 # Design: integrate each anchor ONCE with occupancy_vis_threshold=0.0
 # (publishes every observed voxel), then post-filter the NPZ at
@@ -25,6 +22,7 @@
 #   THRESHOLDS=…    override threshold list (default "0.0 0.3 0.5 0.7")
 #   N_KITTI=…       frames/scene for KITTI    (default 100)
 #   N_SCENENET=…    frames/scene for SceneNet (default 300)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

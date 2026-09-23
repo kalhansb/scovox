@@ -1,3 +1,4 @@
+// Moved comments: doc/scovox_core_code_notes.md
 #include "scovox/uncertainty.hpp"
 #include <cmath>
 #include <limits>
@@ -38,17 +39,10 @@ float variance(const Voxel& v) {
 }
 
 float entropy(const Voxel& v) {
-  // NOTE: this is the Beta *differential* entropy (closed form below), kept
-  // verbatim for the legacy fused `scovox::Map` path so existing fused-path consumers
-  // and tests retain their historical scale. It is UNBOUNDED BELOW: for a
-  // near-point-mass voxel (e.g. a_occ=100, a_free=alpha_0=0.01, which survives
-  // the a<=0/b<=0 guard) it returns a large NEGATIVE value, NOT a bounded
-  // [0, ln2] occupancy uncertainty. Do NOT treat the result as Bernoulli/Shannon
-  // entropy. Consumers that need a bounded occupancy-uncertainty signal must
-  // compute Bernoulli H(p_occ) = -p ln p - (1-p) ln(1-p) at the call site
-  // (as expectedInformationGain does for its H_y term, and as occupancy
-  // map-stats mean-entropy aggregators do); we intentionally do not
-  // change this function's semantics to avoid a silent behavior regression.
+  // Beta differential entropy, not Bernoulli/Shannon: unbounded below (large
+  // negative for near-point-mass voxels). Callers needing a bounded occupancy
+  // uncertainty compute H(p_occ); do not change these semantics.
+  // (notes: uncertainty-beta-diff-entropy)
   const float a = v.a_occ;
   const float b = v.a_free;
   if (a <= 0.f || b <= 0.f) return 0.f;
@@ -75,28 +69,17 @@ float expectedInformationGain(const Voxel& v) {
                    - p        * digamma(a + 1.f)
                    - (1.f - p) * digamma(b + 1.f);
 
-  // EIG is a mutual information and must be >= 0. Near saturation (p -> 0 or 1)
-  // the bounded H_y term is clamped to 0 at the 1e-7 boundary while E_H stays
-  // strictly positive, so the raw H_y - E_H goes slightly negative (e.g.
-  // ~-8e-3 at Beta(1000,1)). A negative EIG mis-ranks saturated voxels in the
-  // next-best-view / frontier scorers and poisons mean_eig. Clamp to 0, matching
-  // the bernoulliKL noise clamp and the EIGAlwaysNonNegative test contract.
+  // EIG is a mutual information and must be >= 0; near saturation H_y is
+  // clamped to 0 while E_H stays positive, so the raw difference dips below 0.
+  // Clamp, as the EIGAlwaysNonNegative test requires.
+  // (notes: uncertainty-eig-clamp)
   return std::max(0.f, H_y - E_H);
 }
 
 float semanticEntropy(const Voxel& v) {
-  // Discrete categorical (Shannon) entropy over the mean Dirichlet
-  // probabilities p_i = alpha_i / a0, bounded in [0, ln(K)].
-  //
-  // We deliberately do NOT return the Dirichlet *differential* entropy here:
-  // like the Beta differential entropy in entropy() it is unbounded below and
-  // dives to large negatives on concentrated/heavily-observed voxels (e.g.
-  // sem_cnt={1000,0} → Dirichlet(1001, …) gives a strongly negative value),
-  // which is meaningless as a per-voxel "semantic uncertainty" and poisons any
-  // map-level mean. The plug-in mean-probability Shannon entropy is the bounded
-  // categorical uncertainty downstream consumers (labelling/ranking) expect and
-  // is monotone in how peaked the categorical is, matching the documented
-  // contract of the existing semanticEntropy tests.
+  // Shannon entropy of the mean Dirichlet probabilities p_i = alpha_i / a0,
+  // bounded in [0, ln(K)]. Deliberately not the Dirichlet differential entropy,
+  // which is unbounded below. (notes: uncertainty-semantic-entropy)
   float alphas[K_TOP + 1];
   int K = 0;
 
@@ -124,13 +107,9 @@ float semanticEntropy(const Voxel& v) {
 }
 
 float semanticVariance(const Voxel& v, uint16_t class_id) {
-  // Match semanticEntropy: the Voxel stores raw evidence and the Dirichlet
-  // +1 prior is added at query time (see voxel.hpp::defaultVoxel doc). The
-  // categorical includes only observed slots plus the unknown bucket — the
-  // same K used by semanticEntropy. Without this, entropy and variance
-  // disagreed on under-observed cells (entropy used Dirichlet(c+1, ...)
-  // while variance used Dirichlet(c, ...)) and downstream consumers got
-  // mutually inconsistent uncertainty signals.
+  // Match semanticEntropy: the +1 Dirichlet prior is added at query time, and
+  // the categorical covers only observed slots plus the unknown bucket (the
+  // same K). (notes: uncertainty-variance-matches-entropy)
   float a_k = 0.f;
   bool found = false;
   for (int i = 0; i < K_TOP; ++i) {
@@ -184,11 +163,9 @@ float ssmiFreeKL(const Voxel& v) {
 }
 
 // ====================================================================
-// SemBetaVoxel-typed overloads (D6 from the resume-grilling pass) —
-// bodies are byte-identical to the Voxel versions above; both structs
-// expose a_occ / a_free with identical semantics. Separate overloads
-// rather than templating to keep the existing library symbol surface
-// stable for any downstream linker that explicitly resolves these.
+// SemBetaVoxel-typed overloads: bodies are byte-identical to the Voxel versions
+// above. Separate overloads, not a template, keep the library symbol surface
+// stable. (notes: uncertainty-sembeta-overloads-2)
 // ====================================================================
 float variance(const SemBetaVoxel& v) {
   const float a = v.a_occ;

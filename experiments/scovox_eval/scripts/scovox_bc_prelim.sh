@@ -1,20 +1,13 @@
 #!/bin/bash
 # B/C-bucket preliminary sweep on the standard A1–A6 anchors.
 #
-# Goal: identify which open B/C ablations actually move mIoU on
-# Replica room0 m2f and KITTI seq08 PolarSeg. Items not exercised on these
-# anchors (B2 needs recompile, B6 needs instrumentation, C1–C4 need
-# multi-robot fusion) are deferred and not run here.
-#
-# Replica cells (added to results/ablations_replica_room0_m2f/):
-#   grazon_03    B4 — grazing_angle_threshold=0.3 (default value, on)
-#   q_both_03    B5 — range_decay=10 AND grazing=0.3 (full quality scaling)
-#
-# KITTI cells (added to results/ablations_kitti_seq08_polarseg/):
-#   trans_678    B3 — dynamic_classes=[6,7,8] routed to transient layer
+# Runs B4 and B5 on Replica room0 m2f and B3 on KITTI seq08 PolarSeg (see Cells
+# below). B2, B6 and C1-C4 need a recompile, instrumentation or multi-robot
+# fusion and are not run here. (notes: bc-prelim-scope)
 #
 # Baseline parameters mirror scovox_ablation_replica_room0_m2f.sh /
 # scovox_ablation_kitti_seq08_polarseg.sh, post-NG.
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

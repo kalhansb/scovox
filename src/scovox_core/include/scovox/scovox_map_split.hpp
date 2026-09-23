@@ -10,6 +10,7 @@
 /// Per-frame integration dispatches to TSDF + the SemSplitMap substrate.
 /// Mesh / pointcloud extraction comes from TsdfMap geometry + labelMesh /
 /// labelPointCloud against the Dir (semantics) grid.
+/// Moved comments: doc/scovox_map_split_notes.md
 
 #include <Eigen/Core>
 #include <algorithm>
@@ -58,22 +59,17 @@ class ScovoxMapSplit {
     /// two-DDA split path. Default true.
     bool fused_walker = true;
 
-    /// When false, the fused walker skips every TSDF band write, so the TsdfMap
-    /// grid stays empty. For callers that disabled TSDF (sdf_trunc passed as 0)
-    /// but whose TsdfMap::Params still sanitises sdf_trunc back to a positive
-    /// default — the band integration is then pure dead work if the TsdfMap grid
-    /// is never read. Default true → TSDF integrates exactly as before. The
-    /// occupancy (Beta) and semantic (Dir) substrates are unaffected either way.
+    /// When false, the fused walker skips every TSDF band write and the TsdfMap
+    /// grid stays empty (for callers that disabled TSDF). Occupancy (Beta) and
+    /// semantics (Dir) are unaffected. Default true.
+    /// (notes: split-tsdf-enabled)
     bool tsdf_enabled = true;
 
     // ---- Fine TSDF band (localized two-lattice refinement) ----
-    // docs/design/fine_tsdf_band_dbh_2026_07_30.md. 0 = off (default —
-    // byte-identical behaviour, no fine grid allocated). k > 0 adds a second
-    // sparse TSDF-only lattice at res_fine = resolution / 2^k, written only
-    // inside registered refinement cylinders (addRefinementRegion), in a
-    // ±fine_sdf_trunc_voxels fine-voxel band around gated hits. Independent
-    // of tsdf_enabled: the fine band can run with the coarse TSDF off
-    // (e.g. the occupancy-only LiDAR config).
+    // fine_ratio_log2 = 0 (default) disables it and allocates no fine grid. k >
+    // 0 adds a TSDF-only lattice at resolution / 2^k, written only inside
+    // registered refinement cylinders; independent of tsdf_enabled.
+    // (notes: fine-band-params)
     uint8_t fine_ratio_log2       = 0;
     int     fine_sdf_trunc_voxels = 3;      ///< fine trunc = this · res_fine
     float   fine_region_margin    = 0.15f;  ///< gate radius = model r + margin
@@ -105,11 +101,10 @@ class ScovoxMapSplit {
       , fine_region_margin_(p.fine_region_margin)
       , fine_anchor_enable_(p.fine_anchor_enable)
       , fine_anchor_params_(p.fine_anchor) {
-    // The band lives in the fused walker only (see integrateHitSplit). Asking
-    // for both is a request that cannot be honoured, and honouring it silently
-    // as "endpoint only" would hand back a null result that looks like a
-    // measurement. Refuse loudly and zero the knob so `sem_band_` and the
-    // params() the node prints agree with what actually runs.
+    // The semantic band exists only in the fused walker, so
+    // semantic_band_length > 0 with fused_walker false aborts at construction
+    // rather than running endpoint-only under a band label.
+    // (notes: split-band-needs-fused-walker)
     if (sem_band_ > 0.f && !fused_walker_) {
       std::fprintf(stderr,
           "[scovox] FATAL CONFIG: semantic_band_length=%.3f requires "
@@ -182,12 +177,9 @@ class ScovoxMapSplit {
     const Eigen::Vector3f d = endpoint - origin;
     const float depth = d.norm();
     if (depth < 1e-4f) {
-      // Degenerate ray (origin≈endpoint): no TSDF or semantic work happens.
-      // Attribute the (near-zero) bracket to tsdf_ns_ — same accumulator the
-      // main return below uses — so the fused walker reports ALL of its time in
-      // one bucket. (Routing this to sem_ns_ would be doubly wrong: it does
-      // no semantic work, and it splits the fused path's time across two
-      // accumulators whose per-substrate split is meaningless on this path.)
+      // Degenerate ray: no TSDF or semantic work. Its time goes to tsdf_ns_,
+      // like the main return, so the fused walker reports all its time in one
+      // bucket. (notes: fused-degenerate-ray-timing)
       const auto t1 = clk::now();
       tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
       return;
@@ -199,17 +191,10 @@ class ScovoxMapSplit {
     const float trunc = tparams.sdf_trunc;
     const float h     = 0.5f * static_cast<float>(tparams.resolution);
 
-    // SLIM-VDB-style flat semantic band (Params::semantic_band_length). Decided
-    // once per ray, not per voxel, so the branch inside the DDA is a bool test.
-    // Excluded cases, all of them deliberate:
-    //   is_dynamic     — a moving object must not paint its class onto the
-    //                    static surfaces its beam passes through or stops on;
-    //                    its endpoint already routes to the transient grids.
-    //   geometry_off /
-    //   kernel_radius  — an RGB-D overlay source owns the BKI ball path
-    //                    (applyHitUpdateKernel). Running the band as well would
-    //                    deposit that source's class twice per hit.
-    //   no sem_probs   — a bare geometric return has no opinion to pool.
+    // Semantic band decided once per ray. Off for is_dynamic rays (no painting
+    // static surfaces), geometry_off or kernel_radius sources (they own the
+    // kernel path; banding would deposit twice), and rays without sem_probs.
+    // (notes: fused-band-exclusions)
     const bool band_active = sem_band_ > 0.f && !is_dynamic && !geometry_off
                           && !(prof && prof->kernel_radius > 0.f)
                           && sem_probs && !sem_probs->empty();
@@ -217,13 +202,10 @@ class ScovoxMapSplit {
     const float walk_back = tparams.space_carving
         ? depth
         : std::max(depth, trunc);
-    // The band is symmetric about the surface, but the walk behind it normally
-    // stops at `trunc`. Extend the far end when the band reaches deeper, else
-    // the behind-surface half is silently clipped and the knob stops meaning
-    // what it says. At band ≤ trunc — the mirror configuration, both 0.30 m on
-    // KITTI — this is the old expression exactly and costs no extra steps.
-    // Voxels gained beyond trunc have sdf ≤ −trunc, which applyBandUpdate drops
-    // and the semCarve gate (sdf > 0) never sees, so TSDF/occupancy are unmoved.
+    // When the band reaches past trunc, extend the walk behind the surface so
+    // its far half is not clipped. Extra voxels have sdf <= -trunc, which
+    // applyBandUpdate drops and semCarve (sdf > 0) skips.
+    // (notes: fused-band-back-reach)
     const float back_reach = band_active ? std::max(trunc, sem_band_) : trunc;
     const Eigen::Vector3f start_pos = endpoint - walk_back * u;
     const Eigen::Vector3f end_pos   = endpoint + back_reach * u;
@@ -249,13 +231,10 @@ class ScovoxMapSplit {
       const float dist = v_point_voxel.norm();
       const float proj = v_voxel_origin.dot(v_point_voxel);
 
-      // (3) Hit (endpoint voxel) — semantic/occupancy update. Run this BEFORE
-      // the proj≈0 early-return: when the endpoint lands exactly on a voxel
-      // centre, v_point_voxel≈0 so proj≈0, and returning here would skip the
-      // hit update entirely — leaving the surface voxel at prior and diverging
-      // the fused walker from the non-fused SemSplitMap::integrateHit, which
-      // applies the hit unconditionally. The TSDF band update below may still
-      // skip on proj≈0 (its sign is ill-defined there), but semHit must not.
+      // Must run before the proj≈0 early return: an endpoint on a voxel centre
+      // gives proj≈0, and skipping would leave the surface voxel at prior,
+      // unlike SemSplitMap::integrateHit, which always applies the hit.
+      // (notes: fused-hit-before-proj-check)
       if (c == k_hit) {
         semHit(c, sem_probs, quality, is_dynamic, prof);
       }
@@ -264,40 +243,18 @@ class ScovoxMapSplit {
       const float sign = (proj > 0.f) ? 1.f : -1.f;
       const float sdf  = sign * dist;
 
-      // (1) TSDF band update — gate + clamp + Curless–Levoy. The fused walker
-      // always walks back to the origin (walk_back = max(depth, trunc)), so the
-      // upper gate here must MATCH the non-fused TsdfMap::integrateRay band,
-      // which depends on space_carving:
-      //   - space_carving=false (Replica/KITTI default): the non-fused path
-      //     walks only [hit−trunc, hit+trunc], so we keep the `sdf <= trunc + h`
-      //     band gate; dropping it would write the whole front ray that the
-      //     non-fused path never touches (and break the band invariant).
-      //   - space_carving=true: the non-fused path walks [origin, hit+trunc] and
-      //     applyBandUpdate clamps every in-front voxel (incl. sdf > trunc) to
-      //     +trunc, so we drop the upper gate to integrate the full carve front.
-      // applyBandUpdate owns the lower gate (`sdf <= -trunc` → drop) for both.
-      // Dynamic rays write NO persistent TSDF: a moving object must not leave a
-      // permanent surface. Its occupancy/semantics live in the transient grids
-      // (semHit above, is_dynamic=true); the free-space carve below stays
-      // persistent (the air the object passed through is genuinely free).
+      // The upper gate must match TsdfMap::integrateRay: with space_carving
+      // false keep sdf <= trunc + h; with it true integrate the full front.
+      // applyBandUpdate owns the lower gate. Dynamic rays write no persistent
+      // TSDF. (notes: fused-tsdf-band-gate)
       if (tsdf_enabled_ && !is_dynamic && !geometry_off && (tparams.space_carving || sdf <= trunc + h)) {
         tsdf_.applyBandUpdate(c, sdf, tsdf_weight_fn);
       }
 
-      // (1b) SLIM-VDB-style flat semantic band. This is the exact window
-      // SLIM-VDB's Integrate writes `alpha[label] += 1` over — `sdf > -trunc`
-      // on a ray it truncates at depth ± trunc — evaluated on voxels this DDA
-      // is already standing on, which is why it costs no traversal.
-      //
-      // The endpoint is excluded: semHit above already deposited there, and
-      // banding it too would give the surface voxel double weight relative to
-      // its neighbours, inverting the smoothing this is meant to apply.
-      //
-      // Ordered BEFORE the carve so the occupancy `applyBandSemantic` reads is
-      // this voxel's pre-carve state on the immediate path. On the live batched
-      // path the carve is staged until flushCarveFrame, so p_occ cannot move
-      // mid-scan and the two orders coincide — but they must not diverge
-      // between paths, so the order is pinned here rather than left to luck.
+      // Band deposit on voxels the DDA already visits, excluding the endpoint
+      // (semHit already deposited there). Must stay before the carve so
+      // applyBandSemantic reads pre-carve occupancy and both carve paths agree.
+      // (notes: fused-semantic-band-order)
       if (band_active && c != k_hit && sdf > -sem_band_ && sdf <= sem_band_) {
         semBand(c, sem_probs, quality, prof);
       }
@@ -324,27 +281,16 @@ class ScovoxMapSplit {
     }
 
     const auto t1 = clk::now();
-    // Fused walker: TSDF band updates and semantic hit/carve are interleaved in
-    // ONE per-voxel loop, so wall-clock cannot be cleanly attributed per
-    // substrate without bracketing every applyBandUpdate vs semHit/semCarve with
-    // a clock read — two steady_clock::now() calls per voxel would dominate and
-    // distort the very cost being measured in this hot Bresenham loop. We
-    // therefore report the COMBINED TSDF+semantic time under tsdf_ns_ and leave
-    // sem_ns_ untouched on the fused path (it reads 0). For a true per-substrate
-    // split, run the non-fused integrateHitSplit walker, which times the two
-    // DDAs separately. See tsdfTimeUs()/semdirTimeUs() docs.
+    // The fused walker reports combined TSDF+semantic time under tsdf_ns_ and
+    // leaves sem_ns_ at 0, since per-voxel clock reads would distort the hot
+    // loop. Use integrateHitSplit for a per-substrate split.
+    // (notes: fused-walker-timing)
     tsdf_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
   }
 
-  /// Non-fused split walker (two DDAs). Kept for A/B parity testing.
-  ///
-  /// NOTE: this path does NOT implement `semantic_band_length`. The band is
-  /// defined as "deposit on the voxels the walker is already standing on", and
-  /// the whole claim being tested is that this costs no extra traversal — which
-  /// is only true of the fused walker's single DDA. Reimplementing it here
-  /// would mean a third DDA and would measure something else. Callers get a
-  /// hard warning at construction rather than silent endpoint-only numbers;
-  /// see the `band + !fused_walker` check in ScovoxMapSplit's constructor.
+  /// Non-fused split walker (two DDAs), kept for A/B parity testing. It does
+  /// not implement semantic_band_length; the constructor refuses that
+  /// combination. (notes: split-walker-no-band)
   void integrateHitSplit(const Eigen::Vector3f&    origin,
                          const Eigen::Vector3f&    endpoint,
                          const std::vector<float>* sem_probs,
@@ -385,22 +331,19 @@ class ScovoxMapSplit {
   // Per-scan carve batching (universal free-space path)
   // -------------------------------------------------------------------
 
-  /// Open a carve frame on the semantic substrate: every carve (fused walker or
-  /// non-fused integrateHit/Miss) is staged read-free until flushCarveFrame().
-  /// Wrap a whole scan's rays in beginCarveFrame()/flushCarveFrame(). See
-  /// SemSplitMap for the rationale (full-ray free-space, one write per voxel).
-  /// Also opens the fine-band scan frame: gated hits are staged per region
-  /// so flushCarveFrame can anchor-correct the whole scan before fusing.
+  /// Opens a carve frame: every carve is staged read-free until
+  /// flushCarveFrame(), so wrap a whole scan's rays in the pair. Also opens the
+  /// fine-band frame, staging gated hits per region for the anchor-corrected
+  /// flush. (notes: carve-frame-begin)
   void beginCarveFrame() {
     semsplit_.beginCarveFrame();
     beginFineFrame();
   }
 
-  /// Write all staged carves for the scan (one Beta update per unique voxel,
-  /// block-ordered, occupied-wins). Timed into the same tsdf_ns_ bucket as the
-  /// fused walk, so tsdfTimeUs() reflects total carve cost (walk staging +
-  /// flush). Returns the number of voxels written (carve only — fine-band ray
-  /// count is reported via fineLastFrameRays()).
+  /// Writes all staged carves (one Beta update per unique voxel, occupied-wins)
+  /// and flushes the fine frame, timed into tsdf_ns_. Returns voxels written,
+  /// carve only; fine rays are in fineLastFrameRays().
+  /// (notes: carve-frame-flush)
   std::size_t flushCarveFrame() {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
@@ -441,14 +384,10 @@ class ScovoxMapSplit {
 
   const RefinementRegions& refinementRegions() const { return fine_regions_; }
 
-  /// Feed one raw sensor return to the fine band ONLY — no coarse-map write.
-  /// This is the full-density path: nodes typically voxel-grid-downsample
-  /// each scan before `integrateHit`, which caps what the fine lattice can
-  /// see at one return per downsample cell. Routing every raw (deskewed)
-  /// return here instead gives refinement regions the sensor's native point
-  /// density while the coarse map keeps its downsampled diet. Same gate,
-  /// staging, and per-scan anchor treatment as dispatcher-staged hits;
-  /// out-of-region endpoints are a no-op after one O(1) hash lookup.
+  /// Feeds one raw return to the fine band only (no coarse-map write), giving
+  /// refinement regions full sensor density. Same gate, staging and anchor
+  /// treatment as integrateHit; out-of-region endpoints cost one hash lookup.
+  /// (notes: fine-refine-hit)
   void refineHit(const Eigen::Vector3f& origin, const Eigen::Vector3f& endpoint) {
     if (fine_tsdf_) stageFineHit(origin, endpoint);
   }
@@ -482,11 +421,9 @@ class ScovoxMapSplit {
   // Per-call timing accumulators
   // -------------------------------------------------------------------
 
-  /// Accumulated TSDF time. NOTE: on the fused walker (fused_walker=true, the
-  /// default) this is the COMBINED TSDF+semantic integration time — the fused
-  /// loop interleaves both substrates and is not separable without per-voxel
-  /// clock overhead. Only the non-fused integrateHitSplit / integrateMiss paths
-  /// attribute TSDF and semantic time to separate accumulators.
+  /// Accumulated TSDF time; on the fused walker (the default) it is combined
+  /// TSDF+semantic time. Only integrateHitSplit and integrateMiss attribute
+  /// semantic time separately. (notes: split-tsdf-time-meaning)
   std::int64_t tsdfTimeUs()   const noexcept { return tsdf_ns_ / 1000; }
   /// Accumulated semantic-substrate time. On the fused walker this is 0 by
   /// design (the combined cost is reported under tsdfTimeUs()); it is non-zero
@@ -579,11 +516,9 @@ class ScovoxMapSplit {
     for (auto& v : fine_staged_) v.clear();
   }
 
-  /// Gate + stage one hit for the fine band. Inside an open scan frame the
-  /// hit is buffered per region for the anchor-corrected flush; outside a
-  /// frame (direct integrateHit callers, e.g. unit tests without the carve
-  /// bracket) it fuses immediately, uncorrected — mirroring SemSplitMap's
-  /// immediate-vs-batched carve semantics.
+  /// Gates and stages one hit for the fine band: inside an open scan frame it
+  /// is buffered per region for the anchor-corrected flush; outside a frame it
+  /// fuses immediately, uncorrected. (notes: fine-stage-hit)
   void stageFineHit(const Eigen::Vector3f& origin,
                     const Eigen::Vector3f& endpoint) {
     const int idx =
@@ -596,11 +531,10 @@ class ScovoxMapSplit {
     }
   }
 
-  /// Per-region anchor fit + band fusion of all staged hits. The whole
-  /// scan's in-region rays are translated by the fitted Δ (a rigid shift of
-  /// the sensor pose in the horizontal plane) so the fusion input aligns
-  /// with the region's canonical cylinder — drift is absorbed at the door,
-  /// before the irreversible Curless–Levoy average. Fit failure → Δ = 0.
+  /// Per region, fits the anchor shift and fuses all staged rays translated by
+  /// it, so fusion input aligns with the canonical cylinder before the
+  /// irreversible average. A failed fit means zero shift.
+  /// (notes: fine-flush-anchor)
   std::size_t flushFineFrame() {
     fine_frame_open_ = false;
     if (!fine_tsdf_) return 0;

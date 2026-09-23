@@ -1,3 +1,4 @@
+# Moved comments: doc/scovox_mapping_code_notes.md
 """Single-robot SCovox launch file — parameter audit reference.
 
 Launch with:
@@ -39,10 +40,9 @@ def generate_launch_description():
             "w_occ":      2.0,
 
             # -- Semantics (4) [KEEP] -------------------------------------------------
-            # kappa0                   double  2.0   -     Dirichlet base pseudo-count per hit
-            # semantic_occ_gate        double  0.5   -     Hard p_occ threshold for semantic updates
-            # (top-K width per voxel is the compile-time K_TOP in scovox_core
-            #  voxel.hpp — not a parameter)
+            # kappa0: Dirichlet base pseudo-count per hit. Per-voxel top-K width
+            # is the compile-time K_TOP (scovox_core voxel.hpp), not a
+            # parameter. (notes: single-launch-semantics-params)
             "kappa0":                   2.0,
             "semantic_occ_gate":        0.5,
 
@@ -58,10 +58,9 @@ def generate_launch_description():
             "evidence_saturation": 1000,
 
             # -- Range weighting (3) ---------------------------------------------------
-            # range_decay_length <= 0 disables range weighting.
-            # range_decay_length   double  -1.0   m    Distance at which w decays to ~37% (<=0 disables)
-            # min_range            double  0.3    m    Discard returns closer than this
-            # max_range            double  10.0   m    Discard returns farther than this
+            # range_decay_length (m): distance at which the weight decays to
+            # ~37%; <= 0 disables. min_range/max_range (m): returns closer or
+            # farther are discarded. (notes: single-launch-range-params)
             "range_decay_length": -1.0,
             "min_range":           0.3,
             "max_range":           10.0,
@@ -72,31 +71,19 @@ def generate_launch_description():
             "grazing_angle_threshold": -1.0,
 
             # -- Transient / dynamic layer (3) ----------------------------------------
-            # max_semantic_classes is the total label space; the per-voxel
-            # top-K width is the compile-time K_TOP (scovox_core voxel.hpp).
-            # max_semantic_classes  int            10   -    Total class count (label space)
-            # transient_decay_rate  double         0.8  -    Per-frame decay for dynamic voxels
-            # dynamic_classes       int[]          []   -    Class ids routed to the transient
-            #                                                 decaying grid (argmax match); empty
-            #                                                 = feature off. Uncomment to enable,
-            #                                                 e.g. "dynamic_classes": [11, 12].
-            #                                                 Leave unset (not []) to keep it off:
-            #                                                 an empty list breaks ROS 2 param
-            #                                                 type inference.
+            # max_semantic_classes is the total label space (per-voxel top-K is
+            # compile-time K_TOP). dynamic_classes routes argmax classes to the
+            # transient decaying grid; leave it unset to keep it off, as []
+            # breaks ROS 2 type inference.
+            # (notes: single-launch-transient-params)
             "max_semantic_classes": 10,
             "transient_decay_rate": 0.8,
 
             # -- Input frames & topics (7) [KEEP -- robot-specific] --------------------
-            # base_frame          string  "base_link"  -   Robot base frame
-            # integration_frame   string  "odom"       -   Frame for map integration
-            # map_frame           string  "map"        -   Global map frame
-            # depth_topic         string  ...          -   Depth image topic
-            # depth_info_topic    string  ...          -   CameraInfo topic for depth
-            # seg_topic           string  ...          -   Semantic segmentation topic
-            # stride              int     1            px  Pixel stride when subsampling depth
-            # min_depth           double  0.1          m   Depth clip minimum
-            # max_depth           double  10.0         m   Depth clip maximum
-            # trace_no_return_rays bool   false        -   Carve free space for no-return pixels
+            # Base, integration and global map frames; depth, CameraInfo and
+            # segmentation topics; depth pixel stride (px) and clip range (m);
+            # trace_no_return_rays carves free space for no-return pixels.
+            # (notes: single-launch-frames-topics-params)
             "base_frame":          ["", robot_name, "/base_link"],
             "integration_frame":   ["", robot_name, "/odom"],
             "map_frame":           "map",
@@ -109,31 +96,17 @@ def generate_launch_description():
             "trace_no_return_rays": False,
 
             # -- Mode / identity (2) [KEEP] -------------------------------------------
-            # mode      string  "rolling"  -   "rolling" (publishes ScovoxMapBinary
-            #                                   snapshots, rolling planning_map crop)
-            #                                   | "persistent" (no binary)
-            # robot_id  string  ""         -   Robot identifier (informational)
+            # mode: rolling publishes ScovoxMapBinary snapshots and a rolling
+            # planning_map crop; persistent publishes no binary. robot_id is
+            # informational. (notes: single-launch-mode-params)
             "mode":                "rolling",
             "robot_id":            robot_name,
 
             # -- Output / visualisation (11) [CANDIDATE: planning map -> separate node] -
-            # The 8 planning_map_* params could be moved to a dedicated
-            # planning-map server node, leaving just publish_pointcloud,
-            # occupancy_vis_threshold, and scovox_publish_rate here.
-            # publish_pointcloud        bool    true    -    Publish coloured occupancy pointcloud
-            # pointcloud_topic          string  ~/pc    -    Topic for pointcloud output
-            # scovox_topic              string  ~/sec   -    Topic for full ScovoxMap (a_occ/a_free)
-            # occupancy_vis_threshold        double  0.7     -    Minimum P(occ) to include in outputs
-            # scovox_publish_rate       double  1.0     Hz   Rate of full ScovoxMap publication
-            # publish_planning_map      bool    true    -    Publish 2-D OccupancyGrid for planners
-            # planning_map_topic        string  ~/pm    -    Topic for planning OccupancyGrid
-            # planning_map_resolution   double  0.20    m    Grid cell size
-            # planning_map_size_m       double  80.0    m    Square grid side length
-            # planning_map_origin_x     double  -40.0   m    Grid origin X (world frame)
-            # planning_map_origin_y     double  -40.0   m    Grid origin Y (world frame)
-            # planning_map_min_z        double  -1.0    m    Min voxel Z projected into grid
-            # planning_map_max_z        double   2.0    m    Max voxel Z projected into grid
-            # planning_map_inflation_m  double  0.0     m    Obstacle inflation radius
+            # Outputs: coloured occupancy pointcloud, full ScovoxMap
+            # (a_occ/a_free) at scovox_publish_rate Hz, min P(occ) for outputs,
+            # and a 2-D OccupancyGrid for planners (cell, side, origin, z band,
+            # inflation in m). (notes: single-launch-output-params)
             "publish_pointcloud":       True,
             "pointcloud_topic":         "~/pointcloud",
             "scovox_topic":             "~/scovox",
@@ -152,12 +125,10 @@ def generate_launch_description():
     )
 
     # -- DSCovoxNode ---------------------------------------------------------------
-    # Only parameters dscovox_mapping_node actually declares are set here. The
-    # planning-map, pose-correction (pose_source/correction_*) and
-    # consensus-tuning (epsilon_w/Lsat/k_conflict/epsilon_sem/lambda_sem) keys
-    # formerly listed were never declared by the node and were silently
-    # ignored; consensus constants live in scovox_core, and the per-voxel
-    # top-K width is the compile-time K_TOP (scovox_core voxel.hpp).
+    # Only parameters dscovox_mapping_node declares are set here; undeclared
+    # keys are silently ignored. Consensus constants live in scovox_core;
+    # per-voxel top-K width is the compile-time K_TOP.
+    # (notes: single-launch-dscovox-declared-params)
     dscovox_node = Node(
         package="scovox_mapping",
         executable="dscovox_mapping_node",
@@ -171,11 +142,9 @@ def generate_launch_description():
             "input_topics": [["", robot_name, "/scovox_node/scovox_bin"]],
 
             # -- Output ----------------------------------------------------------------
-            # pointcloud_topic   string  ~/pointcloud  -    Fused pointcloud output
-            # map_frame          string  "map"         -    Frame for fused map
-            # occupancy_vis_threshold double  0.7      -    Min P(occ) for outputs
-            # semantic_occ_gate  double  0.5           -    p_occ gate for semantic merge
-            # publish_rate_hz    double  1.0           Hz   Fused map publish rate (= code default)
+            # Fused pointcloud topic, fused-map frame, min P(occ) for outputs,
+            # and fused-map publish rate (Hz).
+            # (notes: single-launch-dscovox-output-params)
             "pointcloud_topic":         "/dscovox_mapping/pointcloud",
             "map_frame":                "map",
             "occupancy_vis_threshold":  0.7,

@@ -1,19 +1,15 @@
 #!/bin/bash
 # SceneNet val-batch evaluator for SCovox iter6 (use_split + fused_walker).
 #
-# For each preprocessed trajectory under data/scenenet_val_layout/train/<seq>/:
-#   1. Launch scovox_mapping_node with scenenet_eval.launch.py
-#   2. Replay 300 frames via scenenet_replay_node at 10 Hz
-#   3. Capture ~/pointcloud → NPZ
-#   4. Build GT voxel grid via scenenet_build_gt.py
-#   5. Score with scenenet_compute_metrics.py at the end
-#
-# Defaults: use_split:=true, share_tsdf:=false, fused_walker:=true,
-#           semantic_mode:=dirichlet, resolution:=0.05, K_TOP=2 (compile-time).
+# Per trajectory under data/scenenet_val_layout/train/: launch, replay at 10
+# Hz, capture the pointcloud to NPZ, build the GT grid if missing; score all
+# cells at the end. Expects K_TOP set to 2 at compile time.
+# (notes: scenenet-iter6-steps)
 #
 # Usage:
 #   ./scenenet_run_batch_iter6.sh                    # 13 default cells
 #   ./scenenet_run_batch_iter6.sh 0_223 0_175 0_485  # specific cells
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

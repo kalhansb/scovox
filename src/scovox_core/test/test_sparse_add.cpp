@@ -1,5 +1,6 @@
 /// @file test_sparse_add.cpp
 /// Tests for sparse_add eviction and mass conservation.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 #include "scovox/voxel.hpp"
@@ -139,12 +140,9 @@ TEST(SparseAdd, NullAUnkStillWorks) {
 // =====================================================================
 
 TEST(SparseAdd, ZeroIncrementLandsInEmptySlot) {
-  // Pin the zero-increment contract. Tracing sparse_add() on an empty voxel:
-  //   - match loop:  needs sem_cnt[i] > 0.0f, false for every empty slot -> no match.
-  //   - empty loop:  sem_cnt[i] <= 0.0f is true for slot 0 (0.0f) -> the slot is
-  //                  claimed with sem_cls[0] = cls and sem_cnt[0] = inc (== 0.0f).
-  // So a zero increment is NOT dropped: it occupies slot 0 with the given class id
-  // and a zero count, and leaves a_unk untouched (no eviction/drop path is hit).
+  // A zero increment is not dropped: it claims the first empty slot (sem_cnt <=
+  // 0, here slot 0) with the class id and a zero count, and leaves a_unk
+  // untouched. (notes: sparse-add-zero-increment)
   Voxel v = makeEmpty();
   sparse_add(v.sem_cnt, v.sem_cls, 1, 0.0f, &v.a_unk);
   EXPECT_EQ(v.sem_cls[0], 1);

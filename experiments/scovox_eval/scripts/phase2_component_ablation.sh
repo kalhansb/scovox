@@ -1,30 +1,15 @@
 #!/bin/bash
-# NEW_EXPERIMENT_PLAN.md Phase 2 — component ablation on the post-SemDir
-# substrate. **Expanded from the plan's 4 anchors to 6** by adding two
-# more KITTI sequences (seq06, seq10) alongside the canonical seq08 —
-# same coverage convention as Phase 4 h2h, which uses 5 KITTI seqs.
-# With 3 modes that's 6 × 3 = 18 cells; run on use_split=true to
-# exercise the SemDirMap path.
-#
-# Anchors:
-#   - KITTI seq06 (added; suburban, fast traffic — different distribution)
-#   - KITTI seq08 (plan's canonical anchor)
-#   - KITTI seq10 (added; highway/long-straight, less semantic clutter)
-#   - SceneNet 0_789  (high SCovox mIoU = 0.385)
-#   - SceneNet 0_723  (low  SCovox mIoU = 0.269)
-#   - SceneNet 0_485  (mid  SCovox mIoU = 0.303)
-# Modes: dirichlet (D), majority_vote (MV), naive (NP)
-#
-# ⚠️ SceneNet uses GT one-hot labels → soft-prob reduces to hard. The
-# "history matters" finding (D vs NP, D vs MV) still tests cleanly on
-# both datasets. The "soft-prob recovers calibration signal" finding
-# is KITTI-only (PolarSeg .topk).
+# Phase 2 component ablation on the post-SemDir substrate: 6 anchors x 3
+# semantic modes = 18 cells, run with use_split to exercise the SemDirMap path.
+# SceneNet uses GT one-hot labels, so soft-prob reduces to hard.
+# (notes: ablation-phase2-anchors-modes)
 #
 # Env knobs:
 #   SCENES=…       — override the anchor list (smoke: "kitti_08")
 #   MODES=…        — override the mode list  (smoke: "dirichlet")
 #   N_KITTI=…      — frames/scene for KITTI    (default 100)
 #   N_SCENENET=…   — frames/scene for SceneNet (default 300)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws
@@ -152,11 +137,10 @@ for anchor in "${ANCHORS[@]}"; do
       # Stage NPZ into the seq subdir layout the scorer expects.
       stage="${RES_ROOT}/_score_${tag}/${seq}"; mkdir -p "${stage}"
       cp "${npz}" "${stage}/scovox.npz"
-      # `--replay_to_yaml_lut` remaps PolarSeg's REPLAY class layout (lane-
-      # marking at id 15, veg/trunk/terrain/pole +1 vs yaml learning_map)
-      # back to yaml space before bucket-IoU. Without it 4 classes score 0
-      # and KITTI mIoU drops by ~0.10 absolute. See kitti-miou-replay-bug
-      # 2026-05-11 memo + Phase 0 smoke for the canonical invocation.
+      # The replay_to_yaml_lut flag remaps PolarSeg's REPLAY class layout
+      # (lane-marking at 15, later classes shifted +1) to yaml space before
+      # bucket-IoU; without it the shifted classes score 0.
+      # (notes: kitti-replay-lut-flag)
       miou=$(python3 "${EVAL_PKG}/scripts/eval_scovox_kitti_miou.py" \
           --kitti_root "${KITTI_ROOT}" \
           --npz_root "${RES_ROOT}/_score_${tag}" \

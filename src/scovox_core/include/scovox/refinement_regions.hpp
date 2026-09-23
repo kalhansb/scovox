@@ -20,6 +20,7 @@
 /// tangential component is unobservable. See the design doc's
 /// "Per-scan anchor re-registration" section for why this makes the fine
 /// lattice drift-free relative to its tree.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <Eigen/Core>
 #include <cmath>
@@ -51,11 +52,10 @@ class RefinementRegions {
   explicit RefinementRegions(float cell_size = 4.0f)
       : cell_(cell_size > 0.1f ? cell_size : 4.0f), inv_cell_(1.f / cell_) {}
 
-  /// Register (or replace, keyed on `cyl.id`) a region. `margin` widens the
-  /// gate radius beyond the model radius. Returns the slot index. Slot
-  /// indices are stable for the registry's lifetime (removal tombstones,
-  /// re-registration of the same id reuses its slot) so per-slot scan
-  /// buffers stay valid.
+  /// Registers or replaces (keyed on cyl.id) a region; margin widens the
+  /// gate radius beyond the model radius. Returns the slot index, stable
+  /// while registered, so per-slot scan buffers stay valid.
+  /// (notes: refinement-add-slot-stability)
   int add(const RefinementCylinder& cyl, float margin) {
     int idx = indexOf(cyl.id);
     if (idx >= 0) {
@@ -228,15 +228,10 @@ struct AnchorFitParams {
   float damping     = 0.10f;
 };
 
-/// Fit the 2-DoF horizontal shift Δ minimising
-///   Σ_i ρ_huber( ‖p_i + Δ − c‖ − r )
-/// over one scan's in-region endpoint XY positions `pts`, against the
-/// canonical cylinder centre `c = (cx, cy)` and radius `r`.
-///
-/// Returns std::nullopt when the fit must not be trusted: too few points,
-/// a degenerate normal matrix, or a converged shift beyond `max_shift`
-/// (wrong association / not actually the trunk). Callers then integrate
-/// uncorrected — losing a scan's correction, never inventing one.
+/// Fits the 2-DoF horizontal shift minimising the Huber radial residual of
+/// pts against cylinder (c, r). Returns nullopt when untrusted (too few
+/// points, degenerate system, shift over max_shift); callers integrate
+/// uncorrected. (notes: anchor-fit-contract)
 inline std::optional<Eigen::Vector2f> fitCylinderAnchorShift(
     const std::vector<Eigen::Vector2f>& pts,
     const Eigen::Vector2f& c, float r,

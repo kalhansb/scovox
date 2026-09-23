@@ -1,6 +1,7 @@
 #pragma once
 /// @file uncertainty.hpp
 /// @brief Beta and Dirichlet uncertainty functions — zero ROS dependencies.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <algorithm>
 #include <cmath>
@@ -24,25 +25,17 @@ float semanticVariance(const Voxel& v, uint16_t class_id);
 float betaKL(const Voxel& a, const Voxel& b);
 
 // ====================================================================
-// SemBetaVoxel-typed (split-grid 24-byte struct) overloads — D6 from
-// the resume-grilling pass. Bodies are identical to the Voxel versions
-// (both structs expose a_occ / a_free / a_unk / sem_cls[] / sem_cnt[]
-// with the same semantics); separate overloads are added rather than
-// templating the .cpp definitions to keep the existing library symbol
-// surface stable. Only the helpers actually consumed by the dscovox_node
-// + scovox_node publishers are added now (variance, expectedInformationGain);
-// the rest can be added incrementally if a downstream caller needs them.
+// SemBetaVoxel (24-byte) overloads with the same bodies as the Voxel versions;
+// separate overloads rather than templates keep the library symbol surface
+// stable. Only variance and expectedInformationGain exist.
+// (notes: uncertainty-sembeta-overloads)
 // ====================================================================
 float variance(const SemBetaVoxel& v);
 float expectedInformationGain(const SemBetaVoxel& v);
 
-/// Lower-bound estimate of distinct classes ever observed at this voxel.
-/// Uses only existing fields — zero extra memory.
-/// Underestimates m, which makes the Hutter floor conservative (less
-/// unknown mass). Acceptable if noted as a lower bound in the paper.
-///
-/// Template form (D6): both Voxel and SemBetaVoxel expose `sem_cnt[K_TOP]`
-/// and `a_unk` fields with identical semantics, so the body is shared.
+/// Lower bound on distinct classes ever observed, from existing fields only;
+/// underestimating m makes the Hutter floor conservative. Shared by Voxel and
+/// SemBetaVoxel. (notes: uncertainty-distinct-classes)
 template <typename V>
 inline int estimateDistinctClasses(const V& v) {
   int m = 0;
@@ -53,40 +46,23 @@ inline int estimateDistinctClasses(const V& v) {
   return std::max(m, 1);  // floor at 1 to avoid log(0)
 }
 
-/// Hutter (AISTATS 2013, §3) adaptive escape mass for the sparse Dirichlet.
-///
-/// β* = m / [2 ln((N+1)/m)]
-///
-/// m: distinct classes ever observed (or lower bound)
-/// N: total semantic observations (sum of all sem_cnt + a_unk)
-///
-/// Returns a floor for a_unk that gives the residual a principled
-/// interpretation as a Dirichlet escape probability — the posterior
-/// mass allocated to untracked classes — rather than a dump bucket
-/// for evicted evidence.
+/// Hutter escape mass m / (2 ln((N+1)/m)), with m distinct classes seen (or a
+/// lower bound) and N the total semantic observations; a floor for a_unk as
+/// the posterior mass of untracked classes. (notes: uncertainty-hutter-escape)
 inline float hutterEscapeMass(int m, float N) {
   if (m <= 0 || N <= 0.f) return 0.f;
   const float ratio = (N + 1.f) / static_cast<float>(m);
-  // The escape mass is a pseudo-count for untracked classes and is bounded
-  // above by the total observation count N — you cannot allocate more unknown
-  // evidence than evidence actually seen. The Hutter formula assumes N ≫ m; as
-  // ratio → 1⁺ (N small relative to m) the raw m / (2 ln ratio) term diverges
-  // (e.g. m=1, N≈1e-4 → ratio≈1.0001 → ~5000), which is physically impossible.
-  // Clamp to N in both the degenerate (ratio ≤ 1, i.e. m ≥ N+1) and the
-  // near-singleton regimes.
+  // The escape mass cannot exceed N; the raw formula diverges as ratio nears
+  // 1, so clamp to N both when ratio <= 1 (m >= N+1) and near it.
+  // (notes: uncertainty-hutter-clamp)
   if (ratio <= 1.f) return N;  // degenerate: m ≥ N+1, escape mass capped at N
   return std::min(static_cast<float>(m) / (2.f * std::log(ratio)), N);
 }
 
-/// Effective a_unk with Hutter floor applied.
-///
-/// Use this at QUERY TIME (entropy, class prediction, visualization)
-/// instead of raw v.a_unk. Do NOT use in update paths — the raw
-/// accumulation in sparse_add and dirichlet_update_semantics must
-/// remain unmodified so evidence is conserved exactly.
-///
-/// Template form (D6): shared body for Voxel and SemBetaVoxel. Both
-/// expose `a_unk` and `sem_cnt[K_TOP]` with identical semantics.
+/// a_unk with the Hutter floor applied. Query time only (entropy, prediction,
+/// visualisation); never in update paths, where sparse_add and
+/// dirichlet_update_semantics must keep raw a_unk so evidence is conserved.
+/// (notes: uncertainty-effective-residual)
 template <typename V>
 inline float effectiveResidual(const V& v) {
   const int m = estimateDistinctClasses(v);

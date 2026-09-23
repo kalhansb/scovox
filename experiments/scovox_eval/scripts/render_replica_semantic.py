@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """Render class-ID semantic PNGs for Replica along NICE-SLAM trajectories.
 
 Inputs:
@@ -91,11 +92,10 @@ def make_sim(scene_path: Path, H: int, W: int, hfov_deg: float) -> habitat_sim.S
     return habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
 
 
-# NICE-SLAM traj.txt: c2w, camera axes OpenCV (y-down, z-fwd), world axes Replica
-# native (z-up, gravity along -Z). Habitat expects: camera axes OpenGL
-# (y-up, -z-fwd), world axes y-up (gravity along -Y). Compose two transforms:
-#   (a) world rotation: Replica world (z-up) -> Habitat world (y-up): Rx(-90°)
-#   (b) camera-axis flip: OpenCV -> OpenGL: diag(1,-1,-1,1) applied on the right.
+# Poses are c2w with OpenCV camera axes in the z-up Replica world; Habitat wants
+# OpenGL camera axes in a y-up world. Left-multiply by Rx(-90 deg) for the
+# world, right-multiply by diag(1,-1,-1,1) for the camera.
+# (notes: replica-pose-frame-conversion)
 _WORLD_REPLICA_TO_HABITAT = np.array([
     [1.0,  0.0, 0.0, 0.0],
     [0.0,  0.0, 1.0, 0.0],

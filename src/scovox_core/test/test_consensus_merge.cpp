@@ -1,6 +1,7 @@
 /// @file
 /// @brief Consensus merge: independent BetaVoxel (occupancy) + DirVoxel
 /// (semantics) merges, each conjugate and mass-conserving.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -102,19 +103,10 @@ TEST(ConsensusMerge, DirEvictionRoutesToOther) {
   EXPECT_NEAR(f.other, (kC - scovox::K_TOP) * kAlpha + 3.0f + 2.0f, 1e-5f);
 }
 
-// E6.3 (order-invariance, pairwise leg). The Beta merge is plain addition, so
-// `BetaMergeIsSymmetricAndAdditive` above settles occupancy. The Dir merge is
-// addition PLUS truncation, and truncation is where order can start to matter —
-// so commutativity has to be pinned separately, and specifically in the regime
-// that truncates. Both cases below carry more than K_TOP distinct classes
-// between them, so eviction is live in every assertion.
-//
-// This holds because mergeDir builds a union dict (its upsert is additive, hence
-// order-free) and then applies a strict total order — count desc, class id asc.
-// The class-id tie-break is load-bearing: without it two classes with equal
-// counts straddling the K_TOP boundary would be kept-or-dumped according to
-// which source was folded first. `DirMergeTieAtTruncationBoundaryIsCommutative`
-// pins exactly that case.
+// Dir merge is addition plus truncation, so commutativity is pinned where
+// eviction is live (over K_TOP classes). It holds because mergeDir orders by
+// count desc, then class id asc; the id tie-break is load-bearing.
+// (notes: merge-dir-commutes-under-eviction)
 TEST(ConsensusMerge, DirMergeIsCommutativeUnderEviction) {
   auto a = dirPrior(); a.cls[0] = 1; a.cnt[0] = kAlpha + 5.0f; a.cls[1] = 2; a.cnt[1] = kAlpha + 4.0f;
   auto b = dirPrior(); b.cls[0] = 3; b.cnt[0] = kAlpha + 4.5f; b.cls[1] = 4; b.cnt[1] = kAlpha + 1.0f;
@@ -158,13 +150,9 @@ TEST(ConsensusMerge, DirMassConservation) {
 }
 
 // ===========================================================================
-// num_classes ≤ K_TOP edge (residual_dims ≤ 0). The OTHER prior is
-// (num_classes − K_TOP)·α₀, which is zero at num_classes==K_TOP and would go
-// NEGATIVE at num_classes<K_TOP. defaultDirVoxel / mergeDir both clamp it at 0
-// so the prior subtraction in mergeDir can never become prior INFLATION. These
-// pin that clamp on the reachable scovox_core path (the receiver-side
-// projectBetaDirToVoxel / isPriorDir helpers live in the mapping node and are
-// covered by the explicit mergeFrames reject below + node tests).
+// num_classes <= K_TOP edge: the OTHER prior (num_classes - K_TOP)*alpha_0 is 0
+// at K_TOP and negative below; defaultDirVoxel and mergeDir clamp it at 0 so
+// the prior subtraction never inflates OTHER. (notes: merge-other-prior-clamp)
 // ===========================================================================
 
 TEST(ConsensusMerge, DefaultDirVoxelClampsOtherPriorAtKTop) {

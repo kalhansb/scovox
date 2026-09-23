@@ -3,11 +3,12 @@
 # both 5 cm and 10 cm resolutions). Outputs go into `_tsdf_v2/` so v1 (which
 # used carve_band=0.1 + endpoint-only TSDF) is preserved.
 #
-# Patched scovox_node now routes carve_band>0 through the fused walk so the
-# band is actually populated (no longer single-cell at the hit).
+# scovox_node fills the whole band when carve_band > 0 (fused walk), not just
+# the hit cell. (notes: tsdf-v2-carve-band-fused-walk)
 #
 # KITTI seq 06-10: 100 scans, polarseg, 10 cm, sdf_trunc=0.10 m (1 voxel band)
 # Replica  all 8 : 2000 frames, m2f ADE, 5 cm, sdf_trunc=0.10 m (2 voxel band)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

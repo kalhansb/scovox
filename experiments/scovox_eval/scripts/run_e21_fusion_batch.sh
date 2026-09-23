@@ -1,19 +1,11 @@
 #!/bin/bash
 # E2.1 fusion smoke — split-grid trajectory-split SCovox + dscovox fusion.
 #
-# Per-scene topology (replica_eval_fusion.launch.py + use_split=true):
-#   /robotA/scovox_node  ← replay frames [0, 1000)
-#   /robotB/scovox_node  ← replay frames [1000, 2000)
-#   /dscovox_node        ← merges both via wire-format v2 (37 B/voxel SemBeta)
-#
-# Per cell capture:
-#   results/e21_fusion_2026_05_08/<scene>/{solo_a,solo_b,fused}.npz
-#
-# Score: eval_e21_fusion.py — voxel-mIoU + Chamfer + F@5cm vs replica GT.
-# Verdict per spec: fused beats max(solo_a, solo_b) on mIoU, F@5cm, Chamfer.
-#
-# Idempotent: scenes with all 3 npz present are skipped.
-# Sequential execution per user preference.
+# Robot A replays frames [0, N_PER_ROBOT), robot B the next N_PER_ROBOT;
+# dscovox_node merges both. Per scene captures solo_a, solo_b and fused npz
+# (skipped when all 3 exist), then scores with eval_e21_fusion.py.
+# (notes: e21-fusion-topology)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -o pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

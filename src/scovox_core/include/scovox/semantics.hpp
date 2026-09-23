@@ -7,6 +7,7 @@
 /// over the current Beta posterior on occupancy. Free voxels (low p_occ)
 /// contribute small mass; confidently-occupied voxels contribute fully.
 /// No hard threshold gate.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <vector>
 #include <cmath>
@@ -63,18 +64,10 @@ inline void dirichlet_update_semantics(Voxel* v,
   if (uinc > 0.0f) v->a_unk += uinc;
 }
 
-/// NAIVE mode — intentional ablation baseline.
-///
-/// "Last observation wins": every update wipes prior semantic state and
-/// stores the argmax class with a fixed count of 1.0. By design this:
-///   - ignores `quality`, `kappa0`, and `p_occ` (no weighting),
-///   - cannot accumulate confidence over repeated observations,
-///   - returns the same `semanticEntropy` regardless of how many times the
-///     cell was observed.
-/// `apply_semantics` still applies a hard `p_occ > 0.5` cutoff for NAIVE
-/// and MAJORITY_VOTE (so they only fire on occupied voxels). This is used
-/// as a contrast against the Dirichlet mode in ablations and should NOT
-/// be "improved" without removing it from the ablation suite.
+/// Ablation baseline: last observation wins (argmax class, count 1),
+/// ignoring quality, kappa0 and p_occ. apply_semantics gates it at p_occ >
+/// 0.5. Do not improve it without removing it from the ablation suite.
+/// (notes: semantics-naive-baseline)
 inline void naive_update_semantics(Voxel* v,
                                    const std::vector<float>* class_probs) {
   if (!class_probs) return;
@@ -91,14 +84,10 @@ inline void naive_update_semantics(Voxel* v,
   v->sem_cnt[0] = 1.f;
 }
 
-/// MAJORITY_VOTE mode — intentional ablation baseline.
-///
-/// Each admitted observation contributes a single +1 vote to the argmax
-/// class. Like NAIVE, this ignores `quality`, `kappa0`, and `p_occ`;
-/// unlike NAIVE it accumulates votes across observations. A hard
-/// `p_occ > 0.5` cutoff is applied at `apply_semantics`,
-/// so MAJORITY_VOTE only fires on occupied voxels — the only ablation
-/// variable vs DIRICHLET is the accumulation rule.
+/// Ablation baseline: one +1 vote for the argmax class per observation,
+/// ignoring quality, kappa0 and p_occ; apply_semantics gates it at p_occ >
+/// 0.5, so only the accumulation rule differs from DIRICHLET.
+/// (notes: semantics-majority-vote-baseline)
 inline void majority_vote_semantics(Voxel* v,
                                     const std::vector<float>* class_probs) {
   if (!class_probs) return;

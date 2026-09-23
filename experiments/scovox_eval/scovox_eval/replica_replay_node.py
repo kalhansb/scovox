@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """ROS2 node that replays pre-rendered Replica frames into SCovox.
 
 Supports two dataset formats (auto-detected):
@@ -46,13 +47,10 @@ from tf2_ros import TransformBroadcaster
 from builtin_interfaces.msg import Time as TimeMsg
 
 
-# Map category names to distinct RGB colors for SCovox semantic input.
-# These colors must match semantic_color_map_keys/classes in the SCovox launch config.
-# Class 0 = unknown (black). Unmapped categories also get black.
-#
-# Format: "category_substring": (R, G, B) — matched case-insensitively.
-# The RGB value is packed as (R<<16 | G<<8 | B) for the SCovox color map key.
-#
+# Category substring (matched case-insensitively) to RGB for SCovox semantic
+# input. Colors must match semantic_color_map_keys/classes in the SCovox launch
+# config, packed R<<16|G<<8|B. Unmapped categories are black.
+# (notes: replica-category-colors)
 # Replica indoor categories          R     G     B
 CATEGORY_COLORS = {
     "wall":       (174,  199,  232),  # light blue (shared with flatforest)
@@ -226,12 +224,10 @@ class ReplicaReplayNode(Node):
         }
         self._depth_scale = cam.get("scale", 6553.5)
 
-        # Semantic mapping: build pixel-value → RGB color lookup.
-        # When semantic_subdir == "semantic", pixel values are object/instance IDs
-        # and we map through info_semantic.json objects[] (obj_id → class_name → color).
-        # When semantic_subdir is anything else (e.g. "semantic_gt_fixed",
-        # "semantic_m2f_ade"), pixel values are CLASS IDs directly and we map
-        # through info_semantic.json classes[] (class_id → class_name → color).
+        # Builds the pixel-value to RGB lookup. With semantic_subdir "semantic"
+        # pixels are object IDs mapped via info_semantic.json objects[];
+        # class-ID subdirs such as semantic_gt_fixed map via classes[].
+        # (notes: replica-semantic-lookup)
         self.sem_class_map = {}
         info_path = self.dataset / "info_semantic.json"
         if info_path.exists():
@@ -395,16 +391,10 @@ class ReplicaReplayNode(Node):
         ])
 
         if self.camera_poses:
-            # NICE-SLAM: camera-to-world in mesh native frame.
-            # Publish directly — no coordinate conversion.
-            # SCovoxNode's kR converts optical→body; the TF rotation
-            # must undo kR and apply the camera-to-world rotation.
-            # kR converts optical (Z-fwd,X-right,Y-down) → body (X-fwd,Y-left,Z-up)
-            # We need: T_world = T_cam2world * kR^(-1) * p_optical
-            # So TF rotation = R_cam2world * kR^T  (since kR is orthogonal)
-            # But SCovoxNode does: T_oo.linear() = TF_rotation * kR
-            # So: T_oo = R_cam2world * kR^T * kR = R_cam2world ✓
-            # Therefore: TF_rotation = R_cam2world * kR^T
+            # Camera-to-world pose in the mesh's native frame, no axis
+            # conversion. SCovoxNode applies TF_rotation * kR (optical to body),
+            # so publish R_cam2world * kR^T; kR here mirrors SCovoxNode's kR.
+            # (notes: replica-camera-pose-tf)
             kR = np.array([[0,0,1],[-1,0,0],[0,-1,0]], dtype=np.float64)
             R_tf = R @ kR.T
             q_tf = _rotation_matrix_to_quaternion(R_tf)

@@ -9,6 +9,7 @@
 /// Used by `scovox::TsdfMap` (band-only DDA, SLIM-VDB-equivalent integration).
 /// The semantic and occupancy state lives in a parallel
 /// `Bonxai::VoxelGrid<scovox::SemBetaVoxel>`; see `sembeta_voxel.hpp`.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <cstddef>
 #include <type_traits>
@@ -37,11 +38,9 @@ static_assert(std::is_standard_layout_v<TsdfVoxel>,
     "TsdfVoxel must have standard layout for the wire format's "
     "byte-for-byte reinterpret_cast emit path.");
 
-/// Default-constructed TSDF voxel: distance=0, weight=0 (= unobserved).
-/// Matches Bonxai's pool zero-init, so existing leaf-block construction
-/// already produces this state. Provided for explicit-construction sites
-/// (e.g. unit tests) and as the canonical "what does an unobserved voxel
-/// look like?" reference.
+/// Unobserved TSDF voxel (distance 0, weight 0), the same state Bonxai's pool
+/// zero-init produces; for explicit-construction sites.
+/// (notes: tsdf-voxel-default)
 inline TsdfVoxel defaultTsdfVoxel() noexcept { return {0.0f, 0.0f}; }
 
 }  // namespace scovox

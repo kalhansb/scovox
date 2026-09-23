@@ -2,6 +2,7 @@
 /// @brief Wire format (revision 8: block-run coords + u8 sqrt-companded
 /// quantization + packed class ids) round-trip, quantization edge semantics,
 /// and header/structure validation.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -155,15 +156,10 @@ TEST(BinarySerializer, TruncatedFrameThrows) {
   EXPECT_THROW(scovox::BinarySerializer::deserialize(blob), std::runtime_error);
 }
 
-// Regression for the forged-record-count DoS (review finding 38 / 8): a frame
-// with a valid MAGIC/VERSION/header but a record count (tsdf/beta/dir) far
-// larger than the bytes actually present must be REJECTED, not silently
-// accepted nor allowed to drive an unbounded reserve(). We forge each of the
-// three counts in turn (with an otherwise-empty body) and assert deserialize
-// throws so the receiver can drop the frame instead of integrating garbage.
-// All three stream guards validate the count against the remaining byte budget
-// BEFORE the reserve, so the forged count surfaces as the documented
-// runtime_error; std::exception is asserted as the (looser) contract.
+// A valid header with a record count far beyond the bytes present must make
+// deserialize throw before any unbounded reserve(). Each stream count is forged
+// in turn; std::exception is the asserted contract.
+// (notes: serializer-forged-count-test)
 TEST(BinarySerializer, ForgedRecordCountIsRejected) {
   // Build a minimal, otherwise-valid header so the forged count is the only
   // anomaly. Layout (little-endian, 21 B): MAGIC u32, VERSION u8, resolution
@@ -248,15 +244,9 @@ TEST(BinarySerializer, ModestForgedCountTruncationThrowsRuntimeError) {
 
 TEST(BinarySerializer, EmitSizeMatchesSpec) {
   auto f = makeFrame();
-  // Both Beta records — coords (1,2,3), (4,5,6) — share block (0,0,0), bits
-  // 83 < 302, n=2 → mode 1 index list. Same for the Dir records.
-  // Header: 4 + 1 + 4 + 2 + 1 + 4 + 4 + 1 = 21 B     (rev 7: +fine_ratio_log2)
-  // TSDF:   4 (count) + 2 × 20 = 44 B                        (flat records)
-  // Block:  12 (coord) + 1 (mode) + 2 (n) + 2·2 (idx) = 19 B
-  // Beta:   4 (count) + 19 + 2 × 8  = 39 B                   (f32 payloads)
-  // Dir:    4 (count) + 19 + 2 × 14 = 51 B                   (f32: other +
-  //                              cnt 4·K + cls 1·K, K=2; rev 8 u8 class ids)
-  // Fine:   4 (count, empty here) = 4 B                      (rev 7 tail)
+  // Both Beta records (and both Dir records) share block (0,0,0), so each
+  // stream is one mode-1 index-list block. Sizes in bytes: header 21, TSDF 44,
+  // Beta 39, Dir 51, Fine 4. (notes: serializer-emit-size-breakdown)
   if (scovox::K_TOP == 2) {
     auto full = scovox::BinarySerializer::serialize(
         f, scovox::BinarySerializer::Options{/*share_tsdf=*/true});

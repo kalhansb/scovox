@@ -3,12 +3,10 @@
 # on a subset of Replica (NG only — Replica baseline already has range decay off)
 # and SemanticKITTI seq 08 (NG and NR).
 #
-# Hypothesis:
-#   NG  — without the gate, free-space rays vote on labels → semantic ECE worse.
-#   NR  — without range decay, far-range noisy observations carry equal weight
-#         → mIoU degrades at map edges.
+# (notes: ablation-ng-nr-hypotheses)
 #
 # Usage: bash scovox_ablation_ng_nr.sh
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

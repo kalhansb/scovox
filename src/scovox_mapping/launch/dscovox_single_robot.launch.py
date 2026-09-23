@@ -1,14 +1,10 @@
 # =======================================================================
 # dscovox — SINGLE-ROBOT dscovox map bring-up (rolling mapper + merger).
 # =======================================================================
-# One rolling-mode mapper feeds one merger, which reconstructs the fused
-# `dscovox` map on `/<robot>/dscovox_node/pointcloud`. Correctly namespaced so
-# the delta topic is exactly `/<robot>/scovox_node/scovox_bin` (what the merger
-# subscribes to). Doubles as the KNOWN-GOOD reference when a mapper is NOT
-# publishing scovox_bin: if the topic flows HERE but not in your setup, the
-# difference is your config (almost always
-# mode != rolling, or a namespace/node-name mismatch). See
-# docs/scovox_bin_manual_bringup.md for the full step-by-step diagnosis.
+# One rolling-mode mapper feeds one merger (fused map on
+# /<robot>/dscovox_node/pointcloud) via exactly /<robot>/scovox_node/scovox_bin.
+# Also the known-good reference when a mapper does not publish scovox_bin.
+# (notes: dscovox-single-launch-purpose)
 #
 # This launch provides ONLY the scovox side. YOU supply, in the same ROS graph
 # (same ROS_DOMAIN_ID / container network):
@@ -27,6 +23,7 @@
 #   ros2 topic list | grep scovox_bin
 #   ros2 topic hz   /robot1/scovox_node/scovox_bin
 # =======================================================================
+# Moved comments: doc/scovox_mapping_code_notes.md
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition

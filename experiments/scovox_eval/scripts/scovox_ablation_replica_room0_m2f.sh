@@ -1,15 +1,11 @@
 #!/bin/bash
 # Single-knob ablation sweep on Replica room0 with m2f predictions.
-# See docs/issues/ablations_punch_list.md for the candidate list.
-#
-# Each cell: name=<knob>=<val>, with all other knobs at the post-NG baseline:
-#   range_decay=-1, w_occ=2, w_free=1, kappa0=2, evidence_saturation=1000,
-#   semantic_min_confidence=0.1, carve_skip=0.7, semantic_occ_gate=0 (NG).
-# (Note: replica_eval default w_occ is 6 in the launch file but the paper
-#  baseline for indoor RGB-D is 2.0 — see default_params.yaml. We pass 2.0
-#  explicitly to align with the documented baseline.)
+# BASE_ARGS is the baseline; each cell overrides one knob. w_occ 2.0 is
+# passed explicitly because the replica_eval launch default is 6 while
+# default_params.yaml uses 2.0. (notes: ablation-replica-baseline)
 #
 # Outputs: results/ablations_replica_room0_m2f/<cell>/scovox.npz + .log
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

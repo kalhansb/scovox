@@ -11,6 +11,7 @@
 #          slimvdb_build_inside.sh 102 replica
 #
 # Idempotent: re-running only rebuilds what changed.
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -euo pipefail
 
@@ -68,11 +69,10 @@ else
 fi
 
 # ───────────────────────────── 2/3  SLIM-VDB library ────────────────────────
-# SLIM-VDB uses find_package(OpenVDB) in CMake MODULE mode — OpenVDB ships
-# FindOpenVDB.cmake (not OpenVDBConfig.cmake), so CMAKE_MODULE_PATH must include
-# our OpenVDB prefix's cmake/OpenVDB dir. CMAKE_PREFIX_PATH alone isn't enough.
-# Export CPLUS_INCLUDE_PATH because SLIM-VDB's CMakeLists overwrites
-# CMAKE_CXX_FLAGS (kills our -I), so CXX compiles can't find openvdb headers.
+# OpenVDB ships only FindOpenVDB.cmake, so CMAKE_MODULE_PATH must include its
+# cmake/OpenVDB dir (CMAKE_PREFIX_PATH alone fails). CPLUS_INCLUDE_PATH is
+# exported since SLIM-VDB's CMakeLists overwrites CMAKE_CXX_FLAGS.
+# (notes: slimvdb-build-openvdb-module-path)
 export CPLUS_INCLUDE_PATH="${OVDB_PREFIX}/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
 export LIBRARY_PATH="${OVDB_PREFIX}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
 echo ">>> [2/3] Configuring + building SLIM-VDB core (NCLASSES=${NCLASSES})"

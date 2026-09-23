@@ -1,11 +1,9 @@
 #!/bin/bash
 # Single-knob ablation sweep on SemanticKITTI seq 08 with PolarSeg
 # predictions, 100 frames, 10 cm voxel.
-# See docs/issues/ablations_punch_list.md for the candidate list.
-#
-# Baseline (post-NG): range_decay=50, w_occ=6, w_free=1, kappa0=2,
-#   evidence_saturation=1000, semantic_min_confidence=0.1, carve_skip=0.4,
-#   semantic_occ_gate=0 (NG).
+# BASE_ARGS is the baseline cell; every other cell overrides one knob.
+# (notes: ablation-kitti-baseline)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

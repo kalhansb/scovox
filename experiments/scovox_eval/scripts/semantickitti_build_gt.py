@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """Build voxelized GT NPZ from SemanticKITTI — minimal memory.
 
 Per-voxel storage: only (best_label, best_count, total_count) = 6 bytes.
@@ -106,37 +107,16 @@ def main():
 
     print(f"Seq {seq_str}: {n_scans} scans, res={args.resolution}m")
 
-    # Running accumulator: key(int64) -> [counts_per_class] as numpy array
-    # Use a simple approach: collect all (key, label) from all scans,
-    # then do ONE final sort + groupby. But stream to disk to limit RAM.
-    #
-    # Actually: just use a Python dict[int, np.uint16[20]].
-    # 50M voxels × (40 bytes array + ~120 bytes dict overhead) ≈ 8 GB. Too much.
-    #
-    # Compromise: use dict[int, int] mapping key -> packed(best_label << 16 | best_count).
-    # This is a simple running max — NOT a true majority vote, but close enough
-    # when one label dominates (which it does for most voxels at 10cm).
-    #
-    # Better compromise: dict[int, int] mapping key -> (label << 16 | count) for the
-    # top label only. Update: if new label == stored label, increment count. If new
-    # label != stored label, decrement count; if count reaches 0, replace with new.
-    # This is the Boyer-Moore majority vote algorithm — exact majority in one pass.
+    # (notes: gt-build-in-memory-options)
 
-    # Boyer-Moore streaming majority vote per voxel
-    # Store: voxel_key -> (candidate_label, count)
-    # Python int is 28 bytes, tuple is 56 bytes, dict entry ~100 bytes
-    # 50M entries × ~180 bytes = 9 GB. Still too much.
+    # (notes: gt-build-boyer-moore)
 
-    # NUCLEAR OPTION: just write per-scan (key, label) arrays to disk,
-    # then process with external sort in chunks.
+    # (notes: gt-build-external-sort)
 
-    # SIMPLEST OPTION THAT WORKS: Process scans, build per-scan voxelized
-    # arrays, concatenate keys+labels, sort, groupby. But do it with
-    # memory-mapped temp files.
+    # (notes: gt-build-temp-file-option)
 
-    # Let's try: accumulate per-scan unique (key, label) pairs.
-    # ~50k unique voxels/scan × 4071 scans = ~200M pairs × 9 bytes = 1.8 GB on disk.
-    # Then mmap, sort by key, groupby.
+    # Writes each scan's unique (key, label) pairs to a temp file on disk, then
+    # sorts them by key and groups by voxel. (notes: gt-build-disk-pairs)
 
     import tempfile, os
 

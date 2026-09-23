@@ -15,6 +15,7 @@
 /// happen legitimately (Dirichlet gated by `dirichlet_min_p_occ`, or
 /// SLIM-VDB-only mode with no SemBeta grid) and consumers must filter
 /// for it.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <cstdint>
 #include <vector>
@@ -47,15 +48,9 @@ inline uint16_t dominantClass(const SemBetaVoxel& v) {
 
 }  // namespace detail
 
-/// Per-triangle labels. The anchor voxel is the cube's positive-side
-/// (in-front-of-surface) corner, identified via TSDF sign in `tsdf_grid`.
-/// Returns a vector aligned with `geom.triangles` (one label per triangle).
-///
-/// The implementation walks each triangle, recovers the anchor voxel coord
-/// by mapping the triangle's centroid back to the TSDF grid, then queries
-/// SemBeta. This is approximate (a triangle's centroid doesn't always land
-/// exactly in the anchor voxel) but matches what `Map::extractMesh` already
-/// does for the legacy fused Voxel grid.
+/// Per-triangle labels aligned with geom.triangles: each triangle's centroid is
+/// looked up in the SemBeta grid. Approximate, since a centroid may miss the
+/// anchor voxel. (notes: labelling-mesh-centroid)
 inline std::vector<uint16_t> labelMesh(
     const TriangleMesh&                      geom,
     const Bonxai::VoxelGrid<TsdfVoxel>&      tsdf_grid,
@@ -106,12 +101,9 @@ inline std::vector<uint16_t> labelPointCloud(
 // DirVoxel overloads (split Beta/Dirichlet substrate — SemSplitMap's Dir grid)
 // ---------------------------------------------------------------------------
 //
-// Same anchor-via-centroid strategy as the SemBeta overloads above; argmax uses
-// the occupied-class `dominantClass(const DirVoxel&, alpha_0)` from
-// dir_voxel.hpp, which refuses to commit when `other` exceeds every top-K
-// slot's observed evidence. Occupancy is *not* consulted here — in the
-// split substrate the surface geometry comes from the TSDF grid and per-point
-// occupancy from the Beta grid; this function answers only "which class".
+// Same centroid lookup as the SemBeta overloads; the argmax is dominantClass
+// from dir_voxel.hpp, which returns 0xFFFF when OTHER's observed evidence beats
+// every slot. Occupancy is not consulted. (notes: labelling-dirvoxel)
 
 /// Per-triangle labels against a DirVoxel grid.
 inline std::vector<uint16_t> labelMesh(

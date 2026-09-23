@@ -3,15 +3,14 @@
 // TopkProvider — file-backed loader/cache for per-frame soft-probability
 // (.topk) blobs produced by topk_npz_to_bin.py.
 //
-// Extracted verbatim from SCovoxNode (Tier 2 refactor): the node used to carry
-// the per-frame cache, the binary parser, the fill helpers, and the loader
-// telemetry inline. Pulling them into a standalone unit makes the binary parser
-// unit-testable without spinning up ROS (the only ROS dependency is the
-// injected logger/clock used for the same throttled diagnostics as before).
+// Kept outside the node so the binary parser is unit-testable without ROS; the
+// only ROS dependency is the injected logger and clock.
+// (notes: topk-provider-extraction)
 //
 // Pointcloud layout: [u32 N][u8 C][N*C u8 probs(×255)] — slot j == SCovox class id.
 // Image      layout: [u16 H][u16 W][u8 C][H*W*C u8 probs(×255)] — slot j == SCovox class id.
 // Slot 0 is unknown/unlabeled by convention.
+// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <algorithm>
 #include <cstdint>
@@ -94,12 +93,10 @@ public:
       cache_n_ = N; cache_c_ = C;
       cache_h_ = 0; cache_w_ = 0;
     }
-    // Guard the header reads before sizing the buffer. An empty or truncated
-    // .topk file leaves the dimension fields at their zero-init (failed reads
-    // no-op), and a garbage `total` from a partially-read header would throw
-    // bad_alloc out of resize() — uncaught in the integration callback, that
-    // calls std::terminate and kills the mapper. Require a clean header read
-    // and a payload within a sane absolute ceiling.
+    // Validate the header before resize(): an empty or truncated file leaves
+    // zero dimensions; a garbage total from a partial header would throw
+    // bad_alloc in the integration callback and kill the mapper. Capped at
+    // kMaxTopkBytes. (notes: topk-header-guard)
     static constexpr size_t kMaxTopkBytes = size_t(1) << 30;  // 1 GiB
     if (!f.good() || total == 0 || total > kMaxTopkBytes) {
       RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000,
@@ -111,13 +108,9 @@ public:
     }
     cache_probs_.resize(total);
     f.read(reinterpret_cast<char*>(cache_probs_.data()), total);
-    // Detect a truncated payload by the bytes actually delivered, NOT by the
-    // stream flags: a short read sets BOTH failbit and eofbit, so the old
-    // `!f.good() && !f.eof()` test was (true && false) == false and silently
-    // accepted the partial buffer — the zero-filled tail (from resize) would
-    // then be fed to the Dirichlet update as legitimate zero-probability
-    // classes, corrupting semantics for the whole frame. gcount() is the only
-    // reliable short-read signal here.
+    // Detect a truncated payload with gcount(), not the stream flags (a short
+    // read sets both failbit and eofbit); accepting the zero-filled tail would
+    // corrupt the frame's semantics. (notes: topk-short-read)
     if (static_cast<size_t>(f.gcount()) != total) {
       RCLCPP_WARN(logger_, "topk: short read for %s (got %zu of %zu bytes)",
                   path, static_cast<size_t>(f.gcount()), total);
@@ -142,12 +135,10 @@ public:
     return true;
   }
 
-  // Emit a running tally of soft-prob loader outcomes. Guards the
-  // silent-fallback footgun: when the probs dir is set but loads intermittently
-  // fail, the per-frame WARN is throttled at 5 s and easy to miss in long batch
-  // runs; this INFO is throttled at the caller's rate and shows running totals
-  // so the operator (or a smoke-gate assert) can verify soft-prob dispatched on
-  // every expected frame. No-op when topk is disabled.
+  // Running totals of soft-prob loads vs one-hot fallbacks, throttled at the
+  // caller's rate, so intermittent load failures show up beyond the 5
+  // s-throttled per-frame warn. No-op when topk is disabled.
+  // (notes: topk-loader-summary)
   void logSummary(int throttle_ms) {
     if (probs_dir_.empty()) return;
     const uint64_t total = load_success_ + load_failure_;
@@ -211,11 +202,9 @@ private:
   // 14-class taxonomy, so a fixed selection buffer avoids a per-pixel malloc.
   static constexpr int kMaxTrunc = 16;
 
-  // Zero every probability outside the `topk_trunc_` largest. The dropped mass
-  // is deliberately NOT renormalized onto the survivors: dirichletUpdate turns
-  // whatever is missing from 1.0 into OTHER, so a truncated observation reads
-  // as "this class, and I decline to guess about the rest" rather than as a
-  // more confident version of the same distribution.
+  // Zero every probability outside the topk_trunc_ largest. Do not renormalize
+  // the survivors: dirichletUpdate turns the mass missing from 1.0 into OTHER.
+  // (notes: topk-truncate-no-renorm)
   void truncate(std::vector<float>& cp) const {
     const int N = topk_trunc_;
     if (N <= 0) return;

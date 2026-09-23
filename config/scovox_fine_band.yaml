@@ -13,15 +13,14 @@
 # the fine map; measurement (e.g. the DBH circle fit, scovox/dbh_fit.hpp)
 # is post-processing on the shared rev-7 fine stream or the saved map.
 # =======================================================================
+# Moved comments: docs/code_notes/scovox_code_notes.md
 
 /**:
   ros__parameters:
     # --- Fine lattice -----------------------------------------------------
-    # res_fine = resolution / 2^k. At base 0.10 m: k=2 -> 2.5 cm, k=3 ->
-    # 1.25 cm. k=3 is the sensor floor for the Hesai XT32 at 3-4 m orbit
-    # range (~1.1 cm horizontal beam spacing, ~1 cm range sigma); beyond it
-    # voxels go hit-starved and noise dominates. Pair k=3 with
-    # fine_sdf_trunc_voxels: 3 (trunc 3.75 cm, still > 2x range sigma).
+    # res_fine = resolution / 2^k. k=3 (1.25 cm at 0.10 m) is the Hesai XT32
+    # sensor floor at 3-4 m orbit range; pair k=3 with fine_sdf_trunc_voxels 3.
+    # (notes: fine-band-lattice-ratio)
     fine_ratio_log2: 2            # res_fine = resolution / 4 (0.10 -> 0.025)
     fine_sdf_trunc_voxels: 3      # fine trunc = 3 * res_fine (7.5 cm at k=2)
     fine_region_margin: 0.15      # gate radius = trunk model radius + this

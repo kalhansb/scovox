@@ -1,20 +1,13 @@
 #!/bin/bash
 # NEW_EXPERIMENT_PLAN.md Phase 3 — 13-trajectory SceneNet fusion batch.
 #
-# Per-trajectory split: robot A=[0,200), robot B=[100,300) (50% overlap
-# per the plan). wire_format=v3 end-to-end (validated by Step 8 fusion
-# smoke commit a958172).
-#
-# Iterates the existing step8_scenenet_fusion_smoke_v3.sh logic per
-# trajectory rather than calling it as a black box — gives finer control
-# over result-dir layout (one cell per trajectory) and per-trajectory
-# logging.
-#
-# Default trajectory list = the 13 from the SceneNet head-to-head batch
-# (project-scenenet-first-batch-2026-05-12). Idempotent: cells with all
-# 3 NPZs present are skipped.
+# Per trajectory, robot A replays frames [0, N_PER_ROBOT) and robot B
+# [OVERLAP, OVERLAP+N_PER_ROBOT), with wire_format v3 end to end. Cells
+# with all 3 NPZs present are skipped.
+# (notes: fusion-batch-split-and-skip)
 #
 # Env knobs: TRAJS, N_PER_ROBOT, OVERLAP, RATE_HZ
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws
@@ -26,11 +19,8 @@ N_PER_ROBOT="${N_PER_ROBOT:-200}"
 OVERLAP="${OVERLAP:-100}"
 RATE_HZ="${RATE_HZ:-4.0}"
 
-# 13 val trajs actually staged on disk under scenenet_val_layout/train/
-# (2026-05-14 audit). The prior default referenced the head-to-head 13
-# from [[project-scenenet-first-batch-2026-05-12]], but only 4 of those
-# overlap with what's on disk. The 13 below are all immediately usable
-# without re-downloading the 262 GB train shards.
+# Default: the 13 val trajectories staged on disk under
+# scenenet_val_layout/train/. (notes: fusion-batch-default-trajs)
 TRAJS_DEFAULT=(0_175 0_178 0_182 0_223 0_279
                0_485 0_490 0_571 0_682 0_723
                0_789 0_867 0_977)
@@ -42,11 +32,9 @@ source "${WS}/install/setup.bash"
 export PYTHONPATH="${EVAL_PKG}:${PYTHONPATH:-}"
 mkdir -p "${RES_ROOT}"
 
-# Filter to trajectories that actually have data staged. Per the
-# [[project-scenenet-rgbd-mirror]] memo, only a subset of the head-to-
-# head 13 has data on disk — full train shards are 262 GB and won't fit.
-# Missing trajs would just silently NaN out the scoring; skipping them
-# up front keeps the matrix honest.
+# Drop trajectories with no data dir under SCENENET_ROOT/train; a
+# missing one would otherwise silently score NaN.
+# (notes: fusion-batch-skip-missing-trajs)
 _PRESENT=()
 for _t in "${TRAJ_LIST[@]}"; do
   if [[ -d "${SCENENET_ROOT}/train/${_t}" ]]; then

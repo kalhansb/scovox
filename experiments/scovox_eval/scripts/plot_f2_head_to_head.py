@@ -1,3 +1,4 @@
+# Moved comments: doc/scovox_eval_code_notes.md
 """F2 — SCovox vs SLIM-VDB head-to-head mIoU per scene/sequence.
 
 Hard-coded from the canonical headline tables in experiments_and_results.md
@@ -17,11 +18,9 @@ REPLICA_SOFT   = [0.4600, 0.3502, 0.3075, 0.2331, 0.1486, 0.3133, 0.4080, 0.1820
 REPLICA_SLIM   = [0.1293, 0.0923, 0.1037, 0.0972, 0.0597, 0.1321, 0.1228, 0.0942]
 
 # KITTI (5 seqs, PolarSeg→20cls, 10 cm, 100 frames each)
-# 2026-05-09 protocol fix: SCovox numbers re-scored with eval_scovox_kitti_miou.py
-# (strict bucket-IoU on pred ∪ gt) — same protocol as the SLIM-VDB column.
-# Pre-fix numbers (lenient KD-Tree pred→GT match @10cm via eval_ablations_kitti_seq08.py)
-# preserved in git as the prior values: hard=[0.6253,0.5461,0.4328,0.4447,0.4117],
-# soft=[0.6309,0.5536,0.4394,0.4730,0.4124] — DO NOT REUSE for SLIM-VDB head-to-head.
+# SCovox values are scored with eval_scovox_kitti_miou.py (strict bucket-IoU on
+# pred union gt), the same protocol as the SLIM-VDB column; do not reuse numbers
+# from the lenient KD-tree match. (notes: f2-kitti-scoring-protocol)
 KITTI_SEQS  = ["seq06", "seq07", "seq08", "seq09", "seq10"]
 KITTI_HARD  = [0.2467, 0.2309, 0.2159, 0.1934, 0.1452]
 KITTI_SOFT  = [0.2502, 0.2345, 0.2243, 0.1982, 0.1510]

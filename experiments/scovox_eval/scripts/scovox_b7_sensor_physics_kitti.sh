@@ -1,16 +1,10 @@
 #!/bin/bash
 # B7 ablation: sensor-physics-derived (w_occ, w_free) on SemanticKITTI seq 08 PolarSeg.
 #
-# Key purpose: confirm whether the post-cleanup mIoU regression seen on
-# Replica room0 also appears on LiDAR. Pre-cleanup baseline lives in
-# results/ablations_kitti_seq08_polarseg/baseline/ (2026-04-26).
-#
-# Three cells:
-#   b7_kitti_old_default     (6.00, 1.00)  — pre-cleanup KITTI default; recheck
-#   b7_kitti_lidar_physics   (8.00, 4.67)  — sensor-physics LiDAR derivation
-#   b7_kitti_moderate        (2.00, 1.00)  — RGB-D modality mismatch (negative ctrl)
-#
-# 100 scans @ 0.5 Hz ≈ 4-5 min/cell.
+# Three (w_occ, w_free) cells, in CELLS: the old KITTI default (6, 1), the LiDAR
+# sensor-physics derivation (8, 4.67), and the moderate RGB-D pair (2, 1) as a
+# negative control. (notes: b7-kitti-cells)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

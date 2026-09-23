@@ -17,6 +17,7 @@
 ///   scovox::Voxel v = map.getUnionVoxel(hit);
 ///   float eig = scovox::expectedInformationGain(v);
 /// @endcode
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include "scovox/map_interface.hpp"
 
@@ -143,11 +144,9 @@ private:
                           const std::vector<float>* class_probs,
                           float quality, float range_w, float angle_w);
 
-  /// Single fused DDA walk for non-dynamic rays:
-  ///   origin → posToCoord(hit + sdf_trunc * u)
-  /// per-voxel fuses Beta free / Beta occupied + semantics / TSDF in band.
-  /// Replaces the legacy two-pass `carve_free` + `update_endpoint`, paying
-  /// one DDA per ray. `updated_coords` may be nullptr.
+  /// One fused DDA walk per non-dynamic ray, from origin to hit + sdf_trunc *
+  /// u, updating Beta free/occupied, semantics and in-band TSDF per voxel.
+  /// updated_coords may be nullptr. (notes: map-fused-integrate-ray)
   void fused_integrate_ray_static(const Eigen::Vector3f& origin,
                                   const Eigen::Vector3f& hit,
                                   std::vector<CoordT>* updated_coords,

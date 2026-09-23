@@ -1,14 +1,13 @@
-# Live DSCovoxNode (merger) configuration. Until this file existed, dscovox
-# params were set only inline in scovox_multi_robot.launch.py /
-# scovox_single_robot.launch.py and experiment-script CLI overrides — those
-# still win when passed explicitly. Full per-param reference:
-# default_params.yaml (DSCovoxNode section).
+# Live DSCovoxNode (merger) configuration. Parameters passed explicitly by a
+# launch file or on the command line override it.
+# (notes: dscovox-params-file-origin)
 #
 # Usage (namespace per robot — every robot runs its own merger):
 #   ros2 run scovox_mapping dscovox_mapping_node --ros-args -r __ns:=/atlas \
 #     --params-file <share>/scovox_mapping/config/dscovox_params.yaml
 # The /** key matches the node in any robot namespace (a bare node-name key
 # only matches the root namespace).
+# Moved comments: doc/scovox_mapping_code_notes.md
 /**:
   ros__parameters:
     # ScovoxMapBinary delta streams to fuse (one per robot). Every robot runs

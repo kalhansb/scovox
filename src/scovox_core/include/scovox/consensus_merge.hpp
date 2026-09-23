@@ -25,6 +25,7 @@
 /// Both frames must share `α_0` and `num_classes`; `mergeFrames` asserts this.
 ///
 /// TSDF merge is the Curless–Levoy weighted average.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <algorithm>
 #include <cmath>
@@ -73,12 +74,10 @@ struct CoordEq {
 
 }  // namespace detail
 
-/// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) occupancy prior.
-/// The `num_classes` / `alpha_0` params are retained for call-site symmetry with
-/// `mergeDir` but are UNUSED for occupancy: the prior is now the decoupled
-/// constant `kBetaOccPrior` = `kBetaFreePrior` = 1.0 (docs/occupancy_prior.md),
-/// not the old calibrated `C·α₀`. Sender and receiver share this compile-time
-/// constant, so the prior-subtraction below stays consistent across nodes.
+/// Per-voxel BetaVoxel merge under the symmetric Beta(1,1) prior. num_classes
+/// and alpha_0 are unused (kept for symmetry with mergeDir); sender and
+/// receiver share the compile-time kBetaOccPrior/kBetaFreePrior.
+/// (notes: merge-beta-prior)
 inline BetaVoxel mergeBeta(const BetaVoxel& a,
                            const BetaVoxel& b,
                            uint16_t         num_classes,
@@ -87,14 +86,10 @@ inline BetaVoxel mergeBeta(const BetaVoxel& a,
   const float occ_prior  = kBetaOccPrior;
   const float free_prior = kBetaFreePrior;
   BetaVoxel f{};
-  // Floor each fused α at its prior. Below-prior inputs are NORMAL, not just
-  // corruption: the split-path evidence saturation (SemSplitMap::
-  // applyBetaSaturation) rescales BOTH α by cap/s_total, which pushes the
-  // minority bucket below its prior on any saturated lopsided voxel (e.g.
-  // cap=1000, a_occ≈999 ⇒ a_free≈0.999 < 1). The floor then binds with a fused
-  // p_occ error bounded by the prior itself (~1e-4 at cap 1000). It also still
-  // guards a corrupt source from producing a negative α and an out-of-[0,1]
-  // p_occ that would poison downstream entropy/EIG.
+  // Floor each fused α at its prior: saturation rescaling legitimately pushes a
+  // minority bucket below its prior, and the floor keeps a corrupt source from
+  // producing a negative α or p_occ outside [0,1].
+  // (notes: merge-beta-floor-at-prior)
   f.a_occ  = std::max(occ_prior,  a.a_occ  + b.a_occ  - occ_prior);
   f.a_free = std::max(free_prior, a.a_free + b.a_free - free_prior);
   return f;
@@ -135,22 +130,10 @@ inline DirVoxel mergeDir(const DirVoxel& a,
   for (int i = 0; i < K_TOP; ++i) if (a.cls[i] != 0xFFFF) upsert(a.cls[i], a.cnt[i]);
   for (int i = 0; i < K_TOP; ++i) if (b.cls[i] != 0xFFFF) upsert(b.cls[i], b.cnt[i]);
 
-  // Deterministic, fold-order-invariant ordering: count desc, then class id
-  // asc as a tie-break. The secondary key is what makes the order independent of
-  // source iteration: without it, two classes with equal counts at the K_TOP
-  // truncation boundary would be kept-or-dumped depending on which source we
-  // folded first, making the fused slots (and dominantClass) nondeterministic
-  // across runs/rehashes. NOTE: this makes the merge DETERMINISTIC but not fully
-  // order-INDEPENDENT — a class dumped to OTHER in one pairwise fold cannot climb
-  // back into a slot in a later fold. True commutativity requires accumulating
-  // every source's evidence before a single truncation; callers needing that
-  // must fold in a fixed source order.
-  //
-  // Hand-rolled insertion sort rather than std::sort: n ≤ 2·K_TOP, and at -O3 an
-  // inlined std::sort drags in its 16-element introsort fallback whose dead
-  // `__first + 16` access trips a -Warray-bounds false positive when mergeDir is
-  // inlined into a hot caller (the dscovox refold path). Output is identical —
-  // the comparator is a strict total order (all cls distinct after upsert).
+  // Order by count desc, class id asc: deterministic but not order-independent,
+  // so callers must fold sources in a fixed order. Hand-rolled, not std::sort,
+  // which trips a false -Warray-bounds when inlined at -O3.
+  // (notes: merge-dir-slot-order)
   auto orderBefore = [](const Entry& x, const Entry& y) {
     return x.cnt != y.cnt ? x.cnt > y.cnt : x.cls < y.cls;
   };

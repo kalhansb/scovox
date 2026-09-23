@@ -22,6 +22,7 @@
 /// Cross-grid contract: `TsdfMap` deliberately does not include
 /// `sembeta_voxel.hpp`. The SLIM-VDB-equivalent row constructs and uses a
 /// `TsdfMap` *alone*, with no SemBeta dependency.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <Eigen/Core>
 #include <bonxai/bonxai.hpp>
@@ -51,11 +52,10 @@ class TsdfMap {
     /// leaf mask). Default 2/3 → 4×4×4 inner blocks of 8×8×8 leaves.
     uint8_t inner_bits    = 2;
     uint8_t leaf_bits     = 3;
-    /// Signed-distance truncation in metres. Voxels with `|sdf| > sdf_trunc`
-    /// behind the surface are skipped; in front, behaviour depends on
-    /// `space_carving`. Must be > 0; values <= 0 are clamped at construction
-    /// (TSDF disabled is not supported by this class — use a different
-    /// pipeline if you don't want a TSDF).
+    /// Signed-distance truncation (m): behind the surface |sdf| > sdf_trunc is
+    /// skipped, in front it depends on space_carving. Must be > 0; values <= 0
+    /// are reset at construction, as TSDF-off is unsupported here.
+    /// (notes: tsdf-sdf-trunc)
     float   sdf_trunc     = 0.15f;
     /// SLIM-VDB-style space carving. False (default): walk only
     /// `[hit - trunc·û, hit + trunc·û]`, matching SLIM-VDB's
@@ -76,24 +76,10 @@ class TsdfMap {
   // Integration
   // ----------------------------------------------------------------------
 
-  /// Curless–Levoy update along the truncation band of one ray.
-  ///
-  /// `origin`, `endpoint` are world-space positions in metres. The voxel-set
-  /// touched is identical to SLIM-VDB's openvdb DDA range up to the
-  /// acknowledged `RayIterator` parity gaps documented in §1.1 of
-  /// `docs/design/slimvdb_like_tsdf_mapping_plan.md`.
-  ///
-  /// Per-voxel update inside the band:
-  ///     sdf       = sign((vc - origin) · (endpoint - vc)) · ‖endpoint - vc‖
-  ///     w         = weight_fn(sdf)
-  ///     d_clamped = clamp(sdf, -sdf_trunc, +sdf_trunc)
-  ///     d_new     = (d_old · w_old + d_clamped · w) / (w_old + w)
-  ///     w_new     =  w_old + w
-  /// Voxels with `sdf <= -sdf_trunc` (behind the surface, past the band)
-  /// are skipped. Voxels with `w == 0` are skipped (no allocation).
-  ///
-  /// All touched coords are appended to the internal touched-set buffer
-  /// for `drainTouched()` (Q7).
+  /// Curless-Levoy update along one ray's truncation band (world positions,
+  /// metres): sdf from voxel centre to endpoint, clamped to ±sdf_trunc; sdf <=
+  /// -sdf_trunc or zero weight is skipped. Touched coords go to drainTouched().
+  /// (notes: tsdf-integrate-ray)
   void integrateRay(const Eigen::Vector3f& origin,
                     const Eigen::Vector3f& endpoint,
                     const WeightFn&        weight_fn = constant(1.0f));
@@ -107,11 +93,9 @@ class TsdfMap {
   /// (sort + unique).
   std::vector<CoordT> drainTouched();
 
-  /// O(n) clear of the touched buffer without sort+unique. Use on the
-  /// no-publisher path (e.g. dataset-mode runs without ~/scovox_bin
-  /// subscribers) where the drained coords would be discarded anyway —
-  /// drainTouched()'s sort+unique cost at Replica res 0.05 / 320×240
-  /// stride 1 is ~1 s/frame; clearTouched() is ~µs.
+  /// O(n) clear of the touched buffer, no sort+unique. Use it when the drained
+  /// coords would be discarded anyway (no publisher).
+  /// (notes: tsdf-clear-touched)
   void clearTouched() noexcept { touched_.clear(); }
 
   /// Touched-set size without draining. Diagnostics / rate-limiting.
@@ -178,18 +162,14 @@ class TsdfMap {
   // ----------------------------------------------------------------------
   // Fused-walker per-voxel API (2026-05-09)
   // ----------------------------------------------------------------------
-  //
-  // `ScovoxMapSplit::integrateHitFused` walks the union DDA once and feeds
-  // pre-computed SDFs to both grids. `applyBandUpdate` is the per-voxel
-  // tail of `visit()` after the SDF math: SLIM-VDB band gate, ±trunc clamp,
-  // weight check, Curless–Levoy update, touched-buffer push. Exposed so
-  // the shared walk doesn't recompute SDF on the TsdfMap side.
+  // applyBandUpdate is the per-voxel tail of visit() after the SDF math,
+  // exposed so ScovoxMapSplit::integrateHitFused can feed precomputed SDFs
+  // without recomputing them here. (notes: tsdf-fused-walker-api)
 
-  /// Per-voxel TSDF band update at `c` for a pre-computed signed distance
-  /// `sdf` (positive = before endpoint, negative = past). Drops voxels
-  /// with `sdf <= -trunc` (SLIM-VDB band gate) and `weight_fn(sdf) <= 0`.
-  /// Otherwise clamps to ±trunc, runs Curless–Levoy weighted average, and
-  /// pushes `c` to the touched buffer.
+  /// Band update at c for a precomputed sdf (positive before the endpoint).
+  /// Drops sdf <= -trunc and weight_fn(sdf) <= 0; otherwise clamps to ±trunc,
+  /// runs Curless-Levoy and pushes c to the touched buffer.
+  /// (notes: tsdf-apply-band-update)
   void applyBandUpdate(const CoordT& c, float sdf, const WeightFn& weight_fn);
 
  private:

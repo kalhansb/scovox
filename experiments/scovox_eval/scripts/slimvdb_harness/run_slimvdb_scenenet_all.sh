@@ -29,6 +29,7 @@
 # Usage:
 #   ./run_slimvdb_scenenet_all.sh                       # all 13 cells
 #   ./run_slimvdb_scenenet_all.sh 0_223 0_485           # specific cells
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -euo pipefail
 
@@ -91,16 +92,10 @@ for seq in "${SEQS[@]}"; do
     python3 "${POLLER}" --period 1.0 --out "${TELEMETRY_CSV}" &
     POLL_PID=$!
 
-    # The pipeline binary's CWD must contain config/scenenet.yaml; we cd into
-    # examples/cpp/ (where config/ lives in the source tree) and run from there.
-    # We bind-mount the host workspace path twice — once at /workspace (legacy
-    # convention shared with all other runners) and once at the host path
-    # itself, so the host-absolute symlinks under data/scenenet_val_layout/...
-    # and data/scenenet/val_preprocessed/.../depth/*.png resolve correctly
-    # inside the container without rewriting ~10k symlinks to be relative.
-    # scenenet_pipeline's Render() step uses Open3D/OpenCV which want a GUI
-    # backend (GTK) — even for offscreen rendering. Forward the host X
-    # display so cvInitSystem can find a usable connection.
+    # Runs from examples/cpp, where config/scenenet.yaml lives. WS is also
+    # mounted at its host path so host-absolute symlinks under data/ resolve in
+    # the container. X is forwarded: Render() needs a GUI backend.
+    # (notes: scenenet-docker-mounts)
     docker run --rm --gpus all \
         --user "$(id -u):$(id -g)" \
         -e HOME=/tmp \

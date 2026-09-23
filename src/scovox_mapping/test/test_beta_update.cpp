@@ -1,5 +1,6 @@
 /// @file test_beta_update.cpp
 /// Tasks 1.5 + 1.6: Digamma unit tests + Beta update correctness (>=25 tests).
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <gtest/gtest.h>
 #include <cmath>
@@ -180,11 +181,7 @@ TEST(BetaUpdate, FullDecayResetsToPrior) {
 }
 
 // --- 4. Update properties ---
-//
-// NOTE: under the joint ray-casting likelihood, ray-order commutativity
-// no longer holds — each ray's update is conditional on the current state
-// of upstream voxels. The earlier `OrderOfHitsDoesNotMatter` test was
-// removed when reach_prob was introduced.
+// (notes: test-beta-order-commutativity-note)
 
 TEST(BetaUpdate, MultipleHitsAreAdditive) {
   // Beta update is conjugate: 2 hits should give same result as 1+1
@@ -207,13 +204,10 @@ TEST(BetaUpdate, MultipleHitsAreAdditive) {
 }
 
 // --- 5. Carving a beam through an occupied voxel leaves it solid ---
-//
-// The wall guard is OFF by default (we trust the most recent scan). A beam that
-// passes through the wall to a farther return therefore deposits ONE free
-// increment (≤ w_free) on the wall voxel — but the wall stays confidently
-// occupied because its accumulated a_occ (100 rays) dwarfs a single free update.
-// This is the intended dynamic-clearing behaviour: repeated pass-through
-// eventually clears a stale obstacle, one scan does not.
+// The wall guard is off by default, so a beam through the wall adds one free
+// increment (at most w_free); the wall stays occupied. Only repeated
+// pass-through clears a stale obstacle.
+// (notes: test-beam-through-wall-stays-solid)
 
 TEST(BetaUpdate, CarvingAttenuatedPastOccupied) {
   Params p;

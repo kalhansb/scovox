@@ -1,9 +1,8 @@
-// Unit tests for scovox::TopkProvider — the file-backed .topk soft-prob loader
-// extracted from SCovoxNode. Exercises the binary parser, the cache, the fill
-// helpers, and the corrupt-file fallbacks (the bugs the inline code's comments
-// document: bad/empty header → bad_alloc, and the gcount short-read footgun)
-// without spinning up a ROS graph: logging only needs a logger + clock, which
-// work without rclcpp::init().
+// Unit tests for scovox::TopkProvider, the file-backed .topk loader: parser,
+// cache, fill helpers and corrupt-file fallbacks. No ROS graph needed: the
+// logger and clock work without rclcpp::init().
+// (notes: test-topk-provider-scope)
+// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <cstdint>
 #include <cstdio>

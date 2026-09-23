@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """ROS2 node that replays SceneNet RGB-D frames into SCovox.
 
 Reads depth PNGs + semantic label PNGs + poses.txt from the SLIM-VDB
@@ -70,11 +71,9 @@ class SceneNetReplayNode(Node):
         self.declare_parameter("rate_hz", 10.0)
         self.declare_parameter("robot_name", "atlas")
         self.declare_parameter("use_gt_labels", True)
-        # Step 8 / NEW_EXPERIMENT_PLAN Phase 3 — trajectory split for
-        # multi-robot fusion. start_frame defaults to 0 (full sequence,
-        # matches pre-Step-8 behaviour byte-for-byte); n_scans defaults
-        # to -1 (no cap). For fusion: robot A → start=0 n=200,
-        # robot B → start=100 n=200  (50% overlap convention).
+        # Trajectory split for multi-robot fusion: start_frame is the first
+        # frame published (default 0, full sequence); n_scans caps the frame
+        # count (-1 = no cap). (notes: scenenet-trajectory-split)
         self.declare_parameter("start_frame", 0)
         self.declare_parameter("n_scans", -1)
 

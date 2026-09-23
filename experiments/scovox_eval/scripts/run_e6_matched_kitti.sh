@@ -1,17 +1,11 @@
 #!/bin/bash
 # E6.1 — SCovox SLIM-VDB-matched-config head-to-head, KITTI side.
 #
-# Per sequence (06,07,08,09,10):
-#   1. Run scovox_node with matched config (band_only=true, range_decay=-1,
-#      min/max_range=5/30, voxel=0.10, sdf_trunc=0.30, K_TOP=2,
-#      min_tsdf_weight_publish=10.0, soft PolarSeg topk).
-#   2. Replay 100 scans at rate_hz=0.5.
-#   3. Capture ~/pointcloud → scovox.npz.
-#
-# Per cell:  results/matched_config_2026_05_08/kitti/<seq>/scovox.npz
-#
-# Idempotent: seqs whose scovox.npz exists are skipped. predictions_topk
-# already exists per seq (no rotation needed).
+# Per sequence: runs scovox_node with the SLIM-VDB-matched config (expects
+# K_TOP set to 2), replays 100 scans at 0.5 Hz, captures scovox.npz. Seqs
+# with a scovox.npz are skipped; predictions_topk must already exist.
+# (notes: e6-kitti-matched-config)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -o pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

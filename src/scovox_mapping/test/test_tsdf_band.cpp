@@ -4,6 +4,7 @@
 /// Default config used by most tests: resolution=0.10, sdf_trunc=0.30
 /// (== 3 voxels). Rays are axis-aligned along +x so voxel coords are easy to
 /// reason about: the surface voxel is at floor(hit.x / resolution).
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <gtest/gtest.h>
 #include <cmath>
@@ -117,11 +118,9 @@ TEST(TSDFBand, RunningAverageAccumulatesWeight) {
 // 6. Beta unaffected by adding TSDF integration --------------------------
 
 TEST(TSDFBand, BetaUnaffectedByTSDFIntegration) {
-  // With TSDF disabled (trunc=0), a single ray puts a known a_occ on the
-  // surface voxel: defaultVoxel().a_occ + w_occ * range_w * angle_w.
-  // Default Params: w_occ=2, range_decay disabled here, angle_w=1, so
-  // a_occ should be 1 + 2 = 3, a_free should be 1. Same numbers must hold
-  // when TSDF is enabled — the fused walk must not perturb Beta state.
+  // With TSDF on or off, one ray must leave identical Beta state on the surface
+  // voxel: the fused walk must not perturb Beta.
+  // (notes: test-tsdf-beta-unperturbed)
   Map m_off = makeTsdfMap(0.0f);
   Map m_on  = makeTsdfMap(kTrunc);
   Eigen::Vector3f origin(0, 0, 0), hit(2.05f, 0, 0);
@@ -136,13 +135,10 @@ TEST(TSDFBand, BetaUnaffectedByTSDFIntegration) {
   EXPECT_FLOAT_EQ(a.a_unk,  b.a_unk);
 }
 
-// 7. Carving a beam through an occluder — wall stays solid, TSDF still lands ---
-//
-// The wall guard is OFF by default (trust the recent scan), so a beam passing
-// through the wall carves the whole segment: front voxels get free evidence,
-// the wall gets one free increment but stays solid (accumulated a_occ
-// dominates), and TSDF (geometric, not Bayesian) lands at full strength at the
-// far surface and its band regardless of occupancy.
+// The wall guard is off by default, so a beam through the wall carves the whole
+// segment; the wall gets one free increment but stays solid, and TSDF lands at
+// full strength at the far surface and its band.
+// (notes: test-tsdf-beam-through-occluder)
 
 TEST(TSDFBand, JointRaycastAttenuation) {
   Map m = makeTsdfMap();

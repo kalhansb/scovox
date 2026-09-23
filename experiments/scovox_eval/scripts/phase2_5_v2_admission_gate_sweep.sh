@@ -1,21 +1,10 @@
 #!/bin/bash
 # NEW_EXPERIMENT_PLAN.md Phase 2.5-v2 — integration-time admission gate sweep.
 #
-# Companion to the publish-time Phase 2.5 (which returned a null result
-# because low-p_occ voxels carry class=Unknown which the scorer ignores).
-# This sweeps the integration-time gate `dirichlet_min_p_occ` instead,
-# which actually controls which voxels get a real class commit.
-#
-# At t=0.0 every hit commits a class regardless of occupancy posterior
-# (SLIM-VDB-like envelope). Predicts mIoU drops monotonically as threshold
-# decreases, with the largest drop between 0.3 and 0.0.
-#
-# Anchors: KITTI seq08 (LiDAR + PolarSeg soft) and SceneNet 0_223 (RGB-D
-# GT labels). 4 thresholds × 2 anchors = 8 cells.
-#
-# Wall-clock budget: ~50 min (each cell needs a fresh integration, unlike
-# Phase 2.5 which reused the same SemDirMap state through different
-# publish thresholds).
+# Sweeps the integration-time gate dirichlet_min_p_occ, which controls which
+# voxels get a real class commit; at 0.0 every hit commits a class. Each of
+# the 8 cells is a fresh integration. (notes: admission-gate-sweep-design)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

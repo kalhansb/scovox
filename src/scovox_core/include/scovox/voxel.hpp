@@ -1,3 +1,4 @@
+// Moved comments: doc/scovox_core_code_notes.md
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -8,28 +9,19 @@
 
 namespace scovox {
 
-/// Number of tracked class slots per voxel. **Ship value 2** — the paper /
-/// production configuration; every default build is byte-identical to the
-/// hard-coded constant this replaced.
-///
-/// Overridable at *build* time only (`-DSCOVOX_K_TOP=n`), for the S1
-/// sufficiency sweep (experiments/PLAN.md §3 S) which needs K ∈ {1,2,3,full}
-/// as four separate builds. It is a struct-layout constant: every translation
-/// unit in the workspace must see the same value, so a sweep build must pass
-/// the flag to `colcon build` as a whole and install into its own base — never
-/// mix objects across values.
+/// Tracked class slots per voxel; ship value 2, overridable only at build time
+/// via SCOVOX_K_TOP. A layout constant: every translation unit must see the
+/// same value, so build the whole workspace with it; never mix.
+/// (notes: voxel-k-top)
 #ifndef SCOVOX_K_TOP
 #define SCOVOX_K_TOP 2
 #endif
 constexpr int K_TOP = SCOVOX_K_TOP;
 static_assert(K_TOP >= 1, "K_TOP must be >= 1");
 
-/// Default symmetric Dirichlet prior `α₀` applied per underlying class
-/// dimension. **Recommended ship value `0.01`** — matches the "Beta starts
-/// near zero" behaviour of the legacy code and minimises behavioural drift
-/// across the SemBeta / unified-SemDir / split-Beta+Dir substrates, all of
-/// which share this default. The launch-file knob `dirichlet_prior` exposes it
-/// for the one-shot Jeffreys-prior ablation (`1 / (C + 1)`).
+/// Default symmetric Dirichlet prior per class dimension, ship value 0.01,
+/// shared by all substrates; the dirichlet_prior launch knob overrides it.
+/// (notes: voxel-dirichlet-prior)
 constexpr float kDefaultDirichletPrior = 0.01f;
 
 // Process-wide counters for the four sparse_add branches. All paths are
@@ -115,39 +107,10 @@ inline void sparse_add(float* sem_cnt, uint16_t* sem_cls, uint16_t cls, float in
   }
   int min_i = 0;
   for (int i = 1; i < K_TOP; ++i) { if (sem_cnt[i] < sem_cnt[min_i]) min_i = i; }
-  // Posterior-predictive swap test (Dirichlet-Multinomial model).
-  //
-  // The question: "Should incoming class c (with evidence `inc`) replace
-  // tracked class j (with evidence `sem_cnt[min_i]`)?"
-  //
-  // Under a symmetric Dirichlet prior (α₀ equal for all classes), the
-  // posterior predictive probability of class i is:
-  //
-  //   P(next = i) = (α_i) / (Σα)
-  //
-  // where α_i = sem_cnt[i] + α₀ for tracked classes. Swapping c into
-  // the tracking set is optimal when:
-  //
-  //   (inc + α₀) / (Σα + inc) > (sem_cnt[min_i] + α₀) / (Σα)
-  //
-  // For small inc relative to Σα (typical: inc ~ 1-2, Σα ~ 10-50),
-  // this simplifies to:
-  //
-  //   inc > sem_cnt[min_i]
-  //
-  // This is exactly the Space-Saving criterion (Metwally et al. 2005),
-  // which is near-optimal for heavy-hitter tracking (Cormode 2016).
-  //
-  // Strict `>` (not `>=`) is a deliberate stability choice: a tied
-  // newcomer is dropped to a_unk rather than allowed to evict. This
-  // prevents thrashing under noisy classifiers emitting equal-weight
-  // observations. The trade-off is a first-arrival bias for exact
-  // ties — tolerable because exact ties are rare once any meaningful
-  // evidence has accumulated.
-  //
-  // The residual a_unk receives a principled interpretation at query
-  // time via the Hutter (2013) adaptive escape mass — see
-  // effectiveResidual() in uncertainty.hpp.
+  // Swap the incoming class in only if inc > sem_cnt[min_i] (the Space-Saving
+  // criterion, the posterior-predictive test for small inc). Strict > is
+  // deliberate: ties drop to a_unk to avoid thrashing.
+  // (notes: sparse-add-swap-test)
   if (inc > sem_cnt[min_i]) {
     if (a_unk) *a_unk += sem_cnt[min_i];  // conserve evicted mass
     sem_cls[min_i] = cls; sem_cnt[min_i] = inc;

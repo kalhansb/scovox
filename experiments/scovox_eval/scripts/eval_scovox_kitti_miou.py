@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """Voxel-wise mIoU for SCovox on SemanticKITTI.
 
 Same methodology as eval_slimvdb_kitti_miou.py EXCEPT the GT voxel grid is
@@ -51,14 +52,10 @@ def build_gt_voxels_scovox(kitti_root, sequence, n_scans, voxel_size, lmap):
     return {k: max(d.items(), key=lambda kv: kv[1])[0] for k, d in counts.items()}
 
 
-# REPLAY → yaml learning-class LUT (per `[[kitti-miou-replay-bug]]` memo).
-# PolarSeg's .topk files use the REPLAY scheme which inserts class 15 =
-# "lane-marking" and shifts veg/trunk/terrain/pole/traffic-sign +1 vs
-# yaml's learning_map (which has no lane-marking dim). Predicted voxels
-# in REPLAY space (16..20) must be remapped to yaml space (15..19) before
-# bucket-IoU against yaml-space GT; otherwise those classes score 0.
-# Lane-marking (REPLAY 15) merges into road (yaml 9 = "road") — the
-# PolarSeg convention treats it as a road sub-class.
+# PolarSeg .topk predictions use the REPLAY layout (lane-marking at 15,
+# classes 16..20 shifted +1 vs yaml learning_map). Remap to yaml 15..19
+# before scoring against yaml-space GT; lane-marking maps to road (9).
+# (notes: kitti-replay-to-yaml-lut)
 _REPLAY_TO_YAML_LUT = np.arange(256, dtype=np.int32)
 _REPLAY_TO_YAML_LUT[15] = 9   # lane-marking → road
 _REPLAY_TO_YAML_LUT[16] = 15  # vegetation

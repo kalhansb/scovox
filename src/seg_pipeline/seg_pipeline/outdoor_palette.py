@@ -1,3 +1,4 @@
+# Moved comments: doc/seg_pipeline_code_notes.md
 """Outdoor semantic palette + Mapillary-Vistas(65) -> compact(14) collapse.
 
 The SCovox RGB-D path decodes each segmentation pixel's packed 0xRRGGBB through
@@ -58,17 +59,10 @@ COMPACT_COLORS = [
 
 NUM_CLASSES = len(COMPACT_NAMES)  # 14 (0..13)
 
-# Priority-ordered keyword groups: (compact_id, [substrings]). The FIRST group
-# whose any-substring is found in the lowercased model class name wins, so list
-# the more specific groups first (e.g. sidewalk/curb before wall/barrier;
-# rider/bicyclist before vehicle/bicycle). Names that match nothing -> 0 (other).
-# Substrings are matched against the model's own class names, and this table
-# covers BOTH label sets we test with:
-#   * Mapillary Vistas v1.2 ("construction--flat--road", "object--vehicle--car")
-#   * ADE20K semantic ("tree", "grass", "earth", "path", "streetlight", ...)
-# Ordering note: the POLE group precedes the VEGETATION group on purpose, because
-# ADE's "streetlight" contains the substring "tree" — pole must claim it first so
-# it isn't mis-collapsed to vegetation.
+# First group with a substring in the lowercased class name wins; no match is 0
+# (other). Covers Mapillary Vistas and ADE20K names. Keep specific groups first;
+# pole precedes vegetation, as streetlight contains tree.
+# (notes: palette-keyword-group-priority)
 _KEYWORD_GROUPS = [
     (8,  ["person"]),                                   # person (before rider/bicyclist)
     (9,  ["rider", "bicyclist", "motorcyclist"]),       # rider (before vehicle)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """Render paper-quality 3-panel qualitative comparisons: GT | SCovox | SLIM-VDB.
 
 Voxel-cube rendering via Open3D's EGL OffscreenRenderer (Filament). One
@@ -508,11 +509,10 @@ def render_scenenet(ws_root: Path, seq: str, out_dir: Path,
 def render_kitti(ws_root: Path, seq: str, out_dir: Path,
                  width: int, height: int,
                  view: str = "kitti_bev_angle",
-                 # In cam0 frame: X=right, Y=down (gravity), Z=forward.
-                 # Keep ~5 m above road to ~2 m below; clip a 50 m square
-                 # around the trajectory mean. Tight enough that SLIM-VDB's
-                 # puffy shell stays under ~1M voxels (Filament rendering
-                 # budget) while still showing a recognisable urban block.
+                 # cam0 frame (X right, Y down, Z forward). y_clip keeps about
+                 # 5 m above to 2 m below the road; horizontal_half_extent
+                 # crops a 50 m square, small enough for the Filament render
+                 # budget. (notes: render-kitti-crop-window)
                  y_clip: Optional[Tuple[float, float]] = (-5.0, 2.0),
                  horizontal_half_extent: float = 25.0) -> Path:
     global _CURRENT_PALETTE
@@ -533,11 +533,10 @@ def render_kitti(ws_root: Path, seq: str, out_dir: Path,
 
     sl_pts, sl_lbl = load_slim_voxelsbin(
         ws_root / f"third_party_sw/slim_vdb/outputs/kitti/{seq}/voxels.bin")
-    # SCovox accumulates voxels in the cam0 world frame (T_world_velo = P @ Tr)
-    # while SLIM-VDB accumulates in the velodyne world frame
-    # (T_world_velo = Tr_inv @ P @ Tr) — see eval_scovox_kitti_miou.py header.
-    # The two frames are related by Tr (velo→cam0), so left-multiply Tr to
-    # bring SLIM-VDB voxels into SCovox/GT's frame for a fair visual overlay.
+    # SCovox and GT are in the cam0 world frame (P @ Tr), SLIM-VDB in the
+    # velodyne world frame (Tr_inv @ P @ Tr); left-multiplying by Tr (velo to
+    # cam0) brings SLIM-VDB into the SCovox/GT frame.
+    # (notes: render-kitti-slim-frame)
     Tr = np.eye(4, dtype=np.float64)
     for line in (ws_root / "data/semantickitti/dataset/sequences"
                  / seq / "calib.txt").read_text().splitlines():

@@ -1,13 +1,8 @@
 #!/bin/bash
-# Extend the SCovox-NG ablation to all 8 Replica scenes for both label
-# regimes (semantic_gt_fixed and semantic_m2f_ade). Skips scenes that
-# already have an NPZ. The 3-scene baseline NG runs (room0, office0,
-# office3) live in:
-#   replica_ng_5cm/      (GT-oracle labels)
-#   replica_ng_m2f_5cm/  (m2f predictions)
-# This script adds the remaining 5 scenes (room1, room2, office1, office2,
-# office4) to each, so the NG mIoU column is comparable to the 8-scene
-# baseline (gate=0.6) numbers in exp3 / paper_experiments tables.
+# Adds EXTRA_SCENES to the SCovox-NG ablation for GT (replica_ng_5cm) and
+# m2f (replica_ng_m2f_5cm) labels, completing all 8 Replica scenes. Skips
+# scenes that already have an NPZ. (notes: ng-extend-scope)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

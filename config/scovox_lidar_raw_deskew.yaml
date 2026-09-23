@@ -6,11 +6,9 @@
 # (gyro-integrated per-point rotation + uniform voxel grid), instead of consuming
 # a localizer's already-deskewed but ~11x-DOWNSAMPLED cloud (~11.6k pts/scan).
 #
-# WHY: feeding /glim_ros/points fixes the 7.2 m vertical smear (-> 0.40 m) but
-# costs recall because GLIM downsamples to ~10k pts/scan. Native deskew keeps the
-# full-res cloud -> thin surfaces AND full coverage. The smear is intra-scan SKEW
-# (per the feed-cmp in scovox-vertical-overfill.md); rotation dominates it, and
-# gyro integration reproduces GLIM's rotational deskew without GLIM's downsampling.
+# The vertical smear is intra-scan skew dominated by rotation, so gyro deskew
+# removes it while keeping the full-res cloud (GLIM's downsampled cloud costs
+# recall). (notes: raw-deskew-why)
 #
 # GLIM still runs as the LOCALIZER and owns the TF tree
 #   map -> odom -> imu -> os_lidar
@@ -28,6 +26,7 @@
 # for GLIM's sub; scovox's pointcloud sub is also RELIABLE. /imu/data is taken at
 # SensorDataQoS (best-effort) so it connects regardless of the publisher's QoS.
 # =======================================================================
+# Moved comments: docs/code_notes/scovox_code_notes.md
 
 /**:
   ros__parameters:
@@ -53,24 +52,10 @@
     deskew_translation: false
 
     # --- Uniform voxel-grid downsample (the smear lever) -----------------
-    # GLIM thins its map by voxel-downsampling each scan in preprocessing
-    # (config_preprocess.json: downsample_resolution 1.0, ~10k pts/scan). The raw
-    # full-res cloud over-samples the noisy surface so every scan fills the tails
-    # of each column's z-distribution → thick smear. Collapsing points to one
-    # centroid per voxel (sensor frame, per scan, after deskew) cuts that
-    # tail-sampling. 0.0 = off. Sweep up from 0.01 to trade thinness vs recall.
-    #
-    # SWEEP RESULT (rate 0.5, 120s, max_range 20) — shared-column z-cells / XY
-    # footprint(cols) / scovox pts:
-    #   0.01: 17cells 163k 3.39M | 0.1: 16 164k 3.18M | 0.2: 11 162k 2.48M
-    #   0.5:  4cells 151k 1.05M | 1.0: 2cells 125k 0.40M
-    # Knee at 0.5: 4x thinner (17->4) for only -7% footprint; past it the footprint
-    # tax accelerates for little extra thinness. 0.5 matches the 0.40m thinness of
-    # feeding GLIM's downsampled /glim_ros/points, natively, at 2.6x the points.
-    #
-    # 0.5 is also the in-code default (the sweep knee above); kept explicit
-    # here as this config's sweep is the evidence for it. Refinement regions
-    # are unaffected (raw returns bypass this via fine_raw_returns).
+    # Per-scan voxel-grid downsample (sensor frame, after deskew), one point per
+    # voxel, thins the smear at some recall cost; 0.0 = off. 0.5 is the sweep
+    # knee and in-code default; fine_raw_returns bypasses it in regions.
+    # (notes: raw-deskew-downsample-sweep)
     downsample_voxel_size: 0.5
 
     # --- TF placement timing (the actual smear lever) --------------------

@@ -3,17 +3,10 @@
 # (room0..2, office0..4) and ALL KITTI sequences (06–10), strictly serial
 # to avoid ROS namespace collisions and GPU contention.
 #
-# Phase 1:  KITTI SCovox (hard + soft) for all 5 seqs            ~35 min
-# Phase 2:  Replica SCovox per-scene loop (M2F → topk → soft →   ~50 min × 8 = 6.7h
-#           hard → cleanup)
-# Phase 3:  KITTI SLIM-VDB all seqs (existing docker runner)     ~25 min
-# Phase 4:  Replica SLIM-VDB all scenes (existing docker runner) ~4 h
-#
-# Total: ~11 hours. Idempotent — each cell has a `[[ -f scovox.npz ]]`
-# guard so partial runs resume safely. Logs to:
-#   /tmp/softprob_logs/final_run_phase{1..4}.log
-#
-# Disk: peak ~35 GB during a Replica scene (.topk + NPZ). Free ≥ 35 GB.
+# Phases: KITTI SCovox, Replica SCovox per-scene loop, KITTI SLIM-VDB, Replica
+# SLIM-VDB. Each SCovox cell skips if its scovox.npz exists, so a partial run
+# resumes. Start with at least 35 GB free disk. (notes: final-run-phases)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

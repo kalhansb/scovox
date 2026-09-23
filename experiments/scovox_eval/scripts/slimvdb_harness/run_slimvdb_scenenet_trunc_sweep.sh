@@ -1,16 +1,13 @@
 #!/bin/bash
 # SLIM-VDB SceneNet truncation-distance sweep.
 #
-# Tests the hypothesis: SCovox's mIoU advantage over SLIM-VDB comes mostly from
-# SLIM-VDB writing semantic labels into the ±sdf_trunc TSDF shell around every
-# depth measurement, which leaks FPs into the immediate free-space envelope.
-#
-# We re-run SLIM-VDB at sdf_trunc ∈ {0.05, 0.075, 0.15} and score with the
-# same strict bucket-IoU. Narrower trunc → fewer free-space FPs → mIoU ↑.
+# Re-runs SLIM-VDB at each sdf_trunc given (default 0.05 0.075 0.15) and scores
+# each with the same strict bucket-IoU. (notes: trunc-sweep-hypothesis)
 #
 # Usage:
 #   ./run_slimvdb_scenenet_trunc_sweep.sh 0.05      # one value
 #   ./run_slimvdb_scenenet_trunc_sweep.sh 0.05 0.075 0.15   # full sweep
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -euo pipefail
 

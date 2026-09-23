@@ -1,6 +1,7 @@
 #pragma once
 /// @file node_utils.hpp
 /// @brief Shared utilities for scovox_node and dscovox_node.
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <algorithm>
 #include <array>
@@ -39,11 +40,9 @@ inline std::vector<std::array<float, 3>> generateSemanticColors(size_t count) {
   return colors;
 }
 
-/// Result of selecting the strongest top-K semantic slots from a Voxel.
-/// `kept` holds the chosen (class_id, count) pairs in descending count order;
-/// only the first `kept_count` entries are valid. `dropped_mass` is the sum
-/// of the counts that were *not* kept and must be folded into the consumer's
-/// `a_unk` to preserve total semantic mass.
+/// Strongest top-K semantic slots: kept is sorted by descending count, only the
+/// first kept_count entries are valid; dropped_mass must be folded into the
+/// consumer's a_unk to conserve semantic mass. (notes: topk-semantics-struct)
 struct TopKSemantics {
   std::array<std::pair<uint16_t, float>, K_TOP> kept{};
   size_t kept_count = 0;
@@ -53,12 +52,9 @@ struct TopKSemantics {
 /// Select the `top_k` strongest semantic slots from `v` (sorted descending by
 /// count) and report any dropped slots' mass via `dropped_mass`.
 ///
-/// `sparse_add` does not maintain slot order, so the K_TOP slots in a Voxel
-/// are in arbitrary order with respect to count. A naive "first K non-zero
-/// slots" loop can both promote a weak slot over a strong one (label bug) and,
-/// if the dropped counts aren't folded into `a_unk`, leak total semantic mass
-/// (mass-conservation bug). This helper exists so every consumer that wants
-/// fewer than K_TOP classes uses the same correct selection rule.
+/// sparse_add keeps slots in arbitrary order, so every consumer wanting fewer
+/// than K_TOP classes must use this helper to pick the strongest and account
+/// for the dropped mass. (notes: topk-select-why-helper)
 inline TopKSemantics selectTopKSemantics(const Voxel& v, int top_k) {
   std::array<std::pair<uint16_t, float>, K_TOP> pairs{};
   size_t n = 0;
@@ -67,11 +63,9 @@ inline TopKSemantics selectTopKSemantics(const Voxel& v, int top_k) {
       pairs[n++] = {v.sem_cls[i], v.sem_cnt[i]};
     }
   }
-  // Hand-rolled insertion sort (n ≤ K_TOP) instead of std::sort: at -O3 the
-  // inlined std::sort pulls in its 16-element introsort fallback, whose dead
-  // `__first + 16` access trips a -Warray-bounds false positive when this is
-  // inlined into the dscovox refold path. Descending by count; identical output
-  // for this n.
+  // Insertion sort (n <= K_TOP), descending by count. Do not switch to
+  // std::sort: inlined at -O3 into the dscovox refold path it trips a
+  // -Warray-bounds false positive. (notes: topk-insertion-sort)
   for (size_t i = 1; i < n; ++i) {
     const std::pair<uint16_t, float> key = pairs[i];
     size_t j = i;
@@ -80,12 +74,9 @@ inline TopKSemantics selectTopKSemantics(const Voxel& v, int top_k) {
   }
 
   TopKSemantics out;
-  // Clamp the request to [0, K_TOP]. A negative `top_k` is treated as 0 (not 1):
-  // a caller asking for "no semantic slots" (occupancy-only emit) must get
-  // kept_count == 0 and have the *entire* semantic mass folded into
-  // `dropped_mass`, rather than silently keeping one class and under-folding by
-  // one slot. The previous std::max(1, top_k) floor violated that intent and
-  // leaked the strongest slot's mass past the dropped_mass accumulation.
+  // Clamp top_k to [0, K_TOP]; a negative top_k means 0, so an occupancy-only
+  // caller gets kept_count == 0 and all semantic mass in dropped_mass.
+  // (notes: topk-negative-top-k)
   const size_t cap = std::min<size_t>(static_cast<size_t>(K_TOP),
                                       top_k < 0 ? 0u : static_cast<size_t>(top_k));
   out.kept_count = std::min(n, cap);
@@ -102,28 +93,13 @@ inline TopKSemantics selectTopKSemantics(const Voxel& v, int top_k) {
 ///
 ///   p(best) = (best_cnt + 1) / [Σ_{tracked active} (cnt + 1) + (effectiveResidual(v) + 1)]
 ///
-/// Matches the categorical used by `semanticEntropy` / `semanticVariance`
-/// in scovox_core, so all three uncertainty signals (entropy, variance,
-/// and the published confidence) stay mutually consistent. Replaces the
-/// pre-2026-05-03 inline `cf = best_cnt / Σ tracked` rule, which dropped
-/// `a_unk` and the Dirichlet prior from the denominator and was therefore
-/// systematically over-confident whenever K_TOP eviction had occurred.
+/// Uses the same categorical as semanticEntropy and semanticVariance, so
+/// entropy, variance and the published confidence stay consistent.
+/// (notes: argmax-confidence-consistency)
 ///
-/// Edge cases:
-///   - n_active == 0 (Beta evidence but no semantic observations): returns
-///     (0, 0.f). Callers gating on `p_best >= threshold` will not colour /
-///     emit a label — correct behaviour.
-///   - Tied counts: first-index-wins from the inner strict-`>` test, which
-///     matches `sparse_add`'s eviction rule (also strict-`>`). The argmax
-///     is therefore *not unique* under exact ties; this propagates the
-///     same first-arrival bias flagged by C4 in the ablations punch list,
-///     and the paper should not claim uniqueness without that caveat.
-/// Template form (D6): shared body for Voxel and SemBetaVoxel. Both
-/// expose `sem_cnt[K_TOP]`, `sem_cls[K_TOP]`, and the
-/// `effectiveResidual(v)` Hutter helper accepts both via its own
-/// template overload (uncertainty.hpp). Existing call sites pass a
-/// Voxel and the deduction picks the same body that used to be the
-/// non-template overload — no behavioural change for the legacy path.
+/// n_active == 0 returns (0, 0.f). Exact ties go to the first slot (strict >,
+/// as in sparse_add), so the argmax is not unique. One template body serves
+/// Voxel and SemBetaVoxel. (notes: argmax-confidence-edge-cases)
 template <typename V>
 inline std::pair<uint16_t, float> argmaxClassConfidence(const V& v) {
   uint16_t best_cls = 0;
@@ -141,17 +117,10 @@ inline std::pair<uint16_t, float> argmaxClassConfidence(const V& v) {
     }
   }
   if (n_active == 0) return {0, 0.f};
-  // The residual term here is `effectiveResidual(v)`, which is now bounded above
-  // by N = Σ sem_cnt + a_unk (the Hutter escape mass is clamped to N in
-  // uncertainty.hpp). That bound is what keeps this confidence denominator sane
-  // for weakly-observed voxels: e.g. sem_cnt={0.05}, a_unk=0 gives residual 0.05
-  // (not the unbounded ~10 the raw m/(2 ln ratio) term used to produce), so
-  // p_best ≈ 1.05/2.1 ≈ 0.5 rather than collapsing to ~0.087 below the labelling
-  // threshold. We deliberately do NOT add a second, tighter cap (e.g. clamp the
-  // residual to sum_cnt) here: this categorical must stay identical to the one
-  // used by semanticEntropy / semanticVariance so all three uncertainty signals
-  // remain mutually consistent, and the bound that fixes the collapse lives in
-  // the shared effectiveResidual helper.
+  // effectiveResidual(v) is bounded above by the sum of sem_cnt plus a_unk (in
+  // uncertainty.hpp), which keeps this denominator sane. Do not add a tighter
+  // cap here: the categorical must match semanticEntropy and semanticVariance.
+  // (notes: argmax-residual-bound)
   const float denom = sum_cnt + static_cast<float>(n_active)
                     + effectiveResidual(v) + 1.f;
   if (denom <= 0.f) return {best_cls, 0.f};

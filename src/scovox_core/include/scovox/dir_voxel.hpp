@@ -40,6 +40,7 @@
 /// empty-slot fill overwrites that placeholder with `α₀ + inc`, so the fill's
 /// Δ exceeds `inc` by α₀·(1−k) ≤ α₀. This merely restores the eroded prior,
 /// is bounded by α₀ per fill, and needs no downstream guard.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <cstddef>
 #include <cstdint>
@@ -47,16 +48,10 @@
 
 #include "scovox/voxel.hpp"  // K_TOP + g_sparse_*_count counters
 
-/// Per-slot confidence track for the max-probability eviction comparator.
-/// Build-time only (`-DSCOVOX_TRACK_QMAX=1`), following the `SCOVOX_K_TOP`
-/// one-install-tree-per-variant convention, because it changes
-/// `sizeof(DirVoxel)` (4 + 6·K_TOP → 4 + 8·K_TOP; 16 B → 20 B at K_TOP=2) and
-/// we must be able to quote the shipped build's bytes unchanged.
-///
-/// Never serialized: binary_serializer.hpp emits only `other`, `cnt[]` and
-/// `cls[]`, so a `SCOVOX_TRACK_QMAX=1` sender stays wire-compatible with a
-/// `=0` receiver. The comparator only changes *which* class wins a slot, and
-/// that outcome is already fully visible in the `cls`/`cnt` that do go out.
+/// Build-time per-slot confidence track for the eviction comparator; it changes
+/// sizeof(DirVoxel) (16 B to 20 B at K_TOP=2). qmax is never serialized, so a
+/// =1 sender stays wire-compatible with a =0 receiver.
+/// (notes: dirvoxel-track-qmax)
 #ifndef SCOVOX_TRACK_QMAX
 #define SCOVOX_TRACK_QMAX 0
 #endif
@@ -94,10 +89,8 @@ struct DirVoxel {
   }
 };
 
-// Layout invariants. K_TOP=2 (production / paper default):
-//   sizeof == 4 (other) + 4·K_TOP (cnt) + 2·K_TOP (cls) = 4 + 12 = 16.
-// General K_TOP: 4 + 6·K_TOP, rounded up to 4-byte alignment for the trailing
-// uint16_t pair.
+// Layout invariant: sizeof(DirVoxel) = 4 + 6·K_TOP bytes rounded up to 4-byte
+// alignment (16 B at K_TOP=2). (notes: dirvoxel-layout-size)
 /// 6 B per slot (4 cnt + 2 cls), or 8 B when the qmax confidence track is
 /// compiled in.
 constexpr std::size_t kDirSlotBytes = SCOVOX_TRACK_QMAX ? 8u : 6u;
@@ -120,13 +113,9 @@ static_assert(offsetof(DirVoxel, cnt) == offsetof(DirVoxel, other) + sizeof(floa
 static_assert(offsetof(DirVoxel, cls) == offsetof(DirVoxel, cnt) + K_TOP * sizeof(float),
     "DirVoxel layout: cls[] must immediately follow cnt[K_TOP] with no padding.");
 
-/// Default symmetric prior. The top-K slots and OTHER carry the same per-dim
-/// prior `α₀` that the unified `SemDirVoxel` uses, minus the FREE dimension:
-///   - each `cnt[i] = α₀`  (K_TOP slot placeholders)
-///   - `other = (C − K_TOP) · α₀`  (the collapsed out-of-K dimensions)
-/// Total class prior `= C · α₀`, equal to `SemDirVoxel::s_occ()` at prior and
-/// to `BetaVoxel`'s `a_occ` prior (`C·α₀`) — keeping the split consistent with
-/// the live path at the prior.
+/// Default symmetric prior: each empty slot holds cnt[i] = α₀ (cls 0xFFFF) and
+/// other = (C − K_TOP)·α₀ for the collapsed out-of-K dimensions.
+/// (notes: dirvoxel-default-prior)
 inline DirVoxel defaultDirVoxel(uint16_t num_classes = 14,
                                 float    alpha_0     = kDefaultDirichletPrior) noexcept {
   DirVoxel v{};                     // zero-init
@@ -139,17 +128,10 @@ inline DirVoxel defaultDirVoxel(uint16_t num_classes = 14,
   return v;
 }
 
-/// Heavy-hitter sparse-add into the occupied-class Dirichlet, parametrised by
-/// the per-dim prior `α₀`. Routes `inc` into one of the top-K_TOP class slots
-/// (Space-Saving / Metwally 2005) or the OTHER bucket — never lost. Preserves
-/// the strict mass invariant `Δ(other + Σcnt) == inc`.
-///
-/// Direct port of `sparse_add_unified` (semdir_map.cpp), with `alpha_other`
-/// renamed `other` and no FREE interaction (FREE is in the Beta grid).
-/// `q` is the deposit's own class probability in [0,1] (for a Dirichlet update
-/// that is `inc / class_share`). It is *not* evidence and never changes what is
-/// deposited — it only feeds the optional confidence eviction comparator, and
-/// is ignored unless `qmax != nullptr` (which requires SCOVOX_TRACK_QMAX).
+/// Space-Saving sparse-add of inc into a top-K slot or OTHER, never lost:
+/// Δ(other + Σcnt) == inc. q (the deposit's class probability) only feeds the
+/// confidence eviction comparator; ignored unless qmax != nullptr.
+/// (notes: dirvoxel-sparse-add-class)
 inline void sparse_add_class(float*    cnt,
                              uint16_t* cls,
                              uint16_t  c,
@@ -163,14 +145,9 @@ inline void sparse_add_class(float*    cnt,
   const uint16_t q_fx  = !track            ? uint16_t{0}
                        : (q >= 1.0f)       ? uint16_t{65535}
                                            : static_cast<uint16_t>(q * 65535.0f + 0.5f);
-  // (0) Sentinel guard. `0xFFFF` is the empty-slot marker in `cls[]`, so a real
-  // observation of class id 0xFFFF (e.g. a 65535-class taxonomy, or a classifier
-  // whose argmax index hits 0xFFFF) must NOT be written into a slot: it would
-  // fill `cls[i] = 0xFFFF` with real mass yet still read as EMPTY, so the next
-  // add re-fills the slot from scratch (losing the prior inc) and isPriorDir /
-  // dominantClass mis-treat it as unfilled — breaking the strict invariant
-  // Δ(other + Σcnt) == inc. Route the (untrackable) sentinel class straight to
-  // OTHER, which both conserves mass and keeps every slot's sentinel meaning intact.
+  // (0) Sentinel guard: 0xFFFF marks an empty slot, so a real class id 0xFFFF
+  // must never enter a slot (it would read as empty and break the mass
+  // invariant); route it to OTHER. (notes: dirvoxel-sentinel-class)
   if (c == 0xFFFF) {
     *other += inc;
     g_sparse_drop_count.fetch_add(1, std::memory_order_relaxed);
@@ -199,20 +176,15 @@ inline void sparse_add_class(float*    cnt,
   // the comparison key (posterior-predictive Space-Saving; see voxel.hpp).
   int min_i = 0;
   for (int i = 1; i < K_TOP; ++i) if (cnt[i] < cnt[min_i]) min_i = i;
-  // Clamp at 0. A filled slot should always hold >= α₀ (prior + observed
-  // evidence), but an evidence-saturation rescale can erode it below α₀; an
-  // unclamped `cnt[min_i] − α₀` would then be NEGATIVE and turn the
-  // `*other += evicted_evidence` below into a mass SUBTRACTION (driving OTHER
-  // negative, breaking the Δ(other + Σcnt) == inc invariant). The saturation
-  // path also floors filled slots at α₀, so this is normally a no-op safety net.
+  // Clamp at 0: a saturation rescale can erode a filled slot below α₀, and
+  // negative evicted evidence would subtract mass from OTHER. Normally a no-op,
+  // as saturation floors filled slots at α₀. (notes: dirvoxel-evict-clamp)
   const float raw_evicted = cnt[min_i] - alpha_0;
   const float evicted_evidence = raw_evicted > 0.f ? raw_evicted : 0.f;
-  // Comparator choice changes only WHICH deposits win a contested slot, never
-  // how much mass moves: both branches below conserve Δ(other + Σcnt) == inc.
-  // Shipped rule weighs accumulated evidence, so a class that arrives often
-  // beats one that arrives certain; the confidence rule inverts that, letting a
-  // single high-probability observation displace a pile of low-probability
-  // ones. On noisy real-camera labels the latter measured better.
+  // Both comparators conserve Δ(other + Σcnt) == inc and differ only in which
+  // deposit wins. Default: inc must beat the slot's evidence (frequent wins);
+  // with qmax tracking, higher confidence wins.
+  // (notes: dirvoxel-eviction-comparator)
   const bool evict_now = track ? (q_fx > qmax[min_i])
                                : (inc > evicted_evidence);
   if (evict_now) {
@@ -230,20 +202,9 @@ inline void sparse_add_class(float*    cnt,
   }
 }
 
-/// Argmax of the top-K class slots by observed evidence (`cnt − α₀`). Returns
-/// 0xFFFF if no slot is filled, or if `OTHER`'s *observed* evidence exceeds
-/// every slot's evidence (the bulk of the class mass is on out-of-K classes,
-/// so committing to a tracked class would be misleading). Mirrors the
-/// `SemDirVoxel` overload in mesh_labelling.hpp, restricted to the
-/// occupied-class Dirichlet.
-///
-/// The slot key subtracts each slot's `α₀` placeholder; the OTHER key must
-/// subtract OTHER's own prior `(C − K_TOP)·α₀` (the collapsed out-of-K
-/// dimensions, set by `defaultDirVoxel`) for an apples-to-apples comparison —
-/// otherwise OTHER's prior mass alone (0.12 at C=14, α₀=0.01) spuriously
-/// dominates a legitimately-observed slot and the only seen class is hidden.
-/// `num_classes` defaults to 14 (matching `defaultDirVoxel`); the residual is
-/// clamped at 0 to match `defaultDirVoxel`'s `num_classes < K_TOP` convention.
+/// Argmax of the top-K slots by observed evidence (cnt − α₀). Returns 0xFFFF if
+/// no slot is filled or OTHER's observed evidence (other minus its (C −
+/// K_TOP)·α₀ prior) exceeds every slot's. (notes: dirvoxel-dominant-class)
 inline uint16_t dominantClass(const DirVoxel& v,
                               float    alpha_0     = kDefaultDirichletPrior,
                               uint16_t num_classes = 14) noexcept {

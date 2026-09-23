@@ -1,7 +1,8 @@
 #!/bin/bash
-# Final residual probe: add the Dirichlet early-return back at p_occ=0.6
-# (matching the OLD gate_value < semantic_occ_gate=0.6 default). Tests
-# whether this closes the remaining −0.0252 mIoU gap from baseline.
+# Probe cell res_dir_gate_06: Replica room0 with the Dirichlet
+# early-return gate (dirichlet_min_p_occ) at p_occ 0.6.
+# (notes: dir-gate-replica-probe-origin)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

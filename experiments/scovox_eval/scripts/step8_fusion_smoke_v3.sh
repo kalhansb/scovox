@@ -1,23 +1,11 @@
 #!/bin/bash
 # Step 8 fusion smoke — wire_format=v3 end-to-end (Replica room0, short).
 #
-# Validates the v3 publish/receive loop landed in dscovox_node 3a35eae:
-#   - scovox_node A integrates frames [0, 200)   on SemDirMap, emits v3 frames
-#   - scovox_node B integrates frames [200, 400) on SemDirMap, emits v3 frames
-#   - dscovox_node deserialises v3 frames, merges per consensus_merge_v3.hpp
-#   - all three publish ~/pointcloud with the same 11-field schema
-#
-# Pass criteria:
-#   1. fused.npz exists and contains > 0.5 × min(solo_a.points, solo_b.points)
-#      — proves dscovox didn't silently drop everything via the version guard
-#   2. dscovox log shows "v3 receive: pinned num_classes=14 alpha_0=0.0100"
-#      — proves at least one v3 frame deserialised
-#   3. dscovox log has NO "Bad version 3" or "v3 prior mismatch" lines
-#      — proves both robots' frames reached the SemDir merge
-#   4. fused mIoU ≥ max(solo_a, solo_b) − 0.02 (per Step 11 spec, with
-#      tolerance for a short-trajectory split that under-samples geometry)
-#
-# Wall-clock: ~3 minutes at N=200 frames per robot.
+# Robot A replays frames [0, 200), robot B [200, 400); dscovox_node merges their
+# v3 frames. PASS needs a populated fused.npz, the v3 pinned-prior log line, and
+# no Bad version or v3 prior mismatch lines.
+# (notes: step8-v3-smoke-pass-criteria)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 

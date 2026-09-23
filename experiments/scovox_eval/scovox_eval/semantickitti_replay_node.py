@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Moved comments: doc/scovox_eval_code_notes.md
 """ROS2 node that replays SemanticKITTI sequences into SCovox.
 
 Reads Velodyne .bin point clouds + .label semantic annotations + poses
@@ -93,11 +94,10 @@ class SemanticKITTIReplayNode(Node):
         # Max number of scans to replay (paper protocol: 100 for SLIM-VDB parity).
         # -1 means "use all available scans".
         self.declare_parameter("n_scans", -1)
-        # Soft-prob passthrough: when True, skip the range mask so the
-        # PointCloud2 publishes points in raw .bin order. scovox_node
-        # then indexes into the matching .topk file by point index. The
-        # C++ side still applies the same range filter, so the integration
-        # results match the masked path bitwise.
+        # When True, skip the range mask so points keep raw .bin order and
+        # scovox_node can index the matching .topk file by point index;
+        # scovox_node applies the same range filter itself.
+        # (notes: kitti-soft-prob-passthrough)
         self.declare_parameter("soft_prob_passthrough", False)
 
         dataset_path = self.get_parameter("dataset_path").value

@@ -11,6 +11,7 @@
 /// specification (same tables used by Open3D and SLIM-VDB/VDBFusion).
 ///
 /// Part of scovox_core.  No ROS, no OpenVDB, no GPU dependencies.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <vector>
 #include <array>
@@ -399,20 +400,10 @@ struct EdgeKeyHash {
 // extractMesh — marching cubes on TSDF zero-crossing
 // =====================================================================
 
-/// Extract a triangle mesh from the TSDF zero-crossing via marching cubes.
-///
-/// Iterates every active voxel, treats it as the (0,0,0) corner of a cube
-/// whose 8 corners are the voxel and its 7 positive-offset neighbours.
-/// Cubes with any corner below `min_weight` are skipped.
-///
-/// Vertex positions are sub-voxel interpolated along edges where a sign
-/// change occurs, matching the standard marching cubes algorithm used by
-/// Open3D and SLIM-VDB.
-///
-/// @param grid       Bonxai VoxelGrid containing Voxel with tsdf_distance/tsdf_weight.
-/// @param min_weight Minimum tsdf_weight for a corner to count as valid.
-/// @param resolution Voxel edge length in metres.
-/// @return           Triangle mesh with per-triangle semantic labels.
+/// Marching cubes on the TSDF zero-crossing: each active voxel anchors a cube
+/// with its 7 positive-offset neighbours; cubes with any corner below
+/// min_weight are skipped. Returns per-triangle labels.
+/// (notes: mc-extract-mesh-voxel)
 inline TriangleMesh extractMesh(
     const Bonxai::VoxelGrid<Voxel>& grid,
     float min_weight,
@@ -519,17 +510,9 @@ inline TriangleMesh extractMesh(
 // extractZeroCrossing — lightweight sign-change point cloud
 // =====================================================================
 
-/// Extract zero-crossing surface points by checking 3 positive-axis
-/// neighbours per active voxel. Cheaper than full marching cubes —
-/// produces sub-voxel interpolated points wherever the TSDF sign flips.
-///
-/// Semantic label is taken from the positive-side voxel (the one "in
-/// front" of the surface, where the sensor observed the hit).
-///
-/// @param grid       Bonxai VoxelGrid containing Voxel with tsdf_distance/tsdf_weight.
-/// @param min_weight Minimum tsdf_weight for both neighbours to be valid.
-/// @param resolution Voxel edge length in metres.
-/// @return           Vector of sub-voxel surface points with semantic labels.
+/// Sub-voxel surface points wherever the TSDF sign flips between a voxel and
+/// one of its 3 positive-axis neighbours (both at >= min_weight); the label
+/// comes from the positive-side voxel. (notes: mc-extract-zero-crossing-voxel)
 inline std::vector<SurfacePoint> extractZeroCrossing(
     const Bonxai::VoxelGrid<Voxel>& grid,
     float min_weight,
@@ -578,15 +561,9 @@ inline std::vector<SurfacePoint> extractZeroCrossing(
 // extractPointCloud — SLIM-VDB style: emit voxel centers with labels
 // =====================================================================
 
-/// Extract a point cloud of voxel centres where tsdf_weight exceeds the
-/// threshold. This matches SLIM-VDB's `ExtractPointCloud` — every
-/// sufficiently-observed voxel emits one point at its centre with the
-/// argmax semantic label.
-///
-/// @param grid       Bonxai VoxelGrid containing Voxel with tsdf_distance/tsdf_weight.
-/// @param min_weight Minimum tsdf_weight for emission.
-/// @param resolution Voxel edge length in metres (used for centre offset).
-/// @return           Pair of (positions, labels).
+/// One point per voxel with tsdf_weight >= min_weight, labelled with its argmax
+/// class, as in SLIM-VDB's ExtractPointCloud. Returns (positions, labels).
+/// (notes: mc-extract-point-cloud-voxel)
 inline std::pair<std::vector<Eigen::Vector3f>, std::vector<uint16_t>>
 extractPointCloud(
     const Bonxai::VoxelGrid<Voxel>& grid,
@@ -612,15 +589,10 @@ extractPointCloud(
 // Split-grid refactor — TsdfVoxel-typed overloads (geometry only, no labels)
 // =====================================================================
 //
-// These mirror the three legacy extractors above but operate on
-// `Bonxai::VoxelGrid<TsdfVoxel>`, which has no semantic fields. Labels
-// come via free functions in `mesh_labelling.hpp` (Step 4) after
-// extraction, looking up the SemBeta grid by coord.
-//
-// Half-voxel centre offset: SLIM-VDB / VDBFusion convention is to
-// interpolate between voxel CENTRES, not lower corners. The Voxel-typed
-// extractors above use lower corners (Bonxai's `coordToPos`); these new
-// overloads add `+0.5*resolution` per axis to match SLIM-VDB exactly.
+// Geometry-only overloads on VoxelGrid<TsdfVoxel>; mesh_labelling.hpp adds
+// labels afterwards. Unlike the Voxel-typed extractors above (lower corners),
+// these add half a voxel per axis to sit on voxel centres.
+// (notes: mc-tsdf-extractors-centre-offset)
 
 inline TriangleMesh extractMesh(
     const Bonxai::VoxelGrid<TsdfVoxel>& grid,

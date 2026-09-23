@@ -1,5 +1,6 @@
 /// @file test_uncertainty.cpp
 /// Task 1.8: Uncertainty function correctness (>=15 tests).
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 #include <cmath>
@@ -84,15 +85,10 @@ TEST(Uncertainty, EntropySymmetric) {
   EXPECT_NEAR(entropy(makeBeta(5, 10)), entropy(makeBeta(10, 5)), 1e-5f);
 }
 
-// scovox::entropy() is the Beta DIFFERENTIAL entropy, which is unbounded
-// BELOW and diverges to large negatives on near-point-mass voxels — the
-// documented "entropy trap". This is exactly the state every occupied
-// split-substrate voxel reaches: a_occ = C*alpha_0 + accumulated evidence
-// while a_free stays pinned at the prior alpha_0 (=0.01, C=14 -> occ prior
-// 0.14). Pin the divergence so nobody re-uses entropy() as if it were a
-// bounded Shannon stat: at Beta(0.14+50, 0.01) the closed form is ~-99
-// (not in [0, ln2]). The map's "mean Shannon entropy" stat deliberately uses
-// the bounded Bernoulli form below precisely because this poisons the mean.
+// scovox::entropy() is the Beta differential entropy: unbounded below, it
+// diverges negative on near-point-mass voxels. Do not use it as a bounded
+// Shannon stat; the map's mean-entropy stat uses the Bernoulli form below.
+// (notes: uncertainty-beta-entropy-trap)
 TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
   const float alpha0 = 0.01f;     // kDefaultDirichletPrior
   const float C = 14.f;           // default num_classes
@@ -106,12 +102,10 @@ TEST(Uncertainty, EntropyBetaNearPointMassDivergesNegative) {
                          "near-point-mass voxel, got " << h;
 }
 
-// The bounded occupancy-uncertainty stat that production code (e.g. the
-// occupancy map-stats aggregator, and the H_y term inside
-// expectedInformationGain) uses INSTEAD of entropy() on the same near-
-// point-mass voxel: Bernoulli Shannon entropy H(p_occ) with p_occ =
-// a_occ/(a_occ+a_free). It is bounded in [0, ln2] regardless of how
-// concentrated the Beta is — the property entropy() above lacks.
+// Bernoulli Shannon entropy H(p_occ), p_occ = a_occ/(a_occ+a_free), bounded in
+// [0, ln2]: what production code (map-stats aggregator, H_y in
+// expectedInformationGain) uses instead of entropy().
+// (notes: uncertainty-bernoulli-entropy-bound)
 TEST(Uncertainty, BernoulliShannonEntropyBoundedOnNearPointMass) {
   const float alpha0 = 0.01f;
   const float C = 14.f;

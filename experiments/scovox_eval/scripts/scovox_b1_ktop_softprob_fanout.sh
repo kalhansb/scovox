@@ -1,10 +1,9 @@
 #!/bin/bash
 # B1 (post-cleanup) — K_TOP soft-prob sweep, FAN-OUT variant.
 #
-# Like scovox_b1_ktop_softprob.sh but parameterised by Replica scene name
-# and KITTI seq number so it can drive E1.0+E1.1 (per-scene rotation) and
-# E1.2 (per-seq fan-out). Reads SCENE / SEQ from environment; defaults to
-# room0 / 8 to stay backward-compatible with the single-anchor wrapper.
+# Like scovox_b1_ktop_softprob.sh but takes the Replica scene and KITTI seq
+# from the SCENE and SEQ env vars (defaults room0 and 08).
+# (notes: ktop-fanout-scene-seq)
 #
 # Cell paths:
 #   results/softprob_replica_<scene>_m2f/k_top_<K>/scovox.npz
@@ -13,6 +12,7 @@
 # Usage:
 #   SCENE=room1 scovox_b1_ktop_softprob_fanout.sh <K> replica
 #   SEQ=06 scovox_b1_ktop_softprob_fanout.sh <K> kitti
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 if [[ $# -lt 1 ]]; then

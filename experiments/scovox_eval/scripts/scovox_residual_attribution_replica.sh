@@ -1,12 +1,10 @@
 #!/bin/bash
 # Residual attribution for the post-revert mIoU gap.
-# Compares against `post_revert_default` (mIoU 0.3394). Each cell restores
-# one pre-cleanup feature so we can isolate which contributes to the
-# remaining −0.0252 gap vs the original baseline (0.3646).
-#
-#   res_smc          + semantic_min_confidence = 0.1   (rest off)
-#   res_sat          + evidence_saturation = 1000      (rest off)
-#   res_smooth_gate  + gate_k = 12 (smooth sigmoid)    (rest off)
+# Each cell adds one pre-cleanup feature (semantic_min_confidence,
+# evidence_saturation, or the smooth gate_k sigmoid) to the
+# post_revert_default BASE_ARGS, to isolate its share of the mIoU gap.
+# (notes: residual-attribution-cells)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

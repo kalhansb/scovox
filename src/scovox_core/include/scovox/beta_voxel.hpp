@@ -30,6 +30,7 @@
 /// wall-guard; see docs/occupancy_prior.md for the full derivation and the
 /// Jeffreys runner-up. The factory is prior-agnostic, so the calibrated prior
 /// `defaultBetaVoxel(C·α₀, α₀)` remains available as an ablation.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <cstddef>
 #include <type_traits>
@@ -68,31 +69,17 @@ static_assert(std::is_standard_layout_v<BetaVoxel>,
 static_assert(offsetof(BetaVoxel, a_free) == offsetof(BetaVoxel, a_occ) + sizeof(float),
     "BetaVoxel layout: a_free must immediately follow a_occ.");
 
-/// Shipped split-substrate occupancy prior: symmetric **Beta(1,1)** (uniform /
-/// Bayes–Laplace) → prior `p_occ = 0.5`. SINGLE SOURCE OF TRUTH for the split
-/// occupancy prior: allocation (`SemSplitMap`), the consensus merge's
-/// prior-subtraction (`mergeBeta`), the receiver's at-prior detection
-/// (`isPriorBeta`), the sender's emit gate, and the SSMI unobserved baseline
-/// all reference these constants, so sender and receiver stay consistent — the
-/// prior is a compile-time constant, NOT carried on the wire. Decoupled from
-/// the semantic `(num_classes, α₀)` because occupancy and semantics are
-/// independent priors. See docs/occupancy_prior.md (incl. the Jeffreys
-/// `Beta(0.5,0.5)` runner-up and the conditions to switch).
+/// Shipped occupancy prior Beta(1,1), p_occ = 0.5. Single source of truth for
+/// SemSplitMap, mergeBeta, isPriorBeta, the sender's emit gate and SSMI
+/// baseline; it is not sent on the wire, so both ends must share it.
+/// (notes: beta-prior-single-source)
 constexpr float kBetaOccPrior  = 1.0f;
 constexpr float kBetaFreePrior = 1.0f;
 
-/// Beta prior factory. **Required at every allocation**: Bonxai's pool
-/// allocator zero-initialises new leaf blocks, leaving `a_occ = a_free = 0`.
-/// Without this, the first integration would increment from `Beta(0,0)`
-/// instead of from the prior, silently mis-weighting the posterior forever
-/// (the same first-touch invariant as `defaultSemBetaVoxel` /
-/// `defaultSemDirVoxel`).
-///
-/// The factory is prior-agnostic. The 1.0/1.0 default IS the shipped symmetric
-/// Beta(1,1) occupancy prior (`p_occ = 0.5`), which `SemSplitMap` passes
-/// explicitly via `kBetaOccPrior` / `kBetaFreePrior`. Pass `occ_prior = C·α₀`,
-/// `free_prior = α₀` to reproduce the old calibrated unified-Dirichlet marginal
-/// (`p_occ = C/(C+1)`) as an ablation. See docs/occupancy_prior.md.
+/// Beta prior factory, required at every allocation: Bonxai zero-initialises
+/// new leaf blocks, and starting from Beta(0,0) mis-weights the posterior
+/// forever. The 1.0/1.0 defaults are the shipped Beta(1,1) prior.
+/// (notes: beta-prior-factory-first-touch)
 inline BetaVoxel defaultBetaVoxel(float occ_prior = 1.0f,
                                   float free_prior = 1.0f) noexcept {
   BetaVoxel v{};            // zero-init

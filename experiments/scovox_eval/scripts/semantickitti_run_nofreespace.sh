@@ -1,33 +1,14 @@
 #!/bin/bash
 # SemanticKITTI ablation: freespace carving vs endpoint-only (task 4.9f).
 #
-# The existing 4.9 runs (in results/semantickitti_<res>cm/) used carve_band=0
-# (endpoint-only, NO freespace carving). This script re-runs SCovox (Dirichlet)
-# under two explicit freespace configs so we can compare.
-#
-# Variant:
-#   scovox_dirichlet_fullray  — carve_band=-1 (full ray freespace carving)
-#
-# The nocarve baseline already exists as scovox.npz in results/semantickitti_<res>cm/
-# (task 4.9, carve_band=0). No need to re-run it.
-#
-# Output directory:
-#   results/semantickitti_<res>cm_freespace_ablation/
-#     scovox_dirichlet_nocarve.npz       — captured voxel map
-#     scovox_dirichlet_nocarve_run.log   — mapping node log (timing/memory)
-#     scovox_dirichlet_fullray.npz
-#     scovox_dirichlet_fullray_run.log
-#     gt.npz                             — symlinked from main results dir
-#
-# This is a separate directory from the main 4.9 results to keep experiments
-# cleanly isolated. File names include the semantic mode (dirichlet) and the
-# carving config (nocarve/fullray) so they are self-documenting.
-#
-# Metrics are computed via semantickitti_compute_metrics.sh pointed at
-# this directory, with VARIANTS overridden to match the file names above.
+# Runs only the full-ray variant (carve_band -1); the endpoint-only baseline
+# (carve_band 0) already exists as scovox.npz in semantickitti_<res>cm/. Output
+# goes to its own dir, with gt.npz symlinked in.
+# (notes: freespace-ablation-scope)
 #
 # Usage: bash semantickitti_run_nofreespace.sh [RESOLUTION]
 #   RESOLUTION: voxel size in meters (default: 0.10)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -eo pipefail
 

@@ -13,6 +13,7 @@
 # src/scovox_node.cpp and src/dscovox_node.cpp. A key absent there is NOT
 # a parameter: undeclared keys in a params-file are silently ignored.
 # =======================================================================
+# Moved comments: doc/scovox_mapping_code_notes.md
 
 # -----------------------------------------------------------------------
 # SCovoxNode  (scovox_mapping_node)
@@ -27,25 +28,14 @@ scovox_node:
       # Voxel edge length. Determines spatial resolution of the map.
 
     w_occ:                         # float, default 2.0, pseudo-counts
-      # Evidence added to a_occ per hit observation.
-      # Sensor-physics derivation: w_occ = (2·prob_hit − 1) / (1 − prob_hit).
-      #   RGB-D conservative (OctoMap prob_hit=0.7):  w_occ = 1.33
-      #     → noisy depth, many edge-spurious hits; low evidence per ray.
-      #   RGB-D moderate (prob_hit≈0.75, current):    w_occ = 2.0
-      #     → typical RealSense / Azure Kinect indoor.
-      #   LiDAR (prob_hit≈0.9):                       w_occ = 8.0
-      #     → physical TOF returns; very low FP rate, high evidence per ray.
+      # Evidence added to a_occ per hit observation, derived from the sensor hit
+      # probability as w_occ = (2*prob_hit - 1) / (1 - prob_hit).
+      # (notes: params-w-occ-derivation)
 
     w_free:                        # float, default 1.0, pseudo-counts
-      # Evidence added to a_free per free-space ray traversal.
-      # Sensor-physics derivation: w_free = 1/prob_miss − 2.
-      #   RGB-D conservative (OctoMap prob_miss=0.4):  w_free = 0.5
-      #     → frequent missed returns (dark/specular surfaces).
-      #   RGB-D moderate (prob_miss≈0.33, current):    w_free = 1.0
-      #     → moderate confidence in clear free-space rays.
-      #   LiDAR (prob_miss≈0.15):                      w_free ≈ 4.67
-      #     → clear-air rays are highly trustworthy.
-      # Ratio w_occ/w_free matters more than absolute scale for steady-state.
+      # Evidence added to a_free per free-space ray traversal, derived as w_free
+      # = 1/prob_miss - 2. The ratio w_occ/w_free matters more than absolute
+      # scale for steady state. (notes: params-w-free-derivation)
 
     kappa0:                        # float, default 2.0, pseudo-counts
       # Base Dirichlet evidence weight per semantic observation.
@@ -247,11 +237,10 @@ dscovox_node:
       # shared_params.yaml roi_min_z/roi_max_z (shared band must be a
       # SUPERSET of the planner band).
 
-    # NOTE: dscovox_mapping_node declares NO planning-map, pose-correction
-    # (pose_source/correction_*) or consensus-tuning (epsilon_w/Lsat/
-    # k_conflict/epsilon_sem/lambda_sem) parameters — the planning map is the
-    # mapper's (SCovoxNode), and consensus constants are compile-time in
-    # scovox_core. Any such keys in a params-file are silently ignored.
+    # dscovox_mapping_node declares no pose-correction or consensus-tuning
+    # parameters (consensus constants are compile-time in scovox_core); such
+    # keys in a params-file are silently ignored.
+    # (notes: params-dscovox-undeclared-keys)
 
     # === Topic / frame config [T] ===
 
@@ -269,23 +258,8 @@ dscovox_node:
 # -----------------------------------------------------------------------
 # scovox::Params struct (scovox_core library)
 # -----------------------------------------------------------------------
-# Key framework-agnostic parameters in the Params struct (authoritative
-# list and defaults: scovox_core/include/scovox/map_interface.hpp).
-# They control the Beta-conjugate occupancy model, Dirichlet semantics,
-# occupancy gate, evidence saturation, range/angle weighting, and
-# consensus fusion. All have sensible defaults. No ROS dependency.
-#
-#  1. resolution              double  0.05   m
-#  2. w_free                  float   1.0    pseudo-counts
-#  3. w_occ                   float   2.0    pseudo-counts
-#  4. semantic_mode           enum    DIRICHLET
-#  5. kappa0                  float   2.0    pseudo-counts
-#  6. top_k                   int     2      classes
-#  7. semantic_occ_gate       float   0.5    dimensionless  (publish threshold)
-#  8. consensus_kl_threshold  float   5.0    nats
-#  9. consensus_tau_occ_gate  float   0.6    dimensionless
-# 10. range_decay_length      float  -1.0    m  (disabled)
-# 11. min_range               float   0.3    m
-# 12. max_range               float  10.0    m
-# 13. grazing_angle_threshold float  -1.0    dimensionless  (disabled)
+# Framework-agnostic scovox::Params (Beta occupancy, Dirichlet semantics, gates,
+# range/angle weighting, consensus fusion), no ROS dependency. Authoritative
+# list and defaults: scovox_core/include/scovox/map_interface.hpp.
+# (notes: params-core-params-struct)
 # -----------------------------------------------------------------------

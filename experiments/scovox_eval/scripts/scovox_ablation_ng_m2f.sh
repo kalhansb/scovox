@@ -1,11 +1,10 @@
 #!/bin/bash
 # SCovox-NG ablation under m2f predictions (Replica, 3 scenes).
 #
-# Mirrors scovox_ablation_ng_nr.sh's NG block but feeds Mask2Former ADE-150
-# predictions (semantic_subdir=semantic_m2f_ade) instead of GT labels. Goal:
-# show whether the occupancy gate's protective value materialises under
-# noisy segmentation, complementing the GT finding (gate=0 helped + 0.32 mIoU
-# on GT — gate hurts under clean labels).
+# Mirrors the Replica NG block of scovox_ablation_ng_nr.sh but replays
+# Mask2Former ADE-150 predictions (semantic_m2f_ade) instead of GT labels.
+# (notes: ablation-ng-m2f-goal)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

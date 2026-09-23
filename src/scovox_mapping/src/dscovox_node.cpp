@@ -1,53 +1,31 @@
 // dscovox_node.cpp — multi-robot SCovox map merger.
 //
-// Each connected scovox_node ships ScovoxMapBinary deltas of its persistent
-// LOCAL scovox grid (i.e. that robot's own sensor observations only — NEVER
-// the fused dscovox grid). This one-way local→fused topology is what keeps
-// the additive Beta–Dirichlet consensus Bayesian: there is no comms-level
-// echo where one robot's evidence is shipped back into another robot's
-// source grid via the merged map, so conditional independence of the two
-// sources given the latent voxel state holds at the protocol level. The
-// dscovox `~/scovox` publish is for downstream consumers (planner,
-// visualisation) only — wiring it back as an input to another dscovox would
-// re-introduce evidence-echo and break the additive rule.
+// Inputs are each robot's LOCAL grid deltas, never a fused grid. Do not wire a
+// dscovox ~/scovox output back in as an input: the evidence echo breaks the
+// additive consensus. (notes: dscovox-local-to-fused-topology)
 //
 // K_TOP semantic-slot truncation lives in scovox (voxel.hpp / sparse_add)
 // and is already applied by the time a binary reaches this node — the wire
 // format carries at most K_TOP slots per voxel. dscovox cannot widen that;
 // any K_TOP-related ablation belongs at the scovox layer (B1).
 //
-// The merger keeps one source grid per robot keyed by the binary's
-// header.frame_id (e.g. "atlas/odom"). Source grids are stored directly in
-// MAP-FRAME coordinates: at receive time we transform each delta voxel once
-// using the source->map pose the producer captured and CARRIED in the message
-// (ScovoxMapBinary.map_from_source), cached the first time we see that source.
-// This node holds NO TF listener — the pose rides with the data.
+// One source grid per robot, keyed by header.frame_id, stored in map-frame
+// coords: each delta voxel is transformed once by the pose carried in
+// map_from_source. No TF listener. (notes: dscovox-source-grids-map-frame)
 //
 // !! REQUIRES c-slam DISABLED !!
-// The cached source->map pose is never refreshed (first carried pose wins).
-// This is correct only while TFs are static. Re-enabling c-slam (loop closures
-// / pose-graph optimization) is a CORRECTNESS BUG: the first pose jump leaves
-// every voxel in the source grid at its old map-frame coord, producing ghost
-// voxels at pre-loop-closure positions and missing voxels at the new positions.
-// Before turning c-slam back on, refactor SourceGrid to store evidence in
-// source-frame coords + reproject on each carried-pose change, with a
-// per-source "pose changed → reproject" handler. See ablation entry C5 in
-// docs/issues/ablations_punch_list.md for the design.
+// The first carried source->map pose is cached and never refreshed: correct
+// only while TFs are static. Under loop closures voxels stay at stale map
+// coords (ghosts); SourceGrid would need source-frame storage.
+// (notes: dscovox-requires-cslam-disabled)
 //
-// On every binary we incrementally update the fused grid by, for each touched
-// map-frame coord, resetting fused[c] to the prior and re-folding the current
-// state of every source's grid at c. The fold uses the same Beta-conjugate
-// consensus as before: a_fused = a_1 + a_2 - 1. Cells the binary did not
-// touch are not visited — their existing fused value is still correct because
-// no source's contribution at those cells changed.
-//
-// The reset-then-refold pattern is what keeps this bit-for-bit equivalent to
-// a from-scratch rebuild while making the work proportional to the delta size
-// instead of the total map size. Critically, it cannot double-count: a
-// source's previous contribution at a cell is wiped before that source's
-// current contribution is folded back in.
+// Each binary refolds only the touched map-frame cells: reset fused[c] to the
+// prior, then fold every source's current value (a_fused = a_1 + a_2 - 1).
+// Equals a full rebuild; cannot double-count.
+// (notes: dscovox-reset-then-refold)
 //
 // No submaps. No pose graph. No loop closures. No periodic rebuild.
+// Moved comments: doc/dscovox_node_notes.md
 
 #include <rclcpp/rclcpp.hpp>
 #include <scovox_msgs/msg/scovox_map_binary.hpp>
@@ -86,30 +64,20 @@ namespace {
 
 struct SourceGrid {
   std::string source_frame;                // header.frame_id of the binary
-  // This source's contribution to the world, stored in MAP-FRAME coords.
-  // Each entry is the latest snapshot of (occupancy, semantics) received for
-  // that map-frame voxel from this robot.
-  //
-  // Split Beta/Dirichlet (wire format) receiver populates these two grids:
-  // occupancy (BetaVoxel) ∥ semantics (DirVoxel). No TsdfMap on the receiver
-  // because share_tsdf=false is the wire default — TSDF state never crosses the
-  // wire to dscovox in the production path.
+  // This source's latest (occupancy, semantics) snapshot per voxel, in
+  // MAP-FRAME coords: beta_grid and dir_grid. No TSDF grid: TSDF does not cross
+  // the wire (share_tsdf=false). (notes: source-grid-split-grids)
   std::unique_ptr<Bonxai::VoxelGrid<scovox::BetaVoxel>> beta_grid;
   std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  dir_grid;
-  // Cached static source->map transform. Taken from the first update's carried
-  // map_from_source pose and never refreshed — this assumes TFs are static
-  // (c-slam disabled). Under c-slam, loop closures change this transform and the
-  // cache becomes a correctness bug. See the file-header banner and C5 in
-  // ablations_punch_list.md.
+  // Source->map transform from the first update's carried map_from_source;
+  // never refreshed, so valid only while TFs are static (c-slam disabled).
+  // (notes: source-grid-cached-pose)
   Eigen::Isometry3d T_map_source{Eigen::Isometry3d::Identity()};
   bool pose_cached{false};
-  // What this source has delivered, cumulatively, since this node started.
-  // Published as ScovoxFusionCounters so a consumer can ask "have the maps
-  // exchanged with THIS robot?" — a question the fused map's own voxel total
-  // cannot answer, because it sums own sensing and every peer into one number.
-  // See the message for what each counts and why arrival is the load-bearing
-  // one. Written under the unique_lock in the ingest path; read under a shared
-  // lock from the publish timer.
+  // Cumulative per-source totals since node start, published as
+  // ScovoxFusionCounters. Written under the unique_lock at ingest; read under a
+  // shared lock by the fusion-counters timer.
+  // (notes: source-grid-fusion-counters)
   uint64_t deltas_received{0};   // voxel deltas ingested from this source
   uint64_t cells_touched{0};     // fused cells written while integrating them
 };
@@ -126,12 +94,10 @@ inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::Transform& tf) {
   return T;
 }
 
-// The pure receiver-side consensus helpers — kPriorSlop, isPriorBeta/isPriorDir,
-// projectBetaDirToSemBetaForViz, projectBetaDirToVoxel, and the refoldBeta/
-// refoldDir cores — now live in scovox/dscovox_consensus.hpp (namespace scovox)
-// so the unit tests can exercise the SAME code this node runs (findings
-// #18/#19/#20). The unqualified call sites below resolve to them via ADL (every
-// call passes a scovox-typed voxel argument).
+// The receiver consensus helpers (isPriorBeta, isPriorDir, projectBetaDir*,
+// refoldBeta, refoldDir) live in scovox/dscovox_consensus.hpp, shared with the
+// unit tests; unqualified calls resolve by ADL.
+// (notes: dscovox-consensus-helpers-shared)
 } // namespace
 
 class DSCovoxNode : public rclcpp::Node {
@@ -184,37 +150,17 @@ public:
     pc_min_interval_s_ = declare_parameter<double>("pointcloud_min_interval_s", 0.1);
     last_pc_pub_ns_.store(get_clock()->now().nanoseconds(), std::memory_order_relaxed);
 
-    // Shared-ROI z-band — receive-side defensive mirror of the sender's wire
-    // filter. Records whose MAP-frame voxel centre falls outside
-    // [share_roi_z_min, share_roi_z_max] are dropped at ingest, so the fused
-    // map honours the band even if one sender was launched without it.
-    // KEEP IN SYNC with scovox_node share_roi_z_min/share_roi_z_max (sender
-    // wire filter, applied in its integration frame) and with explo_planner
-    // shared_params.yaml roi_min_z/roi_max_z: the shared band must be a
-    // SUPERSET of the planner band. min >= max (default 0/0) disables.
+    // Ingest-side z-band clip on map-frame voxel centres; min >= max disables.
+    // KEEP IN SYNC with scovox_node share_roi_z_min/max; must be a superset of
+    // explo_planner roi_min_z/roi_max_z. (notes: dscovox-share-roi-z-band)
     share_z_min_ = declare_parameter<double>("share_roi_z_min", 0.0);
     share_z_max_ = declare_parameter<double>("share_roi_z_max", 0.0);
 
     // --- WORLD-FIXED planning map for the exploration planner ---------------
-    // The merger already answers GetOccupancyGrid, but that projection is
-    // sized to a TIGHT BOUNDING BOX of the observed voxels: its origin and
-    // extent move every time the map grows. An exploration planner cannot use
-    // that envelope. It indexes the grid with raw world XY and treats every
-    // out-of-bounds cell as OCCUPIED (isCellOccupied), so a shrink-wrapped
-    // grid reports the entire unexplored world as blocked — candidates are
-    // rejected as unreachable and the planner starves. This publisher is the
-    // same 2D projection over a FIXED envelope that does not move under the
-    // consumer, mirroring scovox_node's own local/global planning-map split.
-    //
-    // Two consumers now: the exploration planner, and — since generation 5 —
-    // simple_nav_3d's global nav planner, which was repointed here from
-    // /<robot>/dscovox_node/planning_map. That name never had a publisher, so
-    // the nav global planner sat inert for the whole campaign history before
-    // the repoint. Deliberately still NOT ~/planning_map: that name means the
-    // rolling local crop from scovox_node, and the local nav planner needs it
-    // to keep meaning exactly that.
-    //
-    // Off by default: nothing that does not ask for it pays the projection.
+    // 2D projection over a FIXED envelope for the exploration planner and
+    // simple_nav_3d's global planner, which read out-of-bounds as occupied. Not
+    // ~/planning_map (scovox_node's rolling crop). Off by default.
+    // (notes: dscovox-global-planning-map)
     pub_plan_glob_ = declare_parameter<bool>("publish_global_planning_map", false);
     plan_glob_res_ = declare_parameter<double>("global_planning_map_resolution", 0.40);
     plan_glob_sz_  = declare_parameter<double>("global_planning_map_size_m", 200.0);
@@ -235,33 +181,24 @@ public:
     initSemanticColors();
 
     // Explicit reliable + depth 1, mirroring scovox_node's pc_pub_: the fused
-    // cloud is tens of MB (one point per fused voxel) and SystemDefaultsQoS
-    // resolved to BEST_EFFORT on this build — every fragmented sample dropped
-    // and RViz never received a single cloud. Depth 1 caps publisher-side
-    // buffering (see scovox_node's OOM note).
+    // cloud is tens of MB and best-effort drops fragmented samples. Depth 1
+    // caps publisher-side buffering. (notes: dscovox-pointcloud-qos)
     pc_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       declare_parameter<std::string>("pointcloud_topic", "~/pointcloud"),
       rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
 
-    // Fused-map topic for downstream consumers (planner, visualisation). Topic
-    // form of the on-demand GetRegion service: a full snapshot of the fused
-    // Beta/Dir grids projected to a ScovoxMap, published from the publish timer
-    // below when the map has changed and someone is subscribed (see
-    // publishFusedMap). Latched QoS — KeepLast(1) + reliable + transient_local —
-    // so the last published snapshot is retained and replayed to a (re)connecting
-    // subscriber; the very first subscriber receives it on the next publish tick
-    // after connecting. Only one full snapshot is ever retained (the voxel dump
-    // can be large). Any subscriber MUST match this QoS or it receives nothing.
+    // Full ScovoxMap snapshot of the fused Beta/Dir grids (topic form of
+    // GetRegion), published by the publish timer when changed and subscribed.
+    // Latched (KeepLast(1), reliable, transient_local): subscribers MUST match.
+    // (notes: dscovox-fused-map-topic)
     scovox_map_pub_ = create_publisher<scovox_msgs::msg::ScovoxMap>(
       declare_parameter<std::string>("scovox_topic", "~/scovox"),
       rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
 
-    // Latched, matching the exploration planner's subscriber QoS exactly
-    // (KeepLast(1) + reliable + transient_local). The planner blocks in its
-    // start-up wait until the first map arrives, so a QoS mismatch here would
-    // present as a planner that never leaves INIT rather than as an error.
-    // The topic name is declared unconditionally so `ros2 param get` reports
-    // it even when the publisher is disabled.
+    // Latched QoS must match the exploration planner's subscriber exactly, or
+    // the planner waits in INIT with no error. The topic is declared even when
+    // disabled so ros2 param get reports it.
+    // (notes: dscovox-global-planning-map-qos)
     {
       auto plg_t = declare_parameter<std::string>("global_planning_map_topic",
                                                  std::string("~/global_planning_map"));
@@ -276,20 +213,10 @@ public:
       }
     }
 
-    // Per-source integration counters — "have the maps exchanged, and with
-    // whom?". Reliable and latched for the same reason as the fused map: a
-    // consumer that connects late must receive the current totals rather than
-    // wait for the next tick to learn a peer exists.
-    //
-    // ITS OWN TIMER, NOT THE PUBLISH TIMER, and that is the point rather than
-    // an implementation detail. Everything on publish_timer_ is gated on the
-    // fused map having changed (publishFusedMap consumes fused_dirty_) or on
-    // having subscribers, so all of it falls silent in exactly the case a
-    // consumer most needs a sample: nothing is arriving from a peer. Hanging
-    // these counters off that timer would make "this peer is quiet" and
-    // "dscovox is quiet" the same observation, which is the ambiguity the
-    // counters exist to remove. Rate is independent of publish_rate_hz for the
-    // same reason.
+    // Per-source integration counters, reliable and latched. Own timer,
+    // independent of publish_rate_hz: the publish timer's outputs are gated on
+    // change and subscribers and would fall silent when a peer does.
+    // (notes: dscovox-fusion-counters-timer)
     fusion_counters_pub_ =
       create_publisher<scovox_msgs::msg::ScovoxFusionCounters>(
         declare_parameter<std::string>("fusion_counters_topic",
@@ -305,24 +232,10 @@ public:
         [this] { publishFusionCounters(); });
     }
 
-    // Reliable + deeper queue for binary submap deltas. The old
-    // SystemDefaultsQoS resolved to BEST_EFFORT on this build, which
-    // silently dropped large ScovoxMapBinary payloads under any
-    // backpressure. Combined with scovox_node's fire-and-forget
-    // dirty_.clear() after publish, drops became permanent voxel loss.
-    // KeepLast absorbs publish bursts when this node is busy
-    // rebuilding the fused grid; reliable forces redelivery of any
-    // packet the transport drops.
-    //
-    // Depth is a parameter because the binding limit is the SHALLOWEST end of
-    // the chain, and under a comms emulator the sender end is not the direct
-    // publisher: an outage queues deltas, and reconnect releases the whole
-    // backlog in one pass, far faster than this node drains it. A reliable
-    // KEEP_LAST reader that overflows discards the excess with no error and no
-    // counter — the relay's drop_overflow only sees its own pre-relay queue —
-    // so the loss surfaces as permanently missing voxels in the fused map with
-    // nothing anywhere recording that it happened. Size it to the emulator's
-    // rx_qos_depth (or larger) for those runs. Default 50 = prior behaviour.
+    // Reliable KeepLast for binary deltas: a dropped delta is permanent voxel
+    // loss. An overflowing reliable reader drops silently, so under a comms
+    // emulator set scovox_bin_qos_depth >= its rx_qos_depth.
+    // (notes: dscovox-bin-sub-qos-depth)
     const int bin_depth = std::max(
         1, static_cast<int>(declare_parameter<int>("scovox_bin_qos_depth", 50)));
     auto bin_qos =
@@ -341,15 +254,10 @@ public:
       std::bind(&DSCovoxNode::onGetOccupancyGrid, this, std::placeholders::_1, std::placeholders::_2));
 
     if (pub_hz_ > 0.0) {
-      // The fused grid is kept current incrementally inside onBinaryMap.
-      // The visualization pointcloud is normally driven from there too;
-      // this timer is the fallback (when no binaries arrive).
-      //
-      // One outer shared_lock spans every publisher in the tick so they all
-      // see the same fused state — without it, an onBinaryMap callback can
-      // mutate the fused grids between any two of them. publish* helpers
-      // must NOT take mu_ themselves — std::shared_mutex is non-recursive
-      // so re-locking here would be UB.
+      // Fallback publish when no binaries arrive. One shared_lock spans the
+      // tick so all publishers see the same fused state; publish* helpers must
+      // NOT lock mu_ (non-recursive std::shared_mutex).
+      // (notes: dscovox-publish-timer-lock)
       publish_timer_ = rclcpp::create_timer(
         this, get_clock(),
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -357,11 +265,9 @@ public:
         [this] {
           std::shared_lock<std::shared_mutex> lk(mu_);
           maybePublishPointCloud();
-          // Topic form of GetRegion: publish the whole fused map for the
-          // planner. Shares this tick's shared_lock (publishFusedMap must not
-          // re-lock the non-recursive shared_mutex). NOTE: gated on pub_hz_ > 0
-          // like every other publisher here — disabling the publish timer also
-          // disables the fused-map topic the planner depends on.
+          // Fused map for the planner; uses this tick's shared_lock (must not
+          // re-lock). Gated on pub_hz_ > 0: disabling the publish timer also
+          // disables this topic. (notes: dscovox-fused-map-gated-on-pub-hz)
           publishFusedMap();
           // World-fixed 2D projection for the exploration planner. Shares this
           // tick's shared_lock (must not re-lock the non-recursive mutex) and
@@ -401,19 +307,10 @@ private:
   };
 
   // ==================================================================
-  // ScovoxMapBinary receive path — the node's only receive path. Every binary
-  // is a split Beta/Dir envelope. Operates on the de-unified BetaVoxel
-  // (occupancy) ∥ DirVoxel (semantics) grids + consensus_merge.hpp. The two
-  // grids ingest + refold INDEPENDENTLY: a touched coord may be in either or
-  // both. Priors are pinned from the first frame's header.
-  //
-  // NOTE: the RPC query services (GetRegion / GetOccupancyGrid) project the
-  // split Beta(+Dir) grids into a transient scovox::Voxel via a
-  // substrate-agnostic templated core. The SEMANTIC query math uses the
-  // raw-evidence convention; the OCCUPANCY math uses the symmetric Beta(1,1)
-  // prior (p_occ=0.5) — see projectBetaDirToVoxel / docs/occupancy_prior.md.
-  // Occupancy-only services (GetOccupancyGrid) read just the Beta grid;
-  // GetRegion joins the Dir grid for per-class evidence.
+  // The only receive path; every binary is a split Beta/Dir envelope. Beta and
+  // Dir grids ingest and refold independently; priors are pinned from the first
+  // frame. Query services project them to scovox::Voxel.
+  // (notes: dscovox-receive-path)
   // ==================================================================
   void onBinaryMap(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
     if (msg->version != 5) {
@@ -422,12 +319,9 @@ private:
         msg->version);
       return;
     }
-    // The frame body is serialized in host byte order (BinarySerializer uses raw
-    // field memcpy, not an endian-canonical encoding). The publisher stamps
-    // msg->little_endian from its host; until a byte-swapping decode path exists,
-    // a sender of the opposite endianness can only be mis-decoded. Reject it loud
-    // rather than silently corrupting the fused map. (No-op on a homogeneous
-    // little-endian fleet, which is every supported target today.)
+    // Frames are host-byte-order memcpy with no byte-swap decode, so a sender
+    // of the other endianness is rejected rather than mis-decoded.
+    // (notes: dscovox-endianness-reject)
     constexpr bool kHostLittleEndian =
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         true;
@@ -458,11 +352,9 @@ private:
     }
     if (frame.beta_deltas.empty() && frame.dir_deltas.empty()) return;
 
-    // The producer captured its source->map pose at publish time and carried it
-    // in the message, so the merger never touches TF. First-pose-wins: the first
-    // frame from a source pins T_map_source (below); later frames' carried poses
-    // are ignored. The static-TF / c-slam-off assumption is unchanged — only its
-    // mechanism moved from a TF lookup to the message's map_from_source.
+    // The producer carries its source->map pose in the message; the merger
+    // never touches TF. First pose wins: later frames' poses are ignored
+    // (static TF, c-slam off). (notes: dscovox-carried-pose-first-wins)
     const Eigen::Isometry3d Tmo = tfToIsometry(msg->map_from_source);
 
     float src_res = frame.resolution > 0.f ? frame.resolution : 0.f;
@@ -602,13 +494,10 @@ private:
       }
       {
         auto fa = split_fused_dir_->createAccessor();
-        // Fold the Dir sources in a deterministic (sorted-by-source-id) order.
-        // mergeDir truncates to top-K and a class dumped to OTHER cannot climb
-        // back, so the fused slots — and hence dominantClass / mesh labels —
-        // depend on fold order. Iterating sources_ (an unordered_map) directly
-        // would let them flip across runs and rehashes; sort the keys first so
-        // the refold is reproducible. (Beta merge is additive/commutative and
-        // needs no ordering.)
+        // Fold Dir sources in sorted source-id order: mergeDir truncates to
+        // top-K and OTHER mass cannot climb back, so fused labels depend on
+        // fold order. Beta merge is commutative.
+        // (notes: dscovox-dir-fold-order)
         std::vector<const std::string*> keys;
         keys.reserve(sources_.size());
         for (auto& [k, sg] : sources_)
@@ -627,17 +516,10 @@ private:
       n_touched_dir  = touched_dir.size();
       n_sources      = sources_.size();
 
-      // Accumulate this source's running totals while the write lock is still
-      // held. Deliberately AFTER the reject paths above: a frame that returned
-      // early (bad prior, num_classes==0) never became map and is not counted
-      // as delivery.
-      //
-      // ARRIVAL IS COUNTED AS PRESENTED, NOT AS STORED — the deltas the frame
-      // carried, before the shared-ROI z-band clip drops the ones outside the
-      // band. That is the right measure for the question this counter answers:
-      // a clipped delta still crossed the radio, and the clip is this robot's
-      // own policy rather than anything about whether the peer is reaching it.
-      // cells_touched, being about the fused map, is counted post-clip.
+      // Counted after the reject paths, so rejected frames are not delivery.
+      // deltas_received counts deltas as presented, before the z-band clip;
+      // cells_touched is post-clip.
+      // (notes: dscovox-counters-presented-not-stored)
       src.deltas_received += n_beta_deltas + n_dir_deltas;
       src.cells_touched   += n_touched_beta + n_touched_dir;
     }  // unique_lock released
@@ -704,20 +586,13 @@ private:
     *fv = scovox::refoldDir(refold_dir_src_, fused_num_classes_, fused_alpha_0_);
   }
 
-  // Rate-limited visualization publish. Called from the binary callback's
-  // tail (so the user-visible map updates as soon as ingest produces fresh
-  // data) and from the timer as a fallback (so the map keeps refreshing in
-  // RViz even if no binaries arrive). publishPointCloud already returns
-  // early if no subscriber, so this is free when nobody is watching.
-  //
-  // Caller must hold mu_ (shared). The lock is hoisted to the call sites so
-  // every publisher in a single timer tick sees the same fused state.
+  // Rate-limited pointcloud publish, called from the binary callback tail and
+  // the timer fallback; free with no subscriber. Caller must hold mu_ (shared).
+  // (notes: dscovox-maybe-publish-pointcloud)
   void maybePublishPointCloud() {
-    // Race-free rate limit: this runs under only a SHARED lock and can execute
-    // concurrently from the timer and a binary callback. Claim the window with a
-    // single atomic compare_exchange so exactly one caller proceeds per interval
-    // (a plain read-then-write of a non-atomic timestamp would be a data race
-    // and could let both publish in the same window). See last_pc_pub_ns_.
+    // Runs under a shared lock, concurrently from the timer and a callback:
+    // claim the window with one atomic compare_exchange so exactly one caller
+    // publishes per interval. (notes: dscovox-pointcloud-cas-rate-limit)
     const int64_t now_ns = get_clock()->now().nanoseconds();
     const int64_t min_dt_ns =
         static_cast<int64_t>(pc_min_interval_s_ * 1e9);
@@ -743,11 +618,9 @@ private:
     const float ot = (float)min_occ_;
     size_t cnt = 0;
     g.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT&) {
-      // Skip prior-only cells via isPriorBeta, independent of the prior's p_occ.
-      // (Gating on isPriorBeta rather than a p_occ threshold keeps this correct
-      // for any prior: the old calibrated prior p_occ ≈ 0.933 exceeded the 0.7
-      // threshold and would publish as phantom occupied; the prior is now
-      // Beta(1,1)/0.5. See docs/occupancy_prior.md.) Mirror the RPC walkers' gate.
+      // Skip prior-only cells via isPriorBeta, not a p_occ threshold, so the
+      // gate holds for any prior. Mirrors the RPC walkers' gate.
+      // (notes: dscovox-pointcloud-prior-gate)
       if (isPriorBeta(v, fused_num_classes_, fused_alpha_0_)) return;
       if (v.p_occ() >= ot) ++cnt;
     });
@@ -791,13 +664,10 @@ private:
       auto p = g.coordToPos(co);
       *ix = p.x; *iy = p.y; *iz = p.z; *ip = pr;
       const auto [best_cls, cf] = scovox::argmaxClassConfidence(v);
-      // The semantic_class PointField is UINT8 (wire/schema locked — RViz and
-      // pointcloud_to_npz.py read it as one byte), but argmaxClassConfidence
-      // returns a uint16_t class id. A naive static_cast<uint8_t> of an id >=256
-      // (e.g. a 360-class taxonomy) would silently alias to id%256 and collide
-      // with an unrelated class for BOTH the label and the palette colour. Emit
-      // 0 (unknown) instead so the >255 case is unambiguous rather than wrong.
-      // Mirror this same UINT8 limit in scovox_node.cpp's pointcloud publishers.
+      // semantic_class is UINT8 (RViz and pointcloud_to_npz.py read one byte);
+      // class ids >= 256 emit 0 (unknown) rather than alias. Mirror this limit
+      // in scovox_node.cpp's pointcloud publishers.
+      // (notes: dscovox-semantic-class-uint8)
       const uint8_t bc = (best_cls < 256) ? static_cast<uint8_t>(best_cls) : 0;
       *ik = bc; *ic = cf;
       float r = 1, gg = 1, b = 1;
@@ -853,11 +723,9 @@ private:
     });
   }
 
-  // Lock-free GetRegion core, shared by the service handler and the fused-map
-  // topic publisher. Caller MUST already hold (at least) a shared lock on mu_:
-  // std::shared_mutex is non-recursive, so this function must never lock it
-  // itself. Fills rs->map header + the voxels inside rq's bbox (regionOnGrid
-  // does the clip) by projecting the fused split Beta/Dir grids.
+  // Lock-free GetRegion core shared by the service and the fused-map publisher.
+  // Caller MUST hold at least a shared lock on mu_; never lock it here
+  // (non-recursive). (notes: dscovox-fill-region-lock-free)
   void fillRegion(const scovox_msgs::srv::GetRegion::Request::SharedPtr& rq,
                   const scovox_msgs::srv::GetRegion::Response::SharedPtr& rs)
   {
@@ -888,24 +756,18 @@ private:
     fillRegion(rq, rs);
   }
 
-  // Publish the ENTIRE fused map as a ScovoxMap topic. Called from the publish
-  // timer, which already holds a shared lock on mu_ — this must NOT lock mu_
-  // (non-recursive shared_mutex). Skipped when no one is subscribed (so a large
-  // voxel dump isn't built for nothing) and when the map hasn't changed since
-  // the last publish. The subscription check comes first so dirtiness is
-  // preserved while nobody listens, then delivered on the first tick after a
-  // subscriber connects. The latched (transient_local) QoS retains that last
-  // published snapshot and replays it to any later (re)connecting subscriber.
+  // Publish the whole fused map as ScovoxMap; the caller holds the shared lock,
+  // so do NOT lock mu_. Subscribers are checked before fused_dirty_ is
+  // consumed, so a change waits until someone listens.
+  // (notes: dscovox-publish-fused-map)
   void publishFusedMap()
   {
     if (!scovox_map_pub_ || scovox_map_pub_->get_subscription_count() == 0)
       return;
     if (!fused_dirty_.exchange(false)) return;
-    // Full-coverage bbox: regionOnGrid clips in coord space via posToCoord
-    // (floor(corner/res_)). Size the corner relative to res_ so it lands at
-    // ±1e8 voxels — far outside any real map yet comfortably inside int32 at
-    // ANY resolution (a fixed metric constant would overflow the cast at very
-    // fine resolutions). Consumers re-apply their own ROI clip on ingest.
+    // Full-coverage bbox of +-1e8 voxels, scaled by res_ so the coord cast
+    // stays inside int32 at any resolution. Consumers apply their own ROI clip.
+    // (notes: dscovox-full-coverage-bbox)
     const double big = 1e8 * std::max(static_cast<double>(res_), 1e-3);
     auto rq = std::make_shared<scovox_msgs::srv::GetRegion::Request>();
     rq->min_corner.x = rq->min_corner.y = rq->min_corner.z = -big;
@@ -915,22 +777,9 @@ private:
     scovox_map_pub_->publish(rs->map);
   }
 
-  // Publish the per-source integration counters. Driven by its own timer, and
-  // unlike every other publisher here it takes its own shared lock, has no
-  // dirty gate, and does not check the subscription count.
-  //
-  // NO GATES, ON PURPOSE. The message is a handful of integers, so the cost of
-  // publishing one nobody reads is nothing, while the cost of NOT publishing is
-  // that a consumer cannot tell a peer that has gone quiet from a dscovox that
-  // has gone quiet — and those two need different responses. Every skip
-  // condition the other publishers carry (map unchanged, nobody subscribed)
-  // correlates with exactly the silence this is here to make legible.
-  //
-  // Sorted by source frame so successive samples are positionally comparable
-  // (sources_ is an unordered_map and its iteration order is not stable across
-  // rehashes). Entries are never removed: a source that stops sending keeps its
-  // frozen counts, because dropping it would restore the ambiguity between
-  // "silent" and "never heard of".
+  // Own timer and own shared lock, no dirty or subscriber gate, so a quiet peer
+  // is distinguishable from a quiet dscovox. Sorted by source frame; entries
+  // are never removed. (notes: dscovox-fusion-counters-no-gates)
   void publishFusionCounters()
   {
     if (!fusion_counters_pub_) return;
@@ -953,24 +802,10 @@ private:
     fusion_counters_pub_->publish(msg);
   }
 
-  // World-fixed 2D projection of the FUSED grid for the exploration planner.
-  // Caller must already hold mu_ (shared) — the publish timer does.
-  //
-  // Why this does not reuse occupancyGridOnGrid below: that one derives its
-  // origin and extent from the data (a tight bbox), which is correct for an
-  // on-demand service and fatal for a planner that reads out-of-bounds as
-  // occupied. Here the envelope is a constant of the run.
-  //
-  // THE THREE-STATE CONTRACT, which is the whole point of the fix:
-  //   -1  unknown  — no evidence. Cells outside the observed set keep this,
-  //                  and so do prior-only voxels (isPriorBeta): a voxel that
-  //                  exists in the grid carrying nothing but its Dirichlet
-  //                  prior has never been measured by anyone. Marking those 0
-  //                  would fabricate free space; marking them 100 would
-  //                  reproduce the starvation this fix exists to remove.
-  //    0  free      — observed, p_occ below the occupancy threshold.
-  //  100  occupied  — observed, p_occ at or above it. Occupied wins ties
-  //                   across voxels sharing a cell (the else-if below).
+  // World-fixed 2D projection of the fused grid; caller holds mu_ (shared). -1
+  // unknown (unobserved or prior-only, never 0 or 100), 0 free (p_occ below
+  // threshold), 100 occupied (wins ties).
+  // (notes: dscovox-global-map-three-state)
   void publishGlobalPlanningMap() {
     if (!pl_glob_pub_ || !split_fused_beta_) return;
     // Nothing subscribed ⇒ nothing to pay for. transient_local still replays
@@ -1119,13 +954,10 @@ private:
          plan_glob_oy_{-100.0}, plan_glob_infl_{1.5},
          plan_glob_zmin_{0.05}, plan_glob_zmax_{1.0}, plan_glob_period_{1.0};
   std::chrono::steady_clock::time_point plan_glob_last_{};
-  // Rate-limiter timestamp for the visualisation pointcloud, stored as raw
-  // nanoseconds in a std::atomic. maybePublishPointCloud() runs under only a
-  // SHARED lock (from both the binary-callback tail and the publish timer), so
-  // two readers can execute concurrently; a plain rclcpp::Time would be torn /
-  // race-written here. The atomic + compare_exchange below makes the
-  // read-decide-update a single race-free claim so exactly one caller publishes
-  // per window even under a multi-threaded executor.
+  // Pointcloud rate-limit timestamp in ns. Atomic because
+  // maybePublishPointCloud runs under only a shared lock from two paths;
+  // compare_exchange lets exactly one caller publish per window.
+  // (notes: dscovox-last-pc-pub-atomic)
   std::atomic<int64_t> last_pc_pub_ns_{0};
   // Set when onBinaryMap fuses new data; consumed (exchanged false) by
   // publishFusedMap so the fused-map topic is only rebuilt+serialized when it
@@ -1143,12 +975,9 @@ private:
   std::unique_ptr<Bonxai::VoxelGrid<scovox::DirVoxel>>  split_fused_dir_;
   uint16_t fused_num_classes_{0};
   float    fused_alpha_0_{scovox::kDefaultDirichletPrior};
-  // Dedicated "prior has been pinned" flag for the wire receive path. We must
-  // NOT overload fused_num_classes_==0 as the "not yet pinned" sentinel: a
-  // sender that ships num_classes==0 (misconfig/upstream bug) would store 0 and
-  // re-pin/re-log every frame, and the cross-prior mismatch guard would never
-  // run (so a second num_classes==0 source with a different alpha_0 would fuse
-  // without rejection). num_classes==0 frames are rejected explicitly in the path.
+  // Set when the prior is pinned from the first valid frame. Do not use
+  // fused_num_classes_==0 as the unpinned sentinel; num_classes==0 frames are
+  // rejected explicitly. (notes: dscovox-prior-pinned-flag)
   bool     prior_pinned_{false};
   mutable std::shared_mutex mu_;
   std::vector<rclcpp::Subscription<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr> subs_;

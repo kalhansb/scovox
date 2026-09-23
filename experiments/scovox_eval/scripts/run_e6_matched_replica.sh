@@ -1,20 +1,11 @@
 #!/bin/bash
 # E6.1 — SCovox SLIM-VDB-matched-config head-to-head, Replica side.
 #
-# Per scene:
-#   1. (re)generate semantic_m2f_topk/ from semantic_m2f_ade_probs/
-#   2. Run scovox_node with matched config (band_only=true, range_decay=-1,
-#      min/max_range=0.2/8.0, voxel=0.05, sdf_trunc=0.15, K_TOP=2,
-#      min_tsdf_weight_publish=5.0, soft m2f topk).
-#   3. Replay 2000 frames at rate_hz=2.0.
-#   4. Capture ~/pointcloud → scovox.npz.
-#   5. Delete the topk dir to free disk for the next scene.
-#
-# Per cell saved under
-#   results/matched_config_2026_05_08/replica/<scene>/
-# in scovox.npz, scovox_run.log.
-#
-# Idempotent: scenes whose scovox.npz exists are skipped.
+# Per scene: regenerates semantic_m2f_topk, runs scovox_node with the
+# SLIM-VDB-matched config (expects K_TOP set to 2), replays 2000 frames at
+# 2 Hz, captures scovox.npz, deletes topk. Scenes with a scovox.npz are
+# skipped. (notes: e6-replica-matched-config)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -o pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

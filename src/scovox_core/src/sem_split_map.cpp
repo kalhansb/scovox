@@ -3,6 +3,7 @@
 /// De-unifies `SemDirMap` into a `BetaVoxel` occupancy grid + a `DirVoxel`
 /// occupied-class grid, using the SemBeta two-stream update with SemDir-matched
 /// priors and strict per-grid mass conservation.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include "scovox/sem_split_map.hpp"
 
@@ -238,11 +239,10 @@ bool SemSplitMap::applyCarveUpdate(const CoordT& c, float quality,
   const float w_inc  = w_free * quality;
   if (w_inc <= 0.f) return true;  // no-op; not a wall
 
-  // Batched path (a carve frame is open — the live pipeline): stage the
-  // strongest free vote for this voxel and defer the write to flushCarveFrame.
-  // No grid read, no wall guard: a scan trusts its own beam — every voxel it
-  // traversed to reach a return is free NOW (see class docs). One write per
-  // voxel per scan, block-ordered at flush.
+  // Batched path (carve frame open): stage the strongest free vote per voxel
+  // and defer the write to flushCarveFrame, one write per voxel per scan. No
+  // grid read and no wall guard: a scan trusts its own beam.
+  // (notes: carve-batched-path)
   if (carve_frame_open_) {
     if (!params_.batch_free_carve) return true;
     auto it = carve_stage_.find(c);
@@ -356,20 +356,16 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
                                    std::vector<CoordT>*      touched_beta,
                                    std::vector<CoordT>*      touched_dir,
                                    const HitWeights*         prof) {
-  // Occupied-wins: a PERSISTENT surface return in this scan must not be carved
-  // free even if another ray grazes through it. Gate on `touched_beta` — it is
-  // non-null only on the persistent path (the transient/dynamic path passes
-  // nullptr). A dynamic endpoint routes its occupancy to the transient grid and,
-  // by the is_dynamic contract, the persistent grid stays free there, so it must
-  // NOT suppress another ray's legitimate persistent free carve of that voxel.
+  // Occupied-wins: a persistent surface return must not be carved free by
+  // another ray in this scan. Gated on touched_beta (null on the transient
+  // path) so a dynamic endpoint never blocks a persistent free carve.
+  // (notes: carve-occupied-wins-gate)
   if (carve_frame_open_ && touched_beta) carve_hits_.insert(c);
 
-  // RGB-D→LiDAR BKI spread: a semantics-only source with a kernel radius spreads
-  // its class onto nearby LiDAR-occupied voxels instead of committing at the lone
-  // endpoint voxel `c` (which the LiDAR downsample almost never leaves occupied).
-  // Deposits only into the Dir grid `dacc`; reads LiDAR occupancy from the
-  // PERSISTENT Beta grid inside the helper. A no-label point (sem_probs null)
-  // contributes nothing — a semantics-only source must not touch geometry.
+  // Semantics-only source with kernel_radius > 0: spread its class onto nearby
+  // LiDAR-occupied voxels instead of the endpoint. Writes only dacc, reads the
+  // persistent Beta grid; a point without labels does nothing.
+  // (notes: hit-rgbd-bki-spread)
   if (prof && prof->kernel_radius > 0.f) {
     if (sem_probs && !sem_probs->empty())
       applyHitUpdateKernel(c, sem_probs, quality, dacc, touched_dir,
@@ -378,12 +374,10 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
     return;
   }
 
-  // Per-source overrides (fusion). Null prof => the map's global params_ — the
-  // single-sensor path, byte-identical. A semantics-only source passes w_occ=0
-  // (RGB-D "pure LiDAR authority"), so Stream A is skipped by the existing
-  // `w_occ_share > 0` guard and this voxel's occupancy stays 100% LiDAR-built;
-  // Stream B then gates on that LiDAR occupancy. kappa0/min_p_occ are per-source
-  // too; evidence_saturation / alpha_0 remain global (per-grid caps / priors).
+  // Per-source overrides; null prof uses the global params_. A semantics-only
+  // source passes w_occ=0, so Stream A is skipped and occupancy stays
+  // LiDAR-built. evidence_saturation and alpha_0 stay global.
+  // (notes: hit-per-source-overrides)
   const float w_occ     = prof ? prof->w_occ              : params_.w_occ;
   const float kappa0    = prof ? prof->kappa0             : params_.kappa0;
   const float min_p_occ = prof ? prof->dirichlet_min_p_occ : params_.dirichlet_min_p_occ;
@@ -448,26 +442,17 @@ void SemSplitMap::applyHitUpdateOn(const CoordT&             c,
 // ===========================================================================
 // SLIM-VDB-style flat semantic band — Stream B only, on the walked ray
 // ===========================================================================
-//
-// SLIM-VDB's Integrate (VDBVolume.cpp) walks [depth−sdf_trunc, depth+sdf_trunc]
-// per point because that is what the TSDF update needs, and folds the semantic
-// write into the same DDA iteration:
-//
-//     if (sdf > -sdf_trunc_) { ...tsdf/weight...; alpha[label] += 1; }
-//
-// This is that write. The caller (ScovoxMapSplit::integrateHitFused) owns the
-// |sdf| ≤ band gate and the endpoint exclusion; by the time we are here the
-// voxel has already been chosen. Keep this function branch-light: it runs once
-// per band voxel per point, which on KITTI is ~5 extra calls per return.
+// Stream B write for one band voxel (SLIM-VDB's alpha[label] += 1). The caller
+// ScovoxMapSplit::integrateHitFused owns the |sdf| <= band gate and the
+// endpoint exclusion. Keep it branch-light. (notes: band-semantic-slim-vdb)
 void SemSplitMap::applyBandSemantic(const CoordT&             c,
                                     const std::vector<float>* sem_probs,
                                     float                     quality,
                                     const HitWeights*         prof) {
-  // No class signal ⇒ nothing to pool. Unlike the endpoint path we must NOT
-  // fall through to `other += class_share` here: a bare geometric return
-  // carries no opinion about its neighbours' classes, and dumping prior mass
-  // into every band voxel would dilute exactly the evidence this is meant to
-  // concentrate.
+  // No class signal: return. Unlike the endpoint path, do NOT add class_share
+  // to other: a bare geometric return has no opinion on its neighbours'
+  // classes, and prior mass would dilute the band evidence.
+  // (notes: band-no-label-no-other)
   if (!sem_probs || sem_probs->empty()) return;
 
   // Only DIRICHLET has a meaningful notion of accumulating fractional evidence.
@@ -481,22 +466,19 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
 
   float class_share;
   if (params_.semantic_band_require_occ) {
-    // LiDAR authority, read-only: no Beta voxel here means no beam has ever
-    // stopped near this cell, so it is free space in front of the surface (or
-    // the unobserved interior behind it) and takes no label.
-    // `create_if_missing=false` is load-bearing — allocating would grow the
-    // Beta grid along every ray.
+    // LiDAR authority, read-only: no Beta voxel means no beam ever stopped near
+    // this cell, so it takes no label. create_if_missing=false is load-bearing;
+    // allocating would grow the Beta grid along every ray.
+    // (notes: band-lidar-authority-gate)
     const BetaVoxel* b = beta_acc_.value(c, /*create_if_missing=*/false);
     if (!b) return;
     const float p_occ = b->p_occ();
     if (p_occ < min_p_occ) return;
     class_share = kappa0 * p_occ * quality;
   } else {
-    // Faithful SLIM-VDB mirror: no occupancy model, no gate, flat weight. This
-    // is `alpha[label] += 1` with kappa0 as the unit. Skipping the Beta read is
-    // not just a shortcut — an ungated band voxel may have no Beta entry at all,
-    // so there is no p_occ to weight by, and inventing one (say 1.0) would
-    // quietly re-introduce a different rule again.
+    // Ungated SLIM-VDB mirror: no occupancy gate, flat weight kappa0 * quality.
+    // Do not read Beta or invent a p_occ: an ungated band voxel may have no
+    // Beta entry. (notes: band-ungated-flat-weight)
     class_share = kappa0 * quality;
   }
   if (class_share <= 0.f) return;
@@ -511,23 +493,9 @@ void SemSplitMap::applyBandSemantic(const CoordT&             c,
 // ===========================================================================
 // BKI (S-BKI) semantic spread — RGB-D→LiDAR fusion
 // ===========================================================================
-//
-// For a semantics-only source (RGB-D: w_occ=0, geometry_off) with
-// `prof->kernel_radius = l > 0`, the class is not committed at the single
-// endpoint voxel `c` but spread to its neighborhood, following the Semantic
-// Bayesian Kernel Inference update (Gan et al., RA-L 2020, Eq. 9):
-//
-//     α*ᵏ  +=  k(d) · (κ₀ · p_occ · q)      for every voxel within radius l
-//
-// with the Melkumyan–Ramos compactly-supported sparse kernel (Eq. 10, σ₀=1),
-// which is exactly zero at d ≥ l so the neighborhood is finite:
-//
-//     k(d) = ⅓(2+cos(2π d/l))(1 − d/l) + (1/2π)·sin(2π d/l),   d < l.
-//
-// Pure LiDAR authority is preserved: a neighbor receives a label ONLY if it is
-// occupied in the PERSISTENT Beta grid (`p_occ ≥ dirichlet_min_p_occ`), so
-// RGB-D can never paint a voxel LiDAR hasn't confirmed as surface. `p_occ` also
-// weights the deposit, so weakly-occupied voxels get proportionally less label.
+// S-BKI spread (Gan et al.): add k(d)*kappa0*p_occ*q to each voxel within
+// radius l, using the sparse kernel that is zero at d >= l. Only voxels with
+// persistent p_occ >= min_p_occ get a label. (notes: bki-kernel-spread)
 void SemSplitMap::applyHitUpdateKernel(const CoordT&             c,
                                        const std::vector<float>* sem_probs,
                                        float                     quality,
@@ -679,11 +647,9 @@ void SemSplitMap::applyDirSaturation(DirVoxel* d) const {
   d->other *= k;
   for (int i = 0; i < K_TOP; ++i) {
     d->cnt[i] *= k;
-    // A FILLED slot must never scale below its α₀ prior: a slot conceptually
-    // holds α₀ + observed evidence, and eroding α₀ makes sparse_add_class read a
-    // negative evicted_evidence (cnt − α₀ < 0) and subtract mass from OTHER. Floor
-    // FILLED slots only — flooring empty slots (cnt ≈ k·α₀) would re-inflate
-    // s_class back above the saturation cap.
+    // Floor FILLED slots at alpha_0: below it sparse_add_class reads negative
+    // evicted evidence and drains other. Never floor empty slots; that would
+    // push s_class back above the cap. (notes: dir-saturation-slot-floor)
     if (d->cls[i] != 0xFFFF && d->cnt[i] < alpha_0) d->cnt[i] = alpha_0;
   }
 }

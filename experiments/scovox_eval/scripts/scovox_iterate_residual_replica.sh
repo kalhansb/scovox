@@ -2,10 +2,10 @@
 # Iteration step: stack all pre-cleanup knobs, plus a jitter re-run of the
 # baseline post_revert config for noise-floor measurement.
 #
-#   res_all_old_knobs   sat=1000 + smc=0.1 + gate_k=12 + dir_min_p_occ=0.6
-#                       (closest reproduction of pre-cleanup pipeline)
-#   res_jitter_check    identical config to post_revert_default
-#                       (re-run to measure single-cell run jitter)
+# res_all_old_knobs stacks the pre-cleanup knobs (closest to the
+# pre-cleanup pipeline); res_jitter_check re-runs the post_revert_default
+# config unchanged. (notes: residual-iterate-cells)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

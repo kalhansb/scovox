@@ -14,6 +14,7 @@
 /// Everything here is pure (voxels + num_classes + alpha_0 in, voxel/bool out) —
 /// no ROS, Bonxai, Eigen, or node member state. The node keeps the Bonxai
 /// accessor / grid plumbing; only the per-cell math lives here.
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <algorithm>
 #include <cstdint>
@@ -27,14 +28,9 @@
 
 namespace scovox {
 
-/// Shared at-prior epsilon for the wire receiver isPrior* tests. This MUST
-/// match the sender's at-prior emit gate (scovox_node.cpp uses + 1e-4f on the
-/// alpha_free / alpha_other / beta priors). If the receiver slop is looser than
-/// the sender gate (the old max(0.01, 0.01·α_0)), a barely-observed voxel that
-/// the sender deliberately put on the wire — e.g. a_free = α_0 + 0.005, which
-/// clears the sender's 1e-4 gate — is classified "at prior" here and silently
-/// dropped from the fused map. Keeping the two epsilons identical guarantees
-/// every emitted voxel survives the refold.
+/// At-prior epsilon for the receiver isPrior* tests. Must equal the sender's
+/// at-prior emit gate in scovox_node.cpp (1e-4); a looser slop here drops
+/// barely-observed voxels the sender emitted. (notes: consensus-prior-slop)
 static constexpr float kPriorSlop = 1e-4f;
 
 /// BetaVoxel "is at prior" check for the split consensus refold. A voxel
@@ -82,13 +78,10 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
   out.a_occ  = b.a_occ;
   out.a_free = b.a_free;
   if (d) {
-    // RAW-evidence convention: subtract the OTHER bucket's (C-K)*alpha_0 prior
-    // (clamped at 0 for C<=K_TOP, matching defaultDirVoxel) just as the RPC
-    // projectBetaDirToVoxel does. argmaxClassConfidence / effectiveResidual /
-    // semanticVariance all assume a_unk holds raw evicted mass with no prior;
-    // leaving the prior in (out.a_unk = d->other) inflated the confidence
-    // denominator by (C-K)*alpha_0 and made the published semantic_confidence
-    // disagree with the GetRegion RPC for the identical voxel.
+    // Raw-evidence convention, as in projectBetaDirToVoxel: subtract the OTHER
+    // prior (C-K)*alpha_0, clamped at 0 for C <= K_TOP. argmaxClassConfidence,
+    // effectiveResidual and semanticVariance expect a_unk without the prior.
+    // (notes: consensus-viz-raw-evidence)
     const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
     const float other_prior =
         (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
@@ -109,22 +102,10 @@ inline scovox::SemBetaVoxel projectBetaDirToSemBetaForViz(
 /// The Dir pointer may be null (occupancy-only voxel, or a caller that only
 /// needs occupancy — EIG/entropy/SSMI are occupancy-only).
 ///
-/// scovox::Voxel stores RAW semantic evidence (the Dirichlet prior is applied
-/// at query time, not in storage), whereas DirVoxel stores prior-inflated
-/// counts. So the projection subtracts the per-class α_0 from each tracked
-/// slot and the OTHER bucket's (C−K)·α_0 prior, yielding the same raw-evidence
-/// convention selectTopKSemantics / argmaxClassConfidence expect — the SEMANTIC
-/// fields are byte-identical to what the fused path produced. Empty Dir slots
-/// (cnt == α_0) collapse to sem_cnt == 0 and are skipped by every consumer's
-/// `sem_cnt > 0` test.
-///
-/// OCCUPANCY now uses the SAME prior as the fused Voxel: a_occ / a_free are copied
-/// verbatim from the BetaVoxel, which ships the symmetric Beta(1,1) prior
-/// (a_occ = a_free = 1.0 → prior p_occ = 0.5) — identical to the unified/fused Voxel
-/// (defaultVoxel). So there is no longer a prior-induced p_occ / variance / EIG /
-/// SSMI gap vs the fused Voxel at the prior. (Historically the split path used a calibrated
-/// Beta(C·α_0, α_0) prior, p_occ = C/(C+1) ≈ 0.933; that was switched to
-/// Beta(1,1) — see docs/occupancy_prior.md.)
+/// Voxel stores raw semantic evidence, DirVoxel prior-inflated counts: subtract
+/// alpha_0 per slot and (C-K)*alpha_0 (clamped at 0) from OTHER; empty slots
+/// become sem_cnt 0. a_occ and a_free are copied verbatim.
+/// (notes: consensus-rpc-projection-priors)
 inline scovox::Voxel projectBetaDirToVoxel(
     const scovox::BetaVoxel& b, const scovox::DirVoxel* d,
     uint16_t num_classes, float alpha_0) {
@@ -132,11 +113,9 @@ inline scovox::Voxel projectBetaDirToVoxel(
   out.a_occ  = b.a_occ;
   out.a_free = b.a_free;
   if (d) {
-    // Clamp residual_dims at 0 to mirror defaultDirVoxel: when num_classes <=
-    // K_TOP there are no residual classes, so the OTHER prior is 0 (defaultDir
-    // stored other=0). An unclamped (C-K)*alpha_0 < 0 would make the subtraction
-    // d->other - other_prior = d->other + |prior| ADD a phantom alpha_0 of
-    // unknown mass, skewing every projected voxel's entropy/EIG/argmax.
+    // Clamp residual_dims at 0 to mirror defaultDirVoxel: with num_classes <=
+    // K_TOP the OTHER prior is 0; a negative prior would add phantom unknown
+    // mass. (notes: consensus-other-prior-clamp)
     const int residual_dims = static_cast<int>(num_classes) - scovox::K_TOP;
     const float other_prior =
         (residual_dims > 0) ? (static_cast<float>(residual_dims) * alpha_0) : 0.f;
@@ -149,17 +128,10 @@ inline scovox::Voxel projectBetaDirToVoxel(
   return out;
 }
 
-/// Pure core of the per-cell occupancy refold (BetaVoxel stream). Reset the
-/// fused cell to the symmetric Beta(1,1) prior, then fold every NON-prior source
-/// via mergeBeta (seed-copying the first non-prior source). `sources[i] ==
-/// nullptr` means that source has no voxel at this cell; sources at prior are
-/// skipped via isPriorBeta (a pure optimisation — folding the prior is a no-op).
-///
-/// This is the safeguard that makes the incremental refold bit-for-bit
-/// equivalent to a from-scratch rebuild and immune to double-counting: the
-/// result depends only on the current *set* of source values, never on how many
-/// times a snapshot was received. The node calls this with one entry per source
-/// grid accessor; tests call it with an explicit pointer list.
+/// Per-cell occupancy refold: start from the Beta(1,1) prior and fold every
+/// non-prior source with mergeBeta (nullptr = no voxel). Depends only on the
+/// current set of source values, not on how often a snapshot arrived.
+/// (notes: consensus-refold-beta)
 inline scovox::BetaVoxel refoldBeta(
     const std::vector<const scovox::BetaVoxel*>& sources,
     uint16_t num_classes, float alpha_0) {

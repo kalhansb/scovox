@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Download Replica v1 and extract ONLY the 8 scenes we use.
 #
-# Source: facebookresearch/Replica-Dataset release v1.0 (17-part tarball).
-# The upstream download.sh extracts the entire ~100 GB dataset; this wrapper
-# streams through the tarball and keeps only the scenes we need, then deletes
-# the .part?? archives to reclaim disk.
+# Source: Replica-Dataset release v1.0 (17-part tarball). Streams the tarball
+# keeping only SCENES, then deletes the .part archives.
+# (notes: replica-download-streaming)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -e
 

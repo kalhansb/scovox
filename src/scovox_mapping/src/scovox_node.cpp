@@ -1,3 +1,4 @@
+// Moved comments: doc/scovox_node_notes.md
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -54,11 +55,10 @@ public:
   SCovoxNode() : Node("scovox_node"), tf_buffer_(this->get_clock(), tf2::Duration(std::chrono::seconds(600))), tf_listener_(tf_buffer_) {
     auto P = declareMapParams();
     declareNodeParams();
-    // Cache the launch param block. scovox::Params still carries the
-    // node-level sensor filters (range_decay_length, min_range, max_range,
-    // grazing_angle_threshold, semantic_occ_gate, resolution, top_k) that the
-    // integration + publish paths read; with the legacy map_ object gone this
-    // is their owner.
+    // Cache the launch params: scovox::Params owns the node-level sensor
+    // filters (range_decay_length, min_range, max_range,
+    // grazing_angle_threshold, semantic_occ_gate, resolution, top_k) the
+    // integration and publish paths read. (notes: params-cache-launch-block)
     map_params_ = P;
     // Per-source fusion weight profiles (consulted only when fuse_lidar_rgbd_).
     buildFusionProfiles(P);
@@ -86,20 +86,14 @@ public:
     // carry over from P. weighting_function defaults to constant(1).
     SP.tsdf.sdf_trunc     = P.sdf_trunc;
     SP.tsdf.space_carving = P.tsdf_space_carving;
-    // enable_tsdf:false sets sdf_trunc=0, but TsdfMap::sanitise re-clamps that
-    // back up to 0.15 — silently keeping the fused walker's per-voxel TSDF band
-    // writes (TsdfVoxel alloc + Curless-Levoy average + touched push) running
-    // even though the occupancy/LiDAR config never reads the TsdfMap grid
-    // (tsdf_pub_ null, no extract_mesh, share_tsdf_=false). Thread the real
-    // intent through so those dead writes are skipped. Default true keeps every
-    // TSDF-on config — and all scovox_core gtests, which build with
-    // sdf_trunc=0.15 — byte-identical; only the (unread) TsdfMap grid changes.
+    // TsdfMap::sanitise re-clamps sdf_trunc 0 back up, so pass the real intent:
+    // with tsdf_enabled false the fused walker skips the TsdfMap band writes
+    // nobody reads. (notes: tsdf-enabled-intent)
     SP.tsdf_enabled = (sdf_trunc_launch_ > 0.f);
-    // SemSplitMap (de-unified BetaVoxel ∥ DirVoxel substrate): every
-    // Bayesian / sparse-Dirichlet knob from launch P maps 1:1.
-    // semantic_occ_gate / min_range / max_range / grazing_angle_threshold are
-    // node-level sensor filters consumed BEFORE integrateHit so they are not
-    // mirrored. evidence_saturation widens uint16→float.
+    // Every Bayesian / sparse-Dirichlet knob in P maps 1:1. semantic_occ_gate,
+    // min_range, max_range and grazing_angle_threshold are node-level filters
+    // applied before integrateHit, so they are not mirrored.
+    // (notes: semsplit-param-mapping)
     SP.semsplit.w_free                  = P.w_free;
     SP.semsplit.w_occ                   = P.w_occ;
     SP.semsplit.kappa0                  = P.kappa0;
@@ -113,11 +107,10 @@ public:
     SP.semsplit.semantic_band_require_occ = semantic_band_require_occ_;
     SP.semsplit.range_decay_length      = static_cast<float>(P.range_decay_length);
     SP.semsplit.semantic_mode           = P.semantic_mode;
-    // num_classes / alpha_0 — dataset-dependent priors that govern the
-    // OTHER bucket's prior mass `(C − K_TOP)·α_0`. Wrong num_classes shifts
-    // the semantic prior and the eviction capacity (KITTI=20 vs NYU13=14).
-    // Defaults match SemSplitMap::Params defaults (NYU13 / 0.01). KITTI
-    // launches override num_classes:=20.
+    // Dataset-dependent priors: num_classes sets the OTHER bucket's prior mass
+    // (C - K_TOP)*alpha_0 and the eviction capacity. Defaults match
+    // SemSplitMap::Params (NYU13, 0.01); KITTI launches set num_classes 20.
+    // (notes: semsplit-dataset-priors)
     SP.semsplit.num_classes             = num_classes_;
     SP.semsplit.alpha_0                 = alpha_0_;
     // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default
@@ -162,14 +155,10 @@ public:
     double sm_rate = this->declare_parameter<double>("scovox_publish_rate", 1.0);
     sm_timer_ = rclcpp::create_timer(this, get_clock(), std::chrono::duration<double>(1.0/sm_rate),
       [this]{
-        // Hold one shared_lock for the whole timer tick so the ScovoxMap and
-        // PointCloud always represent the same map state, and so neither
-        // helper races against scheduleMemUsage's detached reader thread.
-        // SingleThreadedExecutor already serializes us against onImages, but
-        // wrapping here makes the contract explicit and survives a future
-        // switch to MultiThreadedExecutor. publishScovoxMap and
-        // publishPointCloud must NOT take map_mtx_ themselves —
-        // std::shared_mutex is non-recursive, so re-locking here would be UB.
+        // Hold one shared_lock for the whole tick so every output reflects one
+        // map state and none races the scheduleMemUsage worker.
+        // publishScovoxMap and publishPointCloud must NOT take map_mtx_
+        // (non-recursive). (notes: timer-shared-lock)
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
         publishScovoxMap();
         if (pub_pc_) publishPointCloud();
@@ -177,11 +166,10 @@ public:
         if (fine_tsdf_pub_) publishFineTSDFPointCloud();
       });
     if (bin_pub_ && share_rate_hz_ > 0.0) {
-      // Timer-owned binary publish (share_rate_hz > 0): the sensor callbacks
-      // skip their inline publishBinaryMap and touched coords accumulate until
-      // this tick. Unique lock — publishBinaryMap drains the touched-sets and
-      // writes the change-gate shadow grids, both mutations. Under the
-      // SingleThreadedExecutor this also serializes us against integration.
+      // Timer-owned binary publish (share_rate_hz > 0): sensor callbacks skip
+      // the inline publishBinaryMap; touched coords accumulate until this tick.
+      // Unique lock: publishBinaryMap drains touched-sets and writes shadow
+      // grids. (notes: share-timer-binary-publish)
       bin_timer_ = rclcpp::create_timer(this, get_clock(),
         std::chrono::duration<double>(1.0 / share_rate_hz_),
         [this]{
@@ -200,13 +188,10 @@ public:
         share_roi_z_max_ > share_roi_z_min_ ? "" : " off");
     }
     if (split_map_->fineEnabled()) {
-      // Region registration interface. Reliable + latched (transient_local),
-      // deep history — registrations are rare, small, and must not be lost:
-      // latching replays the publisher's retained add/remove history to a
-      // subscription that (re)joins late, and the replay converges because
-      // adds are keyed-replace and removes idempotent. NB a transient_local
-      // sub only matches transient_local publishers — manual `ros2 topic pub`
-      // needs `--qos-durability transient_local`.
+      // Reliable, transient_local, deep history: a late joiner gets the
+      // retained add/remove replay, which converges (adds are keyed-replace,
+      // removes idempotent). Manual ros2 topic pub needs transient_local
+      // durability. (notes: fine-region-sub-qos)
       fine_region_sub_ = create_subscription<scovox_msgs::msg::RefinementRegion>(
           fine_region_topic_,
           rclcpp::QoS(rclcpp::KeepLast(100)).reliable().transient_local(),
@@ -252,11 +237,9 @@ public:
       P.sdf_trunc, (int)P.tsdf_space_carving, (int)P.band_only_integration);
     RCLCPP_INFO(get_logger(), "split substrate: sizeof(TsdfVoxel)=%zu sizeof(BetaVoxel)=%zu sizeof(DirVoxel)=%zu",
       sizeof(scovox::TsdfVoxel), sizeof(scovox::BetaVoxel), sizeof(scovox::DirVoxel));
-    // Print the SANITISED deposit rule, read back out of the constructed map,
-    // never the launch argument. A binary predating either knob accepts the
-    // parameter and ignores it, which is how a sweep silently measures nothing;
-    // this line is the only thing that distinguishes "band ran" from "band was
-    // spelled correctly". Drivers should grep for it, not for the launch arg.
+    // Print the deposit rule read back from the constructed map, never the
+    // launch arg; it is the only proof the band actually ran. Drivers grep this
+    // line, not the launch arg. (notes: semantic-deposit-log-line)
     {
       const auto& sp = split_map_->semsplit().params();
       RCLCPP_INFO(get_logger(),
@@ -271,13 +254,10 @@ public:
     }
   }
   ~SCovoxNode() override {
-    // Join the diagnostic memlog worker (scheduleMemUsage) before any node
-    // member is destroyed. The worker holds a shared_lock on map_mtx_ and
-    // dereferences map_/split_map_/logger via the captured `this`; if it
-    // were detached (the prior behaviour) it could still be walking the grid
-    // when rclcpp::spin() returns and this object is torn down → UAF. Joining
-    // here makes shutdown deterministic; the worker is read-only and bounded
-    // by one grid walk, so the join is short.
+    // Join the scheduleMemUsage memlog worker before any member is destroyed:
+    // it holds a shared_lock on map_mtx_ and dereferences this. It is read-only
+    // and bounded by one grid walk, so the join is short.
+    // (notes: dtor-join-memlog-worker)
     if (mem_log_thread_.joinable()) mem_log_thread_.join();
   }
 private:
@@ -287,11 +267,10 @@ private:
     P.resolution = dp("resolution", 0.10);
     P.inner_bits = (uint8_t)std::clamp((int)dp("inner_bits", 2), 1, 4);
     P.leaf_bits  = (uint8_t)std::clamp((int)dp("leaf_bits", 3), 1, 4);
-    // Semantic (Dir) grid block size. Independent of leaf_bits because the Dir
-    // grid is hit-only + Stream-B gated — ~18× sparser than the full-ray Beta
-    // grid — so it wastes ~9 of every 10 slots in an 8³ block. SemSplitMap
-    // clamps this to <= leaf_bits; pass dir_leaf_bits:=3 to restore the old
-    // shared geometry exactly. See SemSplitMap::Params::dir_leaf_bits.
+    // Semantic (Dir) grid block size, independent of leaf_bits because the
+    // hit-only Dir grid is far sparser than the Beta grid. SemSplitMap clamps
+    // it to <= leaf_bits; 3 restores the shared geometry.
+    // (notes: param-dir-leaf-bits)
     P.dir_leaf_bits = (uint8_t)std::clamp((int)dp("dir_leaf_bits", 2), 1, 4);
     P.w_free = dp("w_free", 1.0);  P.w_occ = dp("w_occ", 2.0);
     P.kappa0 = dp("kappa0", 2.0);
@@ -305,13 +284,10 @@ private:
           requested_top_k, P.top_k);
       }
     }
-    // TSDF: truncation distance is set in voxel units so it scales with
-    // resolution across launch files. The whole legacy fused path treats
-    // sdf_trunc==0 as "TSDF off" — no band walk in fused_integrate_ray_static,
-    // no ~/tsdf_pointcloud publisher, no ~/extract_mesh service. `enable_tsdf`
-    // (default true) is the explicit off-switch that forces it there; split
-    // mode (use_split=true) can't honor it (TsdfMap re-clamps sdf_trunc<=0 in
-    // tsdf_map.cpp), so the constructor warns. `carve_band` is independent.
+    // sdf_trunc is sdf_trunc_voxels * resolution so it scales with resolution.
+    // enable_tsdf false or sdf_trunc_voxels <= 0 gives sdf_trunc 0 = TSDF off
+    // (no ~/tsdf_pointcloud, no ~/extract_mesh). carve_band is independent.
+    // (notes: param-sdf-trunc-voxels)
     {
       const bool enable_tsdf = dp("enable_tsdf", true);
       const int sdf_trunc_voxels = (int)dp("sdf_trunc_voxels", 3);
@@ -346,8 +322,8 @@ private:
       else if (sm == "majority_vote") P.semantic_mode = scovox::SemanticMode::MAJORITY_VOTE;
       else P.semantic_mode = scovox::SemanticMode::DIRICHLET; }
     max_sem_ = dp("max_semantic_classes", 10);
-    // Semantic mechanism knobs (SceneNN mechanism round). Shipped defaults are
-    // off/0, so an unmodified launch is byte-identical to before.
+    // Semantic mechanism knobs; the defaults leave every mechanism off.
+    // (notes: param-semantic-mechanism-knobs)
     semantic_topk_trunc_    = dp("semantic_topk_trunc", 0);
     evict_by_confidence_    = dp("semantic_evict_by_confidence", false);
     semantic_spread_radius_ = dp("semantic_spread_radius", 0.0);
@@ -387,11 +363,10 @@ private:
     map_frame_ = dp("map_frame", std::string("map"));
     int_frame_ = dp("integration_frame", std::string("odom"));
     // ── LiDAR + RGB-D fusion (opt-in) ────────────────────────────────────────
-    // Master switch. Default false → today's either/or single-sensor path: every
-    // integrateHit passes prof=nullptr, so the substrate reads the global map
-    // weights and behaviour is byte-identical. true → the node subscribes BOTH
-    // streams and hands each its own HitWeights profile (built in buildFusionProfiles),
-    // so LiDAR and RGB-D write the ONE SemSplitMap with their own sensor models.
+    // Default false: single-sensor path, integrateHit passes prof=nullptr
+    // (global map weights). true: subscribe both streams, each with its own
+    // HitWeights profile from buildFusionProfiles, into the one SemSplitMap.
+    // (notes: param-fuse-lidar-rgbd)
     fuse_lidar_rgbd_ = dp("fuse_lidar_rgbd", false);
     // Per-stream ray-origin frames (fusion only). LiDAR carve rays originate at
     // the LiDAR body/optical frame, RGB-D at the camera; both default to
@@ -406,11 +381,10 @@ private:
     min_d_ = dp("min_depth", 0.1);  max_d_ = dp("max_depth", 10.0);
     trace_nr_ = dp("trace_no_return_rays", false);
     carve_band_ = dp("carve_band", -1.0);
-    // mode = "persistent": single-robot, no binary publish to dscovox.
-    // mode = "rolling":    publishes ScovoxMapBinary updates for the merger
-    //                      and the planning_map is a rolling crop around the
-    //                      robot (Phase 2). The underlying voxel grid is
-    //                      fully persistent in both modes — no pruning.
+    // persistent: single-robot, no ScovoxMapBinary publish. rolling: publishes
+    // ScovoxMapBinary for the merger and planning_map is a robot-centred crop.
+    // The voxel grid is never pruned in either mode.
+    // (notes: param-mode-rolling-persistent)
     mode_ = dp("mode", std::string("rolling"));
     if (mode_ != "rolling" && mode_ != "persistent") mode_ = "rolling";
     robot_id_ = dp("robot_id", std::string(""));
@@ -424,18 +398,10 @@ private:
     plan_zmin_ = dp("planning_map_min_z", -1.0);
     plan_zmax_ = dp("planning_map_max_z", 2.0);
     plan_infl_ = dp("planning_map_inflation_m", 0.0);
-    // Terrain-relative projection (3D/hilly sites). When true the absolute
-    // [planning_map_min_z, planning_map_max_z] band is IGNORED; instead each
-    // XY column is classified against a band RELATIVE to that column's own
-    // ground elevation (lowest occupied voxel + contiguous stack walk capped
-    // at planning_map_ground_stack_m, absorbing residual vertical smear).
-    // A column whose relative band [rel_min_z, rel_max_z] above the ground
-    // top contains an occupied voxel is blocked (100); a column with
-    // observed ground and a clear band is free (0); columns with no occupied
-    // voxel (free-only / unobserved) stay unknown (-1). Obstacles shorter
-    // than ~ground_stack_m above the detected ground merge into the ground
-    // stack and read traversable. NB: rel_min_z must stay > 0 or the ground
-    // itself blocks every cell.
+    // true: ignore the absolute min_z/max_z band; mark a column blocked if it
+    // has an occupied voxel within [rel_min_z, rel_max_z] above its own ground
+    // top (stack capped at ground_stack_m). rel_min_z must stay > 0.
+    // (notes: planning-terrain-relative)
     plan_terrain_rel_ = dp("planning_map_terrain_relative", false);
     plan_rel_zmin_ = dp("planning_map_rel_min_z", 0.4);
     plan_rel_zmax_ = dp("planning_map_rel_max_z", 2.0);
@@ -445,30 +411,19 @@ private:
     // (plan_ox_, plan_oy_, plan_sz_) envelope).
     plan_window_size_m_ = dp("planning_map_window_size_m", 20.0);
     // --- second, WORLD-FIXED planning map (exploration planner) -------------
-    // The planning_map above is sized for the local navigation planner: in
-    // mode=rolling it is a small robot-centred crop, and its extent IS that
-    // planner's window (simple_nav_3d has no separate window param). An
-    // exploration planner needs the opposite: a fixed envelope covering the
-    // whole ROI, because it rejects candidates whose cell is out of bounds
-    // (isCellOccupied treats out-of-bounds as occupied) and measures its
-    // coverage-termination unknown fraction over the ROI clipped to the grid.
-    // Point both at one topic and you must pick which consumer to break, so
-    // this is a SECOND publisher over the same voxel grid with its own
-    // envelope, resolution and rate. Off by default: nothing that does not ask
-    // for it pays the cost, and mode=persistent (the other way to get a fixed
-    // envelope) is not an option because it disables the ScovoxMapBinary
-    // publish that multi-robot map sharing depends on.
+    // Second publisher over the same grid with a fixed world envelope for the
+    // exploration planner; the rolling planning_map is the local planner's
+    // window, so one topic cannot serve both. Off by default.
+    // (notes: planning-global-map)
     pub_plan_glob_ = dp("publish_global_planning_map", false);
     plan_glob_res_ = dp("global_planning_map_resolution", 0.40);
     plan_glob_sz_  = dp("global_planning_map_size_m", 200.0);
     plan_glob_ox_  = dp("global_planning_map_origin_x", -100.0);
     plan_glob_oy_  = dp("global_planning_map_origin_y", -100.0);
     plan_glob_infl_ = dp("global_planning_map_inflation_m", plan_infl_);
-    // Publish period, seconds. Unlike planning_map this one is NOT free to
-    // emit per integration frame: the inflation pass is O(occupied * (r/res)^2)
-    // over the whole envelope and the message is O(size^2/res^2) bytes, both of
-    // which run on the integration thread. An exploration planner re-reads the
-    // latched map about once per planning step, so ~1 Hz is already generous.
+    // Publish period, seconds. Not per integration frame: the inflation pass
+    // and message size scale with the whole envelope and run on the integration
+    // thread. (notes: planning-global-period)
     plan_glob_period_ = dp("global_planning_map_period_sec", 1.0);
     pub_tsdf_ = dp("publish_tsdf_pointcloud", true);
     min_tsdf_w_ = dp("min_tsdf_weight_publish", 0.5);
@@ -477,30 +432,20 @@ private:
     // per-grid memUsageDetailed walk + detached reader thread don't run on
     // the production mapping hot path; set true to profile memory.
     mem_log_ = dp("log_mem_usage", false);
-    // Sender-side wire toggle for the TSDF stream:
-    //   share_tsdf=false (default): emit Beta + Dir only (dscovox-fusion-only
-    //     path; each robot keeps its local TSDF).
-    //   share_tsdf=true: also emit the TSDF stream (opt-in for fused-geometry
-    //     consensus). Maps to BinarySerializer::Options.share_tsdf.
-    //   The rev-7 fine-TSDF stream rides the same toggle: it ships iff
-    //   share_tsdf is on AND the fine band is enabled (fine_ratio_log2 > 0).
+    // Sender-side TSDF stream toggle (BinarySerializer::Options.share_tsdf);
+    // false (default) emits Beta + Dir only. The fine-TSDF stream ships only if
+    // share_tsdf is on and fine_ratio_log2 > 0. (notes: share-tsdf-toggle)
     share_tsdf_ = dp("share_tsdf", false);
-    // Sender-side wire toggle for the Dir (semantics) stream — share_tsdf's
-    // mirror, default ON so the wire is unchanged unless a robot opts into
-    // geometry-only sharing (E6.9):
-    //   share_dir=false: elide the Dir section (dir_count=0 — a zero-length
-    //     stream is already legal wire, same codec rev). Receiver contract,
-    //     verified in dscovox onBinaryMap: ingest is snapshot-replace per
-    //     RECORD and the refold walks only arrived cells, so an absent stream
-    //     means "no semantic update", never "erase semantics" — a peer keeps
-    //     any semantics it already holds, it just stops receiving updates.
+    // Sender-side Dir stream toggle, default true. false elides the Dir section
+    // (zero-length stream); receivers read an absent stream as no semantic
+    // update, never erase, so peers keep their semantics.
+    // (notes: share-dir-toggle)
     share_dir_ = dp("share_dir", true);
     // ── Fine TSDF band — localized two-lattice refinement ──────────────────
-    // docs/design/fine_tsdf_band_dbh_2026_07_30.md. fine_ratio_log2 = 0 (the
-    // default) disables everything (no fine grid, no subscription). k = 2 at
-    // resolution 0.10 → 2.5 cm fine voxels. The node's job ends at PRODUCING
-    // the fine lattice; measurement (e.g. the DBH circle fit, dbh_fit.hpp) is
-    // post-processing on the shared/saved map, not a mapping responsibility.
+    // fine_ratio_log2 = 0 (default) disables it all (no fine grid, no
+    // subscription); k = 2 at resolution 0.10 gives 2.5 cm fine voxels. The
+    // node only produces the fine lattice; measurement is post-processing.
+    // (notes: fine-band-params)
     fine_ratio_log2_      = std::clamp<int>((int)dp("fine_ratio_log2", 0), 0, 8);
     fine_trunc_voxels_    = std::max<int>(1, (int)dp("fine_sdf_trunc_voxels", 3));
     fine_region_margin_   = dp("fine_region_margin", 0.15);
@@ -511,34 +456,22 @@ private:
     // height (1.3 m ± 0.3 m) for the DBH post-processing use case.
     fine_region_z_lo_     = dp("fine_region_z_lo", 1.0);
     fine_region_z_hi_     = dp("fine_region_z_hi", 1.6);
-    // Full sensor density for refinement regions: when the per-scan voxel-grid
-    // downsample is active, in-region raw (deskewed) returns are ALSO routed
-    // straight to the fine lattice (refineHit — fine-band-only, no coarse
-    // write), so the fine band sees the sensor's native point density instead
-    // of one return per downsample cell. No effect when downsampling is off
-    // (the full cloud already reaches integrateHit).
+    // When the per-scan downsample is active, in-region raw (deskewed) returns
+    // also go straight to the fine lattice via refineHit (no coarse write). No
+    // effect when downsampling is off. (notes: fine-raw-returns)
     fine_raw_returns_  = dp("fine_raw_returns", true);
     fine_region_topic_ = dp("fine_region_topic", std::string("~/refinement_region"));
     pub_fine_tsdf_     = dp("publish_fine_tsdf_pointcloud", true);
     // ── Low-bandwidth share controls (ScovoxMapBinary wire path, mode=rolling) ──
-    // share_rate_hz: cadence of the binary delta publish. <=0 (default) keeps
-    // the legacy per-scan publish inline in the sensor callbacks. >0 moves the
-    // publish onto a wall timer at this rate; touched coords accumulate
-    // between ticks and drainTouched* sort+uniques them, so slower rates
-    // coalesce repeated writes of the same voxel into ONE wire record. The
-    // receiver merge is snapshot-replace per (source, coord), so coalescing is
-    // lossless — the merger converges to the same state either way.
+    // <= 0 (default) publishes inline per scan; > 0 publishes on a timer, and
+    // drainTouched* coalesces repeated writes of a voxel into one record.
+    // Lossless: the receiver merge is snapshot-replace per (source, coord).
+    // (notes: share-rate-hz)
     share_rate_hz_ = dp("share_rate_hz", 0.0);
-    // share_change_gate: per-voxel change gate against the LAST-EMITTED wire
-    // state. A touched voxel is re-emitted only when its posterior actually
-    // moved: |Δp_occ| > share_gate_p_eps, relative total-evidence growth >
-    // share_gate_evidence_rel, or (Dir) a top-K class slot changed. This kills
-    // the dominant waste stream — saturated / effectively-unchanged free-space
-    // carve voxels re-shipped every scan forever. A voxel's FIRST observation
-    // always emits (it has no gate entry), so planner frontiers are never
-    // delayed, and full snapshots (new-subscriber path) bypass the gate.
-    // Costs a shadow copy of the emitted Beta/Dir state (~8/16 B per emitted
-    // voxel). false = legacy wire, byte-identical to before this gate existed.
+    // Re-emit a touched voxel only when its posterior moved vs the last-emitted
+    // state (share_gate_p_eps, share_gate_evidence_rel, or a Dir top-K slot
+    // change). First observations and full snapshots always emit.
+    // (notes: share-change-gate)
     share_change_gate_ = dp("share_change_gate", true);
     share_gate_p_eps_ = dp("share_gate_p_eps", 0.02);
     share_gate_evidence_rel_ = dp("share_gate_evidence_rel", 0.10);
@@ -550,25 +483,10 @@ private:
     if (share_gate_evidence_rel_dir_ < 0.0)
       share_gate_evidence_rel_dir_ = share_gate_evidence_rel_;
     // ── E6.6 gate-policy experiment knobs (experiment_plan.md §E6.6) ──
-    // share_gate_mode selects the emit TRIGGER when share_change_gate is on:
-    //   "significance"      (default) — |Δp_occ| > τ OR relative evidence
-    //                       growth > share_gate_evidence_rel (κ = 1 + rel).
-    //                       This is the OR-form significance gate; the wire
-    //                       carries the full posterior either way.
-    //   "state_flip"        — OctoMap-equivalent baseline: emit only when the
-    //                       thresholded state flips (Beta: p_occ crosses
-    //                       share_stateflip_p_occ; Dir: dominantClass changes).
-    //                       Payload unchanged (full posterior).
-    //   "state_flip_binary" — MARBLE-equivalent baseline: state_flip trigger
-    //                       AND the payload is binarized — Beta collapsed to
-    //                       prior + share_binarize_evidence on the winning
-    //                       side, Dir to a one-hot argmax slot; a voxel with
-    //                       no dominant class ships no Dir record at all (the
-    //                       baseline cannot express "uncertain"). Wire FORMAT
-    //                       is unchanged, so the byte advantage a purpose-built
-    //                       binary codec would add must be credited
-    //                       analytically in E6.6's equal-bandwidth comparison.
-    // The any-change baseline row is share_change_gate:=false, not a mode.
+    // Emit trigger when share_change_gate is on: significance (default; p_occ
+    // or evidence change), state_flip (thresholded state flips),
+    // state_flip_binary (flip trigger plus binarized payload). Any-change =
+    // gate off. (notes: share-gate-mode)
     share_gate_mode_ = dp("share_gate_mode", std::string("significance"));
     if (share_gate_mode_ != "significance" && share_gate_mode_ != "state_flip" &&
         share_gate_mode_ != "state_flip_binary") {
@@ -579,18 +497,14 @@ private:
     }
     gate_state_flip_ = share_gate_mode_.rfind("state_flip", 0) == 0;
     gate_binarize_   = share_gate_mode_ == "state_flip_binary";
-    // τ(n) ablation (E6.6 req. ④): with tau_ref_n > 0 the mean-arm threshold
-    // shrinks once last-sent evidence n exceeds it:
-    //   τ_eff = τ · (tau_ref_n / n)^tau_n_pow.
-    // pow = 1 is the design doc's 1/n; pow = 0.5 is the constant-KL rate in
-    // the quadratic regime (KL ≈ n·Δp²/2p(1−p) ⇒ Δp* ∝ n^-1/2). 0 = fixed τ.
+    // With share_gate_tau_ref_n > 0 the mean-arm threshold shrinks once
+    // last-sent evidence n exceeds it: tau_eff = tau * (tau_ref_n /
+    // n)^tau_n_pow. 0 keeps tau fixed. (notes: share-gate-tau-n)
     share_gate_tau_ref_n_ = dp("share_gate_tau_ref_n", 0.0);
     share_gate_tau_n_pow_ = dp("share_gate_tau_n_pow", 0.5);
-    // share_heartbeat_sec: per-voxel re-emit period. Loss healing plus the
-    // liveness half of the negative-information contract — a receiver that
-    // heard nothing about an emitted voxel for longer than this may treat the
-    // silence as "unchanged within τ", not "unheard". Needs the gate's
-    // last-emit state, so it requires share_change_gate:=true. 0 = off.
+    // Per-voxel re-emit period: heals loss and lets a receiver read silence
+    // longer than this as unchanged within tau. Needs share_change_gate. 0 =
+    // off. (notes: share-heartbeat)
     share_heartbeat_sec_ = dp("share_heartbeat_sec", 0.0);
     if (share_heartbeat_sec_ > 0.0 && !share_change_gate_) {
       RCLCPP_WARN(get_logger(),
@@ -601,35 +515,20 @@ private:
     share_stateflip_p_occ_   = dp("share_stateflip_p_occ", 0.5);
     share_binarize_evidence_ = dp("share_binarize_evidence", 20.0);
     // ── E6.7 message-size knob ──
-    // share_max_voxels_per_msg: >0 splits one publish tick's deltas across
-    // ceil(total/N) self-contained ScovoxMapBinary messages (each carries the
-    // full envelope + pose; each LZ4-compressed separately). The receiver merge
-    // is snapshot-replace per (source, coord), so chunk boundaries cannot
-    // change the converged state — only delivery dynamics (loss blast radius
-    // vs per-message overhead and LZ4 ratio). 0 (default) = one message per
-    // tick, the legacy wire behaviour.
+    // > 0 splits a tick's deltas into ceil(total/N) self-contained, separately
+    // LZ4-compressed messages; the converged state is unchanged (merge is
+    // replace per (source, coord)). 0 (default) = one message per tick.
+    // (notes: share-max-voxels-per-msg)
     share_max_voxels_per_msg_ = static_cast<int>(dp("share_max_voxels_per_msg", 0));
-    // share_chunk_interleave: how the chunker DIVIDES a tick between the four
-    // sections. true (default) = proportional interleave, so any prefix of the
-    // chunk sequence carries each section in proportion to its size and a
-    // receiver gets semantics from the first message. false = the legacy
-    // section-at-a-time drain (tsdf → beta → dir → fine), which puts every
-    // semantic record behind the entire occupancy stream. Inert unless
-    // share_max_voxels_per_msg > 0, and it cannot change the converged state
-    // either way (merge is replace-per-(source, coord)) — kept as a knob so
-    // the two orderings can be A/B'd in one binary.
+    // How the chunker divides a tick among the four sections: true (default)
+    // interleaves proportionally so semantics arrive from the first message;
+    // false drains tsdf, beta, dir, fine in turn. Inert unless chunking.
+    // (notes: share-chunk-interleave)
     share_chunk_interleave_ = dp("share_chunk_interleave", true);
-    // share_max_bytes_per_tick: > 0 caps the COMPRESSED bytes put on the wire
-    // in one publish tick; chunks past the cap are deferred FIFO to later
-    // ticks. This is the burst shaper the voxel cap above is not: chunking
-    // bounds message SIZE but still emits every chunk back-to-back within the
-    // tick. Deferral cannot change the converged state — chunks carry
-    // absolute state, the publisher preserves order, and the receiver merge
-    // is replace-per-(source, coord) — it trades burst height for convergence
-    // delay. Every tick sends at least one message even if that message alone
-    // exceeds the budget (progress guarantee), so without chunking the cap
-    // degenerates to one-whole-tick-message-per-tick — hence the warning.
-    // 0 (default) = unlimited: the legacy publish path, wire-identical.
+    // > 0 caps compressed bytes per tick; excess chunks defer FIFO without
+    // changing the converged state. Every tick sends at least one message, so
+    // the cap needs chunking to shape bursts. 0 (default) = unlimited.
+    // (notes: share-max-bytes-per-tick)
     share_max_bytes_per_tick_ =
         static_cast<int64_t>(dp("share_max_bytes_per_tick", 0));
     if (share_max_bytes_per_tick_ > 0 && share_max_voxels_per_msg_ <= 0) {
@@ -638,47 +537,35 @@ private:
         "one whole-tick message is always sent, so the budget cannot shape "
         "bursts; set a chunk size");
     }
-    // share_roi_z_min/max: vertical band (integration frame, metres) outside
-    // which voxels stay OFF the wire (both Beta and Dir streams). The LOCAL
-    // map is untouched — this filters only what is shared, so out-of-band
-    // structure survives in each robot's own map. min >= max (the 0/0
-    // default) disables the band.
-    // KEEP IN SYNC with dscovox_node share_roi_z_min/share_roi_z_max (the
-    // receiver-side defensive clip) and with explo_planner
-    // shared_params.yaml roi_min_z/roi_max_z: the shared band must be a
-    // SUPERSET of the planner band, or free voxels at the band edge arrive
-    // clipped and read as unknown to the planner.
+    // Voxels outside this z band (integration frame, m) stay off the wire;
+    // local map unaffected; min >= max disables. Keep in sync with dscovox_node
+    // share_roi_z_min/max; must contain explo_planner roi_min_z..roi_max_z.
+    // (notes: share-roi-z-band)
     share_roi_z_min_ = dp("share_roi_z_min", 0.0);
     share_roi_z_max_ = dp("share_roi_z_max", 0.0);
     // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default true.
     // Set false to fall back to the two-DDA split path for A/B parity testing.
     fused_walker_ = dp("fused_walker", true);
-    // Semantic priors. num_classes is the dataset's total class count — sets
-    // the OTHER bucket's prior mass to (num_classes − K_TOP) · alpha_0 so the
-    // implicit Dirichlet still marginalises onto the true (C+1)-category
-    // distribution. Defaults match SemSplitMap::Params (NYU13 / 0.01). KITTI
-    // launches override num_classes:=20; Replica/SceneNet stay at 14.
+    // num_classes is the dataset's total class count; it sets the OTHER
+    // bucket's prior mass (num_classes - K_TOP) * alpha_0. Defaults match
+    // SemSplitMap::Params (NYU13, 0.01); KITTI launches use 20.
+    // (notes: param-semantic-priors)
     num_classes_ = std::max<int>(scovox::K_TOP + 1,
                                  dp("num_classes", (int)scovox::SemSplitMap::Params{}.num_classes));
     alpha_0_     = (float)dp("dirichlet_prior",
                              (double)scovox::SemSplitMap::Params{}.alpha_0);
     if (alpha_0_ <= 0.f) alpha_0_ = scovox::kDefaultDirichletPrior;
-    // Audit hook (split-grid only): when non-empty, every periodic memlog
-    // tick overwrites this path with a flat binary snapshot of TsdfMap:
-    //   uint64_t n; then n × {float x, float y, float z, float distance,
-    //   float weight} = 20 B/voxel, voxel-centre coords in scovox_node's
-    //   world frame. Lets a parity-test harness compare the TsdfMap voxel
-    //   set against SLIM-VDB's voxels.bin after a Tr_inv frame conversion
-    //   (see tools/tsdf_parity_test.py). Empty default → no-op.
+    // When non-empty, each memlog tick overwrites this path with a TsdfMap
+    // snapshot: uint64 n, then n x {x, y, z, distance, weight} floats (20 B,
+    // voxel centres, world frame), read by tools/tsdf_parity_test.py.
+    // (notes: tsdf-dump-path)
     tsdf_dump_path_ = dp("tsdf_dump_path", std::string{});
     pointcloud_mode_ = !input_pc_topic_.empty();
     // ── Intra-scan deskew (gyro-based rotation correction) ──────────────────
-    // deskew_mode: "auto" (deskew iff the cloud has a per-point time field),
-    // "on"/"gyro" (force; warn if the field is missing), or "off" (never — set
-    // this for already-deskewed feeds like /glim_ros/points, which still carry a
-    // `t` field and would otherwise be double-corrected). Phase 1 is rotation
-    // only: each point is rotated from its capture time back to scan-start using
-    // gyro integrated across the scan, then placed by the single scan-start pose.
+    // auto deskews iff the cloud has a per-point time field; on/gyro forces it;
+    // off never (already-deskewed feeds that still carry a t field). Rotation
+    // pass: each point rotates back to scan start via integrated gyro.
+    // (notes: deskew-mode)
     deskew_mode_ = dp("deskew_mode", std::string("auto"));
     if (deskew_mode_ == "gyro") deskew_mode_ = "on";
     if (deskew_mode_ != "off" && deskew_mode_ != "on" && deskew_mode_ != "auto") deskew_mode_ = "auto";
@@ -692,29 +579,16 @@ private:
     // from consecutive scan poses — no IMU accel, no latency. Off by default;
     // rotation captures the bulk of the smear.
     deskew_translation_ = dp("deskew_translation", false);
-    // TF placement timing. The raw /ouster/points scan reaches scovox at the same
-    // instant it reaches GLIM, so GLIM has not yet computed/broadcast the
-    // odom<-os_lidar pose for that stamp. With a short timeout the exact-stamp
-    // lookup fails and we fall back to Time(0) (the PREVIOUS scan's pose) →
-    // mis-placed scan → accumulation smear. tf_lookup_timeout_sec lets scovox
-    // WAIT for GLIM's TF (the TransformListener fills the buffer on its own
-    // thread, so this blocks only the main loop, not TF intake). tf_require_exact
-    // drops a scan rather than integrating it at a stale Time(0) pose.
+    // tf_lookup_timeout_sec waits for the scan's exact-stamp TF rather than
+    // fall back to Time(0), the previous scan's pose; it blocks only the main
+    // loop. tf_require_exact drops the scan instead of using Time(0).
+    // (notes: tf-lookup-timeout)
     tf_lookup_timeout_sec_ = dp("tf_lookup_timeout_sec", 0.2);
     tf_require_exact_ = dp("tf_require_exact", false);
-    // Uniform voxel-grid downsample, applied per-scan in the SENSOR frame BEFORE
-    // integration (after deskew) — this is what GLIM does in preprocessing
-    // (config_preprocess.json: voxel-grid @ downsample_resolution). The raw
-    // full-res cloud over-samples the noisy surface so every scan fills the tails
-    // of the per-column z-distribution → thick smear; collapsing points to one
-    // centroid per voxel cuts that tail-sampling without throwing away coverage.
-    // 0.0 = off (full per-point path, unchanged). Geometric only: when >0 the
-    // per-point semantic/top-k labels are dropped (fine for the raw LiDAR path).
-    // Default 0.5 = the swept optimum for coarse-map thinness (see the sweep
-    // table in scovox_lidar_raw_deskew.yaml: 4x thinner shared columns than
-    // 0.1 for only -7% footprint). Configs may override (geometric/fused run
-    // 0.1 = map resolution); refinement regions are unaffected either way —
-    // in-region raw returns bypass this via refineHit (fine_raw_returns).
+    // Per-scan voxel-grid downsample in the sensor frame, after deskew and
+    // before integration; 0 = off. When > 0, per-point semantic/top-k labels
+    // are dropped. Refinement-region raw returns bypass it via refineHit.
+    // (notes: downsample-voxel-size)
     downsample_voxel_size_ = dp("downsample_voxel_size", 0.5);
     {
       auto gb = dp("gyro_bias", std::vector<double>{0.0, 0.0, 0.0});
@@ -725,38 +599,24 @@ private:
     // Prevents ghost voxels at origin when TF is briefly wrong at startup.
     startup_tf_stable_sec_ = dp("startup_tf_stable_sec", 2.0);
     startup_tf_jump_thresh_ = dp("startup_tf_jump_threshold", 0.5);
-    // Runtime divergence guard. Once the startup gate has declared the pose
-    // stable, keep watching frame-to-frame pose jumps. A jump larger than
-    // runtime_tf_jump_threshold means localization has diverged / teleported
-    // (e.g. the NDT track lost lock): drop that frame AND re-arm the startup
-    // stabilization so we stop integrating against the bad pose until it
-    // settles again. Set runtime_tf_gate=false to keep the legacy
-    // startup-only behaviour. The runtime threshold should sit above real
-    // frame-to-frame motion (walking ~0.1-0.15 m at 10 Hz) so normal travel
-    // never trips it.
+    // After startup, a frame-to-frame jump above runtime_tf_jump_threshold
+    // drops the frame and re-arms startup stabilization; false keeps
+    // startup-only gating. The threshold must exceed normal per-frame motion.
+    // (notes: runtime-tf-gate)
     runtime_tf_gate_ = dp("runtime_tf_gate", true);
     runtime_tf_jump_thresh_ = dp("runtime_tf_jump_threshold", 1.0);
-    // Localization reject gate. A frame-to-frame jump gate cannot see a pose
-    // that is *frozen* — when an external localizer (e.g. NDT map-matcher)
-    // loses lock it rejects scans, stops updating its pose, but keeps
-    // re-broadcasting the stale transform on a timer. The TF therefore looks
-    // fresh and jump-free while the robot keeps moving, so scovox would smear
-    // every new scan onto the stuck pose. This gate subscribes to the
-    // localizer's /alignment_status (diagnostic_msgs/DiagnosticArray) and skips
-    // integration whenever it reports the pose is stale: accepted_gap_sec (time
-    // since the last accepted update) exceeds reject_gate_max_accepted_gap_sec,
-    // or consecutive_rejected_updates reaches reject_gate_min_consecutive.
+    // Skip integration while the localizer's alignment status says the pose is
+    // stale (accepted_gap_sec over reject_gate_max_accepted_gap_sec, or
+    // consecutive rejects reach reject_gate_min_consecutive when > 0).
+    // (notes: reject-gate)
     reject_gate_enable_ = dp("reject_gate_enable", false);
     alignment_status_topic_ = dp("alignment_status_topic", std::string("/alignment_status"));
     reject_gate_max_accepted_gap_sec_ = dp("reject_gate_max_accepted_gap_sec", 0.5);
     reject_gate_min_consecutive_ = (int)dp("reject_gate_min_consecutive", 0);
-    // Soft-probability ablation: directory of <frame>.topk flat-binary blobs
-    // produced by topk_npz_to_bin.py. When non-empty, scovox_node uses the
-    // frame index (low 16 bits of header.stamp.nanosec, set by the replay
-    // node) to look up per-point/per-pixel top-K class distributions and
-    // feeds them into the Dirichlet update instead of the one-hot built
-    // from the hard label. Must contain only zero-padded names like
-    // "000000.topk". Empty string = legacy hard-label path.
+    // Directory of <frame>.topk blobs (topk_npz_to_bin.py), looked up by the
+    // low 16 bits of header.stamp.nanosec; feeds top-K distributions into the
+    // Dirichlet update. Zero-padded names only. Empty = hard labels.
+    // (notes: topk-probs-dir)
     topk_probs_dir_ = dp("topk_probs_dir", std::string(""));
     topk_topk_max_  = (int)dp("topk_probs_max_k", 5);
     // E5.2: per-frame eviction stats CSV. Empty = disabled. When set,
@@ -774,13 +634,10 @@ private:
     }
   }
 
-  // Build the per-source HitWeights profiles used when fuse_lidar_rgbd_ is on.
-  // LiDAR defaults fall back to the global map weights (parity with the single-
-  // sensor path when only the master switch is flipped); override lidar_w_occ:=8
-  // etc. for the high-evidence ToF calibration (map_interface.hpp). RGB-D is
-  // "pure LiDAR authority": w_occ=0 (Stream A skipped → occupancy stays LiDAR-
-  // built, Stream B gates on it), w_free=0 (no carve onto the shared Beta grid),
-  // geometry_off=true (no TSDF band). A/B "zero vs small w_occ" is a param flip.
+  // Per-source HitWeights for fuse_lidar_rgbd_. LiDAR defaults to the global
+  // map weights. RGB-D defaults to pure LiDAR authority: w_occ 0, w_free 0 (no
+  // carve on the shared Beta grid), geometry_off (no TSDF band).
+  // (notes: fusion-profiles)
   void buildFusionProfiles(const scovox::Params& P) {
     auto dp = [&](auto n, auto d){ return this->declare_parameter<decltype(d)>(n, d); };
     lidar_prof_.w_occ  = (float)dp("lidar_w_occ",  (double)P.w_occ);
@@ -792,21 +649,16 @@ private:
     rgbd_prof_.w_occ  = (float)dp("rgbd_w_occ",  0.0);
     rgbd_prof_.w_free = (float)dp("rgbd_w_free", 0.0);
     rgbd_prof_.kappa0 = (float)dp("rgbd_kappa0", (double)P.kappa0);
-    // Gate MUST be strictly above the Beta(1,1) prior (p_occ=0.5): with
-    // rgbd_w_occ=0 an RGB-D hit on a voxel LiDAR never touched allocates a Beta
-    // voxel at prior, and the DIRICHLET gate is `p_occ_post >= min_p_occ`, so a
-    // 0.5 default would commit semantics on prior-only geometry — defeating pure
-    // LiDAR authority. 0.55 rejects the prior AND LiDAR-carved-free voxels while a
-    // single LiDAR hit (p_occ≈0.9, even a weak q≈0.05 hit ≈0.58) admits. Raise
-    // toward 0.6 for stricter authority (worsens leading-edge temporal recall).
+    // Must stay strictly above the Beta(1,1) prior 0.5: with rgbd_w_occ 0 an
+    // RGB-D hit allocates a prior Beta voxel and the gate is p_occ_post >=
+    // min_p_occ. 0.55 rejects prior and carved-free voxels.
+    // (notes: fusion-rgbd-min-p-occ)
     rgbd_prof_.dirichlet_min_p_occ = (float)dp("rgbd_dirichlet_min_p_occ", 0.55);
     rgbd_prof_.geometry_off = dp("rgbd_geometry_off", true);
-    // RGB-D→LiDAR BKI spread radius `l` (metres). 0 = classic exact-voxel gate
-    // (RGB-D labels a voxel only if its own endpoint coincides with a LiDAR-
-    // occupied voxel — starved by the LiDAR downsample). >0 spreads each RGB-D
-    // label onto every LiDAR-occupied voxel within `l` via the S-BKI kernel.
-    // Start ~0.4 (LiDAR length-scale from Gan et al.); ~1 voxel at resolution
-    // 0.10. Cost scales as (2·l/res+1)³ persistent-Beta lookups per RGB-D point.
+    // RGB-D to LiDAR BKI spread radius l, metres. 0 = exact-voxel gate; > 0
+    // spreads each RGB-D label onto LiDAR-occupied voxels within l via the
+    // S-BKI kernel, costing (2l/res+1)^3 Beta lookups per point.
+    // (notes: fusion-rgbd-kernel-radius)
     rgbd_prof_.kernel_radius = (float)dp("rgbd_kernel_radius", 0.0);
     if (fuse_lidar_rgbd_) {
       RCLCPP_INFO(get_logger(),
@@ -851,15 +703,10 @@ private:
     if (fuse_lidar_rgbd_ && !pointcloud_mode_)
       RCLCPP_WARN(get_logger(), "fuse_lidar_rgbd=true but input_pointcloud_topic empty — no LiDAR stream; running RGB-D only");
     if (want_lidar) {
-      // Best-effort by default to match the real robot's LiDAR driver, which
-      // publishes best-effort. A reliable sub would refuse a best-effort
-      // publisher and we would silently get no cloud. Best-effort still connects
-      // to reliable publishers too (e.g. a bag replay), so this is safe.
-      // BUT: over localhost with a small OS UDP buffer (net.core.rmem_max), a
-      // best-effort link silently drops fragments of large (2+ MB) PointCloud2
-      // scans, losing most frames on a KITTI replay. input_reliable_qos:=true
-      // selects a reliable sub so a reliable publisher retransmits lost
-      // fragments — full frame delivery for offline eval.
+      // Best-effort by default to match the robot's best-effort LiDAR driver (a
+      // reliable sub would refuse it). input_reliable_qos true lets a reliable
+      // publisher retransmit, for full-frame offline replay.
+      // (notes: lidar-input-qos)
       const bool reliable_input = this->declare_parameter<bool>("input_reliable_qos", false);
       auto qos = reliable_input ? rclcpp::QoS(rclcpp::KeepLast(10)).reliable()
                                 : rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
@@ -905,12 +752,9 @@ private:
     auto tsdf_t = dp("tsdf_pointcloud_topic", std::string("~/tsdf_pointcloud"));
     sm_pub_ = create_publisher<scovox_msgs::msg::ScovoxMap>(sm_t, 10);
     if (mode_ == "rolling") {
-      // Explicit reliable + deeper queue for binary deltas. dscovox_node
-      // mirrors this. The int-overload (just `, 10`) was nominally
-      // RELIABLE but combined with the subscriber's SystemDefaultsQoS
-      // (which resolved to BEST_EFFORT here) the connection downgraded
-      // and silently dropped large submap payloads. Pinning both ends
-      // explicitly removes the ambiguity.
+      // Explicit reliable QoS, depth 50, for binary deltas; dscovox_node's
+      // subscriber mirrors it. Keep both ends pinned explicitly.
+      // (notes: binary-pub-qos)
       auto bin_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
       bin_pub_ = create_publisher<scovox_msgs::msg::ScovoxMapBinary>(
         sm_t + std::string("_bin"), bin_qos);
@@ -977,20 +821,10 @@ private:
     return 0;
   }
 
-  // TF quality gate shared by the depth and LiDAR paths. Returns true when the
-  // observer pose `O` (sensor origin in the integration frame) is trustworthy
-  // enough to integrate this frame. Two stages:
-  //   (1) Startup stabilization — wait until the pose has been jump-free
-  //       (< startup_tf_jump_threshold) for startup_tf_stable_sec before EVER
-  //       integrating. Guards against ghost voxels at the origin while TF is
-  //       briefly wrong at startup.
-  //   (2) Runtime divergence guard — once stable, a frame-to-frame jump larger
-  //       than runtime_tf_jump_threshold means localization diverged: drop the
-  //       frame and re-arm stage (1) so integration pauses until the pose
-  //       settles again.
-  // Records tf_prev_pos_ on every frame (gated or not) so the jump is always
-  // measured against the immediately preceding pose (the legacy code froze
-  // tf_prev_pos_ once stable).
+  // True when observer pose O is trustworthy. Waits for startup_tf_stable_sec
+  // of jump-free pose; once stable, a jump above runtime_tf_jump_threshold
+  // drops the frame and re-arms. tf_prev_pos_ updates every frame.
+  // (notes: tf-gate-pass)
   bool tfGatePass(const Eigen::Vector3f& O) {
     const rclcpp::Time now = this->now();
     // Jump vs the previous pose; record O now so all paths update the reference
@@ -1075,10 +909,9 @@ private:
   }
 
   // ── Snapshot/integrate seam (RGB-D) ─────────────────────────────────────
-  // The sensor callback captures the frame and the capture-time pose into a
-  // DepthSnapshot, then hands it to integrateDepthSnapshot below. Integration
-  // reads pose from the snapshot only — no TF touch — so the map update depends
-  // solely on the bundled pose, mirroring dscovox's pose-rides-with-the-data.
+  // The callback bundles the frame and capture-time pose into a DepthSnapshot;
+  // integrateDepthSnapshot reads pose only from it and never touches TF.
+  // (notes: rgbd-snapshot-seam)
   struct DepthSnapshot {
     sensor_msgs::msg::Image::ConstSharedPtr depth;
     sensor_msgs::msg::Image::ConstSharedPtr seg;
@@ -1198,12 +1031,10 @@ private:
     const bool rgba = (seg->encoding==enc::RGBA8||seg->encoding==enc::BGRA8);
     const int sch = rgba ? 4 : 3;
     const bool srgb = (seg->encoding==enc::RGB8||seg->encoding==enc::RGBA8);
-    // RGB-D semantic frames MUST integrate at the EXACT capture-time pose. The old
-    // code fell back to Time(0) (latest pose) on an exact-stamp miss, but seg adds
-    // ~250 ms of inference latency, so the depth stamp is ~250 ms old and "latest"
-    // is ahead by the robot's motion — those semantic points smear into the map
-    // (~5% of frames in testing). Reject instead: drop the frame on any exact-stamp
-    // miss. (LiDAR onPointCloud keeps its own fallback; this policy is RGB-D only.)
+    // RGB-D frames MUST integrate at the exact capture-time pose: segmentation
+    // latency makes the latest pose wrong, so an exact-stamp miss drops the
+    // frame. RGB-D only; onPointCloud keeps its own fallback.
+    // (notes: rgbd-exact-stamp-pose)
     Eigen::Isometry3f T_oo;
     try { T_oo = toE(tf_buffer_.lookupTransform(int_frame_, depth->header.frame_id, depth->header.stamp, rclcpp::Duration::from_seconds(0.2)));
     } catch (const std::exception& e) {
@@ -1246,12 +1077,10 @@ private:
       }
     }
     else {
-      // No bin_pub_ in persistent mode → publishBinaryMap is never
-      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
-      // (every integrated ray appends coords). Clear via the O(n)
-      // path: drainTouched* sorts+uniques, but the result is unused here,
-      // so a plain clear is ~µs. The bin_pub_ branch above still uses
-      // drainTouched* for the wire-format dedup it needs.
+      // Persistent mode has no bin_pub_, so publishBinaryMap never drains the
+      // touched buffers; clear them here or they grow unbounded. A plain clear
+      // suffices because the dedup result is unused.
+      // (notes: rgbd-clear-touched-persistent)
       split_map_->clearTouchedTsdf();
       split_map_->clearTouchedSemDir();
     }
@@ -1343,12 +1172,10 @@ private:
     }
   }
 
-  // Build the per-scan cumulative-rotation table over [t0, t0+window] by
-  // strapdown-integrating buffered gyro expressed in the sensor frame:
-  //   ΔR(t0→τ+dτ) = ΔR(t0→τ) · Exp(ω_s·dτ),  ω_s = R_lidar_imu · ω_imu.
-  // Knot k stores (τ_k−t0, ΔR(t0→τ_k)); the point loop slerps between knots and
-  // applies ΔR to map each point back to the scan-start sensor frame. Returns
-  // false (→ no deskew) when the buffer can't cover the scan.
+  // Build the cumulative-rotation table over [t0, t0+window] by integrating
+  // gyro rotated into the sensor frame (R_lidar_imu); knots hold (tau_k - t0,
+  // dR). Returns false (no deskew) if the buffer cannot cover the scan.
+  // (notes: deskew-table)
   bool buildDeskewTable(double t0, double window) {
     deskew_table_.clear();
     if (imu_buf_.size() < 2 || !extrinsic_valid_) return false;
@@ -1384,10 +1211,10 @@ private:
   }
 
   // ── Snapshot/integrate seam (LiDAR) ─────────────────────────────────
-  // onPointCloud snapshots the cloud + capture-time pose into a LidarSnapshot,
-  // then hands it here. Integration reads pose from the snapshot only. The one
-  // TF touch left inside is ensureLidarImuExtrinsic — a static sensor<-imu
-  // calibration (not a robot pose), the documented carve-out from the seam.
+  // onPointCloud bundles the cloud and capture-time pose into a LidarSnapshot;
+  // integration reads pose only from it. The one TF call left,
+  // ensureLidarImuExtrinsic, is a static calibration.
+  // (notes: lidar-snapshot-seam)
   struct LidarSnapshot {
     sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
     Eigen::Isometry3f T_oi;   // int_frame_ <- sensor (no kR; LiDAR is ROS convention)
@@ -1424,22 +1251,10 @@ private:
     auto t_tf = std::chrono::high_resolution_clock::now();
     const auto& P = map_params_;
 
-    // Range gate in SQUARED distance, applied to the RAW per-point range
-    // (x^2+y^2+z^2) at parse time — BEFORE any deskew, binning, or transform
-    // work. |p| in the sensor frame IS the sensor's measured range (min/max
-    // range are sensor-relative specs: min kills self-returns/dust at the
-    // housing, max kills clamp returns), and the rotation deskew preserves it,
-    // so the early gate is exact and an out-of-range return costs three
-    // multiplies and nothing else. The old post-transform gate measured from
-    // the observer O instead — off by the static base->sensor offset plus the
-    // v*dt translation-deskew term — and let out-of-range points into the
-    // downsample medoid statistics, where a just-out-of-range medoid dropped
-    // its voxel's valid returns. `rng` (range-decay weight / carve) is still
-    // taken lazily from (Hp-O).norm() only when a consumer needs it. The
-    // (>0?sq:raw) guard keeps the degenerate negative-threshold case
-    // bit-identical: x->x^2 is monotonic only on [0,inf), and range>=0 always,
-    // so a negative min/max threshold must be compared as-is (it can only ever
-    // always-pass/always-fail).
+    // Range gate on the squared raw sensor-frame range at parse time, before
+    // deskew, binning or transform (deskew preserves |p|). Non-positive
+    // thresholds are compared unsquared. rng is computed only when needed.
+    // (notes: lidar-range-gate-squared)
     const bool need_rng = (P.range_decay_length > 0) || (carve_band_ > 0);
     const float min_r2 = (P.min_range > 0.f) ? P.min_range * P.min_range : P.min_range;
     const float max_r2 = (P.max_range > 0.f) ? P.max_range * P.max_range : P.max_range;
@@ -1448,13 +1263,9 @@ private:
     const int step = (int)cloud->point_step;
     const size_t N = (size_t)cloud->width * (size_t)cloud->height;
 
-    // Validate the buffer geometry before any reinterpret_cast read. A
-    // malformed or truncated PointCloud2 (point_step too small for the declared
-    // field offsets, or data shorter than width*height*point_step) would
-    // otherwise drive an out-of-bounds read in the per-point loop below — a
-    // crash or silent garbage integration on adversarial / buggy input. Valid
-    // clouds always satisfy these (data.size() == height*row_step >=
-    // width*height*point_step, and every field offset+size <= point_step).
+    // Validate point_step, field offsets and data size before any
+    // reinterpret_cast read, so a malformed or truncated PointCloud2 is dropped
+    // instead of read out of bounds. (notes: lidar-validate-buffer)
     if (step <= 0) { RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "PointCloud2 has point_step=%d; dropping", step); return {}; }
     int max_field_end = std::max({off_x, off_y, off_z}) + (int)sizeof(float);
@@ -1484,10 +1295,9 @@ private:
     }
 
     // ── Intra-scan deskew decision (gyro-based rotation) ──────────────────
-    // auto/on: deskew iff the cloud carries a per-point time field AND a gyro
-    // table can be built for this scan. off: never (already-deskewed feeds).
-    // Any missing prerequisite → fall back to the legacy single-pose path so we
-    // never integrate a half-built correction.
+    // Deskew only if the cloud has a per-point time field and a gyro table
+    // builds for this scan; otherwise integrate with the single scan-start
+    // pose, never a half-built correction. (notes: lidar-deskew-decision)
     const double t0_sec = last_input_stamp_.seconds();
     bool do_deskew = false;
     if (deskew_mode_ != "off" && off_t >= 0) {
@@ -1513,11 +1323,9 @@ private:
     }
 
     // ── Phase 2: intra-scan translation deskew (optional) ─────────────────
-    // Shift each point's endpoint by the sensor's odom-frame velocity × its time
-    // offset, so a point captured at t_i is placed at the sensor position at t_i
-    // (not at scan-start). Velocity is differenced from consecutive scan poses
-    // (no IMU accel, no latency). Endpoints only; the carve origin O stays at
-    // scan-start (a ~0.1 m shift over a scan, negligible for free-space carving).
+    // Shift each endpoint by the sensor's odom-frame velocity (differenced from
+    // consecutive scan poses) times its time offset. Endpoints only; the carve
+    // origin O stays at scan start. (notes: lidar-translation-deskew)
     Eigen::Vector3f v_odom = Eigen::Vector3f::Zero();
     bool apply_trans = false;
     if (deskew_translation_ && do_deskew) {
@@ -1553,12 +1361,10 @@ private:
       return dk_last_q;
     };
 
-    // Uniform voxel-grid downsample (sensor frame): integrate one *real* return
-    // per voxel — the measured point nearest the voxel centroid (a medoid, not the
-    // synthetic centroid, which drifts off-surface into free space). GLIM does this
-    // in preprocessing; on the raw cloud it collapses the dense over-sampling that
-    // fills the per-column z-tails (the smear). Geometric only (no semantics/top-k)
-    // — used for the raw LiDAR path.
+    // Voxel-grid downsample in the sensor frame: integrate one real return per
+    // voxel, the measured point nearest the centroid (medoid), not the
+    // off-surface centroid. Geometric only (no semantics or top-k).
+    // (notes: lidar-downsample-medoid)
     size_t ds_in = 0, ds_out = 0;
     // Batched carve frame: full-ray free-space is staged read-free per ray and
     // written once per voxel at flush (block-ordered). This is the fast full-ray
@@ -1625,13 +1431,10 @@ private:
         if (d2 < a.best_d2) { a.best_d2 = d2; a.best_p = d.p; a.best_off = d.off; }
       }
 
-      // Full sensor density for refinement regions: the medoid downsample
-      // above is the coarse map's diet, but the fine lattice wants every
-      // return the sensor produced. Route each raw (deskewed) return through
-      // refineHit — fine-band-only (one O(1) region lookup, no coarse write),
-      // so out-of-region points cost a hash probe and nothing else. The
-      // medoid itself is skipped here: it reaches the fine band through
+      // Route every raw (deskewed) return except the medoid through refineHit
+      // (fine band only, no coarse write); the medoid reaches the fine band via
       // integrateHit below, so no return is fused twice.
+      // (notes: lidar-fine-raw-returns)
       if (fine_raw_returns_ && split_map_->fineEnabled() &&
           !split_map_->refinementRegions().empty()) {
         for (const DPoint& d : pts) {
@@ -1727,11 +1530,10 @@ private:
     }
     if (off_x<0||off_y<0||off_z<0) { RCLCPP_WARN(get_logger(), "PointCloud2 missing xyz fields"); return; }
 
-    // TF: sensor frame -> integration frame (NO kR rotation — LiDAR is already ROS convention).
-    // Wait up to tf_lookup_timeout_sec_ for the EXACT-stamp pose; only fall back
-    // to Time(0) (the previous scan's pose) if tf_require_exact_ is false. A
-    // Time(0) fallback mis-places the whole scan and is the prime suspect for the
-    // accumulation smear, so it is counted + warned.
+    // Sensor to integration frame, no kR (LiDAR is ROS convention). Wait up to
+    // tf_lookup_timeout_sec_ for the exact-stamp pose; fall back to Time(0)
+    // only if tf_require_exact_ is false, counted and warned.
+    // (notes: lidar-tf-exact-then-fallback)
     const auto tf_to = rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_);
     Eigen::Isometry3f T_oi;
     try { T_oi = toE(tf_buffer_.lookupTransform(int_frame_, cloud->header.frame_id, cloud->header.stamp, tf_to));
@@ -1780,12 +1582,10 @@ private:
       }
     }
     else {
-      // No bin_pub_ in persistent mode → publishBinaryMap is never
-      // called → TsdfMap/SemSplitMap touched buffers grow unbounded
-      // (every integrated ray appends coords). Clear via the O(n)
-      // path: drainTouched* sorts+uniques, but the result is unused here,
-      // so a plain clear is ~µs. The bin_pub_ branch above still uses
-      // drainTouched* for the wire-format dedup it needs.
+      // Persistent mode has no bin_pub_, so publishBinaryMap never drains the
+      // touched buffers; clear them here or they grow unbounded. A plain clear
+      // suffices because the dedup result is unused.
+      // (notes: lidar-clear-touched-persistent)
       split_map_->clearTouchedTsdf();
       split_map_->clearTouchedSemDir();
     }
@@ -1817,11 +1617,9 @@ private:
 
   void scheduleMemUsage() {
     if (!mem_log_) return;   // diagnostic-only; gated by log_mem_usage param
-    // Single-in-flight guard: if the previous walk is still running (a grid
-    // walk can outlast the ~10-frame relaunch cadence on large maps), skip
-    // this tick instead of spawning a second worker. Two concurrent workers
-    // would both open ${tsdf_dump_path_}.tmp and race on std::rename,
-    // producing a truncated/corrupt dump. CAS so only one launcher wins.
+    // Skip this tick if the previous walk is still running: two workers would
+    // race on the dump's .tmp file and rename. CAS so only one launcher wins.
+    // (notes: memlog-single-inflight)
     bool expected = false;
     if (!mem_log_inflight_.compare_exchange_strong(expected, true,
                                                    std::memory_order_acq_rel))
@@ -1915,14 +1713,9 @@ private:
   void integrateHit(const Eigen::Vector3f& O, const Eigen::Vector3f& Hp, float rng,
                     const std::vector<float>* cp, float q,
                     const scovox::HitWeights* prof = nullptr) {
-    // Split-grid path. TsdfMap walks the SDF band, SemSplitMap walks the carve
-    // band leading up to the hit. `q` already bakes in the range/grazing
-    // weights (rw*aw) at the call site.
-    //
-    // carve_band: when `carve_band_ > 0` (Replica / KITTI launch default =
-    // 0.1), walk the semantic carve along only the last `carve_band` metres
-    // before the surface, matching the production mIoU baselines. carve_band
-    // <= 0 falls back to full-ray.
+    // q already includes the range/grazing weights. carve_band_ > 0 limits the
+    // semantic carve to the last carve_band_ metres before the surface; <= 0
+    // carves the full ray. (notes: integrate-hit-carve-band)
     Eigen::Vector3f co = O;
     if (carve_band_ > 0) {
       const float d = rng - static_cast<float>(carve_band_);
@@ -1953,11 +1746,9 @@ private:
   }
   void carveNoReturnRays(const Eigen::Vector3f& O, const std::vector<Eigen::Vector3f>& nr_eps,
                          const scovox::HitWeights* prof = nullptr) {
-    // Beta-only carve along no-return rays (no TSDF surface to anchor).
-    // q=1.0f matches the legacy carve which doesn't apply rw/aw. `prof` carries
-    // the per-source w_free — a semantics-only source (RGB-D, w_free=0) deposits
-    // NO a_free here, so its many no-return (sky/far) rays can't erode LiDAR
-    // occupancy on the shared Beta grid.
+    // Beta-only carve along no-return rays, q 1.0 (no rw/aw). prof carries the
+    // per-source w_free, so a w_free 0 source (RGB-D) deposits no a_free and
+    // cannot erode LiDAR occupancy. (notes: carve-no-return-rays)
     for (auto& hf : nr_eps) split_map_->integrateMiss(O, hf, 1.0f, prof);
     sm_dirty_.store(true, std::memory_order_relaxed);
   }
@@ -2019,33 +1810,10 @@ private:
     });
     sm_pub_->publish(m); return {m.voxels.size(), 0.0};
   }
-  // Publish only the voxels that have been touched since the last call. The
-  // dscovox merger keys per-source grids by header.frame_id and overwrites
-  // the matching voxels per binary; voxels not in the binary are kept, so
-  // the merger's view stays exactly in sync with this robot's persistent
-  // grid as long as it sees every dirty voxel at least once.
-  //
-  // To handle a fresh dscovox connecting after this node has already started,
-  // we detect subscriber-count transitions from 0 to >0 and re-mark every
-  // non-prior cell as dirty so the next publish carries a full snapshot.
-  // Split-substrate binary publish path. Drains touched TSDF + Beta + Dir
-  // coords from the SemSplitMap substrate, reads each voxel's current state,
-  // builds a BinarySerializer::Frame (three streams), optionally elides the
-  // TSDF section per share_tsdf_, LZ4-compresses, and publishes with
-  // msg->version=5. Beta (occupancy) and Dir (semantics) cross the wire as
-  // SEPARATE streams — the receiver merges each with its own conjugate rule
-  // (consensus_merge.hpp), losslessly.
-  //
-  // Snapshot-on-resub + at-prior elision are applied per grid. This is the
-  // node's only wire path; the SPLIT substrate (semsplit()) is always valid.
-  // Change-gate predicates: has this voxel moved enough since its LAST-EMITTED
-  // wire state to justify re-shipping? (share_change_gate, declareNodeParams.)
-  // Evidence growth is measured RELATIVE to the emitted state, so a voxel that
-  // keeps accumulating same-p carve evidence re-emits at a geometric (not
-  // per-scan) cadence, and a saturated voxel (evidence cap reached, value
-  // frozen) never re-emits at all.
-  // τ(n) ablation: effective mean-arm threshold given the LAST-SENT evidence
-  // (the receiver's belief mass — that is what the trigger's KL is against).
+  // Change-gate predicates for publishBinaryMap: has a voxel moved enough since
+  // its last-emitted wire state? gateTauEff is the mean-arm threshold for the
+  // last-sent evidence n (the receiver's belief mass).
+  // (notes: binary-change-gate-predicates)
   double gateTauEff(float n_last) const {
     double tau = share_gate_p_eps_;
     if (share_gate_tau_ref_n_ > 0.0 && n_last > share_gate_tau_ref_n_)
@@ -2102,13 +1870,10 @@ private:
     }
 
     // ── Per-tick wire-byte budget (share_max_bytes_per_tick > 0) ────────────
-    // Deferred chunks drain FIRST, FIFO: every chunk carries absolute state
-    // and the publisher preserves order, so an older record for a voxel hits
-    // the wire before any newer one and snapshot-replace at the receiver
-    // makes the newest win. Drained before the TF lookup — each deferred
-    // message already pins its build-time pose, so a TF outage must not
-    // stall the backlog. A tick that has sent nothing yet always sends one
-    // message even over budget, so an oversized chunk cannot wedge the queue.
+    // Deferred chunks drain first, FIFO, so the newest record wins at the
+    // receiver; before the TF lookup, since each pins its build-time pose. A
+    // tick that has sent nothing always sends one message.
+    // (notes: binary-deferred-drain)
     const size_t byte_budget = share_max_bytes_per_tick_ > 0
         ? static_cast<size_t>(share_max_bytes_per_tick_)
         : std::numeric_limits<size_t>::max();
@@ -2128,21 +1893,15 @@ private:
       share_deferred_.pop_front();
     }
 
-    // Snapshot the source->map pose from TF and carry it with this update so the
-    // merger (dscovox) integrates against the bundled pose and never needs the
-    // source->map transform from its own TF tree. Capture it BEFORE advancing
-    // prev_sub_count_ or draining any touched-set: on a failed lookup we bail
-    // without consuming state, so the snapshot re-trigger and the pending deltas
-    // survive to the next tick — guaranteeing the first delta a merger ever sees
-    // pins a valid pose. (map_frame_ <- int_frame_ is identity under the
-    // integration_frame:"map" presets.)
+    // Bundle the map_frame_ <- int_frame_ pose so the merger never needs its
+    // own TF. Look it up BEFORE advancing prev_sub_count_ or draining any
+    // touched-set, so a failed lookup consumes no state.
+    // (notes: binary-bundled-pose)
     geometry_msgs::msg::Transform map_from_source;
     try {
-      // Zero timeout: under the SingleThreadedExecutor the TF listener callback
-      // runs on this same thread, so blocking here can never let a new transform
-      // arrive — the pose can only be found if it is already cached. A nonzero
-      // timeout would just burn dead wait while holding map_mtx_. On a miss we
-      // defer and retry next tick (see the catch below).
+      // Zero timeout: take only an already-cached pose rather than wait while
+      // holding map_mtx_. On a miss, defer the publish to the next tick.
+      // (notes: binary-tf-zero-timeout)
       map_from_source = tf_buffer_.lookupTransform(
           map_frame_, int_frame_, rclcpp::Time(0),
           rclcpp::Duration(0, 0)).transform;
@@ -2303,11 +2062,10 @@ private:
           const double zc = dgrid.coordToPos(c).z + zhalf;
           if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
         }
-        // Binarized baseline: a voxel with no dominant class (OTHER veto or
-        // nothing observed) has nothing an argmax-only payload can say — no
-        // record, and the gate entry keeps its previous emitted state. A
-        // receiver that heard class k earlier keeps class k; the baseline has
-        // no retraction, faithfully. (E6.6 measures exactly this blindness.)
+        // Binarized baseline: a voxel with no dominant class ships no record
+        // and its gate entry keeps the previous emitted state, so receivers
+        // keep any earlier class (no retraction).
+        // (notes: binary-binarized-no-dominant)
         if (gate_binarize_ &&
             scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_) == 0xFFFF)
           return;
@@ -2336,13 +2094,10 @@ private:
     }
 
     // ----- Heartbeat arm (share_heartbeat_sec > 0; E6.6) -----
-    // Re-pin every emitted voxel at least once per period: heals a lost delta
-    // (reliable QoS notwithstanding, the E6.4 relay drops whole messages) and
-    // makes silence mean "unchanged within τ" rather than "unheard". Walks the
-    // gate grids — exactly the ever-emitted set, never the whole map. The
-    // touched-path emits above already stamped t_emit = t_now, so a voxel
-    // never rides both paths in one tick. Snapshot ticks skip this: the
-    // snapshot itself re-pins everything.
+    // Re-pin every emitted voxel at least once per period so silence means
+    // unchanged within tau. Walks only the gate grids; touched-path emits
+    // already stamped t_now, and snapshot ticks skip this.
+    // (notes: binary-heartbeat-arm)
     if (!snapshot && share_heartbeat_sec_ > 0.0 && gate_beta_ && gate_dir_) {
       auto bacc = ss.betaGrid().createAccessor();
       auto dacc = ss.dirGrid().createAccessor();
@@ -2422,33 +2177,10 @@ private:
     if (chunk >= total) {
       publish_frame(frame);
     } else {
-      // E6.7 chunking: split one tick's frame across several messages. Every
-      // chunk is a complete, independently decodable ScovoxMapBinary (own
-      // envelope, pose, LZ4 stream) and may mix sections — the receiver merge
-      // is per-(source, coord) replace, so chunk boundaries change delivery
-      // dynamics only, never the converged state. Costs: per-message envelope
-      // overhead + smaller LZ4 windows.
-      //
-      // The split is a PROPORTIONAL INTERLEAVE across the four sections, not
-      // the section-at-a-time drain it used to be. Draining tsdf → beta → dir →
-      // fine in full put every semantic record behind the ENTIRE occupancy
-      // stream: on the connect-triggered full snapshot (~1 M Beta voxels) at
-      // cap 500 a late-joining receiver saw ~2 000 pure-geometry messages
-      // before its first class label, and semantics only completed when the
-      // whole transfer did. Interleaving makes any prefix of the chunk
-      // sequence carry each section in proportion to its size, so a receiver
-      // has usable labels from message 0 and its semantic coverage grows with
-      // the transfer instead of stepping in at the end.
-      //
-      // Mechanism: give record `i` of a section of size `n` the position key
-      // (2i+1)/(2n) on a normalized [0,1) axis and 4-way merge the sections by
-      // that key. Keys within a section are already ascending, so this is a
-      // linear merge (no sort), it preserves within-section order exactly, and
-      // after m records each section has contributed within 1 record of its
-      // proportional share m·n/N. Ties break in the historical section order,
-      // so the split stays deterministic. Nothing here touches the wire
-      // format, the envelope, or the serializer — only which records ride in
-      // which message.
+      // Split the frame into chunk-sized, independently decodable messages;
+      // converged state is unchanged. Interleave: record i of an n-record
+      // section gets key (2i+1)/(2n); sections merge by key, ties in section
+      // order. (notes: binary-chunk-interleave)
       scovox::BinarySerializer::Frame part;
       part.resolution      = frame.resolution;
       part.num_classes     = frame.num_classes;
@@ -2516,13 +2248,9 @@ private:
     return {emitted, double(bytes_total) / (1024.0 * 1024.0)};
   }
 
-  // Publish planning_map as a 2D projection of the persistent voxel grid.
-  //
-  // mode=persistent: fixed (plan_ox_, plan_oy_, plan_sz_) envelope.
-  // mode=rolling:    robot-centered crop of side plan_window_size_m_, snapped
-  //                  to grid resolution to avoid sub-cell jitter as the robot
-  //                  moves. The underlying grid is unchanged — only the
-  //                  publication is windowed.
+  // 2D projection of the persistent grid: fixed envelope in mode=persistent; in
+  // mode=rolling a robot-centred crop of plan_window_size_m_, snapped to
+  // plan_res_ to avoid sub-cell jitter. (notes: planning-map-publish)
   void publishPlanningMap() {
     if (!pl_pub_ || pl_pub_->get_subscription_count() == 0) return;
 
@@ -2564,11 +2292,9 @@ private:
                        plan_glob_sz_, plan_glob_res_, plan_glob_infl_);
   }
 
-  // Shared body: 2D projection of the persistent voxel grid over the axis-
-  // aligned envelope [ox, ox+sz) x [oy, oy+sz), at `res` metres per cell, with
-  // occupied cells dilated by `infl` metres. The z band, terrain-relative mode
-  // and occupancy threshold are shared node state — only the envelope,
-  // resolution and inflation differ between the two publishers.
+  // 2D projection over [ox, ox+sz) x [oy, oy+sz) at res m per cell, occupied
+  // cells dilated by infl m. The z band, terrain-relative mode and occupancy
+  // threshold are shared node state. (notes: planning-project-body)
   void projectPlanningMap(rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>& pub,
                           double ox, double oy, double sz, double res,
                           double infl) {
@@ -2586,14 +2312,10 @@ private:
     g.data.assign(w * h, -1);
     const auto& bgrid = split_map_->semsplit().betaGrid();
     if (plan_terrain_rel_) {
-      // Terrain-relative projection: per-column ground elevation, then a
-      // band relative to it (see the param comment). One forEachCell pass
-      // collects the occupied voxels per beta-grid XY column; the column map
-      // is then classified without further grid access. Free voxels are not
-      // consulted: an observed ground with a clear band IS the free
-      // evidence (occupied still wins across beta columns sharing a plan
-      // cell). coordToPos returns voxel CORNERS; the ground surface is the
-      // top face (corner + one voxel) of the ground stack.
+      // One forEachCell pass collects occupied voxels per XY column, then
+      // columns are classified. Free voxels are not consulted; occupied wins in
+      // a plan cell. coordToPos gives corners; ground top = corner + one voxel.
+      // (notes: planning-terrain-columns)
       struct Col { double x = 0.0, y = 0.0; std::vector<float> occ_z; };
       std::unordered_map<uint64_t, Col> cols;
       const float vres = float(bgrid.voxelSize());
@@ -2655,13 +2377,9 @@ private:
         if (nx>=0&&nx<w&&ny>=0&&ny<h) inf[ny*w+nx]=100; } } g.data=std::move(inf); }
     pub.publish(g);
   }
-  // Caller must hold map_mtx_ (shared). The timer body locks once for both
-  // publishScovoxMap and publishPointCloud so they see the same map state.
-  // Split-substrate pointcloud publisher. Occupancy comes from the Beta
-  // grid; semantics from the Dir grid at the same coord. The two are projected
-  // into a SemBetaVoxel so the shared viz helpers (argmaxClassConfidence /
-  // variance / expectedInformationGain) and the 16-field schema stay stable
-  // for pointcloud_to_npz.py / RViz / eval scripts.
+  // Caller must hold map_mtx_ (shared). Occupancy from Beta, semantics from
+  // Dir, projected into SemBetaVoxel; keep the 16-field schema stable for
+  // pointcloud_to_npz.py, RViz and eval scripts. (notes: pointcloud-publish)
   void publishPointCloud() {
     if (!pc_pub_ || !split_map_ || pc_pub_->get_subscription_count() == 0) return;
     auto& ss = split_map_->semsplit();
@@ -2697,12 +2415,10 @@ private:
     // α_0 prior so empty slots read 0).
     const auto& bgrid = ss.betaGrid();
     auto dacc = ss.dirGrid().createConstAccessor();
-    // Transient (dynamic-class) overlay. Dynamic hits land in a parallel
-    // decaying grid; at publish we overlay them on the persistent cloud so they
-    // appear while live and fade as they decay. A transient voxel with
-    // occupancy evidence overrides its persistent counterpart at the same coord
-    // (faithful to the legacy query-time picker). Empty when no dynamic classes
-    // are configured, in which case the override check + extra walk are skipped.
+    // Dynamic hits live in a decaying transient grid overlaid here; a transient
+    // voxel with occupancy evidence overrides the persistent one at the same
+    // coord. Skipped when the transient grid is empty.
+    // (notes: pointcloud-transient-overlay)
     const auto& tbgrid = ss.transientBetaGrid();
     auto tbacc = ss.transientBetaGrid().createConstAccessor();
     auto tdacc = ss.transientDirGrid().createConstAccessor();
@@ -2732,12 +2448,10 @@ private:
       return tb && tb->p_occ() >= min_occ_ && has_beta_evidence(*tb);
     };
 
-    // Single grid walk: collect the voxels that pass the publish gate, then size
-    // and fill the message from the scratch list (was two full forEachCell walks
-    // re-evaluating the same predicate). forEachCell order is deterministic, so
-    // the emitted cloud is byte-identical. Persistent voxels overridden by a
-    // transient voxel at the same coord are dropped; the transient grid walk
-    // then re-emits them with their (decaying) dynamic evidence.
+    // One walk collects the voxels passing the publish gate into pc_scratch_.
+    // Persistent voxels overridden by a transient voxel are dropped here; the
+    // transient walk re-emits them with their decaying evidence.
+    // (notes: pointcloud-single-walk)
     pc_scratch_.clear();
     bgrid.forEachCell([&](const scovox::BetaVoxel& b, const Bonxai::CoordT& co) {
       if (b.p_occ() >= min_occ_ && has_beta_evidence(b) &&
@@ -2797,12 +2511,9 @@ private:
     pc_pub_->publish(cl);
   }
 
-  // Publish a thin shell at the TSDF zero-crossing. Caller must hold
-  // map_mtx_ (shared). Walks TsdfMap for the surface geometry then runs
-  // labelPointCloud against the Dir (semantics) grid to attach the per-point
-  // semantic class. The cross-grid join uses the 0xFFFF sentinel where the Dir
-  // grid has no voxel at the surface coord (same convention labelMesh /
-  // extractZeroCrossing already produce). 5-field schema.
+  // Publish the TSDF zero-crossing shell with per-point Dir-grid labels (0xFFFF
+  // where the Dir grid has no voxel); 5-field schema. Caller must hold map_mtx_
+  // (shared). (notes: tsdf-pointcloud-publish)
   void publishTSDFPointCloud() {
     if (!tsdf_pub_ || !split_map_ || tsdf_pub_->get_subscription_count() == 0) return;
     const auto& tsdf_grid = split_map_->tsdf().grid();
@@ -2848,11 +2559,9 @@ private:
   }
 
   // ── Fine TSDF band: region registration / viz ──────────────────────────
-  // (docs/design/fine_tsdf_band_dbh_2026_07_30.md; all no-ops when
-  // fine_ratio_log2 = 0 — none of these callbacks are created then.)
-  // Measurement on the fine lattice (e.g. the DBH circle fit) is deliberately
-  // NOT here: the node's responsibility ends at generating the map. Consumers
-  // post-process the shared rev-7 fine stream or the saved map.
+  // All no-ops when fine_ratio_log2 = 0 (none of these callbacks are created).
+  // Fine-lattice measurement is not done here; consumers post-process the
+  // shared fine stream or the saved map. (notes: fine-band-callbacks)
 
   /// Caller must hold map_mtx_ (unique). Re-publishing an id updates its
   /// canonical cylinder in place (slot-stable) — this is how a downstream
@@ -2960,14 +2669,10 @@ private:
   // when on, scheduleMemUsage spawns a reader thread every ~10 frames and
   // walks the whole grid. Enable via `log_mem_usage:=true`.
   bool mem_log_{false};
-  // The memlog worker is OWNED (not detached) so the destructor can join it:
-  // a detached thread captures `this` and the grid/mutex/logger, and would
-  // use-after-free if it were still walking the grid when rclcpp::spin()
-  // returns and the node is torn down. mem_log_inflight_ enforces a single
-  // worker at a time — if a grid walk outlasts 10 frames of integration we
-  // skip launching a second one rather than letting two threads race on the
-  // ${tsdf_dump_path_}.tmp file (interleaved writes + a racing std::rename
-  // corrupt the dump). The previous worker is joined before a new one starts.
+  // Owned, not detached, so the destructor can join it before the members it
+  // uses die. mem_log_inflight_ allows one worker at a time (two would race on
+  // the dump file); the previous one is joined first.
+  // (notes: member-memlog-thread)
   std::thread mem_log_thread_;
   std::atomic<bool> mem_log_inflight_{false};
   // TF stability gate
@@ -3005,11 +2710,9 @@ private:
   double semantic_spread_radius_{0.0};
   double semantic_band_length_{0.0};
   bool   semantic_band_require_occ_{true};
-  // Soft-probability mode: directory of <frame>.topk flat-binary blobs, with
-  // file names matching the low 16 bits of header.stamp.nanosec the replay
-  // node sets (zero-padded to 6 digits). Empty = legacy hard-label path.
-  // topk_probs_dir_ survives only as the param sink + construction input for
-  // topk_; the per-frame cache + loader telemetry now live in TopkProvider.
+  // Directory of <frame>.topk blobs named by the low 16 bits of
+  // header.stamp.nanosec, zero-padded to 6 digits; empty = hard labels. Only a
+  // param sink and construction input for topk_. (notes: member-topk-probs-dir)
   std::string topk_probs_dir_;
   int topk_topk_max_{5};
   std::unique_ptr<scovox::TopkProvider> topk_;
@@ -3082,11 +2785,10 @@ private:
   std::deque<DeferredChunk> share_deferred_;
   size_t share_deferred_bytes_{0};
   double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
-  // Last-EMITTED wire state per voxel (the change gate's memory) plus its emit
-  // time — node-clock seconds, double not float: wall-clock epoch seconds are
-  // outside float's exact-integer range, and the heartbeat compares differences
-  // of these. Shadow Bonxai grids with the live grids' geometry; allocated only
-  // when share_change_gate is on in mode=rolling.
+  // Change-gate memory: last-emitted wire state per voxel plus emit time in
+  // node-clock seconds (double; epoch seconds exceed float precision).
+  // Allocated only with share_change_gate in mode=rolling.
+  // (notes: member-gate-shadow-grids)
   struct GateBeta { scovox::BetaVoxel v; double t_emit; };
   struct GateDir  { scovox::DirVoxel  v; double t_emit; };
   std::unique_ptr<Bonxai::VoxelGrid<GateBeta>> gate_beta_;
@@ -3107,13 +2809,10 @@ private:
   // >0 the next publish ships a full snapshot so a freshly-connected dscovox
   // sees this robot's complete current state, not just deltas since startup.
   size_t prev_sub_count_{0};
-  // Timestamp of the most recent integrated input (scan / depth). The full-map
-  // republishers (publishPointCloud + the TSDF cloud) stamp with THIS, not
-  // now(): the localizer (e.g. GLIM) has a valid integration_frame<-...<-map TF
-  // at each scan time, but its TF can lag wall/playback time. Stamping the
-  // republished map at now() makes RViz fail "Could not transform <int_frame> ->
-  // map" (lookup into the future). Stamping at the last scan time keeps the map
-  // transformable into map/any frame at any playback rate.
+  // Stamp of the latest integrated scan/depth input. The full-map republishers
+  // stamp with this, not now(): the localizer's TF can lag playback time, and a
+  // now() stamp fails the map transform in RViz.
+  // (notes: member-last-input-stamp)
   rclcpp::Time last_input_stamp_{0, 0, RCL_ROS_TIME};
   sensor_msgs::msg::CameraInfo di_; std::atomic<bool> have_di_{false};
   mutable std::shared_mutex map_mtx_;  // protects split_map_
@@ -3150,11 +2849,9 @@ private:
   rclcpp::TimerBase::SharedPtr sm_timer_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMap>::SharedPtr sm_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pc_pub_;
-  // Reused scratch for publishPointCloud's single grid walk (collect matching
-  // voxels once, then fill the message from this) so the Beta grid is traversed
-  // once per publish, not twice. clear() retains capacity across publishes.
-  // The bool marks a transient (dynamic-class) voxel so the fill step reads its
-  // semantics from the transient Dir grid instead of the persistent one.
+  // Reused scratch for publishPointCloud's single grid walk; clear() keeps
+  // capacity. The bool marks a transient voxel, whose semantics come from the
+  // transient Dir grid. (notes: member-pc-scratch)
   std::vector<std::tuple<Bonxai::CoordT, scovox::BetaVoxel, bool>> pc_scratch_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tsdf_pub_;
   rclcpp::Publisher<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr bin_pub_;

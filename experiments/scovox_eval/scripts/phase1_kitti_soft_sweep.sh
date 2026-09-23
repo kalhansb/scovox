@@ -1,11 +1,9 @@
 #!/bin/bash
 # Phase 1 KITTI K_TOP sweep — PolarSeg SOFT input (predictions_topk/).
 #
-# The original phase1_ktop_sweep.sh accidentally ran KITTI with HARD labels
-# because it set `soft_prob_passthrough:=true` on the replay node but did
-# NOT set `topk_probs_dir:=...` on scovox_node — both are required for
-# soft-prob ingestion per [[project-softprob-pipeline-2026-05-04]]. The
-# datasets table says "PolarSeg soft" but the executed numbers were hard.
+# Soft-prob ingestion needs both soft_prob_passthrough on the replay node and
+# topk_probs_dir on scovox_node; with only the first, KITTI runs on hard
+# labels. (notes: ktop-soft-needs-both-params)
 #
 # This script reruns the 30 KITTI cells (5 seqs × 6 K) with proper soft
 # ingestion, writing into a parallel results subtree so the hard cells
@@ -16,6 +14,7 @@
 #
 # K_TOP is compile-time → sed-edits voxel.hpp + rebuilds per K. EXIT trap
 # restores K=2.
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws
@@ -30,10 +29,9 @@ N_KITTI=100
 ORIG_K_TOP=2
 
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v miniconda | tr '\n' ':' | sed 's/:$//')
-# scovox_eval is a pip-editable package whose install was previously broken
-# (egg-link pointed at /home/kalhan/Projects/... — capital P — but actual ws
-# is /home/kalhan/projects/...). Bypass pip by injecting the source dir
-# into PYTHONPATH directly so `python3 -m scovox_eval.*` resolves.
+# Puts the scovox_eval source dir on PYTHONPATH directly, bypassing the
+# pip-editable install, so the scovox_eval modules resolve.
+# (notes: eval-pythonpath-bypass-pip)
 export PYTHONPATH="${EVAL_PKG}:${PYTHONPATH}"
 source /opt/ros/humble/setup.bash
 mkdir -p "${RES_ROOT}"

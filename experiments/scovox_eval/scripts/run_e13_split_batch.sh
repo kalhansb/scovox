@@ -1,21 +1,11 @@
 #!/bin/bash
 # E1.3 head-to-head — split-grid SCovox vs SLIM-VDB.
 #
-# Per Step-12 cell sheet:
-#   8 Replica scenes (M2F soft, K=2)
-#   5 KITTI sequences (PolarSeg soft, K=2)
-#   use_split:=true, share_tsdf:=false
-#
-# Per cell capture:
-#   results/e13_split_2026_05_08/{replica,kitti}/<scene>/
-#     scovox.npz, scovox_run.log, summary.txt
-#
-# After all 13 cells: scoring + summary CSV with mIoU / FPS / TsdfMap MB /
-# SemBetaMap MB. Compares TsdfMap bytes against SLIM-VDB bytes per the
-# E1.3 spec ("expect within 5%").
-#
-# Idempotent: cells whose scovox.npz exists are skipped.
-# Sequential by user preference (feedback_sequential_execution.md).
+# Runs 8 Replica scenes (M2F soft, K=2) and 5 KITTI sequences (PolarSeg soft,
+# K=2) with use_split=true, share_tsdf=false, one cell at a time; cells with a
+# scovox.npz are skipped. Then scores all into summary.csv.
+# (notes: e13-cell-sheet)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -o pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws
@@ -92,9 +82,9 @@ for scene in "${REPLICA_SCENES[@]}"; do
     echo "  [warn] ${scene}: no npz produced"
   fi
 
-  # Free disk for next scene (Replica topk dirs are ~29 GB each — without
-  # rotation the second cell ENOSPCs on regen). The original "spare room0"
-  # exclusion was wrong; topk is always re-derivable from ade_probs/.
+  # Deletes the scene's topk dir after each cell; without this rotation the disk
+  # fills on the next regen. topk is always re-derivable from ade_probs/.
+  # (notes: e13-topk-rotation)
   if [[ -d "${topk}" ]]; then
     rm -rf "${topk}"
   fi

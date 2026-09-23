@@ -31,6 +31,7 @@
 #      ros2 run tf2_ros static_transform_publisher \
 #        --frame-id map --child-frame-id r1_map
 # =======================================================================
+# Moved comments: docs/code_notes/scovox_code_notes.md
 /**:
   ros__parameters:
     use_sim_time: false          # live sensors, wall clock
@@ -41,18 +42,16 @@
     # unique frame_id keys this robot's stream in every peer's merger.
 
     # --- Low-bandwidth share controls (Tier 1) -----------------------------
-    # Measured on the map-test-2 stream: legacy 32.8 Mbps -> gate 20.7 ->
-    # gate + 2 Hz coalescing + z-band 4.9 Mbps per robot.
+    # (notes: share-bandwidth-measured)
     share_change_gate: true      # re-send a voxel only when it changed vs its
                                  # last-emitted state (p_occ eps / relative
                                  # evidence growth / top-K class change)
     share_rate_hz: 2.0           # coalesce deltas into a timer publish
                                  # (0.0 = legacy per-scan publish)
 
-    # Shared-ROI z-band (map frame, metres); min >= max disables.
-    # KEEP IN SYNC with the receive-side clip (dscovox_params.yaml
-    # share_roi_z_min/max) and with the planner band (explo_planner
-    # shared_params.yaml roi_min_z/roi_max_z): the shared band must be a
-    # SUPERSET of the planner band.
+    # Shared-ROI z-band (map frame, m); min >= max disables. Keep in sync
+    # with dscovox_params.yaml share_roi_z_min/max, and a superset of the
+    # planner band (shared_params.yaml roi_min_z/roi_max_z).
+    # (notes: share-roi-z-band-sync)
     share_roi_z_min: -0.5
     share_roi_z_max: 2.0

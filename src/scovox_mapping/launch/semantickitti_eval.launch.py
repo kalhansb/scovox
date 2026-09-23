@@ -1,3 +1,4 @@
+# Moved comments: doc/scovox_mapping_code_notes.md
 """SCovox mapping node configured for SemanticKITTI evaluation (LiDAR input).
 
 Usage:
@@ -54,11 +55,10 @@ def _launch_setup(context):
     # node declares evidence_saturation as an integer (dp(..., 1000)); pass an int
     evidence_saturation_arg = int(float(context.launch_configurations.get("evidence_saturation", "1000")))
     semantic_min_confidence_arg = float(context.launch_configurations.get("semantic_min_confidence", "0.1"))
-    # E1 uncertainty capture: rolling mode enables the ScovoxMapBinary publisher
-    # (bin_pub_ is created only when mode==rolling); share_rate_hz>0 gives a
-    # timer-owned binary publish so a snapshot fires when a capture subscriber
-    # connects AFTER replay (with no subscriber the timer is a cheap no-op, so
-    # replay recv stays 100/100). Defaults preserve the paper persistent runs.
+    # Uncertainty capture: map_mode rolling creates the ScovoxMapBinary
+    # publisher; share_rate_hz > 0 adds a timer-owned publish so a subscriber
+    # connecting after replay gets a snapshot. Defaults keep the paper
+    # persistent runs. (notes: kitti-e1-capture-knobs)
     map_mode_arg = context.launch_configurations.get("map_mode", "persistent")
     share_rate_hz_arg = float(context.launch_configurations.get("share_rate_hz", "0.0"))
     # E4 measured-memory hook: emits the periodic [memSplit] (+ [memGate]) grid
@@ -82,11 +82,9 @@ def _launch_setup(context):
             # clouds lose UDP fragments on a best-effort link (small rmem_max),
             # dropping ~60% of frames. Reliable retransmits -> full delivery.
             "input_reliable_qos": True,
-            # Per-scan medoid downsample: the node default flipped 0.0 -> 0.5
-            # upstream (for live raw-LiDAR configs). When > 0 the scan is
-            # thinned AND integrated geometry-only — the semantic_label field
-            # and the topk soft-prob table are both dropped — so the eval pins
-            # it off: full per-point path, the config every capture ran.
+            # Pinned to 0 (off): when > 0 the node thins the scan and integrates
+            # geometry only, dropping the semantic_label field and the topk
+            # soft-prob table. (notes: kitti-downsample-pinned-off)
             "downsample_voxel_size": 0.0,
 
             # Map model — leaf_bits=1 for sparse outdoor LiDAR (2×2×2 blocks)
@@ -128,8 +126,7 @@ def _launch_setup(context):
 
             # Range — match SLIM-VDB KITTI config for apples-to-apples comparison
             # (slim_vdb/examples/cpp/config/kitti.yaml uses min=5.0, max=30.0).
-            # Pre-2026-05-11 value was min=1.0; flipped to 5.0 to eliminate
-            # the only meaningful KITTI head-to-head config asymmetry.
+            # (notes: kitti-min-range-history)
             "range_decay_length": range_decay_length_arg,
             "min_range": 5.0,
             "max_range": 30.0,
@@ -156,13 +153,10 @@ def _launch_setup(context):
             # frame. Raise so integration starts on frame 2.
             "startup_tf_jump_threshold": 10.0,
             "startup_tf_stable_sec": 0.0,
-            # The scovox node adds a runtime TF-divergence gate (default
-            # runtime_tf_jump_threshold=1.0 m) that the paper node lacked. KITTI's
-            # ~1.2 m/frame motion exceeds it, so after frame 2 stabilizes every
-            # subsequent frame is flagged as "localization diverged" and gated
-            # forever -> empty map. The replay feeds exact GT poses (no real
-            # divergence to guard against), so disable the runtime gate and raise
-            # the threshold well above the per-frame vehicle step.
+            # The replay feeds exact GT poses, so the runtime TF-divergence gate
+            # is off and its threshold raised well above the per-frame vehicle
+            # step (about 1.2 m), which would otherwise gate every frame.
+            # (notes: kitti-runtime-tf-gate-off)
             "runtime_tf_gate": False,
             "runtime_tf_jump_threshold": 20.0,
 
@@ -178,13 +172,10 @@ def _launch_setup(context):
             "pointcloud_topic": "~/pointcloud",
             "scovox_topic": "~/scovox",
             "occupancy_vis_threshold": min_occ,
-            # The publish timer holds a shared map lock and walks the whole map
-            # every tick; integration needs the unique lock, so a fast timer on a
-            # growing 600k-voxel map starves the queue-depth-1 cloud subscription
-            # and most replay frames are dropped (recv ~22/100 at 1 Hz). Slow the
-            # timer right down for offline eval — we only need one publish at the
-            # end for the npz capture. Also drop the TSDF cloud republisher (unused
-            # by the eval, another full-grid walk per tick).
+            # Each publish tick walks the whole map under the shared lock and
+            # starves integration (unique lock), dropping replay frames. The
+            # eval needs only the final publish for the npz capture; TSDF cloud
+            # off. (notes: kitti-slow-publish-timer)
             "scovox_publish_rate": 0.2,
             "publish_tsdf_pointcloud": False,
             "publish_planning_map": False,

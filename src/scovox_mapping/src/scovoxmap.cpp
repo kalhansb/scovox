@@ -1,3 +1,4 @@
+// Moved comments: doc/scovox_mapping_code_notes.md
 #include "scovox/scovoxmap.hpp"
 #include <algorithm>
 #include <cmath>
@@ -30,13 +31,9 @@ void Map::beta_update_free(Voxel* v, float range_w) const {
 void Map::apply_evidence_saturation(Voxel* v) const {
   const float cap = static_cast<float>(params_.evidence_saturation);
   if (cap <= 0.f) return;
-  // Beta proportional saturation: scale (a_occ, a_free) by a SINGLE factor so
-  // the larger bucket lands at `cap`, preserving the ratio (and therefore
-  // p_occ). Must be one shared factor: chaining two independent
-  // scale-and-floor blocks (one per bucket) would double-scale when both
-  // buckets exceed cap (neither bucket lands at cap, ratio drifts) and lets
-  // the per-block 1.0 floor distort p_occ on lopsided voxels. We compute the
-  // factor from max(a_occ, a_free) and apply it to both at once.
+  // Scale a_occ and a_free by ONE shared factor so the larger lands at cap,
+  // preserving p_occ. Do not scale each bucket separately: it double-scales and
+  // the 1.0 floor then distorts p_occ. (notes: saturation-shared-beta-factor)
   const float max_beta = std::max(v->a_occ, v->a_free);
   if (max_beta > cap) {
     const float s = cap / max_beta;
@@ -144,11 +141,9 @@ void Map::update_endpoint_on(Grid::Accessor& target_acc, const CoordT& c,
 
 void Map::apply_semantics(Voxel* v, const std::vector<float>* class_probs,
                           float quality) const {
-  // Bayesian-soft for DIRICHLET: weight by p_occ directly (no hard gate).
-  // NAIVE and MAJORITY_VOTE are ablation baselines and use a hard `p_occ > 0.5`
-  // cutoff (their accumulators don't take a continuous weight) so that the
-  // only ablation variable across the three modes remains the per-observation
-  // accumulation rule, not whether updates fire at all.
+  // DIRICHLET weights the update by p_occ. NAIVE and MAJORITY_VOTE are ablation
+  // baselines with a hard p_occ > 0.5 cutoff, since their accumulators take no
+  // continuous weight. (notes: semantics-mode-occupancy-gate)
   const float p_occ = v->p_occ();
 
   switch (params_.semantic_mode) {
@@ -247,44 +242,34 @@ void Map::fused_integrate_ray_static(const Eigen::Vector3f& origin,
   const float trunc = params_.sdf_trunc;          // 0 → TSDF disabled
   const float w_ray = range_w * angle_w;
 
-  // Beta free-update weight matches the legacy carve_free behavior exactly:
-  // it uses the node-supplied range_w (computed from the FULL sensor→hit
-  // distance), not a fresh exp(-segment_depth/decay) over the carve segment.
-  // For the partial-ray (carve_band > 0) case `origin` is a truncated
-  // origin and depth ≈ carve_band, so an in-function recomputation would
-  // diverge from the unified model by orders of magnitude. Use the caller's value.
+  // The free-update weight is the caller's range_w (from the full sensor-to-hit
+  // distance). Do not recompute it from depth here: with carve_band > 0, origin
+  // is truncated and depth is about carve_band.
+  // (notes: fused-carve-weight-caller-range)
   const float carve_w = range_w;
 
   const CoordT k_hit = posToCoord(hit);
   const CoordT k_far = (trunc > 0.f)
       ? posToCoord(Eigen::Vector3f(hit + trunc * u))
       : k_hit;
-  // Band-only mode (benchmarking / TSDF-only): start the DDA at the near
-  // edge of the truncation band rather than the sensor origin. Skips the
-  // long Beta-free carve from origin to (hit - trunc) and matches SLIM-VDB's
-  // [depth-trunc, depth+trunc] DDA. Falls back to full-ray when trunc=0
-  // (TSDF disabled) since there is no band to confine the walk to.
+  // With band_only_integration, the DDA starts at hit - trunc instead of the
+  // origin, skipping the long free carve. Falls back to the full ray when trunc
+  // is 0 (TSDF disabled). (notes: fused-band-only-dda-start)
   const CoordT k0 = (params_.band_only_integration && trunc > 0.f)
       ? posToCoord(Eigen::Vector3f(hit - trunc * u))
       : posToCoord(origin);
 
   if (k0 == k_far) return;  // degenerate ray inside one voxel
 
-  // Per-voxel independence assumption (OctoMap / log_odds-node style). Joint
-  // ray-cast `reach_prob` was tried (commit 513c969) and reverted: cost
-  // ~6 mIoU points on Replica m2f from cold-start damping (every voxel
-  // starts at p_occ=0.5, so reach_prob ≈ 0.5^N along uninitialised rays).
-  // KITTI was bit-flat either way. Through-wall carving is gated by
-  // `carve_skip_occ_threshold` instead — cheap, well-tested, sufficient.
+  // Per-voxel independence: no joint ray-cast attenuation. Through-wall carving
+  // is gated by carve_skip_occ_threshold instead.
+  // (notes: fused-per-voxel-independence)
   bool past_wall = false;
   const float skip = params_.carve_skip_occ_threshold;
 
-  // Bresenham DDA can skip k_hit when it's a corner-crossing voxel on the
-  // line (it picks one voxel per dominant-axis step, so an oblique ray's
-  // true hit voxel may not lie on the picked path even though it's on the
-  // line). Track whether k_hit was visited and explicitly visit it after
-  // the loop if not — guarantees the endpoint Beta-occupied + semantics +
-  // surface TSDF mass always lands.
+  // The DDA can skip k_hit on an oblique ray, so track whether it was visited
+  // and visit it after the loop; the endpoint occupied, semantics and surface
+  // TSDF updates must always land. (notes: fused-dda-skipped-hit-voxel)
   bool k_hit_visited = false;
 
   auto step = [&](const CoordT& c) -> bool {
@@ -445,35 +430,17 @@ void Map::clearTransientGrid() {
 }
 
 void Map::consensusMerge(Voxel& dst, const Voxel& src) const {
-  // Beta-conjugate posterior under conditional independence given θ:
-  //   Beta(α₁, β₁) ⊕ Beta(α₂, β₂) = Beta(α₁ + α₂ − 1, β₁ + β₂ − 1)
-  // with the shared Beta(1, 1) prior subtracted once.
-  //
-  // Conditional independence is upheld by the dscovox publish topology:
-  // each ScovoxMapBinary is sent from a robot's *local* scovox map (its
-  // own sensor observations), never from the merged dscovox map, so a
-  // robot's own evidence cannot be echoed back into its source grid via
-  // the fused output. The one residual correlation source — shared
-  // classifier error if multiple robots run the same segmenter on similar
-  // RGB — is a measurement-model concern on the *semantic* path; the
-  // Bayesian fix is a per-source evidence discount on the Dirichlet
-  // counts, not a change of merge rule, and is unaddressed here.
-  //
-  // No `max(1, ·)` floor: every Voxel in this codebase is constructed with
-  // a_occ, a_free ≥ 1 (defaultVoxel() and the integration paths preserve
-  // this), so α₁ + α₂ − 1 ≥ 1 algebraically. The previous floor was a
-  // non-Bayesian guard against malformed inputs that the type system never
-  // produces; removed 2026-05-03.
+  // Beta-conjugate fusion with the shared Beta(1,1) prior subtracted once.
+  // Valid only while each ScovoxMapBinary comes from a robot's local map, never
+  // the merged map. No floor: every Voxel keeps a_occ, a_free >= 1.
+  // (notes: consensus-beta-merge-rule)
   dst.a_occ  = dst.a_occ  + src.a_occ  - 1.f;
   dst.a_free = dst.a_free + src.a_free - 1.f;
 
-  // Dirichlet semantic merge: always combine src's evidence regardless of
-  // post-merge occupancy. Under conditional independence given the latent
-  // (occ, class) the additive Dirichlet has no occupancy condition. The
-  // "don't put semantic colour on free voxels" intent of the legacy gate is
-  // a *display* concern — downstream consumers filter on p_occ at
-  // query/visualization time (e.g. dscovox_node's pointcloud publish gates
-  // colour by `cf >= sem_gate_`).
+  // Always add src's Dirichlet evidence, whatever the merged occupancy. Hiding
+  // colour on free voxels is a display concern: consumers filter on p_occ at
+  // query time (e.g. dscovox_node's pointcloud colour gate).
+  // (notes: consensus-dirichlet-merge-ungated)
   for (int i = 0; i < K_TOP; ++i) {
     if (src.sem_cnt[i] > 0.f) {
       sparse_add(dst.sem_cnt, dst.sem_cls, src.sem_cls[i], src.sem_cnt[i], &dst.a_unk);
@@ -481,11 +448,9 @@ void Map::consensusMerge(Voxel& dst, const Voxel& src) const {
   }
   dst.a_unk += src.a_unk;
 
-  // No betaKL conflict computation. The previous code computed and returned
-  // a `conflict` bool but every caller discarded it; the threshold knob
-  // (`consensus_kl_threshold`) was log-only and never gated fusion.
-  // betaKL() itself remains in scovox/uncertainty.hpp for callers that want
-  // an explicit disagreement metric outside the merge path.
+  // No conflict check here; betaKL() in scovox/uncertainty.hpp remains for
+  // callers that want an explicit disagreement metric.
+  // (notes: consensus-no-kl-conflict)
 }
 
 } // namespace scovox

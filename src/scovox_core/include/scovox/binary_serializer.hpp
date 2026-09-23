@@ -129,6 +129,7 @@
 /// it, so sender and receiver MUST be compiled with the same K_TOP. A mismatch
 /// is detected during `deserialize` (the K_TOP_wire byte) and throws fatally —
 /// there is NO forward/backward compatibility across K_TOP values.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <algorithm>
 #include <cmath>
@@ -149,22 +150,14 @@ namespace scovox {
 class BinarySerializer {
  public:
   static constexpr uint32_t MAGIC          = 0x53435658;  // "SCVX"
-  // Sane upper bound on the header-supplied class count. num_classes drives the
-  // reconstructed Dirichlet OTHER prior (num_classes − K_TOP)·alpha_0 in
-  // consensus_merge; a forged u16 near 65535 with alpha_0≈0.01 injects ~650
-  // pseudo-counts of "unknown" mass per voxel, swamping real evidence (and two
-  // re-sent snapshots from the same bad sender agree, so the per-frame equality
-  // check can't catch it). No real taxonomy approaches this ceiling.
+  // Ceiling on the header's num_classes: it sets the reconstructed OTHER prior
+  // (num_classes − K_TOP)·alpha_0, so a forged large value would swamp real
+  // evidence. (notes: wire-max-num-classes)
   static constexpr uint16_t MAX_NUM_CLASSES = 4096;
-  // Blob codec revision (distinct from the ROS envelope `version`=5 that routes
-  // to this codec). Bumped 5→6 for the block-run coordinate coding + u16
-  // payload quantization (comms_design_2026_07_30.md Part 1); 6→7 for the
-  // fine-TSDF band (fine_ratio_log2 header byte + trailing fine stream,
-  // fine_tsdf_band_dbh_2026_07_30.md); 7→8 for u8 sqrt-companded evidence
-  // payloads + u8 class ids (see the revision-8 block in the file header).
-  // Any layout change means a mixed-revision fleet fails loud (deserialize
-  // rejects the VERSION byte and the frame is dropped with a warning) instead
-  // of silently misparsing.
+  // Blob codec revision, distinct from the ROS envelope version (=5) that
+  // routes here. Bump it on any layout change: deserialize rejects a mismatched
+  // VERSION, so a mixed-revision fleet fails loud.
+  // (notes: wire-format-version-bumps)
   static constexpr uint8_t  FORMAT_VERSION = 8;
   // Sanity ceiling on the fine-lattice ratio: k=8 is res/256 — far beyond any
   // deployable fine resolution. A forged large k would reconstruct absurd
@@ -179,8 +172,8 @@ class BinarySerializer {
     float    resolution  = 0.0f;
     uint16_t num_classes = 14;            ///< NYU13 default
     float    alpha_0     = kDefaultDirichletPrior;
-    /// u16 quantization step for Beta/Dir payloads. The sender sets
-    /// evidence_saturation / 65535; 0.0 (the default) keeps payloads f32.
+    /// Quantization step for Beta/Dir payloads; 0.0 (the default) keeps
+    /// payloads f32. (notes: wire-frame-quant-step)
     float    quant_step  = 0.0f;
     /// Fine-lattice ratio k (res_fine = resolution / 2^k); 0 = the sender
     /// has no fine grid. Coords in `fine_tsdf_deltas` index the FINE lattice.
@@ -364,15 +357,10 @@ class BinarySerializer {
           std::to_string(MAX_FINE_RATIO_LOG2));
     }
 
-    // Validate the header-supplied prior parameters before any voxel is
-    // reconstructed from them. consensus_merge rebuilds the Dirichlet
-    // (semantic) prior as (num_classes − K_TOP)·alpha_0 with per-slot alpha_0,
-    // so a corrupt header — num_classes < K_TOP, or a non-finite/non-positive
-    // alpha_0 — would silently inject negative or NaN mass into the live map
-    // (and two re-sent snapshots from the same bad sender agree with each
-    // other, so the per-frame equality check cannot catch it). The OCCUPANCY
-    // Beta prior is the symmetric constant kBetaOccPrior, independent of these
-    // fields.
+    // Validate num_classes and alpha_0 before any voxel is rebuilt:
+    // consensus_merge derives the Dirichlet prior (num_classes − K_TOP)·alpha_0
+    // from them, so a corrupt header would inject negative or NaN mass.
+    // (notes: wire-validate-header-priors)
     if (f.num_classes < static_cast<uint16_t>(K_TOP)) {
       throw std::runtime_error(
           "BinarySerializer: num_classes (" + std::to_string(f.num_classes)
@@ -405,11 +393,9 @@ class BinarySerializer {
 
     // TSDF stream (flat records, unchanged from revision 5).
     const uint32_t tsdf_count = r.get<uint32_t>();
-    // Bound the reserve by the bytes actually present: each record is a fixed
-    // 20 B on the wire, so a count claiming more records than the remaining
-    // buffer can hold is a truncated/forged frame. Validate BEFORE reserve so
-    // an attacker-controlled count (e.g. 0xFFFFFFFF) raises the documented
-    // runtime_error rather than a multi-GB length_error/bad_alloc.
+    // Records are a fixed 20 B, so reject a count larger than the remaining
+    // bytes BEFORE reserve: a forged count must raise runtime_error, not a
+    // multi-GB bad_alloc. (notes: wire-count-dos-guard)
     if (tsdf_count > r.remaining() / 20)
       throw std::runtime_error("BinarySerializer: truncated frame");
     f.tsdf_deltas.reserve(tsdf_count);
@@ -627,11 +613,10 @@ class BinarySerializer {
     }
   };
 
-  /// Read block runs until exactly `count` records have been consumed.
-  /// `read_payload(coord)` pulls its own payload bytes from the reader.
-  /// Structural violations — bad mode byte, empty block, out-of-range or
-  /// non-ascending indices, a block overshooting `count` — all throw, so a
-  /// corrupt frame is dropped whole rather than half-integrated.
+  /// Read block runs until exactly count records are consumed;
+  /// read_payload(coord) reads its own payload bytes. Any structural violation
+  /// throws, so a corrupt frame is dropped whole, never half-integrated.
+  /// (notes: wire-read-block-stream)
   template <typename PayloadReader>
   static void readBlockStream(Reader& r, uint32_t count,
                               PayloadReader&& read_payload) {

@@ -1,5 +1,6 @@
 /// @file test_marching_cubes.cpp
 /// Tests for TSDF zero-crossing surface extraction.
+/// Moved comments: doc/scovox_mapping_code_notes.md
 
 #include <gtest/gtest.h>
 #include <cmath>
@@ -106,12 +107,9 @@ TEST(MarchingCubes, SingleCubeVertexOnEdge) {
 }
 
 TEST(MarchingCubes, FlatPlaneProducesMesh) {
-  // Surface at z=4.5 — mid-voxel, between z=4 and z=5, both interior to the
-  // half_extent=5 grid. Two reasons to avoid integer surface_z_coord:
-  //   1. Voxels at the surface coord get exactly d=0.0; standard MC sign
-  //      convention (f[i] < 0 → inside) treats that as positive, so no
-  //      sign change occurs and cube_index stays 0.
-  //   2. The anchor needs corners at both z and z+1 to be present in the grid.
+  // Surface at z=4.5, inside the half_extent=5 grid. An integer surface coord
+  // gives d=0.0, which MC treats as positive (no sign change); the anchor also
+  // needs corners at z and z+1. (notes: test-mc-mid-voxel-surface)
   auto grid = makePlanarGrid(0.10, 5, 4.5f, 10.0f);
   auto mesh = extractMesh(grid, 1.0f, 0.10);
 

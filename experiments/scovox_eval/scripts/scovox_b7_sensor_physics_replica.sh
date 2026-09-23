@@ -1,12 +1,12 @@
 #!/bin/bash
 # B7 ablation: sensor-physics-derived (w_occ, w_free) on Replica room0 m2f.
 #
-# Runs three cells:
-#   b7_moderate_recheck    (2.00, 1.00)  — current default; sanity check vs baseline_newgate_05
-#   b7_conservative        (1.33, 0.50)  — OctoMap defaults (prob_hit=0.7, prob_miss=0.4)
-#   b7_lidar               (8.00, 4.67)  — LiDAR-tuned (off-modality, sanity for KITTI param)
+# Three (w_occ, w_free) cells, in CELLS: the current default (2, 1) as a
+# recheck, OctoMap-default equivalents (1.33, 0.5), and the LiDAR-tuned pair (8,
+# 4.67) as an off-modality check. (notes: b7-replica-cells)
 #
 # Run from workspace root. Output: results/ablations_replica_room0_m2f/<cell>/scovox.npz
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws
@@ -24,8 +24,7 @@ export PYTHONPATH="${EVAL_PKG}:${PYTHONPATH:-}"
 
 mkdir -p "${RESULTS_ROOT}"
 
-# Post-cleanup baseline. Only params that still exist after the
-# bayesian-mapping-cleanup branch (tau/k_gate/s_min/sat/smc/csk removed).
+# Baseline args for every cell. (notes: b7-replica-post-cleanup-baseline)
 BASE_ARGS=(
   robot_name:=ablation
   resolution:=${RES}

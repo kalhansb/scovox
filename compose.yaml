@@ -19,6 +19,7 @@
 #       bash -lc 'colcon test && colcon test-result --all'
 #   docker compose down                        # stop + remove the container
 # ---------------------------------------------------------------------------
+# Moved comments: docs/code_notes/scovox_code_notes.md
 services:
   scovox:
     build:
@@ -29,17 +30,10 @@ services:
     # Host networking + IPC: trivial DDS discovery and X11 (RViz) on one machine.
     network_mode: host
     ipc: host
-    # NVIDIA GPU passthrough so in-container RViz renders on the discrete GPU
-    # (hardware GL), not Mesa/llvmpipe. Host default-runtime is already nvidia,
-    # but request it explicitly (mirrors glim_localisation/compose.yaml). On this
-    # PRIME/Optimus laptop the RViz launch must also export
-    # __NV_PRIME_RENDER_OFFLOAD=1 + __GLX_VENDOR_LIBRARY_NAME=nvidia (see
-    # run_fused_experiment.sh); DRIVER_CAPABILITIES=all pulls in the GLX libs.
-    # GPU passthrough: `runtime: nvidia` + NVIDIA_VISIBLE_DEVICES/DRIVER_CAPABILITIES
-    # (in environment below) is the portable mechanism. The `gpus: all` short syntax
-    # needs Compose >= v2.30; this host runs v2.26, which rejects it as an unknown
-    # property. runtime+env gives the same full-GPU access (verified: nvidia-smi -L
-    # lists the Quadro P2000 inside the container).
+    # GPU passthrough (hardware GL for RViz) via runtime: nvidia plus the
+    # NVIDIA_* env below; not gpus: all, which needs Compose >= v2.30. A PRIME
+    # laptop's RViz launch must also export the NVIDIA render-offload vars.
+    # (notes: compose-gpu-passthrough)
     runtime: nvidia
     environment:
       - DISPLAY=${DISPLAY:-}

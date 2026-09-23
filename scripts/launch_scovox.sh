@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Launch the SCovox mapping node on the RAW Ouster cloud, IN THE SCOVOX CONTAINER.
 #
-# A localizer (e.g. GLIM LiDAR-IMU SLAM, running in a separate container) owns the
-# TF tree (map -> odom -> imu -> os_lidar) and provides the per-scan pose; SCovox
-# subscribes to the full-resolution /ouster/points + /imu/data over ROS 2 DDS and
-# builds the occupancy map online. It deskews each scan natively (gyro rotation)
-# and voxel-downsamples it (downsample_voxel_size) to suppress the vertical smear
-# without GLIM's recall-costing cloud downsample -- see config/ + the README.
+# A separate localizer (e.g. GLIM) owns the TF tree (map -> odom -> imu ->
+# os_lidar) and the per-scan pose. SCovox reads /ouster/points and /imu/data,
+# deskews each scan and voxel-downsamples it.
+# (notes: launch-scovox-localizer-split)
 #
 # Manual:  docker compose exec scovox bash scripts/launch_scovox.sh raw
+# Moved comments: docs/code_notes/scovox_code_notes.md
 set -e
 MODE="${1:-raw}"
 

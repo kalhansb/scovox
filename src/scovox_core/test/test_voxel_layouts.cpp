@@ -7,6 +7,7 @@
 /// shows up in `colcon test` output.
 ///
 /// If this test compiles, Step 1 of the refactor is done.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -41,11 +42,10 @@ TEST(SemBetaVoxelLayout, DefaultIsBeta11Prior) {
 }
 
 TEST(SemBetaVoxelLayout, ZeroInitializedHasEmptyEvidence) {
-    // Bonxai pool zero-init: leaves a_occ = a_free = 0, sem_cls = {0,0}.
-    // p_occ() must return 0.5 (the s == 0 fallback), not NaN.
-    // This is the exact state that defaultSemBetaVoxel() rescues us from
-    // — keeping it under test makes the contrast visible if someone ever
-    // breaks the factory invariant.
+    // Bonxai pool zero-init leaves a_occ = a_free = 0; p_occ() must then
+    // return 0.5 (the s == 0 fallback), not NaN. Only
+    // defaultSemBetaVoxel() yields the prior.
+    // (notes: voxel-layout-zero-init)
     scovox::SemBetaVoxel v{};
     EXPECT_FLOAT_EQ(v.a_occ,  0.0f);
     EXPECT_FLOAT_EQ(v.a_free, 0.0f);

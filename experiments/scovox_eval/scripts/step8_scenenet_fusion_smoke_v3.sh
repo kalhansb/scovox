@@ -7,9 +7,9 @@
 #   - fused.npz is non-empty (proves the v3 publish/receive loop is alive
 #     on the SceneNet topic layout, not just Replica)
 #
-# Trajectory split (NEW_EXPERIMENT_PLAN.md Phase 3 convention): 50%
-# overlap. Robot A=[0..200), Robot B=[100..300). Short for smoke; the
-# full Phase 3 batch will use [0..200) / [100..300) too but on 13 trajs.
+# Robot A replays frames [0, 200) and robot B [100, 300): a 50% overlap.
+# (notes: scenenet-smoke-trajectory-split)
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail
 

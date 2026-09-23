@@ -1,5 +1,6 @@
 /// @file
 /// @brief Step-5 gate: ScovoxMapSplit composer end-to-end smoke + parity.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 #include <Eigen/Core>
@@ -114,16 +115,10 @@ TEST(ScovoxMapSplit, DrainTouchedSplitsByGrid) {
 // ===========================================================================
 // Step 12.10 (2026-05-09): fused ray walker — parity vs split path
 // ===========================================================================
-//
-// The fused walker (`Params::fused_walker = true`, default) runs one
-// Bresenham DDA over the TSDF band [Hp - sdf_trunc·û, Hp + sdf_trunc·û]
-// and dispatches per-voxel into both grids. The split walker runs two
-// independent DDAs. For axis-aligned rays Bresenham reduces to integer
-// stepping along the major axis and both walkers must produce
-// bit-identical TsdfMap state. SemBeta state must also match exactly:
-// the carve subset is `0 < sdf <= carve_band, c != k_hit`, which selects
-// the same voxels along an axis-aligned ray as the legacy
-// `SemBetaMap::carveRay [co, Hp)` walk.
+// The fused walker (fused_walker, default true) runs one DDA per ray and
+// dispatches per voxel into both grids; the split walker runs two. For
+// axis-aligned rays both must give identical TSDF and SemBeta state.
+// (notes: split-fused-walker-parity)
 
 namespace {
 
@@ -241,14 +236,10 @@ TEST(ScovoxMapSplitFusedWalker, MultiRayBandIdentity) {
   EXPECT_EQ(m_fused.tsdfVoxelCount(), m_split.tsdfVoxelCount());
   EXPECT_EQ(m_fused.tsdfGridBytes(),  m_split.tsdfGridBytes());
 
-  // SemDir carve sets agree up to per-ray Bresenham boundary jitter:
-  // the fused walker starts its DDA at `Hp − walk_back·û` while the split
-  // walker starts at `Hp − carve_band·û`, so for oblique rays the two
-  // pick-sequences may pick different voxels at sub-voxel boundaries.
-  // For axis-aligned rays the sets are bit-identical (see the test
-  // above); for the 27-ray off-axis fan with 0.05 m offsets we accept
-  // up to 20 % asymmetric difference, dominated by ±1 voxel/ray jitter
-  // accumulating over ~27 rays in a SemDir set of ~45 voxels.
+  // On oblique rays the walkers start their DDA at different points (fused: Hp
+  // - walk_back*u, split: Hp - carve_band*u), so SemDir carve sets differ by
+  // boundary jitter; the 27-ray fan allows up to 20 % difference.
+  // (notes: split-semdir-jitter-tolerance)
   const auto a = m_fused.semdirVoxelCount();
   const auto b = m_split.semdirVoxelCount();
   const auto diff = a > b ? a - b : b - a;

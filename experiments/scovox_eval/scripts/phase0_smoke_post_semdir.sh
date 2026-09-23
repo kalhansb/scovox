@@ -1,34 +1,25 @@
 #!/bin/bash
 # Phase 0 smoke gate — post-SemDir refactor (NEW_EXPERIMENT_PLAN.md Phase 0).
 #
-# Validates Step 7.5 didn't regress the integration substrate on the two
-# canonical anchors AND that the soft-prob loader is actually dispatching
-# (guards against the silent-fallback footgun pinned by
-# [[softprob-pipeline-2026-05-04]] — the SemBeta-era room0 0.352 vs 0.461
-# regression that turned out to be the topk_probs_dir parameter not
-# reaching the loader).
+# Checks the integration substrate on the two canonical anchors and that the
+# soft-prob loader actually dispatches, catching a silent fallback when
+# topk_probs_dir does not reach the loader. (notes: smoke-phase0-purpose)
 #
 # Three cells, ~10 min total wall-clock:
 #   A. KITTI seq08 hard  (topk_probs_dir empty)   — baseline hard-label mIoU
 #   B. KITTI seq08 soft  (topk_probs_dir set)     — soft-prob mIoU
 #   C. SceneNet 0_223 GT (one-hot from ground_truth_labels)
 #
-# Sharp assertions (catch silent fallbacks regardless of mIoU magnitude):
-#   - Cell B's log MUST contain "topk loader: loaded=N" with N >= 95
-#   - Cell A's log MUST NOT contain any "topk loader:" line
-#   - Cell B's mIoU MUST exceed Cell A's by ≥ 0.02 (proves soft probs
-#     actually changed the posterior; equality means silent fallback)
-#
-# mIoU gates per NEW_EXPERIMENT_PLAN.md:
-#   - Cell B: SemBeta baseline 0.3030 ± 0.02 → pass if ∈ [0.283, 0.323]
-#   - Cell C: SemBeta baseline 0.3624 ± 0.02 → pass if ∈ [0.342, 0.382]
-#   - Cell A: no fixed gate (hard-label is just the comparator for B)
+# Cell B's log must report topk loader loaded >= 95; Cell A's must have no topk
+# loader line. mIoU pass bands: B in [0.283, 0.323], C in [0.342, 0.382]; A is
+# only the comparator for B. (notes: smoke-phase0-assertions-gates)
 #
 # Usage:
 #   ./phase0_smoke_post_semdir.sh
 # Output:
 #   results/phase0_smoke_post_semdir/{kitti_hard,kitti_soft,scenenet_0_223}/scovox.{npz,log}
 #   results/phase0_smoke_post_semdir/SMOKE_REPORT.md
+# Moved comments: doc/scovox_eval_code_notes.md
 
 set -o pipefail  # don't enable -u: ROS setup.bash references unbound AMENT_TRACE_SETUP_FILES
 

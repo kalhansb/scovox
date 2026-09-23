@@ -1,3 +1,4 @@
+# Moved comments: doc/scovox_mapping_code_notes.md
 """SCovox mapping node configured for SceneNet RGB-D evaluation.
 
 Matches SLIM-VDB protocol: 5cm voxels, 14 NYUv2 classes, 320x240 RGB-D.
@@ -23,31 +24,26 @@ def _launch_setup(context):
     share_tsdf_arg = context.launch_configurations.get("share_tsdf", "false").lower() in ("true", "1", "yes")
     # iter6 single-DDA fused ray walker (default true to match production).
     fused_walker_arg = context.launch_configurations.get("fused_walker", "true").lower() in ("true", "1", "yes")
-    # Publish-time occupancy gate — used by Phase 2.5 to vary the labelling
-    # envelope. Was hardcoded 0.5 pre-2026-05-14; now plumbed through
-    # context so phase2_5_gate_threshold_sweep.sh can integrate at 0.0
-    # and see the unfiltered grid.
+    # Publish-time p_occ gate on the emitted pointcloud, default 0.5.
+    # phase2_5_gate_threshold_sweep.sh runs it at 0.0 to see the unfiltered
+    # grid. (notes: scenenet-publish-occ-gate)
     occ_vis_arg = float(context.launch_configurations.get("occupancy_vis_threshold", "0.5"))
     # Phase 2.5-v2 — integration-time admission gate (distinct from
     # the publish-time occupancy_vis_threshold above).
     dirichlet_min_p_occ_arg = float(context.launch_configurations.get("dirichlet_min_p_occ", "0.5"))
-    # A9 inverse-sensor-model weights. Were hardcoded 6.0/1.0 below; plumbed
-    # through context (as semantickitti_eval.launch.py already does) so the A9
-    # sweep can vary them per cell. Defaults reproduce the previous constants
-    # exactly, so every run that does not pass them is bit-identical to before.
+    # Inverse-sensor-model Beta weights, overridable from the launch. The
+    # 6.0/1.0 defaults equal the former hardcoded constants, so runs that do not
+    # pass them are unchanged. (notes: scenenet-a9-sensor-weights)
     w_occ_arg = float(context.launch_configurations.get("w_occ", "6.0"))
     w_free_arg = float(context.launch_configurations.get("w_free", "1.0"))
     # Soft-prob input: per-frame image .topk blobs (H,W,C) from a 2D segmenter.
     # When non-empty, scovox_node reads per-pixel class distributions instead of
     # the one-hot seg colour. Frame index = depth-stamp low 16 bits.
     topk_probs_dir_arg = context.launch_configurations.get("topk_probs_dir", "")
-    # E1 uncertainty capture (mirrors semantickitti_eval.launch.py): rolling mode
-    # enables the ScovoxMapBinary publisher (bin_pub_ exists only when
-    # mode==rolling); share_rate_hz>0 gives a timer-owned binary publish so a
-    # snapshot fires when a capture subscriber connects AFTER replay (with no
-    # subscriber the timer is a cheap no-op, so replay recv stays 300/300).
-    # scovox_publish_rate is overridable so the E1 runner can slow the pointcloud
-    # republish timer down for offline capture. Defaults preserve the paper runs.
+    # Uncertainty capture: map_mode rolling creates the ScovoxMapBinary
+    # publisher; share_rate_hz > 0 adds a timer-owned publish so a subscriber
+    # connecting after replay gets a snapshot. Defaults keep the paper runs.
+    # (notes: scenenet-e1-capture-knobs)
     map_mode_arg = context.launch_configurations.get("map_mode", "persistent")
     share_rate_hz_arg = float(context.launch_configurations.get("share_rate_hz", "0.0"))
     scovox_publish_rate_arg = float(context.launch_configurations.get("scovox_publish_rate", "1.0"))
@@ -161,11 +157,10 @@ def _launch_setup(context):
                     "semantic_evict_by_confidence", "false").lower() == "true",
             "semantic_spread_radius": float(
                 context.launch_configurations.get("semantic_spread_radius", "0.0")),
-            # Perf-attribution knobs (SLIM-VDB frame-time comparison). Every
-            # default below is the value the node already used, so an unset
-            # launch is byte-identical; they exist so the cost of the full-ray
-            # carve, the TSDF band and the carve staging can be measured
-            # SEPARATELY instead of inferred from a single frame_ms.
+            # Perf-attribution knobs (SLIM-VDB frame-time comparison) to measure
+            # carve, TSDF band and carve staging separately. Each default equals
+            # the node's own, so an unset launch is byte-identical.
+            # (notes: scenenet-perf-attribution-knobs)
             "carve_band": float(
                 context.launch_configurations.get("carve_band", "-1.0")),
             "sdf_trunc_voxels": int(

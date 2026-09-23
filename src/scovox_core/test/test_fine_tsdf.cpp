@@ -6,6 +6,7 @@
 /// (refineHit), and the rev-7 wire fine stream + merge. The DBH circle
 /// fit (dbh_fit.hpp — a POST-PROCESSING utility, not called by the
 /// mapping runtime) doubles as the accuracy metric here.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 #include <Eigen/Core>
@@ -263,11 +264,10 @@ TEST(FineTsdf, AnchorAbsorbsOdometryDrift) {
   EXPECT_GE(fit_a.arc_coverage, 0.75f);
   // Anchored radius lands inside the DBH budget.
   EXPECT_NEAR(fit_a.radius, 0.15f, 0.015f);
-  // A fixed-direction drift displaces each azimuth's arc by the drift at
-  // its observation time, so the un-anchored surface is a distorted,
-  // TRANSLATED circle: its fitted radius can stay near-true while the
-  // residual and the recovered centre absorb the damage. Those are the
-  // discriminating metrics.
+  // A fixed-direction drift leaves the un-anchored surface a distorted,
+  // translated circle whose radius can stay near-true, so the RMS residual
+  // and the recovered centre are the discriminating metrics.
+  // (notes: fine-drift-discriminating-metrics)
   if (fit_r.valid) {
     EXPECT_LT(fit_a.rms, fit_r.rms);
     const float ca = std::hypot(fit_a.cx - 2.0f, fit_a.cy - 0.0f);
@@ -286,20 +286,16 @@ TEST(FineTsdf, CleanOrbitDbhWithinBudget) {
   EXPECT_NEAR(fit.cx, 2.0f, 0.01f);
   EXPECT_NEAR(fit.cy, 0.0f, 0.01f);
   EXPECT_GE(fit.arc_coverage, 0.9f);
-  // The clean-orbit RMS floor on this synthetic geometry is ~0.022: the
-  // ±60° scan arcs put oblique rays into the band whose projective bias
-  // survives tent-weighting at the band's inner edge. Well under the 0.03
-  // model-refresh gate, and the drift test asserts the anchored map beats
-  // the smeared one on this same metric.
+  // The clean-orbit RMS floor on this geometry is about 0.022 (oblique-ray
+  // bias at the band's inner edge); the bound stays under the 0.03
+  // model-refresh gate. (notes: fine-clean-orbit-rms-floor)
   EXPECT_LT(fit.rms, 0.025f);
 }
 
 TEST(FineTsdf, ExternalModelRefreshViaReAdd) {
-  // The refresh loop lives OUTSIDE the mapper: a downstream estimator fits
-  // on the fine map and re-publishes the region with the fitted model
-  // (same id → same slot, in-place cylinder update). This contracts the
-  // coarse-detector radius bias out of the anchor fit — see the design
-  // doc's pose section.
+  // The refresh loop lives outside the mapper: a downstream estimator fits on
+  // the fine map and re-adds the region with the fitted model (same id, same
+  // slot, in-place cylinder update). (notes: fine-external-model-refresh)
   scovox::ScovoxMapSplit m(fineParams());
   const int idx0 = m.addRefinementRegion(trunkRegion());
   orbitTrunk(m, 0.f, 0.f, /*n_scans=*/24);

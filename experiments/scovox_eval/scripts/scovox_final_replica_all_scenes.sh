@@ -1,14 +1,10 @@
 #!/bin/bash
 # Final-run driver: SCovox hard-label + SCovox soft-prob across all 8
 # Replica scenes (room0..2, office0..4). Per-scene loop:
-#   1. Run M2F dense inference (collapse_n_classes=19) → NPZ
-#   2. Convert NPZ → .topk (~29 GB peak)
-#   3. Run SCovox soft sweep
-#   4. Run SCovox hard sweep (no .topk needed)
-#   5. Delete this scene's .topk + NPZ to free disk for next scene
-#
-# Disk budget: ~30 GB peak/scene. Free disk should be ≥ 35 GB at start.
-# Total compute: ~50 min/scene × 8 = ~6.5 hours.
+# M2F dense inference, .topk conversion, soft sweep, hard sweep, then
+# delete the scene's .topk and NPZ. Start with at least 35 GB free disk.
+# (notes: final-replica-scene-loop)
+# Moved comments: doc/scovox_eval_code_notes.md
 set -eo pipefail
 
 WS=$HOME/projects/HMR_Exploration_Experiment/hmr_exploration_ws

@@ -7,6 +7,7 @@
 ///   3. Per-voxel weighting via WeightFn (constant default)
 ///
 /// Plus seven behavioural tests that pin Curless–Levoy fundamentals.
+/// Moved comments: doc/scovox_core_code_notes.md
 
 #include <gtest/gtest.h>
 
@@ -49,13 +50,9 @@ TEST(TsdfMapParity, EuclideanSDFnotProjected) {
   auto v = m.getVoxel(probe);
   ASSERT_TRUE(v.has_value());
 
-  // Expected (Euclidean):
-  //   vc - origin   = (0.075, 0.025, 0.025)
-  //   endpoint - vc = (0.025, -0.025, -0.025)
-  //   dist          = ‖endpoint - vc‖ = 0.025·√3 ≈ 0.0433
-  //   proj          = 0.075·0.025 + 0.025·(-0.025) + 0.025·(-0.025)
-  //                 = 0.001875 - 0.000625 - 0.000625 = +0.000625 → sign +1
-  //   sdf           = +0.0433 (in front of surface, inside the band)
+  // Euclidean SDF at the probe: distance |endpoint - vc| = 0.025*sqrt(3) ~
+  // 0.0433, sign +1 (voxel in front of the surface).
+  // (notes: tsdf-test-euclidean-sdf-expected)
   EXPECT_NEAR(v->distance, +0.0433f, 1e-3f);
 
   // Distinguishability: the projected formula would have given
@@ -78,19 +75,13 @@ TEST(TsdfMapParity, VoxelCentreNotLowerCorner) {
   auto v = m.getVoxel(probe);
   ASSERT_TRUE(v.has_value());
 
-  // Expected SDF for vc = (0.075, 0.025, 0.025), endpoint = (0.075, 0, 0):
-  //   endpoint - vc = (0, -0.025, -0.025)
-  //   dist          = 0.0354
-  //   (vc-origin)·(endpoint-vc) = 0.075*0 + 0.025*(-0.025) + 0.025*(-0.025) = -0.00125
-  //   sign          = -1
-  //   sdf           = -0.0354
+  // For vc = (0.075, 0.025, 0.025) and endpoint (0.075, 0, 0): distance ~
+  // 0.0354, sign -1, so sdf ~ -0.0354. (notes: tsdf-test-centre-sdf-expected)
   EXPECT_NEAR(v->distance, -0.0354f, 1e-3f);
 
-  // If the implementation used voxel LOWER CORNER (= 0.05, 0, 0) instead:
-  //   endpoint - corner = (0.025, 0, 0), dist = 0.025
-  //   (corner-origin)·(endpoint-corner) = 0.05*0.025 = +0.00125  → sign +1
-  //   sdf = +0.025
-  // Make sure we are NOT seeing that.
+  // Sampling at the voxel lower corner (0.05, 0, 0) would give sdf = +0.025;
+  // the check asserts the result is nearer the centre-based value.
+  // (notes: tsdf-test-lower-corner-alternative)
   EXPECT_LT(std::fabs(v->distance + 0.0354f), std::fabs(v->distance - 0.025f));
 }
 
