@@ -72,3 +72,19 @@ uint64[] deltas_received
 # the "did the map actually move" half of the exchange question and the reason
 # both numbers are published instead of just the arrival count.
 uint64[] cells_touched
+
+# Highest ScovoxMapBinary.seq received from this source, counting every frame
+# that arrived and decoded — including frames with no occupancy or semantic
+# deltas (TSDF-only chunks) and frames rejected later for a prior mismatch.
+# This is the "how far through the sender's stream am I" term: a peer whose
+# own sent seq is S has delivered everything to me once newest_seq >= S (and
+# seq_gaps has not moved). 0 until a stamped frame arrives. A sender restart
+# (seq falls back below the stored value) re-baselines it to the new value.
+# A source heard only through such frames still gets an entry here, with
+# deltas_received and cells_touched at 0.
+uint64[] newest_seq
+
+# Cumulative count of sequence numbers skipped from this source: frames the
+# sender published that never arrived. Nonzero means the link lost data and a
+# newest_seq comparison overstates what was delivered.
+uint64[] seq_gaps

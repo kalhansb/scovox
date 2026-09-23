@@ -139,18 +139,22 @@ bool spinUntil(rclcpp::Executor& ex, Pred done, double timeout_s) {
   return done();
 }
 
-// One frame of kBetaDeltas occupancy deltas on distinct cells, no semantics.
-scovox_msgs::msg::ScovoxMapBinary makeFrame() {
+// One frame of n_beta occupancy deltas on distinct cells, no semantics.
+// n_beta = 0 is the TSDF-only chunk case: it decodes to nothing dscovox fuses.
+scovox_msgs::msg::ScovoxMapBinary makeFrame(size_t n_beta = kBetaDeltas,
+                                            uint64_t seq = 0,
+                                            const char* source = kSource) {
   scovox::BinarySerializer::Frame f;
   f.resolution  = 0.1f;
   f.num_classes = 14;
   f.alpha_0     = scovox::kDefaultDirichletPrior;
-  for (size_t i = 0; i < kBetaDeltas; ++i)
+  for (size_t i = 0; i < n_beta; ++i)
     f.beta_deltas.push_back(
         {Bonxai::CoordT{static_cast<int32_t>(i), 0, 5}, scovox::BetaVoxel{3.0f, 1.0f}});
 
   scovox_msgs::msg::ScovoxMapBinary m;
-  m.header.frame_id = kSource;
+  m.seq = seq;
+  m.header.frame_id = source;
   m.version = 5;
   m.little_endian = (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
   m.map_from_source.rotation.w = 1.0;
@@ -169,7 +173,8 @@ struct Sample {
 class FusionCountersLiveness : public ::testing::Test {
  protected:
   void SetUp() override {
-    ns_ = "/t9_" + std::to_string(getpid());
+    static int run = 0;
+    ns_ = "/t9_" + std::to_string(getpid()) + "_" + std::to_string(run++);
     in_topic_ = ns_ + "/peer_bin";
     // Child first: fork() before rclcpp::init starts any threads here.
     dscovox_ = std::make_unique<ChildNode>(std::vector<std::string>{
@@ -270,6 +275,77 @@ TEST_F(FusionCountersLiveness, SilenceStillProducesFreshSamplesWithTheCountUncha
       << " s of silence at " << kCountersHz << " Hz: the counters fell silent "
          "with the fused map, which makes a quiet peer and a quiet dscovox the "
          "same observation";
+}
+
+// Gen 34: the sequence columns. Every frame that decodes advances its
+// sender's newest_seq, including one with nothing dscovox fuses (the last chunk
+// a robot sends can be TSDF-only, and an exchange waiting for that seq would
+// otherwise never complete). A skipped number is a gap. A source heard only
+// through such frames still gets an entry, with zero counters.
+TEST_F(FusionCountersLiveness, SequenceAdvancesOnEveryDecodedFrame) {
+  constexpr char kOther[] = "bolt/odom";
+  auto probe = std::make_shared<rclcpp::Node>("fusion_counters_seq_probe", ns_);
+  rclcpp::executors::SingleThreadedExecutor ex;
+  ex.add_node(probe);
+
+  Counters::SharedPtr last;
+  auto bin_pub = probe->create_publisher<scovox_msgs::msg::ScovoxMapBinary>(
+      in_topic_, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+  auto counters_sub = probe->create_subscription<Counters>(
+      ns_ + "/dscovox_node/fusion_counters",
+      rclcpp::QoS(rclcpp::KeepLast(50)).reliable(),
+      [&](const Counters::SharedPtr m) { last = m; });
+  ASSERT_TRUE(spinUntil(ex, [&] {
+    return bin_pub->get_subscription_count() > 0 &&
+           counters_sub->get_publisher_count() > 0;
+  }, 20.0)) << "dscovox never came up; alive=" << dscovox_->alive();
+
+  auto entry = [&](const char* src, uint64_t& newest, uint64_t& gaps,
+                   uint64_t& deltas) {
+    if (!last) return false;
+    const auto it = std::find(last->source_frame.begin(), last->source_frame.end(), src);
+    if (it == last->source_frame.end()) return false;
+    const size_t i = static_cast<size_t>(it - last->source_frame.begin());
+    if (last->newest_seq.size() != last->source_frame.size() ||
+        last->seq_gaps.size() != last->source_frame.size()) return false;
+    newest = last->newest_seq.at(i);
+    gaps   = last->seq_gaps.at(i);
+    deltas = last->deltas_received.at(i);
+    return true;
+  };
+  uint64_t newest = 0, gaps = 0, deltas = 0;
+
+  // seq 2 first: seq 1 never arrived, one gap.
+  bin_pub->publish(makeFrame(kBetaDeltas, 2));
+  ASSERT_TRUE(spinUntil(ex, [&] {
+    return entry(kSource, newest, gaps, deltas) && newest == 2;
+  }, 10.0)) << "newest_seq never reached 2 (newest=" << newest << ")";
+  EXPECT_EQ(gaps, 1u);
+  EXPECT_EQ(deltas, kBetaDeltas);
+
+  // An empty (TSDF-only) frame still advances the sequence.
+  bin_pub->publish(makeFrame(0, 3));
+  ASSERT_TRUE(spinUntil(ex, [&] {
+    return entry(kSource, newest, gaps, deltas) && newest == 3;
+  }, 10.0)) << "an empty frame did not advance newest_seq (newest=" << newest << ")";
+  EXPECT_EQ(gaps, 1u);
+  EXPECT_EQ(deltas, kBetaDeltas);
+
+  // A source heard only through empty frames is listed with zero counters.
+  bin_pub->publish(makeFrame(0, 1, kOther));
+  ASSERT_TRUE(spinUntil(ex, [&] {
+    return entry(kOther, newest, gaps, deltas) && newest == 1;
+  }, 10.0)) << "a source seen only through empty frames has no entry";
+  EXPECT_EQ(gaps, 0u);
+  EXPECT_EQ(deltas, 0u);
+
+  // Unstamped (seq 0) frames are not tracked: the entry does not move.
+  bin_pub->publish(makeFrame(kBetaDeltas, 0));
+  ASSERT_TRUE(spinUntil(ex, [&] {
+    return entry(kSource, newest, gaps, deltas) && deltas == 2 * kBetaDeltas;
+  }, 10.0));
+  EXPECT_EQ(newest, 3u);
+  EXPECT_EQ(gaps, 1u);
 }
 
 }  // namespace

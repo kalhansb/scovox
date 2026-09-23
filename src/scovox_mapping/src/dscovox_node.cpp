@@ -57,6 +57,7 @@
 #include <cstring>
 #include <limits>
 #include <shared_mutex>
+#include <mutex>
 #include <atomic>  // last_pc_pub_ns_ rate-limiter (shared-lock concurrent access)
 #include <chrono>  // plan_glob_last_ steady_clock rate-limiter
 
@@ -80,6 +81,15 @@ struct SourceGrid {
   // (notes: source-grid-fusion-counters)
   uint64_t deltas_received{0};   // voxel deltas ingested from this source
   uint64_t cells_touched{0};     // fused cells written while integrating them
+};
+
+// Sequence tracking per source, kept apart from SourceGrid because it records
+// frames the grid never sees: a TSDF-only chunk decodes to no occupancy or
+// semantic deltas and returns before ingest, yet it is part of the sender's
+// stream and the exchange test needs to know it arrived.
+struct SeqTrack {
+  uint64_t newest{0};   // highest ScovoxMapBinary.seq received (0 = none)
+  uint64_t gaps{0};     // sequence numbers skipped, cumulative
 };
 
 inline Eigen::Isometry3d tfToIsometry(const geometry_msgs::msg::Transform& tf) {
@@ -350,6 +360,7 @@ private:
         "deserialize failed for '%s': %s", sf.c_str(), e.what());
       return;
     }
+    noteSeq(sf, msg->seq);
     if (frame.beta_deltas.empty() && frame.dir_deltas.empty()) return;
 
     // The producer carries its source->map pose in the message; the merger
@@ -777,6 +788,18 @@ private:
     scovox_map_pub_->publish(rs->map);
   }
 
+  // Every decoded frame advances its sender's sequence, whether or not it
+  // carries anything dscovox fuses. seq 0 is an unstamped sender: not tracked.
+  // A value below the stored one is a sender restart and re-baselines.
+  void noteSeq(const std::string& sf, uint64_t seq)
+  {
+    if (seq == 0) return;
+    std::lock_guard<std::mutex> lk(seq_mu_);
+    SeqTrack& t = seq_by_source_[sf];
+    if (seq > t.newest + 1) t.gaps += seq - t.newest - 1;
+    t.newest = seq;
+  }
+
   // Own timer and own shared lock, no dirty or subscriber gate, so a quiet peer
   // is distinguishable from a quiet dscovox. Sorted by source frame; entries
   // are never removed. (notes: dscovox-fusion-counters-no-gates)
@@ -787,16 +810,27 @@ private:
     msg.header.stamp    = now();
     msg.header.frame_id = map_frame_;
     {
+      // A source heard only through frames that never reach ingest has a
+      // sequence entry and no grid; it is listed with zero counters.
       std::shared_lock<std::shared_mutex> lk(mu_);
+      std::lock_guard<std::mutex> slk(seq_mu_);
       msg.source_frame.reserve(sources_.size());
       for (const auto& [k, sg] : sources_) msg.source_frame.push_back(k);
+      for (const auto& [k, t] : seq_by_source_)
+        if (!sources_.count(k)) msg.source_frame.push_back(k);
       std::sort(msg.source_frame.begin(), msg.source_frame.end());
-      msg.deltas_received.reserve(msg.source_frame.size());
-      msg.cells_touched.reserve(msg.source_frame.size());
+      const size_t n = msg.source_frame.size();
+      msg.deltas_received.reserve(n);
+      msg.cells_touched.reserve(n);
+      msg.newest_seq.reserve(n);
+      msg.seq_gaps.reserve(n);
       for (const auto& k : msg.source_frame) {
-        const auto& sg = sources_.at(k);
-        msg.deltas_received.push_back(sg.deltas_received);
-        msg.cells_touched.push_back(sg.cells_touched);
+        const auto sit = sources_.find(k);
+        msg.deltas_received.push_back(sit == sources_.end() ? 0 : sit->second.deltas_received);
+        msg.cells_touched.push_back(sit == sources_.end() ? 0 : sit->second.cells_touched);
+        const auto qit = seq_by_source_.find(k);
+        msg.newest_seq.push_back(qit == seq_by_source_.end() ? 0 : qit->second.newest);
+        msg.seq_gaps.push_back(qit == seq_by_source_.end() ? 0 : qit->second.gaps);
       }
     }
     fusion_counters_pub_->publish(msg);
@@ -968,6 +1002,10 @@ private:
   std::vector<std::array<float, 3>> sem_col_;
   // One source grid per robot, keyed by header.frame_id of incoming binaries.
   std::unordered_map<std::string, SourceGrid> sources_;
+  // Per-source sequence tracking; its own lock, taken after mu_ when both are
+  // held (publishFusionCounters), alone in noteSeq.
+  std::unordered_map<std::string, SeqTrack> seq_by_source_;
+  std::mutex seq_mu_;
   // Split Beta/Dirichlet fused grids. Allocated lazily on the first wire
   // frame; null otherwise. Occupancy ∥ semantics, merged independently
   // (consensus_merge.hpp). Share the pinned (fused_num_classes_, fused_alpha_0_).

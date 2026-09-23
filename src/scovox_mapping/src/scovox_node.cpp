@@ -1882,6 +1882,10 @@ private:
     auto wire_send = [&](scovox_msgs::msg::ScovoxMapBinary&& bin, size_t n) {
       bytes_total += bin.data.size();
       emitted     += n;
+      // Stamped at send, not at build, so a deferred chunk carries the order
+      // it actually went out in. Receivers compare against it to tell when
+      // they hold everything this robot has published.
+      bin.seq = ++share_seq_;
       bin_pub_->publish(std::move(bin));
     };
     while (!share_deferred_.empty()) {
@@ -2784,6 +2788,9 @@ private:
   struct DeferredChunk { scovox_msgs::msg::ScovoxMapBinary msg; size_t n_deltas; };
   std::deque<DeferredChunk> share_deferred_;
   size_t share_deferred_bytes_{0};
+  // Last ScovoxMapBinary.seq published (0 = nothing sent yet). Node-local;
+  // restarts from 0 with the node.
+  uint64_t share_seq_{0};
   double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
   // Change-gate memory: last-emitted wire state per voxel plus emit time in
   // node-clock seconds (double; epoch seconds exceed float precision).
