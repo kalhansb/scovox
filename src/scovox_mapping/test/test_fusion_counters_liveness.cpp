@@ -64,6 +64,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -349,3 +350,146 @@ TEST_F(FusionCountersLiveness, SequenceAdvancesOnEveryDecodedFrame) {
 }
 
 }  // namespace
+
+// DESIGN_gen34 §12.5: skip_unchanged_voxels. The full-map arm sends each
+// robot's whole map every frame, so most voxels arrive unchanged; the flag
+// must skip their refold without changing the fused map. Two real dscovox
+// binaries, flag on and off, get the same frame sequence (repeats, overlaps
+// between sources, a partial change); their fused maps must match exactly,
+// and cells_touched must show the on-node refolded only what changed.
+namespace {
+
+scovox_msgs::msg::ScovoxMapBinary makeRangeFrame(const char* source, uint64_t seq,
+                                                 int from, int to,
+                                                 scovox::BetaVoxel v,
+                                                 int changed_below = -1,
+                                                 scovox::BetaVoxel vc = {}) {
+  scovox::BinarySerializer::Frame f;
+  f.resolution  = 0.1f;
+  f.num_classes = 14;
+  f.alpha_0     = scovox::kDefaultDirichletPrior;
+  for (int i = from; i < to; ++i)
+    f.beta_deltas.push_back({Bonxai::CoordT{i, 0, 5}, i < changed_below ? vc : v});
+  scovox_msgs::msg::ScovoxMapBinary m;
+  m.seq = seq;
+  m.header.frame_id = source;
+  m.version = 5;
+  m.little_endian = (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
+  m.map_from_source.rotation.w = 1.0;
+  m.data = scovox::ScovoxBinarySerializer::compressLZ4(
+      scovox::BinarySerializer::serialize(f));
+  return m;
+}
+
+using Cell = std::array<float, 5>;   // x, y, z, a_occ, a_free
+
+}  // namespace
+
+TEST(SkipUnchangedVoxels, SameFusedMapFewerRefolds) {
+  const std::string base = "/t12_" + std::to_string(getpid());
+  const std::string ns_on = base + "_on", ns_off = base + "_off";
+  auto args = [](const std::string& ns, bool skip) {
+    return std::vector<std::string>{
+        DSCOVOX_NODE_EXE, "--ros-args", "-r", "__ns:=" + ns,
+        "-p", "input_topics:=['" + ns + "/peer_bin']",
+        "-p", "publish_rate_hz:=10.0", "-p", "fusion_counters_hz:=10.0",
+        "-p", std::string("skip_unchanged_voxels:=") + (skip ? "true" : "false"),
+        "--log-level", "warn"};
+  };
+  ChildNode on(args(ns_on, true)), off(args(ns_off, false));
+  rclcpp::init(0, nullptr);
+  {
+    auto probe = std::make_shared<rclcpp::Node>("skip_unchanged_probe", base);
+    rclcpp::executors::SingleThreadedExecutor ex;
+    ex.add_node(probe);
+
+    struct Side {
+      rclcpp::Publisher<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr pub;
+      rclcpp::Subscription<Counters>::SharedPtr csub;
+      rclcpp::Subscription<scovox_msgs::msg::ScovoxMap>::SharedPtr msub;
+      Counters::SharedPtr counters;
+      scovox_msgs::msg::ScovoxMap::SharedPtr map;
+      int maps = 0;
+    };
+    std::array<Side, 2> side;
+    const std::array<std::string, 2> nss{ns_on, ns_off};
+    for (int k = 0; k < 2; ++k) {
+      side[k].pub = probe->create_publisher<scovox_msgs::msg::ScovoxMapBinary>(
+          nss[k] + "/peer_bin", rclcpp::QoS(rclcpp::KeepLast(20)).reliable());
+      side[k].csub = probe->create_subscription<Counters>(
+          nss[k] + "/dscovox_node/fusion_counters",
+          rclcpp::QoS(rclcpp::KeepLast(5)).reliable(),
+          [&side, k](const Counters::SharedPtr m) { side[k].counters = m; });
+      side[k].msub = probe->create_subscription<scovox_msgs::msg::ScovoxMap>(
+          nss[k] + "/dscovox_node/scovox",
+          rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+          [&side, k](const scovox_msgs::msg::ScovoxMap::SharedPtr m) {
+            side[k].map = m;
+            ++side[k].maps;
+          });
+    }
+    ASSERT_TRUE(spinUntil(ex, [&] {
+      for (auto& sd : side)
+        if (sd.pub->get_subscription_count() == 0 || sd.csub->get_publisher_count() == 0 ||
+            sd.msub->get_publisher_count() == 0) return false;
+      return true;
+    }, 20.0)) << "a dscovox never came up; on=" << on.alive() << " off=" << off.alive();
+
+    const scovox::BetaVoxel a{3.0f, 1.0f}, b{1.0f, 4.0f}, c{6.0f, 1.0f};
+    const std::vector<scovox_msgs::msg::ScovoxMapBinary> seq_frames{
+        makeRangeFrame("atlas/odom", 1, 0, 10, a),          // 10 new
+        makeRangeFrame("bolt/odom",  1, 5, 15, b),          // 10 new, 5 overlap
+        makeRangeFrame("atlas/odom", 2, 0, 10, a),          // identical: 0 changed
+        makeRangeFrame("atlas/odom", 3, 0, 10, a, 5, c),    // 5 changed
+        makeRangeFrame("bolt/odom",  2, 5, 15, b),          // identical: 0 changed
+    };
+    for (const auto& m : seq_frames) {
+      for (auto& sd : side) sd.pub->publish(m);
+      spinUntil(ex, [] { return false; }, 0.2);   // keep per-source order
+    }
+
+    auto count = [](const Counters::SharedPtr& m, const char* src,
+                    uint64_t& deltas, uint64_t& cells) {
+      if (!m) return false;
+      const auto it = std::find(m->source_frame.begin(), m->source_frame.end(), src);
+      if (it == m->source_frame.end()) return false;
+      const size_t i = static_cast<size_t>(it - m->source_frame.begin());
+      deltas = m->deltas_received.at(i);
+      cells  = m->cells_touched.at(i);
+      return true;
+    };
+    std::array<std::array<uint64_t, 2>, 2> cells{};   // [side][atlas, bolt]
+    ASSERT_TRUE(spinUntil(ex, [&] {
+      for (int k = 0; k < 2; ++k) {
+        uint64_t d = 0;
+        if (!count(side[k].counters, "atlas/odom", d, cells[k][0]) || d != 30) return false;
+        if (!count(side[k].counters, "bolt/odom",  d, cells[k][1]) || d != 20) return false;
+      }
+      return true;
+    }, 15.0)) << "not every frame reached both nodes";
+    // The last changing frame is the fourth; the fifth changes nothing, so
+    // with the flag on it triggers no republish. Give the 10 Hz publish a
+    // second to carry the fourth out, then read the newest map of each.
+    spinUntil(ex, [] { return false; }, 1.0);
+    ASSERT_TRUE(side[0].map && side[1].map)
+        << "no fused map received (on: " << side[0].maps << ", off: " << side[1].maps << ")";
+
+    EXPECT_EQ(cells[1][0], 30u) << "flag off must refold every delivered voxel";
+    EXPECT_EQ(cells[1][1], 20u);
+    EXPECT_EQ(cells[0][0], 15u) << "flag on: 10 new + 0 repeated + 5 changed";
+    EXPECT_EQ(cells[0][1], 10u) << "flag on: 10 new + 0 repeated";
+
+    auto cellsOf = [](const scovox_msgs::msg::ScovoxMap& m) {
+      std::vector<Cell> v;
+      for (const auto& x : m.voxels)
+        v.push_back({x.position.x, x.position.y, x.position.z, x.a_occ, x.a_free});
+      std::sort(v.begin(), v.end());
+      return v;
+    };
+    const auto on_cells = cellsOf(*side[0].map), off_cells = cellsOf(*side[1].map);
+    EXPECT_EQ(on_cells.size(), 15u);
+    EXPECT_EQ(on_cells, off_cells) << "skip_unchanged_voxels changed the fused map";
+  }
+  rclcpp::shutdown();
+}
+

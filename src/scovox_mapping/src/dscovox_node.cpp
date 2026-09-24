@@ -133,6 +133,12 @@ public:
     if (input_topics_.empty()) throw std::runtime_error("No DSCovox input topics configured");
 
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    // Full-map arm (DESIGN_gen34 §12): a voxel whose incoming value equals the
+    // stored one is not refolded. Refold is a pure function of the sources'
+    // values, so the fused map is identical; only cells_touched counts fewer.
+    // Without it each whole-map frame refolds every voxel under the exclusive
+    // lock. Default false keeps every delta-stream run bit-identical.
+    skip_unchanged_ = declare_parameter<bool>("skip_unchanged_voxels", false);
     min_occ_ = declare_parameter<double>("occupancy_vis_threshold", 0.7);
     sem_gate_ = declare_parameter<double>("semantic_occ_gate", 0.5);
 
@@ -250,9 +256,20 @@ public:
         1, static_cast<int>(declare_parameter<int>("scovox_bin_qos_depth", 50)));
     auto bin_qos =
         rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(bin_depth))).reliable();
+    // Whole-map frames (DESIGN_gen34 §12) each supersede the last, so a deep
+    // history buys nothing and, at ~10 MB a frame, could hold gigabytes.
+    const int full_depth = std::max(
+        1, static_cast<int>(declare_parameter<int>("scovox_full_qos_depth", 2)));
+    auto full_qos =
+        rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(full_depth))).reliable();
+    auto isFullTopic = [](const std::string& t) {
+      static const std::string kSuffix = "scovox_full";
+      return t.size() >= kSuffix.size() &&
+             t.compare(t.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0;
+    };
     for (auto& t : input_topics_) {
       subs_.push_back(create_subscription<scovox_msgs::msg::ScovoxMapBinary>(
-        t, bin_qos,
+        t, isFullTopic(t) ? full_qos : bin_qos,
         std::bind(&DSCovoxNode::onBinaryMap, this, std::placeholders::_1)));
     }
 
@@ -323,6 +340,7 @@ private:
   // (notes: dscovox-receive-path)
   // ==================================================================
   void onBinaryMap(const scovox_msgs::msg::ScovoxMapBinary::SharedPtr msg) {
+    const auto t_enter = std::chrono::steady_clock::now();
     if (msg->version != 5) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "wire receiver expects envelope version 5, got %d (dropping)",
@@ -379,6 +397,7 @@ private:
     size_t n_touched_beta  = 0;       // fused occupancy cells this frame changed
     size_t n_touched_dir   = 0;       // fused semantic  cells this frame changed
     size_t n_sources       = 0;       // robots currently contributing to the fusion
+    size_t n_unchanged     = 0;       // skip_unchanged_voxels: equal values not refolded
 
     {
       std::unique_lock<std::shared_mutex> lk(mu_);
@@ -454,8 +473,12 @@ private:
       // Centre-sample posToCoord (floor() picks whichever map voxel contains
       // the bulk of the source voxel's volume even when the pose is unaligned).
       std::unordered_set<Bonxai::CoordT, CoordTHash, CoordTEqual> touched_beta, touched_dir;
-      touched_beta.reserve(frame.beta_deltas.size());
-      touched_dir.reserve(frame.dir_deltas.size());
+      // A whole-map frame is mostly unchanged voxels; reserving for all of
+      // them would allocate a multi-million-bucket table per frame.
+      if (!skip_unchanged_) {
+        touched_beta.reserve(frame.beta_deltas.size());
+        touched_dir.reserve(frame.dir_deltas.size());
+      }
       const Eigen::Isometry3d Te = src.T_map_source;
       const double half_src_res = 0.5 * double(src_res);
       auto toMapPos = [&](const Bonxai::CoordT& sc) {
@@ -477,6 +500,13 @@ private:
           auto mc = src.beta_grid->posToCoord(mp.x(), mp.y(), mp.z());
           auto* v = ba.value(mc, true);
           if (!v) continue;
+          // A voxel just created holds a default value at or below the prior,
+          // which no sender puts on the wire (at-prior voxels are skipped
+          // there), so a new voxel never compares equal and is refolded.
+          // (Checking existence first with value(mc, false) is not an
+          // option: the accessor caches the missing leaf and the create
+          // that follows returns null.)
+          if (skip_unchanged_ && sameBeta(*v, d.data)) { ++n_unchanged; continue; }
           *v = d.data;     // snapshot-replace
           touched_beta.insert(mc);
         }
@@ -489,6 +519,7 @@ private:
           auto mc = src.dir_grid->posToCoord(mp.x(), mp.y(), mp.z());
           auto* v = da.value(mc, true);
           if (!v) continue;
+          if (skip_unchanged_ && sameDir(*v, d.data)) { ++n_unchanged; continue; }
           *v = d.data;     // snapshot-replace
           touched_dir.insert(mc);
         }
@@ -548,17 +579,49 @@ private:
       "semantics %zu deltas / %zu fused cells (%zu source%s fused)",
       sf.c_str(), n_beta_deltas, n_touched_beta, n_dir_deltas, n_touched_dir,
       n_sources, n_sources == 1 ? "" : "s");
+    if (skip_unchanged_) {
+      // Full-map arm: a separate line so the one above parses unchanged. Age
+      // is capture (sender stamp) to integration, both on the sim clock.
+      // Wall ms is the callback so far: the executor is single-threaded, so
+      // this is how long every other callback of this node waited.
+      RCLCPP_INFO(get_logger(),
+        "dscovox: frame from '%s' seq=%llu voxels=%zu unchanged=%zu age=%.2fs wall_ms=%.1f",
+        sf.c_str(), (unsigned long long)msg->seq, n_beta_deltas + n_dir_deltas,
+        n_unchanged, (get_clock()->now() - rclcpp::Time(msg->header.stamp)).seconds(),
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_enter).count());
+    }
 
     // The fused grid changed; mark it so the publish timer re-publishes the
     // fused-map topic on its next tick (and only then). Reaching here implies
-    // non-empty deltas were fused (empty frames returned early above).
-    fused_dirty_.store(true, std::memory_order_relaxed);
+    // non-empty deltas were fused (empty frames returned early above). With
+    // skip_unchanged_voxels a whole frame can change nothing; then there is
+    // nothing to republish.
+    if (!skip_unchanged_ || n_touched_beta + n_touched_dir > 0)
+      fused_dirty_.store(true, std::memory_order_relaxed);
 
     // Step 3 — visualisation publish.
     {
       std::shared_lock<std::shared_mutex> rlk(mu_);
       maybePublishPointCloud();
     }
+  }
+
+  // Exact equality for skip_unchanged_voxels. Field by field, not memcmp:
+  // struct padding is unspecified. -0.0 == 0.0 would count as equal, and
+  // either refolds to the same fused value.
+  static bool sameBeta(const scovox::BetaVoxel& a, const scovox::BetaVoxel& b) {
+    return a.a_occ == b.a_occ && a.a_free == b.a_free;
+  }
+  static bool sameDir(const scovox::DirVoxel& a, const scovox::DirVoxel& b) {
+    if (a.other != b.other) return false;
+    for (int i = 0; i < scovox::K_TOP; ++i) {
+      if (a.cls[i] != b.cls[i] || a.cnt[i] != b.cnt[i]) return false;
+#if SCOVOX_TRACK_QMAX
+      if (a.qmax[i] != b.qmax[i]) return false;
+#endif
+    }
+    return true;
   }
 
   // Per-cell refold scratch: source-voxel pointer lists reused across cells so
@@ -1006,6 +1069,7 @@ private:
   // held (publishFusionCounters), alone in noteSeq.
   std::unordered_map<std::string, SeqTrack> seq_by_source_;
   std::mutex seq_mu_;
+  bool skip_unchanged_{false};   // skip_unchanged_voxels (§12, full-map arm)
   // Split Beta/Dirichlet fused grids. Allocated lazily on the first wire
   // frame; null otherwise. Occupancy ∥ semantics, merged independently
   // (consensus_merge.hpp). Share the pinned (fused_num_classes_, fused_alpha_0_).

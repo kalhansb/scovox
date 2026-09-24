@@ -1,5 +1,6 @@
 // Moved comments: doc/scovox_node_notes.md
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <limits>
 #include <optional>
 #include <scovox/uncertainty.hpp>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -187,6 +189,17 @@ public:
         share_roi_z_max_,
         share_roi_z_max_ > share_roi_z_min_ ? "" : " off");
     }
+    if (full_pub_) {
+      full_timer_ = rclcpp::create_timer(this, get_clock(),
+        std::chrono::duration<double>(share_full_map_period_s_),
+        [this]{ publishFullMapTick(); });
+      RCLCPP_WARN(get_logger(),
+        "full-map share: every non-prior voxel on %s every %.2f s (sim)%s",
+        full_pub_->get_topic_name(), share_full_map_period_s_,
+        share_max_voxels_per_msg_ > 0 || share_max_bytes_per_tick_ > 0
+          ? "; share_max_voxels_per_msg and share_max_bytes_per_tick apply to "
+            "the delta stream only, never to full frames" : "");
+    }
     if (split_map_->fineEnabled()) {
       // Reliable, transient_local, deep history: a late joiner gets the
       // retained add/remove replay, which converges (adds are keyed-replace,
@@ -259,6 +272,9 @@ public:
     // and bounded by one grid walk, so the join is short.
     // (notes: dtor-join-memlog-worker)
     if (mem_log_thread_.joinable()) mem_log_thread_.join();
+    // The full-map worker reads only its own frame copy, but publishes
+    // through full_pub_ and writes the stats members.
+    if (full_thread_.joinable()) full_thread_.join();
   }
 private:
   scovox::Params declareMapParams() {
@@ -543,6 +559,22 @@ private:
     // (notes: share-roi-z-band)
     share_roi_z_min_ = dp("share_roi_z_min", 0.0);
     share_roi_z_max_ = dp("share_roi_z_max", 0.0);
+    // Full-map stream (DESIGN_gen34 §12): > 0 publishes every non-prior voxel
+    // of this robot's map on ~/scovox_full at this period (node clock), beside
+    // the unchanged delta stream. The comms emulator relays it with the latest
+    // policy in the full-map arm. 0 (default) = off. Needs mode=rolling.
+    share_full_map_period_s_ = dp("share_full_map_period_s", 0.0);
+    if (!(share_full_map_period_s_ >= 0.0)) {
+      RCLCPP_WARN(get_logger(),
+        "share_full_map_period_s=%f is not >= 0; full-map stream off",
+        share_full_map_period_s_);
+      share_full_map_period_s_ = 0.0;
+    } else if (share_full_map_period_s_ > 0.0 && share_full_map_period_s_ < 0.05) {
+      RCLCPP_WARN(get_logger(),
+        "share_full_map_period_s=%f is below the 0.05 s floor; using 0.05",
+        share_full_map_period_s_);
+      share_full_map_period_s_ = 0.05;
+    }
     // Step 12.10 (2026-05-09) — fused single-DDA ray walker. Default true.
     // Set false to fall back to the two-DDA split path for A/B parity testing.
     fused_walker_ = dp("fused_walker", true);
@@ -758,6 +790,16 @@ private:
       auto bin_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
       bin_pub_ = create_publisher<scovox_msgs::msg::ScovoxMapBinary>(
         sm_t + std::string("_bin"), bin_qos);
+      // Full-map frames (§12): a newer frame makes an older one worthless, so
+      // a shallow history suffices; the relay's latest policy does the rest.
+      if (share_full_map_period_s_ > 0.0)
+        full_pub_ = create_publisher<scovox_msgs::msg::ScovoxMapBinary>(
+          sm_t + std::string("_full"),
+          rclcpp::QoS(rclcpp::KeepLast(2)).reliable());
+    } else if (share_full_map_period_s_ > 0.0) {
+      RCLCPP_WARN(get_logger(),
+        "share_full_map_period_s is set but mode is '%s', not rolling; "
+        "no full-map stream", mode_.c_str());
     }
     // Queue depth 1 (was 10): on KITTI 10 cm a single PointCloud2 can be
     // 2 GB. With reliable QoS + a slow subscriber the publisher would
@@ -1851,6 +1893,235 @@ private:
     return (now.s_class() - s0) > (float)share_gate_evidence_rel_dir_ * s0;
   }
 
+  // ── Full-map stream (DESIGN_gen34 §12) ─────────────────────────────────
+  // Every non-prior voxel of this robot's map, one self-contained frame per
+  // tick, on ~/scovox_full. The copy runs here on the executor thread under a
+  // shared lock; serialize + LZ4 + publish run on full_thread_. The delta
+  // stream is untouched: no touched-set drain, no gate write, no deferral,
+  // no chunking (a chunk lost to the relay's latest policy would leave the
+  // receiver a partial map it cannot detect).
+  void publishFullMapTick() {
+    logFullStats();
+    bool expected = false;
+    if (!full_inflight_.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel)) {
+      std::lock_guard<std::mutex> g(full_stats_mu_);
+      ++full_stats_.skip_busy;
+      return;
+    }
+    // Timed from here, not from the lock: every other callback of this node
+    // waits for the whole tick, TF lookup and reap included.
+    const auto t0 = std::chrono::steady_clock::now();
+    // The flag guarantees the previous worker has finished; reap its handle.
+    if (full_thread_.joinable()) full_thread_.join();
+
+    geometry_msgs::msg::Transform map_from_source;
+    try {
+      // Zero timeout, as publishBinaryMap: never wait on TF in a timer.
+      map_from_source = tf_buffer_.lookupTransform(
+          map_frame_, int_frame_, rclcpp::Time(0),
+          rclcpp::Duration(0, 0)).transform;
+    } catch (const tf2::TransformException&) {
+      {
+        std::lock_guard<std::mutex> g(full_stats_mu_);
+        ++full_stats_.skip_tf;
+      }
+      full_inflight_.store(false, std::memory_order_release);
+      return;
+    }
+
+    auto frame = std::make_shared<scovox::BinarySerializer::Frame>();
+    uint64_t seq = 0;
+    rclcpp::Time stamp;
+    // Sized from the last frame: growing 4 M records by doubling would copy
+    // them several times over while the executor waits.
+    frame->beta_deltas.reserve(full_prev_beta_ + full_prev_beta_ / 8);
+    frame->dir_deltas.reserve(full_prev_dir_ + full_prev_dir_ / 8);
+    {
+      std::shared_lock<std::shared_mutex> lock(map_mtx_);
+      auto& ss = split_map_->semsplit();
+      frame->resolution  = static_cast<float>(split_map_->resolution());
+      frame->num_classes = static_cast<uint16_t>(num_classes_);
+      frame->alpha_0     = alpha_0_;
+      frame->quant_step  = map_params_.evidence_saturation > 0
+          ? static_cast<float>(map_params_.evidence_saturation) / 65025.f
+          : 0.f;
+      // The predicates and wire transforms below mirror publishBinaryMap's
+      // snapshot path (emit_tsdf / emit_fine / emit_beta / emit_dir) minus
+      // the change gate; keep them in step.
+      const float beta_occ_prior = scovox::kBetaOccPrior;
+      const float dir_other_prior =
+          static_cast<float>(num_classes_ - scovox::K_TOP) * alpha_0_;
+      const bool zband = share_roi_z_max_ > share_roi_z_min_;
+      const double zhalf = 0.5 * split_map_->resolution();
+      if (share_tsdf_) {
+        split_map_->tsdf().grid().forEachCell(
+          [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
+            if (v.weight > 0.f) frame->tsdf_deltas.push_back({c, v});
+          });
+        if (split_map_->fineEnabled()) {
+          frame->fine_ratio_log2 = split_map_->fineRatioLog2();
+          split_map_->fineTsdf().grid().forEachCell(
+            [&](const scovox::TsdfVoxel& v, const Bonxai::CoordT& c) {
+              if (v.weight > 0.f) frame->fine_tsdf_deltas.push_back({c, v});
+            });
+        }
+      }
+      auto& bgrid = ss.betaGrid();
+      bgrid.forEachCell([&](const scovox::BetaVoxel& v, const Bonxai::CoordT& c) {
+        const bool at_prior = (v.a_occ  <= beta_occ_prior        + 1e-4f) &&
+                              (v.a_free <= scovox::kBetaFreePrior + 1e-4f);
+        if (at_prior) return;
+        if (zband) {
+          const double zc = bgrid.coordToPos(c).z + zhalf;
+          if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
+        }
+        if (gate_binarize_) {
+          const bool occ = v.p_occ() >= (float)share_stateflip_p_occ_;
+          scovox::BetaVoxel w;
+          w.a_occ  = beta_occ_prior +
+                     (occ ? (float)share_binarize_evidence_ : 0.f);
+          w.a_free = scovox::kBetaFreePrior +
+                     (occ ? 0.f : (float)share_binarize_evidence_);
+          frame->beta_deltas.push_back({c, w});
+        } else {
+          frame->beta_deltas.push_back({c, v});
+        }
+      });
+      if (share_dir_) {
+        auto& dgrid = ss.dirGrid();
+        dgrid.forEachCell([&](const scovox::DirVoxel& v, const Bonxai::CoordT& c) {
+          bool any_sem = false;
+          for (int i = 0; i < scovox::K_TOP; ++i)
+            if (v.cls[i] != 0xFFFF) { any_sem = true; break; }
+          if (!any_sem && v.other <= dir_other_prior + 1e-4f) return;
+          if (zband) {
+            const double zc = dgrid.coordToPos(c).z + zhalf;
+            if (zc < share_roi_z_min_ || zc > share_roi_z_max_) return;
+          }
+          if (gate_binarize_) {
+            const uint16_t d =
+                scovox::dominantClass(v, alpha_0_, (uint16_t)num_classes_);
+            if (d == 0xFFFF) return;
+            scovox::DirVoxel w =
+                scovox::defaultDirVoxel((uint16_t)num_classes_, alpha_0_);
+            w.cls[0] = d;
+            w.cnt[0] = alpha_0_ + (float)share_binarize_evidence_;
+            frame->dir_deltas.push_back({c, w});
+          } else {
+            frame->dir_deltas.push_back({c, v});
+          }
+        });
+      }
+      const bool empty = frame->tsdf_deltas.empty() && frame->beta_deltas.empty() &&
+                         frame->dir_deltas.empty() && frame->fine_tsdf_deltas.empty();
+      if (!empty) {
+        // Stamped at CAPTURE, on the executor thread (the only thread that
+        // advances share_seq_): every delta with a lower seq was drained
+        // before this copy, so frame k covers them all, and every delta
+        // drained after it gets a higher seq. Stamping at publish on the
+        // worker would let a later delta slip under it (§12.6).
+        seq = ++share_seq_;
+        stamp = get_clock()->now();
+      }
+    }
+    const double copy_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (seq == 0) {   // empty map: nothing to send, no seq consumed
+      full_inflight_.store(false, std::memory_order_release);
+      return;
+    }
+    full_prev_beta_ = frame->beta_deltas.size();
+    full_prev_dir_  = frame->dir_deltas.size();
+    {
+      std::lock_guard<std::mutex> g(full_stats_mu_);
+      ++full_stats_.copies;
+      full_stats_.copy_ms_sum += copy_ms;
+      full_stats_.copy_ms_max = std::max(full_stats_.copy_ms_max, copy_ms);
+    }
+
+    scovox::BinarySerializer::Options opts;
+    opts.share_tsdf = share_tsdf_;
+    const std::string frame_id = int_frame_;
+    auto work = [this, frame, opts, seq, stamp, map_from_source, frame_id]() {
+      const auto w0 = std::chrono::steady_clock::now();
+      const size_t n = frame->tsdf_deltas.size() + frame->beta_deltas.size() +
+                       frame->dir_deltas.size() + frame->fine_tsdf_deltas.size();
+      size_t raw = 0, lz4 = 0;
+      std::vector<uint8_t> comp;
+      try {
+        auto data = scovox::BinarySerializer::serialize(*frame, opts);
+        raw = data.size();
+        comp = scovox::ScovoxBinarySerializer::compressLZ4(data);
+        lz4 = comp.size();
+      } catch (const std::exception& e) {
+        // An exception out of a std::thread terminates the node; drop the
+        // frame instead (its seq becomes a gap, as for an LZ4 failure).
+        RCLCPP_ERROR(get_logger(), "full-map share: frame seq=%llu dropped: %s",
+                     (unsigned long long)seq, e.what());
+        comp.clear();
+        lz4 = 0;
+      }
+      if (!comp.empty()) {
+        scovox_msgs::msg::ScovoxMapBinary bin;
+        bin.header.stamp    = stamp;
+        bin.header.frame_id = frame_id;
+        bin.map_from_source = map_from_source;
+        bin.version         = 5;   // same envelope as the delta stream
+#if __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__
+        bin.little_endian = true;
+#else
+        bin.little_endian = false;
+#endif
+        bin.seq  = seq;
+        bin.data = std::move(comp);
+        full_pub_->publish(std::move(bin));
+      }
+      const double work_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - w0).count();
+      {
+        std::lock_guard<std::mutex> g(full_stats_mu_);
+        if (lz4 == 0) {
+          ++full_stats_.lz4_fail;   // its seq becomes a gap; the next frame covers it
+        } else {
+          ++full_stats_.published;
+          full_stats_.last_voxels = n;
+          full_stats_.last_raw = raw;
+          full_stats_.last_lz4 = lz4;
+        }
+        full_stats_.work_ms_sum += work_ms;
+        full_stats_.work_ms_max = std::max(full_stats_.work_ms_max, work_ms);
+      }
+      full_inflight_.store(false, std::memory_order_release);
+    };
+    try {
+      full_thread_ = std::thread(std::move(work));
+    } catch (const std::system_error& e) {
+      RCLCPP_ERROR(get_logger(), "full-map share: no worker thread: %s", e.what());
+      full_inflight_.store(false, std::memory_order_release);
+    }
+  }
+
+  // WARN, not INFO: the node runs at --log-level warn in the sim launches, and
+  // this line is the arm's only record of what the sender actually produced.
+  void logFullStats() {
+    FullStats st;
+    {
+      std::lock_guard<std::mutex> g(full_stats_mu_);
+      st = full_stats_;
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 60000,
+      "full-map share: published=%llu skip_busy=%llu skip_tf=%llu lz4_fail=%llu "
+      "last_voxels=%zu last_raw_bytes=%zu last_lz4_bytes=%zu "
+      "copy_ms_mean=%.1f copy_ms_max=%.1f work_ms_mean=%.1f work_ms_max=%.1f",
+      (unsigned long long)st.published, (unsigned long long)st.skip_busy,
+      (unsigned long long)st.skip_tf, (unsigned long long)st.lz4_fail,
+      st.last_voxels, st.last_raw, st.last_lz4,
+      st.copies ? st.copy_ms_sum / st.copies : 0.0, st.copy_ms_max,
+      (st.published + st.lz4_fail) ? st.work_ms_sum / (st.published + st.lz4_fail) : 0.0,
+      st.work_ms_max);
+  }
+
   std::pair<size_t,double> publishBinaryMap() {
     if (!bin_pub_) return {0, 0};
     auto& ss = split_map_->semsplit();
@@ -2791,6 +3062,22 @@ private:
   // Last ScovoxMapBinary.seq published (0 = nothing sent yet). Node-local;
   // restarts from 0 with the node.
   uint64_t share_seq_{0};
+  // Full-map stream (§12). One worker at a time: a tick that finds the last
+  // frame still serializing is skipped and counted, never queued.
+  double share_full_map_period_s_{0.0};
+  rclcpp::Publisher<scovox_msgs::msg::ScovoxMapBinary>::SharedPtr full_pub_;
+  rclcpp::TimerBase::SharedPtr full_timer_;
+  std::thread full_thread_;
+  std::atomic<bool> full_inflight_{false};
+  size_t full_prev_beta_{0}, full_prev_dir_{0};   // last frame's sizes, for reserve
+  struct FullStats {
+    uint64_t published = 0, skip_busy = 0, skip_tf = 0, lz4_fail = 0;
+    size_t last_voxels = 0, last_raw = 0, last_lz4 = 0;
+    double copy_ms_sum = 0, copy_ms_max = 0, work_ms_sum = 0, work_ms_max = 0;
+    uint64_t copies = 0;
+  };
+  FullStats full_stats_;
+  std::mutex full_stats_mu_;
   double share_roi_z_min_{0.0}, share_roi_z_max_{0.0};  // min>=max = band off
   // Change-gate memory: last-emitted wire state per voxel plus emit time in
   // node-clock seconds (double; epoch seconds exceed float precision).
