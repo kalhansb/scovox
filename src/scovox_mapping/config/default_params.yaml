@@ -47,8 +47,17 @@ scovox_node:
       #     → clear-air rays are highly trustworthy.
       # Ratio w_occ/w_free matters more than absolute scale for steady-state.
 
-    kappa0:                        # float, default 2.0, pseudo-counts
+    kappa0:                        # float, default 1.0 (count) / 2.0 (soft)
       # Base Dirichlet evidence weight per semantic observation.
+
+    deposit_rule:                  # string, default "count"; count | soft
+      # How a look deposits into the class channel. `count`: the look's
+      # argmax gets a flat kappa0, the band deposits once per voxel per scan,
+      # and the class channel is uncapped, so cnt[k] counts looks. `soft`:
+      # the softmax is deposited fractionally, weighted by p_occ. Sets the
+      # defaults of kappa0, inc_mode, hit_flat_share, batch_band,
+      # semantic_band_require_occ and class_evidence_saturation; any of
+      # those set explicitly wins. Occupancy is the same under both.
 
     semantic_top_k:                # LEGACY — do not set. int, default = K_TOP
       # Number of top semantic classes stored per voxel (sparse Dirichlet).

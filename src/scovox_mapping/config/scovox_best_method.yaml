@@ -100,28 +100,35 @@
     # by someone who thinks it only affects speed.
     batch_hits: true
 
+    # ---- Deposit rule: the soft posterior --------------------------------
+    # The node's default rule is the count map. This configuration is the
+    # soft one, so it names it; without this line the file would build a
+    # count map at these occupancy settings. `soft` sets inc_mode soft,
+    # hit_flat_share false, batch_band false and class_evidence_saturation -1
+    # (follow the shared cap), and would set semantic_band_require_occ true,
+    # which this file overrides to false above.
+    deposit_rule: soft
+
     # ---- Knobs deliberately left at their library defaults --------------
-    # inc_mode 0, hit_flat_share false, inc_thresh 0.10,
-    # class_evidence_saturation -1 (follow the shared cap), ray_spread 0,
-    # sem_top_k K_TOP (cap ingest at the number of classes a voxel holds).
-    # These six have no ROS parameter, and the promoted configuration wants
-    # exactly the value `SemSplitMap::Params` already declares for each, so
-    # this file does not need them. That is a property of THIS config, not a
-    # general one: a sweep that moves any of the six cannot be expressed
-    # here and has to go through the replay harness.
+    # inc_thresh 0.10, ray_spread 0, sem_top_k K_TOP (cap ingest at the
+    # number of classes a voxel holds). ray_spread and sem_top_k have no ROS
+    # parameter, and the promoted configuration wants exactly the value
+    # `SemSplitMap::Params` already declares for each, so this file does not
+    # need them. That is a property of THIS config, not a general one: a
+    # sweep that moves either cannot be expressed here and has to go through
+    # the replay harness.
     #
-    # One of the six is only conditionally at its promoted value. The replay
+    # The class cap is only conditionally at its promoted value. The replay
     # that produced the promoted run passed `--class-evidence-saturation 0`
-    # explicitly; the library default is -1, which means "share whatever
+    # explicitly; `soft` sets -1, which means "share whatever
     # `evidence_saturation` is". Those agree here ONLY because
     # `evidence_saturation` is 0 above, so both resolve to an uncapped class
     # channel. Raising `evidence_saturation` in this file therefore does not
     # cap one channel -- it caps BOTH, silently, and the class cap is the one
     # that moves semantics. Cap occupancy alone by adding an explicit
-    # `class_evidence_saturation: 0` here first, which needs the parameter to
-    # be exposed on the node.
+    # `class_evidence_saturation: 0.0` here first.
 
-    # `sem_top_k` deserves a word because it is the one of the six whose
+    # `sem_top_k` deserves a word because it is the one of these whose
     # library default changed rather than merely being inherited. Ingest used
     # to deposit every class with a positive probability; it now keeps the
     # `K_TOP` largest and lets the rest fall into OTHER, which is the same

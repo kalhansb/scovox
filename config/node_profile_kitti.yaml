@@ -57,7 +57,7 @@
     # --- Occupancy point (KITTI tuned) -------------------------------------
     w_occ:  1.5
     w_free: 0.0
-    kappa0: 1.0                       # PARITY: node default 2.0, replay 1.0
+    kappa0: 1.0                       # the count rule's default; replay 1.0
     dirichlet_min_p_occ: 0.5          # build-time deposit gate
 
     # --- TF ----------------------------------------------------------------

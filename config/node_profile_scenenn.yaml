@@ -63,7 +63,7 @@
     # --- Occupancy point (SceneNN tuned; overrides the overlay's LiDAR one) -
     w_occ:  3.0
     w_free: 0.0
-    kappa0: 1.0                       # PARITY: node default 2.0, replay 1.0.
+    kappa0: 1.0                       # the count rule's default; replay 1.0.
                                       # This is the class-evidence gain per
                                       # look — at 2.0 every count is doubled.
     dirichlet_min_p_occ: 0.5          # build-time deposit gate (NOT the

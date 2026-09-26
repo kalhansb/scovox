@@ -80,9 +80,13 @@
     # here, as in the promoted config; `w_occ` above is what differs.
     batch_hits: true
 
+    # The soft posterior, named because the node's default rule is the count
+    # map; identical to scovox_best_method.yaml, which says what it sets.
+    deposit_rule: soft
+
     # ---- Knobs deliberately left at their library defaults --------------
-    # inc_mode 0, hit_flat_share false, inc_thresh 0.10,
-    # class_evidence_saturation -1, ray_spread 0 -- identical to
+    # inc_mode soft, hit_flat_share false (both from deposit_rule), inc_thresh
+    # 0.10, class_evidence_saturation -1, ray_spread 0 -- identical to
     # scovox_best_method.yaml, including the caveat that
     # class_evidence_saturation -1 resolves to "uncapped" only because
     # evidence_saturation is 0 above. Raising it caps BOTH channels.

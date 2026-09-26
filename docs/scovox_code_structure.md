@@ -911,13 +911,17 @@ reject gate (`:818-821`), `topk_probs_dir` (`:829`), `eviction_stats_csv`
 **How `P` reaches the library** (`:93-148`): geometry and TSDF from `P`;
 `SP.tsdf_enabled = (sdf_trunc_launch_ > 0)` (`:110`); `w_free`, `w_occ`,
 `kappa0`, `carve_skip_occ_threshold`, `batch_free_carve`, `batch_hits`,
-`evidence_saturation`, `dirichlet_min_p_occ`, `range_decay_length`,
-`semantic_mode` from `P`; `evict_by_confidence`, `semantic_spread_radius`,
-`semantic_band_length`, `semantic_band_require_occ`, `num_classes`,
-`alpha_0`, `fused_walker` and the fine-band fields from node members.
-**Not set anywhere in the node**: `hit_flat_share`, `inc_mode`, `inc_thresh`,
-`class_evidence_saturation`, `ray_spread`, `far_voxel_fast_paths` — they stay
-at `SemSplitMap::Params` / `ScovoxMapSplit::Params` defaults.
+`evidence_saturation`, `batch_band`, `inc_mode`, `inc_thresh`,
+`hit_flat_share`, `dirichlet_min_p_occ`, `range_decay_length`,
+`semantic_mode` from `P`; `class_evidence_saturation`,
+`evict_by_confidence`, `semantic_spread_radius`, `semantic_band_length`,
+`semantic_band_require_occ`, `num_classes`, `alpha_0`, `fused_walker` and the
+fine-band fields from node members. The `deposit_rule` parameter (`count`, the
+default, or `soft`) sets the defaults of `inc_mode`, `hit_flat_share`,
+`batch_band`, `semantic_band_require_occ` and `class_evidence_saturation`;
+each still wins when set on its own. **Not set anywhere in the node**:
+`ray_spread`, `far_voxel_fast_paths` — they stay at `SemSplitMap::Params` /
+`ScovoxMapSplit::Params` defaults.
 
 **Input paths.**
 - RGB-D: `onImages` (`:1342-1413`) → `DepthSnapshot` →
@@ -1107,12 +1111,11 @@ shows that.
 
 ### 3.2 Knobs the node cannot set at all
 
-`hit_flat_share`, `inc_mode`, `inc_thresh`, `class_evidence_saturation`,
 `ray_spread` (`SemSplitMap::Params`) and `far_voxel_fast_paths`
-(`ScovoxMapSplit::Params`) have no `declare_parameter`. Their defaults happen
-to equal the best method, so the node is correct by accident; none of the
-ablation arms behind them can be reproduced through ROS. The node prints
-`far_voxel_fast_paths` (`:298`) as if it were configurable.
+(`ScovoxMapSplit::Params`) have no `declare_parameter`. The node prints
+`far_voxel_fast_paths` as if it were configurable. The deposit-rule knobs
+(`hit_flat_share`, `inc_mode`, `inc_thresh`, `batch_band`,
+`class_evidence_saturation`) are declared, under the `deposit_rule` switch.
 
 `class_evidence_saturation` is the one that bites. Its default is −1, meaning
 "share whatever `evidence_saturation` is", while the promoted replay passed 0
@@ -1536,12 +1539,13 @@ A runner-up deposit can only fill an empty second slot, win an eviction, or be
 dropped — so most of the soft distribution was already discarded downstream.
 `hard` discards it earlier, before the deposit loop pays for it.
 
-**Design choice: `inc_mode` stays 0, and stays out of the ROS interface.** It
-is deliberately harness-only — the three config yamls document the default
-rather than exposing a parameter — because the measurement above does not meet
-the promotion bar. It is faster by a real margin with no *detected* mIoU loss,
-but at n=8 the interval cannot exclude a material one, and re-running cannot
-tighten it. Exposing a ROS parameter is the prerequisite if that ever changes.
+**Design choice, superseded.** `inc_mode` was first kept at 0 and out of the
+ROS interface, because the measurement above alone did not meet the promotion
+bar. The count map (`inc_mode` hard together with a flat endpoint share and a
+batched band) was later promoted on both sensors, and it is now the node's
+default deposit rule (`deposit_rule: count`); `deposit_rule: soft` keeps the
+posterior deposit, and the three RGB-D config yamls name it. The replay
+harness defaults are unchanged and still build the soft map.
 
 **What this prices.** Adopting SLIM-VDB's exact deposit model closes 3.9% of
 the ~135 ms/frame gap at matched accuracy. The number of classes deposited was

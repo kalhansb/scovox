@@ -1,8 +1,10 @@
 # =======================================================================
-# SCovox — the COUNT MAP deposit rule (overlay)
+# SCovox — the COUNT MAP at its tuned operating point (overlay)
 # =======================================================================
-# Load this ON TOP of a base config to make the node deposit whole-number
-# looks instead of a soft posterior:
+# The count-map deposit rule is the node default (`deposit_rule: count`);
+# a base config that names `deposit_rule: soft` gets the soft posterior
+# instead. This overlay names the rule explicitly, so it wins over such a
+# base, and adds the operating point the count map was tuned at:
 #
 #   ros2 run scovox_mapping scovox_mapping_node --ros-args \
 #     --params-file /scovox/config/scovox_fused_lidar_rgbd.yaml \
@@ -18,9 +20,12 @@
 #                            band's half of the same rule, and hit_flat_share
 #                            does not reach it
 #   batch_band=true          one band deposit per voxel per scan, not per pixel
-#   evidence_saturation=0    no cap, so a count stays a count
+#   evidence_saturation=0    no cap, so a count stays a count; the default
+#                            rule uncaps the class channel only
+#                            (class_evidence_saturation 0), this line
+#                            uncaps occupancy as well
 #
-# Leaving band_require_occ at its default (true) is not a smaller version of
+# Setting band_require_occ back to true is not a smaller version of
 # the count map: the band then weights by p_occ AND drops every voxel with no
 # Beta entry, which under w_free 0 is most of the band.
 #
@@ -47,6 +52,7 @@
 /**:
   ros__parameters:
     # --- Deposit rule ------------------------------------------------------
+    deposit_rule:   "count"    # count | soft; sets the defaults of the knobs below
     inc_mode:       "hard"     # soft | hard | thresh
     hit_flat_share: true
     batch_band:     true

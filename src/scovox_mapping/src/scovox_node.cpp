@@ -126,6 +126,7 @@ public:
     SP.semsplit.inc_thresh              = P.inc_thresh;
     SP.semsplit.hit_flat_share          = P.hit_flat_share;
     SP.semsplit.evidence_saturation     = static_cast<float>(P.evidence_saturation);
+    SP.semsplit.class_evidence_saturation = static_cast<float>(class_evidence_saturation_);
     SP.semsplit.dirichlet_min_p_occ     = P.dirichlet_min_p_occ;
     SP.semsplit.evict_by_confidence     = evict_by_confidence_;
     SP.semsplit.semantic_spread_radius  = static_cast<float>(semantic_spread_radius_);
@@ -413,7 +414,6 @@ private:
     // shared geometry exactly. See SemSplitMap::Params::dir_leaf_bits.
     P.dir_leaf_bits = (uint8_t)std::clamp((int)dp("dir_leaf_bits", 2), 1, 4);
     P.w_free = dp("w_free", 1.0);  P.w_occ = dp("w_occ", 2.0);
-    P.kappa0 = dp("kappa0", 2.0);
     {
       const int requested_top_k = (int)dp("semantic_top_k", (int)scovox::K_TOP);
       P.top_k = std::clamp(requested_top_k, 1, (int)scovox::K_TOP);
@@ -443,11 +443,33 @@ private:
     P.carve_skip_occ_threshold = dp("carve_skip_occ_threshold", 0.0);  // <=0 = guard off (trust recent scan)
     P.batch_free_carve = dp("batch_free_carve", true);
     P.batch_hits = dp("batch_hits", true);
-    P.batch_band = dp("batch_band", false);
+    // Deposit rule, as one switch that sets the defaults of the six knobs
+    // below; each can still be set on its own and then wins.
+    //   count (default)  a look's class share goes to its argmax, endpoint
+    //                    and band looks each weigh a flat kappa0 of 1, the
+    //                    band deposits once per voxel per scan, and the class
+    //                    channel is uncapped, so cnt[k] is a number of looks.
+    //   soft             the posterior deposit: fractional shares of kappa0
+    //                    2, weighted by p_occ, one band deposit per pixel,
+    //                    and a class cap that follows evidence_saturation.
+    // All six act on the class channel only. evidence_saturation also caps
+    // the Beta channel, so it is not part of the switch and keeps its own
+    // default either way.
+    {
+      const std::string dr = dp("deposit_rule", std::string("count"));
+      count_rule_ = (dr != "soft");
+      if (dr != "count" && dr != "soft") {
+        RCLCPP_WARN(get_logger(),
+                    "deposit_rule='%s' is not one of count|soft; using count",
+                    dr.c_str());
+      }
+    }
+    P.batch_band = dp("batch_band", count_rule_);
+    P.kappa0 = dp("kappa0", count_rule_ ? 1.0 : 2.0);
     {
       // Deposit rule. `inc_mode` is named rather than numbered so a config
       // cannot select a mode by an integer that later means something else.
-      const std::string im = dp("inc_mode", std::string("soft"));
+      const std::string im = dp("inc_mode", std::string(count_rule_ ? "hard" : "soft"));
       if      (im == "soft")   P.inc_mode = 0;
       else if (im == "hard")   P.inc_mode = 1;
       else if (im == "thresh") P.inc_mode = 2;
@@ -459,7 +481,7 @@ private:
       }
     }
     P.inc_thresh     = dp("inc_thresh", 0.10);
-    P.hit_flat_share = dp("hit_flat_share", false);
+    P.hit_flat_share = dp("hit_flat_share", count_rule_);
     {
       // uint16_t storage: an out-of-range request would otherwise wrap silently
       // (70000 → 4464, a far TIGHTER cap than asked for; -1 → 65535). Clamp to
@@ -473,6 +495,8 @@ private:
       }
       P.evidence_saturation = static_cast<uint16_t>(sat);
     }
+    // Class-channel cap. Negative follows evidence_saturation; 0 uncaps it.
+    class_evidence_saturation_ = dp("class_evidence_saturation", count_rule_ ? 0.0 : -1.0);
     P.dirichlet_min_p_occ = dp("dirichlet_min_p_occ", 0.5);
     sem_vis_thresh_ = dp("semantic_vis_threshold", -1.0);
     P.range_decay_length = dp("range_decay_length", -1.0);
@@ -489,7 +513,7 @@ private:
     evict_by_confidence_    = dp("semantic_evict_by_confidence", false);
     semantic_spread_radius_ = dp("semantic_spread_radius", 0.0);
     semantic_band_length_   = dp("semantic_band_length", 0.0);
-    semantic_band_require_occ_ = dp("semantic_band_require_occ", true);
+    semantic_band_require_occ_ = dp("semantic_band_require_occ", !count_rule_);
     // Both set is a config error, not a blend. SemSplitMap::sanitise resolves it
     // silently in favour of the ball; say so here, because a sweep that thinks
     // it is measuring the band would otherwise report the ball's numbers.
@@ -3368,6 +3392,8 @@ private:
   double semantic_spread_radius_{0.0};
   double semantic_band_length_{0.0};
   bool   semantic_band_require_occ_{true};
+  bool   count_rule_{true};
+  double class_evidence_saturation_{-1.0};
   // Soft-probability mode: directory of <frame>.topk flat-binary blobs, with
   // file names matching the low 16 bits of header.stamp.nanosec the replay
   // node sets (zero-padded to 6 digits). Empty = legacy hard-label path.
